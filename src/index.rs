@@ -103,7 +103,7 @@ impl PdfExtractor {
 pub(super) const INDEX_SIDECARS: [&str; 5] =
     ["-wal", "-shm", "-journal", "-watch-lock", "-external"];
 
-fn opaque_package(path: &Path) -> bool {
+pub(super) fn opaque_package(path: &Path) -> bool {
     const EXTENSIONS: &[&str] = &[
         "app",
         "framework",
@@ -712,6 +712,7 @@ enum Pending {
         path: PathBuf,
         directory: bool,
         availability: &'static str,
+        mtime: i64,
         legacy: Option<Box<LegacyDocument>>,
         content: Option<crate::content::Observation>,
     },
@@ -832,7 +833,10 @@ impl<'a> Walk<'a> {
             }
             let (directory, availability) = match &metadata {
                 Some(meta) => (meta.is_dir(), platform::availability(&path, meta)),
-                None => (false, platform::classify(&path, cached.unwrap().dataless)),
+                None => (
+                    false,
+                    platform::classify(&path, cached.as_ref().unwrap().dataless),
+                ),
             };
             if availability == "placeholder" {
                 self.stats.placeholders += 1;
@@ -911,6 +915,10 @@ impl<'a> Walk<'a> {
                     path: path.clone(),
                     directory,
                     availability,
+                    mtime: metadata.as_ref().map_or_else(
+                        || cached.as_ref().expect("bulk file metadata").mtime,
+                        MetadataExt::mtime,
+                    ),
                     legacy,
                     content,
                 });
@@ -997,6 +1005,7 @@ impl<'a> Walk<'a> {
                     path,
                     directory,
                     availability,
+                    mtime,
                     legacy,
                     content,
                 } => {
@@ -1008,14 +1017,14 @@ impl<'a> Walk<'a> {
                     let kind = if *directory { "directory" } else { "file" };
                     if self.cold {
                         if self
-                            .insert_item(path_text, display, kind, availability)?
+                            .insert_item(path_text, display, kind, availability, *mtime)?
                             .is_some()
                         {
                             self.stats.items += 1;
                         }
                     } else {
                         let (id, _, first) =
-                            self.observe(path_text, display, kind, availability)?;
+                            self.observe(path_text, display, kind, availability, *mtime)?;
                         if first {
                             if let Some(document) = legacy {
                                 self.apply_document(id, document)?;
@@ -1061,23 +1070,24 @@ impl<'a> Walk<'a> {
         display: &str,
         kind: &str,
         availability: &str,
+        mtime: i64,
     ) -> Result<(i64, Option<String>, bool)> {
-        let previous: Option<(i64, String, String)> = self
+        let previous: Option<(i64, String, String, i64)> = self
             .tx()
-            .prepare_cached("SELECT id,kind,availability FROM item WHERE path=?")?
-            .query_row([path], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .prepare_cached("SELECT id,kind,availability,mtime FROM item WHERE path=?")?
+            .query_row([path], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
             .optional()?;
-        let (id, prior) = if let Some((id, old_kind, old_availability)) = previous {
-            if old_kind != kind || old_availability != availability {
+        let (id, prior) = if let Some((id, old_kind, old_availability, old_mtime)) = previous {
+            if old_kind != kind || old_availability != availability || old_mtime != mtime {
                 self.changed = true;
                 self.tx()
-                    .prepare_cached("UPDATE item SET kind=?,availability=? WHERE id=?")?
-                    .execute(params![kind, availability, id])?;
+                    .prepare_cached("UPDATE item SET kind=?,availability=?,mtime=? WHERE id=?")?
+                    .execute(params![kind, availability, mtime, id])?;
             }
             (id, (old_kind == kind).then_some(old_availability))
         } else {
             let id = self
-                .insert_item(path, display, kind, availability)?
+                .insert_item(path, display, kind, availability, mtime)?
                 .context("new index row unexpectedly conflicts with an existing path")?;
             (id, None)
         };
@@ -1096,6 +1106,7 @@ impl<'a> Walk<'a> {
         display: &str,
         kind: &str,
         availability: &str,
+        mtime: i64,
     ) -> Result<Option<i64>> {
         let tx = self.tx.as_ref().expect("writer batch is active");
         let (full, initials) = if display.is_ascii() {
@@ -1113,9 +1124,9 @@ impl<'a> Walk<'a> {
         let name = norm(display);
         let searchable_path = norm(path);
         let changed = tx.prepare_cached(
-            "INSERT INTO item(path,display,kind,availability,name,full,initials,searchable_path)
-             VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(path) DO NOTHING",
-        )?.execute(params![path, display, kind, availability, name, full, initials, searchable_path])?;
+            "INSERT INTO item(path,display,kind,availability,name,full,initials,searchable_path,mtime)
+             VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO NOTHING",
+        )?.execute(params![path, display, kind, availability, name, full, initials, searchable_path, mtime])?;
         if changed == 0 {
             return Ok(None);
         }

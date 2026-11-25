@@ -212,6 +212,7 @@ pub fn pinyin(_: &str) -> (String, String) {
 pub struct FastInfo {
     pub directory: bool,
     pub dataless: bool,
+    pub mtime: i64,
 }
 type Children = Vec<(std::ffi::OsString, Option<FastInfo>)>;
 
@@ -236,6 +237,7 @@ pub fn bulk_children(path: &Path, scratch: &mut Vec<u64>) -> Option<Children> {
     }
     const NAME: u32 = 0x0000_0001;
     const KIND: u32 = 0x0000_0008;
+    const MODTIME: u32 = 0x0000_0400;
     const FLAGS: u32 = 0x0004_0000;
     const ERROR: u32 = 0x2000_0000;
     const RETURNED: u32 = 0x8000_0000;
@@ -243,7 +245,7 @@ pub fn bulk_children(path: &Path, scratch: &mut Vec<u64>) -> Option<Children> {
     let mut a = AttrList {
         bitmapcount: 5,
         reserved: 0,
-        common: RETURNED | NAME | KIND | FLAGS | ERROR,
+        common: RETURNED | NAME | KIND | MODTIME | FLAGS | ERROR,
         vol: 0,
         dir: 0,
         file: 0,
@@ -307,14 +309,17 @@ pub fn bulk_children(path: &Path, scratch: &mut Vec<u64>) -> Option<Children> {
             {
                 return None;
             }
-            let info = if fields & (KIND | FLAGS) == (KIND | FLAGS) {
+            let info = if fields & (KIND | MODTIME | FLAGS) == (KIND | MODTIME | FLAGS) {
                 let kind = u32at(r, i + 8)?;
                 if !matches!(kind, 1 | 2) {
                     continue;
                 }
                 Some(FastInfo {
                     directory: kind == 2,
-                    dataless: u32at(r, i + 12)? & DATALESS != 0,
+                    // Darwin packs attributes on 4-byte boundaries; MODTIME
+                    // is a timespec between the object type and flags.
+                    mtime: i64::from_ne_bytes(r.get(i + 12..i + 20)?.try_into().ok()?),
+                    dataless: u32at(r, i + 28)? & DATALESS != 0,
                 })
             } else {
                 None

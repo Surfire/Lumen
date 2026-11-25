@@ -330,35 +330,36 @@ if action == "semantic-serve":
         print(json.dumps({"id": req["id"], "hits": related_hits(req["query"])}), flush=True)
     sys.exit(0)
 
-if action == "query" and args[:2] == ["--mode", "semantic"]:
-    assert args[:-4] == ["--mode", "semantic", "--gemma", "--limit", "12"] and args[-2] == "--", args
-    check_gemma_options(args[-4:-2])
-    (work / "explicit-gemma-query-started").touch()
-    print(json.dumps(related_hits(args[-1])))
-    sys.exit(0)
+if action in ("query", "validate-hit"):
+    sys.exit("launcher unexpectedly spawned a standalone lexical query or hit validator")
 
-if action == "validate-hit":
-    assert args[0] == "--kind" and args[2] == "--availability" and args[-2] == "--", args
-    path = Path(args[-1])
+
+def validated(hit):
+    assert set(hit) <= {"path", "kind", "availability", "document_stamp"}, hit
+    path = Path(hit["path"])
     assert path.is_absolute()
+    stamp = hit.get("document_stamp")
     if path.name == "鹿鸣.md":
-        assert args[:-2] == ["--kind", "file", "--availability", "local"]
+        assert (hit["kind"], hit["availability"], stamp) == ("file", "local", None)
         (work / "han-validation-started").touch()
     if path.name == "body-match.md":
-        assert args[:5] == ["--kind", "file", "--availability", "local", "--document-stamp"]
-        assert args[5] == indexed_documents()[str(path)]["stamp"]
+        assert (hit["kind"], hit["availability"], stamp) == ("file", "local", indexed_documents()[str(path)]["stamp"])
         (work / "body-validation-started").touch()
+    if path.name == "related-one.md":
+        (work / "semantic-batch-validated").touch()
     if path.name == "cloudledger.txt" and (work / "hold-cloud-reveal").exists() and not (work / "finish-cloud-reveal").exists():
-        assert args[:-2] == ["--kind", "file", "--availability", "provider_metadata_only"]
+        assert (hit["kind"], hit["availability"], stamp) == ("file", "provider_metadata_only", None)
         gate("cloud-reveal")
-    os.execv(engine, [engine, db, database, action, *args])
+    args = ["--kind", hit["kind"], "--availability", hit["availability"]]
+    if stamp is not None:
+        args += ["--document-stamp", stamp]
+    return json.loads(subprocess.check_output([engine, db, database, "validate-hit", *args, "--", str(path)]))["valid"]
 
-if action == "query":
-    hits = query_hits(args)
-    if args[:2] == ["--mode", "name"] and args[-1] == "鹿鸣":
-        (work / "han-disk-name-started").touch()
-    if args[:2] == ["--mode", "text"]:
-        term = args[-1]
+
+def search_request(req):
+    hits = query_hits(["--mode", req["mode"], "--limit", str(req["limit"]), "--", req["query"]])
+    if req["mode"] == "text":
+        term = req["query"]
         if term == "鹿鸣":
             if (work / "hold-han-refresh-body").exists() and not (work / "finish-han-refresh-body").exists():
                 gate("han-refresh-body")
@@ -375,18 +376,23 @@ if action == "query":
             gate("before-render")
         if term == "missing stamp original":
             assert len(hits) == 1 and hits[0].pop("document_stamp")
-    print(json.dumps(hits))
-    sys.exit(0)
+    return hits
 
 if action == "serve":
     for line in sys.stdin:
         req = json.loads(line)
-        assert req["mode"] == "name"
-        if req["query"] == "obsolete" and not (work / "finish-obsolete").exists():
+        if req.get("op") == "validate":
+            assert set(req) == {"id", "op", "hits"}, req
+            valid = [validated(hit) for hit in req["hits"]]
+            print(json.dumps({"id": req["id"], "valid": valid}), flush=True)
+            continue
+        assert set(req) == {"id", "query", "mode", "limit", "check_access"} and req["check_access"] is False, req
+        assert req["mode"] in ("name", "text"), req
+        if req["mode"] == "name" and req["query"] == "obsolete" and not (work / "finish-obsolete").exists():
             gate("obsolete")
-        if req["query"] == "waiting old name" and not (work / "finish-pre-han-name").exists():
+        if req["mode"] == "name" and req["query"] == "waiting old name" and not (work / "finish-pre-han-name").exists():
             gate("pre-han-name")
-        if req["query"] == "late lexical delivery" and not (work / "finish-late-name").exists():
+        if req["mode"] == "name" and req["query"] == "late lexical delivery" and not (work / "finish-late-name").exists():
             gate("late-name")
         if req["query"] == "external-volume-fixture":
             hits = []
@@ -397,7 +403,7 @@ if action == "serve":
             print(json.dumps({"id": req["id"], "hits": hits}), flush=True)
             continue
         try:
-            hits = query_hits(["--mode", req["mode"], "--limit", str(req["limit"]), "--", req["query"]])
+            hits = search_request(req)
             reply = {"id": req["id"], "hits": hits}
         except subprocess.CalledProcessError as error:
             reply = {"id": req["id"], "error": str(error)}
@@ -686,6 +692,12 @@ def main():
             args.snapshots.mkdir(parents=True, exist_ok=True)
             for name in ("lumen-idle-light.png", "lumen-results-light.png", "lumen-results-dark.png"):
                 shutil.copyfile(root / name, args.snapshots / name)
+        run(root, "en")
+    with tempfile.TemporaryDirectory(prefix="lumen-gui-auto-index-") as tmp:
+        root = Path(tmp).resolve()
+        make_corpus(root)
+        install_fixture(root)
+        (root / "automatic-index-scenario").touch()
         run(root, "en")
     with tempfile.TemporaryDirectory(prefix="lumen-gui-settings-") as tmp:
         root = Path(tmp).resolve()

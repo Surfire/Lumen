@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -18,6 +19,7 @@ struct SearchWindow: View {
     let showSettings: () -> Void
     let beginIndex: () -> Void
     let open: (LauncherResult) -> Void
+    let browse: () -> Void
     let fileAction: (FileAction, SearchHit) -> Void
 
     static let headerHeight: CGFloat = 56
@@ -162,8 +164,7 @@ struct SearchWindow: View {
             if let file = model.selectedHit {
                 keyHint("⌘↵", model.t("在 Finder 中显示", "Show in Finder"))
                 if file.isLocal && file.kind == "file" {
-                    keyHint("⌘Y", LauncherInlinePreview.kind(file) == nil ? model.t("快速查看", "Quick Look")
-                            : model.t("预览", "Preview"))
+                    keyHint(model.t("空格 / ⌘Y", "Space / ⌘Y"), model.t("预览", "Preview"))
                 }
             }
         }
@@ -182,6 +183,12 @@ struct SearchWindow: View {
                 .accessibilityIdentifier("launcher-notice")
         }
         Spacer(minLength: 8)
+        if !model.showsResults && !model.activityBusy {
+            Label(model.t("筛选", "Filters"), systemImage: "line.3.horizontal.decrease")
+                .help(model.t("kind:folder、ext:pdf 或 path:\"/Users/…/My Files/\"；也可直接输入绝对路径。",
+                              "Try kind:folder, ext:pdf, or path:\"/Users/…/My Files/\". You can also type an absolute path."))
+                .accessibilityIdentifier("query-filter-hints")
+        }
         if model.canStartIndexFromLauncher {
             Button(model.t("在后台建立索引", "Build in Background"), action: beginIndex)
                 .buttonStyle(.borderless).fontWeight(.semibold)
@@ -230,8 +237,8 @@ struct SearchWindow: View {
             .onChange(of: model.selection) { _, value in
                 if let value { proxy.scrollTo(value) }
             }
-            .onKeyPress(.upArrow) { model.moveSelection(-1); return .handled }
-            .onKeyPress(.downArrow) { model.moveSelection(1); return .handled }
+            .onKeyPress(.upArrow) { browse(); model.moveSelection(-1); return .handled }
+            .onKeyPress(.downArrow) { browse(); model.moveSelection(1); return .handled }
             .onKeyPress(keys: [.return]) { press in
                 guard press.modifiers.isEmpty, let result = model.selectedResult else { return .ignored }
                 open(result)
@@ -288,12 +295,12 @@ struct SearchWindow: View {
         .accessibilityAction(named: Text(model.t("执行", "Run"))) { open(result) }
     }
 
-    private func clickRow(_ result: LauncherResult) {
+    private func clickRow(_ result: LauncherResult, count: Int? = nil) {
+        browse()
         model.selection = result.id
-        // A single recognizer handles both clicks without waiting for a possible second click.
-        if let event = NSApp.currentEvent, event.type == .leftMouseUp, event.clickCount == 2 {
-            open(result)
-        }
+        // Select on mouseUp without waiting to see if it becomes a double click.
+        let event = NSApp.currentEvent
+        if (count ?? (event?.type == .leftMouseUp ? event?.clickCount : nil)) == 2 { open(result) }
     }
 
     private var emptyResultsLabel: String {
@@ -318,6 +325,9 @@ struct SearchWindow: View {
             let path = (url.path as NSString).abbreviatingWithTildeInPath
             detail = model.t("应用程序 · \(path)", "Application · \(path)")
         case .settings: detail = model.t("系统设置", "System Settings")
+        case .system(let operation):
+            if case .define(let word) = operation { detail = word }
+            else { detail = model.t("系统操作", "System Action") }
         }
         let title = action.title(chinese: model.zh)
         return HStack(spacing: 10) {
@@ -339,7 +349,7 @@ struct SearchWindow: View {
         .frame(height: 44)
         .background { selectionBackground(selected) }
         .contentShape(Rectangle())
-        .onTapGesture { clickRow(.action(action)) }
+        .overlay { ActionRowClickView { clickRow(.action(action), count: $0) }.accessibilityHidden(true) }
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(selected ? .isSelected : [])
         .accessibilityAction(named: Text(model.t("打开", "Open"))) { open(.action(action)) }
@@ -353,7 +363,16 @@ struct SearchWindow: View {
         }
     }
 
-    private func resultRow(_ hit: SearchHit) -> some View {
+    @ViewBuilder private func resultRow(_ hit: SearchHit) -> some View {
+        if hit.isLocal && model.containsCurrentFile(hit) {
+            fileRow(hit).onDrag {
+                guard model.containsCurrentFile(hit), let url = LocalFile.dragURL(for: hit) else { return NSItemProvider() }
+                return NSItemProvider(object: url as NSURL)
+            }
+        } else { fileRow(hit) }
+    }
+
+    private func fileRow(_ hit: SearchHit) -> some View {
         let selected = model.selection == hit.path
         return HStack(spacing: 10) {
             FileTypeIcon(name: hit.name, directory: hit.kind == "directory")
@@ -415,6 +434,26 @@ struct SearchWindow: View {
         }
     }
 
+}
+
+@MainActor
+private struct ActionRowClickView: NSViewRepresentable {
+    let click: (Int) -> Void
+
+    func makeNSView(context: Context) -> ActionRowClickTarget { ActionRowClickTarget() }
+    func updateNSView(_ view: ActionRowClickTarget, context: Context) { view.click = click }
+}
+
+// Launch actions are not draggable. Use the native mouseUp click count rather than
+// inferring a double click from SwiftUI gesture timing or NSApp.currentEvent.
+final class ActionRowClickTarget: NSView {
+    var click: ((Int) -> Void)?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { click?(event.clickCount) }
+    }
 }
 
 // Use type artwork without opening or requesting an icon from the indexed path.
@@ -585,10 +624,32 @@ final class SettingsSession: ObservableObject {
         didSet { if page != oldValue { pageChanged(oldValue, page) } }
     }
     @Published private(set) var draft: IndexScope?
+    @Published private(set) var launchAtLogin = false
+    @Published private(set) var loginItemNeedsApproval = false
+    @Published private(set) var loginItemFailed = false
+    let canManageLoginItem: Bool
 
-    init(model: Launcher, pageChanged: @escaping (SettingsPage?, SettingsPage?) -> Void) {
+    init(model: Launcher, manageLoginItem: Bool, pageChanged: @escaping (SettingsPage?, SettingsPage?) -> Void) {
         self.model = model
         self.pageChanged = pageChanged
+        canManageLoginItem = manageLoginItem && Bundle.main.bundleURL.pathExtension == "app"
+    }
+
+    func refreshLoginItem() {
+        guard canManageLoginItem else { return }
+        let status = SMAppService.mainApp.status
+        loginItemNeedsApproval = status == .requiresApproval
+        launchAtLogin = status == .enabled || loginItemNeedsApproval
+    }
+
+    func setLaunchAtLogin(_ enabled: Bool) {
+        guard canManageLoginItem else { return }
+        do {
+            if enabled { try SMAppService.mainApp.register() }
+            else { try SMAppService.mainApp.unregister() }
+            loginItemFailed = false
+        } catch { loginItemFailed = true }
+        refreshLoginItem()
     }
 
     private var baseline: IndexScope {
@@ -775,6 +836,23 @@ struct LauncherSettings: View {
     }
 
     @ViewBuilder private var general: some View {
+        group(model.t("启动", "Startup")) {
+            Toggle(model.t("登录时启动", "Launch at Login"), isOn: Binding(
+                get: { session.launchAtLogin }, set: { session.setLaunchAtLogin($0) }
+            ))
+            .disabled(!session.canManageLoginItem)
+            .accessibilityIdentifier("settings.launch-at-login")
+            .onAppear { session.refreshLoginItem() }
+            if session.loginItemNeedsApproval {
+                Button(model.t("打开登录项设置…", "Open Login Items Settings…")) {
+                    SMAppService.openSystemSettingsLoginItems()
+                }
+            }
+            if session.loginItemFailed {
+                note(model.t("无法更改登录项。请检查 macOS 登录项设置。",
+                             "Could not change this login item. Check macOS Login Items settings."))
+            }
+        }
         group(model.t("语言", "Language")) {
             LabeledContent(model.t("界面语言", "Interface Language")) {
                 Picker(model.t("界面语言", "Interface Language"), selection: $model.language) {

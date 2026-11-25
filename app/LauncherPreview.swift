@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import Darwin
 import PDFKit
 import Quartz
@@ -90,6 +91,23 @@ struct PreviewSnapshot {
 }
 
 enum LocalFile {
+    static func dragURL(for hit: SearchHit, resourceValues: (URL, [URLResourceKey]) throws -> [URLResourceKey: Any] = {
+        try ($0 as NSURL).resourceValues(forKeys: $1)
+    }) -> URL? {
+        guard hit.isLocal, SearchHit.pathAttributes(at: hit.path, kind: hit.kind) != nil else { return nil }
+        let policy = IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES
+        let scope = IOPOL_SCOPE_THREAD
+        let prior = getiopolicy_np(policy, scope)
+        guard prior >= 0, setiopolicy_np(policy, scope, IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0 else { return nil }
+        defer { _ = setiopolicy_np(policy, scope, prior) }
+        // The live path check rejects dataless leaves and ancestors. Ubiquity only
+        // signals iCloud membership, not whether the item is locally resident.
+        let url = URL(fileURLWithPath: hit.path, isDirectory: hit.kind == "directory")
+        guard let values = try? resourceValues(url, [.volumeIsLocalKey]),
+              values[.volumeIsLocalKey] as? Bool == true else { return nil }
+        return url
+    }
+
     static func openReadOnly(_ path: String) -> Int32? {
         let components = path.split(separator: "/")
         guard path.hasPrefix("/"), !components.isEmpty,
@@ -167,6 +185,20 @@ final class LocalPreviewPanel: NSPanel {
         pdf?.document = nil
         super.close()
         snapshot.remove()
+    }
+
+    var onToggle: (() -> Void)?
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown {
+            let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+            if modifiers.isEmpty && event.keyCode == kVK_Space ||
+                modifiers == [.command] && event.charactersIgnoringModifiers?.lowercased() == "y" {
+                if !event.isARepeat { onToggle?() }
+                return
+            }
+        }
+        super.sendEvent(event)
     }
 
     var previewURL: URL? { closed ? nil : snapshot.url }

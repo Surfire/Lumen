@@ -18,22 +18,19 @@ enum WatchState: Equatable {
 }
 
 enum LocalModelState: Equatable {
-    case unchecked, checking, ready, unavailable(LocalModelProblem)
+    case unchecked, available, checking, ready, unavailable(LocalModelProblem)
 }
 
 enum LocalModelProblem: Equatable {
-    case unsupported, runtime, worker, profile, verification
+    case unsupported, runtime, assets, verification
 
-    // Classify the failure without presenting raw paths or process diagnostics.
+    // Classify failures without presenting local paths or account names.
     static func classify(_ diagnostic: String) -> Self? {
         let text = diagnostic.lowercased()
-        if text.contains("unrecognized subcommand"), text.contains("model-status") { return .unsupported }
-        if text.contains("isolated bge runtime") || text.contains("no module named") ||
-            text.contains("packagenotfounderror") { return .runtime }
-        if text.contains("bge worker is missing") { return .worker }
-        if text.contains("profile is missing") || text.contains("pinned snapshot") { return .profile }
-        if text.contains("verified local model files") || text.contains("offline bge worker") ||
-            text.contains("unsupported bge worker") { return .verification }
+        if text.contains("unrecognized subcommand") || text.contains("requires apple silicon") { return .unsupported }
+        if text.contains("resource directory is missing") || text.contains("llama-server") ||
+            text.contains("/runtime/") || text.contains("runtime did not become healthy") { return .runtime }
+        if text.contains("gemma asset") || text.contains("resource directory must") { return .assets }
         return nil
     }
 }
@@ -53,6 +50,16 @@ struct EmbeddingBatch: Decodable {
 private struct WatchEvent: Decodable {
     enum Kind: String, Decodable { case ready, updated }
     let event: Kind
+}
+
+struct FileDiagnosis: Decodable {
+    let name: String
+    let text: String
+    let semantic: String
+}
+
+enum FileDiagnosisState {
+    case idle, checking(String), result(String, FileDiagnosis), failed(String)
 }
 
 enum LauncherProblem {
@@ -76,10 +83,12 @@ final class Launcher: ObservableObject {
     @Published private(set) var searching = false
     @Published private(set) var semanticBusy = false
     @Published private(set) var localModelState = LocalModelState.unchecked
+    @Published private(set) var gemmaCoverage: GemmaCoverage?
     @Published private(set) var searchNotice: LauncherNotice?
     @Published private(set) var indexPhase = IndexPhase.checking
     @Published private(set) var indexWork: IndexWork?
     @Published private(set) var indexReport: IndexReport?
+    @Published private(set) var savedScope: IndexScope?
     @Published private(set) var indexNotice: LauncherNotice?
     @Published private(set) var scanProgress: IndexProgress?
     @Published private(set) var watchProgress: IndexProgress?
@@ -89,28 +98,17 @@ final class Launcher: ObservableObject {
     @Published private(set) var embeddingNotice: LauncherNotice?
     @Published private(set) var watchState = WatchState.checking
     @Published private(set) var watchNotice: LauncherNotice?
+    @Published private(set) var fileDiagnosis = FileDiagnosisState.idle
     @Published var hotKey: HotKey?
     @Published var hotKeyIssue: HotKeyIssue?
     @Published var language: String { didSet { defaults?.set(language, forKey: "language") } }
-    @Published var semanticLanguage: String {
-        didSet {
-            guard semanticLanguage != oldValue else { return }
-            defaults?.set(semanticLanguage, forKey: "semanticLanguage")
-            pauseEmbeddings()
-            cancelModelCheck()
-            localModelState = .unchecked
-            if embeddingState != .pausing { embeddingState = .idle }
-            embeddingBatch = nil
-            embeddingNotice = nil
-            if semanticBusy || hits.contains(where: \.isSemanticCandidate) { scheduleSearch(clearRows: true) }
-        }
-    }
     @Published var scope: IndexScope {
         didSet {
             guard scope != oldValue else { return }
             pauseEmbeddings()
-            defaults?.set(scope.allow, forKey: "allow")
-            defaults?.set(scope.deny, forKey: "deny")
+            defaults?.set(scope.roots, forKey: "rootsPaths")
+            defaults?.set(scope.allow, forKey: "allowPaths")
+            defaults?.set(scope.deny, forKey: "denyPaths")
             defaults?.set(scope.documents, forKey: "documents")
         }
     }
@@ -126,17 +124,24 @@ final class Launcher: ObservableObject {
     private var rejectedPaths = Set<String>()
     private var presentedQuery = ""
     private var directHits: [SearchHit] = []
-    private var hasSemanticVectors = false
+    private var coverageUpdate: Task<Void, Never>?
+    private var coverageRead: Process?
+    private var coverageGeneration: UInt64 = 0
+    private var automaticBuildAttempted = false
+    private var modelInspection: Process?
+    private var diagnosisProcess: Process?
+    private var diagnosisGeneration: UInt64 = 0
     private var debounce: Task<Void, Never>?
     private var semanticDebounce: Task<Void, Never>?
     private var firstNamesReady = false
+    // An existing index may contain paths hidden by permission changes while Lumen was closed.
+    private var scopeTrustedForLookup = false
     private var watchGeneration: UInt64 = 0
     private var watcher: Process?
     private var afterWatcherStops: (() -> Void)?
     private var stoppingWatcher = false
     private var writer: Process?
     private var textProcess: Process?
-    private var semanticProcess: Process?
     private var relatedRevision: UInt64?
     private var modelCheck: Process?
     private var modelCheckGeneration: UInt64 = 0
@@ -148,14 +153,21 @@ final class Launcher: ObservableObject {
         language == "zh" || (language == "system" && Locale.preferredLanguages.first?.hasPrefix("zh") == true)
     }
 
+    var settingsScope: IndexScope { (!scopePending ? savedScope : nil) ?? scope }
+    var canApplyScope: Bool { !closed && indexWork == nil && indexPhase != .checking }
+    var needsScopeSetup: Bool {
+        scopePending || indexPhase == .needsIndex || indexPhase == .unreadable || watchState == .needsSetup
+    }
+
     var hasQuery: Bool { !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-    var canSearch: Bool { indexPhase == .ready && (!scopePending || firstNamesReady) }
+    var canSearch: Bool { indexPhase == .ready && (firstNamesReady || (!scopePending && scopeTrustedForLookup)) }
     var isIndexing: Bool { indexWork == .names || indexWork == .documents }
     var activeProgress: IndexProgress? { isIndexing ? scanProgress : watchProgress }
     var activityBusy: Bool { indexWork != nil || watchState == .starting || watchProgress != nil }
     var relatedExcerptsLabel: String { t("相关原文", "Related Excerpts") }
     var canBuildEmbeddings: Bool {
-        canSearch && !scopePending && indexWork == nil && localModelState != .checking && embeddingState != .verifying
+        canSearch && !scopePending && indexWork == nil && localModelState != .checking && embeddingState != .verifying &&
+            gemmaCoverage?.documents_enabled == true && gemmaCoverage?.pending == true && gemmaCoverage?.limited == false
     }
 
     init(engine: LauncherEngine, defaults: UserDefaults?, locale: String? = nil) {
@@ -163,19 +175,20 @@ final class Launcher: ObservableObject {
         self.defaults = defaults
         scopePending = engine.hasPendingScope
         language = locale ?? defaults?.string(forKey: "language") ?? "system"
-        semanticLanguage = defaults?.string(forKey: "semanticLanguage") == "en" ? "en" : "zh"
-        scope = IndexScope(allow: defaults?.string(forKey: "allow") ?? "",
-                           deny: defaults?.string(forKey: "deny") ?? "",
+        scope = IndexScope(roots: IndexScope.storedPaths("roots", in: defaults),
+                           allow: IndexScope.storedPaths("allow", in: defaults),
+                           deny: IndexScope.storedPaths("deny", in: defaults),
                            documents: defaults?.bool(forKey: "documents") ?? false)
     }
 
     func start() {
+        inspectLocalResources()
         if engine.hasDatabase {
-            _ = engine.run(["status"]) { [weak self] response in
+            _ = engine.run(["status", "--include-scope"]) { [weak self] response in
                 guard let self, !self.closed else { return }
                 if let report = self.report(from: response) {
-                    self.hasSemanticVectors = (report.embedded_chunks ?? 0) > 0
                     self.publish(report)
+                    self.acceptCoverage(from: report)
                 } else {
                     self.indexPhase = .unreadable
                     self.indexNotice = LauncherNotice(.status, response.diagnostic)
@@ -198,9 +211,12 @@ final class Launcher: ObservableObject {
         closed = true
         debounce?.cancel()
         semanticDebounce?.cancel()
+        cancelCoverageRead()
         cancelModelCheck()
+        clearFileDiagnosis()
+        if modelInspection?.isRunning == true { modelInspection?.terminate() }
         engine.close()
-        for process in [watcher, writer, textProcess, semanticProcess, actionProcess].compactMap({ $0 }) where process.isRunning {
+        for process in [watcher, writer, textProcess, actionProcess].compactMap({ $0 }) where process.isRunning {
             process.terminate()
         }
     }
@@ -219,7 +235,9 @@ final class Launcher: ObservableObject {
         case .opening: return t("macOS 无法打开这个项目。", "macOS could not open this item.")
         case .scope: return t("索引范围中的路径必须以 / 开头。", "Index scope paths must start with /.")
         case .scopeState: return t("无法保存索引范围更新状态。请检查索引目录权限后重试。", "Could not save the scope update state. Check index directory permissions and try again.")
-        case .watch: return t("自动更新已停止。你仍可搜索或手动更新。", "Automatic updates stopped. Search and manual updates are still available.")
+        case .watch: return canSearch
+            ? t("文件监听已停止，仍可搜索已验证的索引。", "File watching stopped. You can still search the verified index.")
+            : t("未能核对现有索引的访问权限。", "Lumen could not verify access to the saved index.")
         case .online: return t("此项目仅索引名称和路径，可使用「在 Finder 中显示」。", "Only the name and path were indexed. Use Show in Finder to locate this item.")
         case .stale: return t("此结果已变化或无法访问。请重新搜索。", "This result changed or became unavailable. Search again.")
         }
@@ -227,15 +245,14 @@ final class Launcher: ObservableObject {
 
     func modelDiagnostic(_ issue: LocalModelProblem) -> String {
         switch issue {
-        case .unsupported: return t("当前搜索引擎不支持离线 BGE。", "This search engine does not support offline BGE.")
-        case .runtime: return t("本机 BGE 运行环境缺失或不完整。请准备离线运行环境后重新检查。",
-                                "The local BGE runtime is missing or incomplete. Prepare the offline runtime and check again.")
-        case .worker: return t("此应用缺少 BGE 工作程序。请使用包含离线 BGE 的构建。",
-                               "The BGE worker is missing from this app. Use a build that includes offline BGE.")
-        case .profile: return t("当前语言的本机 BGE 模型文件缺失或校验失败。请准备对应的离线模型后重新检查。",
-                                "The local BGE files for the selected language are missing or failed verification. Prepare the matching offline model and check again.")
-        case .verification: return t("本机 BGE 校验失败。请检查离线运行环境和当前语言的模型文件。",
-                                     "Local BGE verification failed. Check the offline runtime and model files for the selected language.")
+        case .unsupported: return t("当前设备或搜索引擎不支持本机 EmbeddingGemma 2。",
+                                     "This device or search engine does not support local EmbeddingGemma 2.")
+        case .runtime: return t("本机 Gemma 运行环境缺失或无法启动。准备离线资源后可重试。",
+                                 "The local Gemma runtime is missing or cannot start. Prepare the offline resources and try again.")
+        case .assets: return t("本机 Gemma 模型文件缺失或校验失败。准备离线模型后可重试。",
+                                "Local Gemma model files are missing or failed verification. Prepare the offline model and try again.")
+        case .verification: return t("本机 Gemma 校验失败。请检查离线模型和运行环境。",
+                                     "Local Gemma verification failed. Check the offline model and runtime.")
         }
     }
 
@@ -435,7 +452,7 @@ final class Launcher: ObservableObject {
             guard let self, permitsDelivery() else { return }
             let fresh = try? JSONDecoder().decode([SearchHit].self, from: response.output)
             guard response.succeeded, fresh?.contains(hit) == true else {
-                if hit.isSemanticCandidate { recordModelFailure(response) }
+                if hit.isSemanticCandidate { recordModelFailure(response.diagnostic) }
                 self.rejectStaleResult(hit)
                 return
             }
@@ -467,13 +484,13 @@ final class Launcher: ObservableObject {
     }
 
     private func semanticArguments() -> [String] {
-        ["query", "--mode", "semantic", "--bge", "--language", semanticLanguage, "--limit", "12", "--", query]
+        ["query", "--mode", "semantic", "--gemma", "--limit", "12"] + engine.gemmaOptions + ["--", query]
     }
 
     private func shouldFindRelatedExcerpts(directCount: Int) -> Bool {
-        guard hasSemanticVectors, !scopePending, directCount < 8 else { return false }
+        guard gemmaCoverage?.hasResults == true, !scopePending, directCount < 8 else { return false }
         let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.contains("/"), !text.contains("\\"),
+        guard text.utf8.count <= 512, !text.contains("/"), !text.contains("\\"),
               !text.split(whereSeparator: \.isWhitespace).contains(where: {
                   $0.range(of: #"\.[A-Za-z0-9]{1,8}$"#, options: .regularExpression) != nil
               }) else { return false }
@@ -493,7 +510,7 @@ final class Launcher: ObservableObject {
         semanticDebounce = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(260))
             guard !Task.isCancelled, let self, !self.closed, self.revision == current else { return }
-            if self.localModelState == .unchecked {
+            if self.localModelState == .unchecked || self.localModelState == .available {
                 self.verifyLocalModel()
             } else if self.localModelState == .ready {
                 self.searchRelatedExcerpts(revision: current)
@@ -506,33 +523,48 @@ final class Launcher: ObservableObject {
     private func cancelRelatedExcerpts() {
         semanticDebounce?.cancel()
         semanticDebounce = nil
-        if semanticProcess?.isRunning == true { semanticProcess?.terminate() }
-        semanticProcess = nil
+        engine.discardQueuedSemantic()
         semanticBusy = false
         relatedRevision = nil
     }
 
     private func searchRelatedExcerpts(revision: UInt64) {
+        guard gemmaCoverage?.hasResults == true else {
+            semanticBusy = false
+            return
+        }
         relatedRevision = revision
         semanticBusy = true
-        semanticProcess = engine.run(semanticArguments()) { [weak self] response in
-            guard let self, self.revision == revision, self.relatedRevision == revision, !self.closed else { return }
-            self.semanticProcess = nil
-            if response.succeeded, let hits = try? JSONDecoder().decode([SearchHit].self, from: response.output) {
-                self.validatePreviews(hits.filter(\.isSemanticCandidate), revision: revision) { [weak self] available in
-                    guard let self, self.relatedRevision == revision else { return }
-                    self.publishWithRelated(available)
-                    self.semanticBusy = false
-                }
-            } else {
-                self.recordModelFailure(response)
-                let diagnostic = response.diagnostic.lowercased()
-                if diagnostic.contains("no paragraph embeddings") || diagnostic.contains("build embeddings first") {
-                    self.hasSemanticVectors = false
-                }
-                self.publishWithRelated([])
+        engine.searchSemantic(query) { [weak self] reply in
+            self?.receiveRelated(reply, revision: revision)
+        }
+    }
+
+    private func receiveRelated(_ reply: Result<[SearchHit], SearchFailure>, revision: UInt64) {
+        guard !closed, self.revision == revision, relatedRevision == revision else { return }
+        switch reply {
+        case .success(let hits):
+            validatePreviews(hits.filter(\.isSemanticCandidate), revision: revision) { [weak self] available in
+                guard let self, self.relatedRevision == revision else { return }
+                self.publishWithRelated(available)
                 self.semanticBusy = false
             }
+        case .failure(let error):
+            recordModelFailure(error.detail)
+            publishWithRelated([])
+            semanticBusy = false
+            refreshCoverage()
+        }
+    }
+
+    private func inspectLocalResources() {
+        modelInspection = engine.run(["model-status", "--gemma"] + engine.gemmaOptions) { [weak self] response in
+            guard let self, !self.closed, self.localModelState == .unchecked else { return }
+            let status = try? JSONDecoder().decode(LocalModelStatus.self, from: response.output)
+            self.localModelState = response.succeeded && status?.available == true
+                ? .available : .unavailable(LocalModelProblem.classify(status?.diagnostic ?? response.diagnostic) ?? .verification)
+            if self.localModelState == .available { self.queueRelatedExcerpts() }
+            else { self.semanticBusy = false }
         }
     }
 
@@ -541,7 +573,7 @@ final class Launcher: ObservableObject {
         modelCheckGeneration &+= 1
         let current = modelCheckGeneration
         localModelState = .checking
-        modelCheck = engine.run(["model-status", "--language", semanticLanguage, "--verify"]) { [weak self] response in
+        modelCheck = engine.run(["model-status", "--gemma", "--verify"] + engine.gemmaOptions) { [weak self] response in
             guard let self, !self.closed, self.modelCheckGeneration == current else { return }
             self.modelCheck = nil
             let status = try? JSONDecoder().decode(LocalModelStatus.self, from: response.output)
@@ -565,21 +597,61 @@ final class Launcher: ObservableObject {
         modelCheck = nil
     }
 
-    private func recordModelFailure(_ response: EngineResponse) {
-        if let issue = LocalModelProblem.classify(response.diagnostic) {
+    private func recordModelFailure(_ diagnostic: String) {
+        if let issue = LocalModelProblem.classify(diagnostic) {
+            engine.closeSemantic()
             cancelModelCheck()
             localModelState = .unavailable(issue)
             if embeddingState == .verifying { finishEmbeddings(.idle) }
         }
     }
 
+    func diagnoseFile(_ file: URL) {
+        guard !closed, !scopePending, file.isFileURL else { return }
+        clearFileDiagnosis()
+        let generation = diagnosisGeneration
+        let name = file.lastPathComponent
+        fileDiagnosis = .checking(name)
+        diagnosisProcess = engine.run(["diagnose", "--", file.path]) { [weak self] response in
+            guard let self, !self.closed, !self.scopePending, self.diagnosisGeneration == generation else { return }
+            self.diagnosisProcess = nil
+            if response.succeeded, let report = try? JSONDecoder().decode(FileDiagnosis.self, from: response.output) {
+                self.fileDiagnosis = .result(name, report)
+            } else {
+                self.fileDiagnosis = .failed(name)
+            }
+        }
+    }
+
+    func clearFileDiagnosis() {
+        diagnosisGeneration &+= 1
+        if diagnosisProcess?.isRunning == true { diagnosisProcess?.terminate() }
+        diagnosisProcess = nil
+        if case .idle = fileDiagnosis { return }
+        fileDiagnosis = .idle
+    }
+
+    func applyScope(_ requested: IndexScope) {
+        guard canApplyScope else { return }
+        scope = requested
+        buildIndex()
+    }
+
+    func rebuildSavedIndex() {
+        guard let savedScope, indexPhase == .ready, !scopePending else { return }
+        applyScope(savedScope)
+    }
+
     func buildIndex() {
         pauseEmbeddings()
-        guard indexWork == nil, indexPhase != .checking else { return }
+        guard canApplyScope else { return }
         let requested = scope
+        scopeTrustedForLookup = false
         firstNamesReady = false
         scopePending = true
-        hasSemanticVectors = false
+        clearFileDiagnosis()
+        cancelCoverageRead()
+        gemmaCoverage = nil
         invalidateSearch()
         engine.close()
         indexNotice = nil
@@ -645,18 +717,28 @@ final class Launcher: ObservableObject {
             do {
                 try self.engine.finishScopeUpdate()
                 self.scopePending = false
+                self.savedScope = scope
             } catch {
                 self.indexNotice = LauncherNotice(.scopeState, error.localizedDescription)
             }
             self.firstNamesReady = false
+            self.scopeTrustedForLookup = !self.scopePending
             self.indexWork = nil
             self.publish(report)
             self.startWatcherIfReady()
+            self.refreshCoverage()
         }
     }
 
     func buildEmbeddings() {
         guard canBuildEmbeddings else { return }
+        defaults?.set(true, forKey: "gemmaIndexingEnabled")
+        defaults?.set(false, forKey: "gemmaIndexingPaused")
+        automaticBuildAttempted = true
+        prepareEmbeddings()
+    }
+
+    private func prepareEmbeddings() {
         embeddingNotice = nil
         if embeddingState != .paused { embeddingBatch = nil }
         if localModelState == .ready {
@@ -671,11 +753,12 @@ final class Launcher: ObservableObject {
         }
     }
 
-    func pauseEmbeddings() {
+    func pauseEmbeddings(userInitiated: Bool = false) {
+        if userInitiated { defaults?.set(true, forKey: "gemmaIndexingPaused") }
         switch embeddingState {
         case .verifying:
             cancelModelCheck()
-            localModelState = .unchecked
+            localModelState = .available
             embeddingState = .paused
         case .running:
             embeddingState = .pausing
@@ -687,33 +770,29 @@ final class Launcher: ObservableObject {
     private func startEmbeddings() {
         embeddingState = .running
         indexWork = .embeddings
-        embedNextBatch(language: semanticLanguage)
+        embedNextBatch()
     }
 
-    private func embedNextBatch(language: String) {
-        let arguments = ["embed", "--bge", "--language", language, "--max", "32"]
+    private func embedNextBatch() {
+        let arguments = ["embed", "--gemma", "--max", "32"] + engine.gemmaOptions
         writer = engine.run(arguments) { [weak self] response in
             guard let self, !self.closed else { return }
             self.writer = nil
-            guard self.semanticLanguage == language else {
-                self.finishEmbeddings(.idle)
-                return
-            }
             guard response.succeeded, let batch = try? JSONDecoder().decode(EmbeddingBatch.self, from: response.output) else {
-                self.recordModelFailure(response)
+                self.recordModelFailure(response.diagnostic)
                 self.embeddingNotice = LauncherNotice(.embeddings)
                 self.finishEmbeddings(.idle)
                 return
             }
             self.embeddingBatch = batch
-            if batch.new_embeddings > 0 { self.hasSemanticVectors = true }
             if !batch.has_more {
                 self.finishEmbeddings(.finished)
             } else if batch.new_embeddings == 0 && batch.skipped_chunks == 0 {
                 self.embeddingNotice = LauncherNotice(.embeddingNoProgress)
                 self.finishEmbeddings(.paused)
             } else if self.embeddingState == .running {
-                self.embedNextBatch(language: language)
+                if self.gemmaCoverage?.hasResults != true { self.refreshCoverage() }
+                self.embedNextBatch()
             } else {
                 self.finishEmbeddings(.paused)
             }
@@ -723,6 +802,60 @@ final class Launcher: ObservableObject {
     private func finishEmbeddings(_ state: EmbeddingState) {
         indexWork = nil
         embeddingState = state
+        refreshCoverage()
+    }
+
+    private func acceptCoverage(from report: IndexReport) {
+        guard !scopePending else { return }
+        if savedScope != report.scope { savedScope = report.scope }
+        if indexReport != report { indexReport = report }
+        let previous = gemmaCoverage
+        if previous != report.gemma {
+            gemmaCoverage = report.gemma
+            if report.gemma?.hasResults != true, previous?.hasResults == true {
+                cancelRelatedExcerpts()
+                engine.closeSemantic()
+                if hits.contains(where: \.isSemanticCandidate) { publishWithRelated([]) }
+            } else if report.gemma?.hasResults == true, previous?.hasResults != true {
+                queueRelatedExcerpts()
+            }
+        }
+        // Existing BGE vectors are evidence an older user explicitly started semantic indexing.
+        // The saved scope in the database decides whether documents are eligible.
+        if !automaticBuildAttempted, embeddingState == .idle, canBuildEmbeddings,
+           defaults?.bool(forKey: "gemmaIndexingPaused") != true,
+           (report.embedded_chunks ?? 0) > 0 || defaults?.bool(forKey: "gemmaIndexingEnabled") == true {
+            automaticBuildAttempted = true
+            prepareEmbeddings()
+        }
+    }
+
+    private func refreshCoverage(after delay: Duration = .zero) {
+        guard !scopePending, !closed, coverageUpdate == nil else { return }
+        coverageUpdate = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: delay)
+            guard let self, !Task.isCancelled else { return }
+            self.coverageUpdate = nil
+            if self.coverageRead?.isRunning == true {
+                self.refreshCoverage(after: .milliseconds(250))
+                return
+            }
+            self.coverageGeneration &+= 1
+            let generation = self.coverageGeneration
+            self.coverageRead = self.engine.run(["status", "--include-scope"]) { [weak self] response in
+                guard let self, self.coverageGeneration == generation, !self.closed else { return }
+                self.coverageRead = nil
+                if let report = self.report(from: response) { self.acceptCoverage(from: report) }
+            }
+        }
+    }
+
+    private func cancelCoverageRead() {
+        coverageUpdate?.cancel()
+        coverageUpdate = nil
+        coverageGeneration &+= 1
+        if coverageRead?.isRunning == true { coverageRead?.terminate() }
+        coverageRead = nil
     }
 
     private func report(from response: EngineResponse) -> IndexReport? {
@@ -743,7 +876,7 @@ final class Launcher: ObservableObject {
         watchNotice = nil
         watchGeneration &+= 1
         let generation = watchGeneration
-        let arguments = ["watch"] + (watchReportsProgress ? ["--progress"] : [])
+        let arguments = ["watch", "--bundled-pdf-helper"] + (watchReportsProgress ? ["--progress"] : [])
         watcher = engine.run(arguments, onLine: { [weak self] line in
             guard let self, self.watchGeneration == generation, !self.closed else { return }
             self.watchEvent(line)
@@ -774,8 +907,12 @@ final class Launcher: ObservableObject {
     private func watchEvent(_ line: Data) {
         guard !stoppingWatcher, !scopePending,
               let notice = try? JSONDecoder().decode(WatchEvent.self, from: line) else { return }
-        if notice.event == .ready { watchState = .running }
+        if notice.event == .ready {
+            scopeTrustedForLookup = true
+            watchState = .running
+        }
         watchProgress = nil
+        refreshCoverage(after: .milliseconds(400))
         scheduleSearch(keepAction: true)
         let current = revision
         // Discard previews invalidated by the watch event even if a new query is still in flight.

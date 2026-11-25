@@ -1,0 +1,80 @@
+{
+  "model": {
+    "name": "embeddinggemma-2-Q8_0.gguf",
+    "revision": "6ea3e3a309d12a4779cfda98b8c19800d2d5da71",
+    "size": 309855456,
+    "sha256": "2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135",
+    "source_revision": "f9972ac22e696a105c482202646979e33e4b5a1e",
+    "license": "Apache-2.0"
+  },
+  "archive": {
+    "name": "llama-b11457-bin-macos-arm64.tar.gz",
+    "directory": "llama-b11457",
+    "size": 12007659,
+    "sha256": "e234070cbde0c8b0d30f79fa08ff8246abe22c72acb752619349b8d9c46f7839",
+    "commit": "5ad1c5da0ad7f6176256b823925aad19134f0263",
+    "license": "MIT"
+  },
+  "runtime": {
+    "llama-server": {
+      "member": "llama-server",
+      "size": 49984,
+      "sha256": "1bf5602a2be50097c44282a6ecc63234d94ee8f96d39fd45fed6eff4e74b6b41"
+    },
+    "libllama-server-impl.dylib": {
+      "member": "libllama-server-impl.dylib",
+      "size": 9192120,
+      "sha256": "9b3f8af4eca4502f4aa65a3f54ae7f8f9a01e81d77deafa47b6ae1a5db853efd"
+    },
+    "libllama-common.0.dylib": {
+      "member": "libllama-common.0.6.0.dylib",
+      "size": 7749848,
+      "sha256": "94de6e89e2d1df5dc3d7691392edc70046211b6f84639d45b8387ede7b5f2928"
+    },
+    "libmtmd.0.dylib": {
+      "member": "libmtmd.0.6.0.dylib",
+      "size": 1398944,
+      "sha256": "c87488222bc71275f75da743e8cc628b014b59d051bc0e303c444e96f54762a7"
+    },
+    "libllama.0.dylib": {
+      "member": "libllama.0.6.0.dylib",
+      "size": 3311056,
+      "sha256": "535bdfec06711d63a0d5fa3f10410dcb17a2216185fd2f69b52e4828b9324b10"
+    },
+    "libggml.0.dylib": {
+      "member": "libggml.0.26.0.dylib",
+      "size": 60128,
+      "sha256": "85ac40d540a5cc86f28a70270ddcdde677e92eb585c3bacd1b7e82270fe8934b"
+    },
+    "libggml-cpu.0.dylib": {
+      "member": "libggml-cpu.0.26.0.dylib",
+      "size": 957408,
+      "sha256": "937073375f79a187d8fda2e3900a9095e979593b691d6bbb146956743ceddd82"
+    },
+    "libggml-blas.0.dylib": {
+      "member": "libggml-blas.0.26.0.dylib",
+      "size": 58776,
+      "sha256": "6526259e8f70a5b3a394df3ba082050c290d7653846efbdc84b3710b22fb4eac"
+    },
+    "libggml-metal.0.dylib": {
+      "member": "libggml-metal.0.26.0.dylib",
+      "size": 5554552,
+      "sha256": "63a6a89b1e4ebffbe66ca46514979134f9b75668308da4fb71681b4df830ffef"
+    },
+    "libggml-rpc.0.dylib": {
+      "member": "libggml-rpc.0.26.0.dylib",
+      "size": 219808,
+      "sha256": "48c13b7c2c56e2b569b636e6a28d1c0853ad2d1db1980c0afd374651c6e897d0"
+    },
+    "libggml-base.0.dylib": {
+      "member": "libggml-base.0.26.0.dylib",
+      "size": 751256,
+      "sha256": "84a9b80c6d6c0c07e676aa88dcdc3a4d810f3d233133dd96e051aefe606cbf41"
+    },
+    "LICENSE": {
+      "member": "LICENSE",
+      "size": 1078,
+      "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
+    }
+  }
+}

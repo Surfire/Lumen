@@ -45,6 +45,7 @@ struct HotKey: Codable, Equatable {
     var cyclesMacWindows: Bool { modifiers == UInt32(cmdKey) && (code == kVK_ANSI_Grave || key == "`") }
 
     func checkSystemShortcut() throws {
+        if modifiers == UInt32(cmdKey), code == kVK_ANSI_Comma || key == "," { throw HotKeyIssue.app }
         // Some fixed system shortcuts are not necessarily listed as configurable shortcuts.
         switch (Int(code), Int(modifiers)) {
         case (kVK_Space, cmdKey), (kVK_Space, cmdKey | optionKey), (kVK_Space, cmdKey | shiftKey),
@@ -89,7 +90,7 @@ struct HotKey: Codable, Equatable {
 }
 
 enum HotKeyIssue: Error {
-    case invalid, system, occupied, registration(OSStatus)
+    case invalid, system, app, occupied, registration(OSStatus)
 }
 
 @MainActor

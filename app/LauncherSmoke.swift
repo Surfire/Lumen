@@ -8,6 +8,7 @@ final class LauncherSmoke {
     let corpus: URL
     let database: URL
     let executable: URL?
+    let gemmaHome: URL
     let language: String
     let usesOffscreenWindows: Bool
     private let directory: URL
@@ -16,9 +17,14 @@ final class LauncherSmoke {
     var opened: URL?
     var revealed: URL?
     var wasActivated = false
+    var chosenSettingsDirectories: [URL]?
+    var chosenDiagnosticFile: URL?
 
     private init(_ directory: URL, language: String, usesOffscreenWindows: Bool) {
         self.directory = directory
+        gemmaHome = ProcessInfo.processInfo.environment["LUMEN_GEMMA_TEST_HOME"]
+            .map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? directory.appendingPathComponent("missing-gemma", isDirectory: true)
         corpus = directory.appendingPathComponent("corpus", isDirectory: true)
         database = directory.appendingPathComponent("index.sqlite")
         startsWithIndex = FileManager.default.fileExists(atPath: database.path)
@@ -94,6 +100,22 @@ final class LauncherSmoke {
         _ = try editor(app)
 
         if controlledTiming && startsWithIndex {
+            if exists("settings-scenario") {
+                try await verifySettings(app)
+                return
+            }
+            if exists("legacy-bge-consent") {
+                if exists("hold-startup-watch") {
+                    try await until("startup permission verification held") { model.indexPhase == .ready && self.exists("startup-watch-started") }
+                    try type("archive", into: app)
+                    try await Task.sleep(for: .milliseconds(170))
+                    try check(!model.canSearch && model.hits.isEmpty, "cached names became visible before scope verification")
+                    try signal("finish-startup-watch")
+                    try await until("startup scope verified") { model.canSearch && model.hits.contains { $0.name == "archive-one.txt" } }
+                }
+                try await verifyLegacyMigration(app)
+                return
+            }
             try await verifyFailedScopeRelaunch(app)
             return
         }
@@ -155,11 +177,15 @@ final class LauncherSmoke {
                 try check(executable == nil, "the supplied watch engine did not expose the watch command")
                 print("Bundled engine reports manual index updates")
                 model.verifyLocalModel()
-                try await until("baseline engine reports missing BGE support") {
+                try await until("baseline engine reports missing Gemma support") {
                     model.localModelState == .unavailable(.unsupported)
                 }
             } else if exists("legacy-expected") {
-                try await until("legacy index requires a manual rebuild") { model.watchState == .needsSetup }
+                try await until("legacy index requires a new explicit scope") { model.watchState == .needsSetup }
+                app.startBackgroundIndex()
+                try check(app.settings != nil && app.settingsSession.page == .index &&
+                          app.settingsSession.canApply && !app.settingsSession.canRebuild && !model.isIndexing,
+                          "legacy index could rebuild with an inferred scope")
                 return
             } else {
                 try await until("real watch ready event received") { model.watchState == .running }
@@ -168,7 +194,7 @@ final class LauncherSmoke {
                         observedScan.contains { $0.phase == "done" && $0.entries > 0 } && !observedWatch.isEmpty
                     }
                 }
-                if exists("actual-bge") {
+                if exists("actual-gemma") {
                     try await verifyInstalledModel(app)
                     return
                 }
@@ -237,24 +263,82 @@ final class LauncherSmoke {
         }
     }
 
+    private func verifyLegacyMigration(_ app: AppDelegate) async throws {
+        let model = app.model
+        try await until("saved scope and watch became available") {
+            model.gemmaCoverage != nil && model.watchState == .running
+        }
+        try type("archive", into: app)
+        try await until("lexical results remained available during migration") {
+            model.selectedHit?.name == "archive-one.txt" && !model.searching
+        }
+        if model.gemmaCoverage?.documents_enabled == false {
+            try check(model.localModelState == .available && model.embeddingState == .idle &&
+                      !model.canBuildEmbeddings && !exists("model-check-started") && !exists("embeddings-started"),
+                      "legacy consent expanded a metadata-only scope")
+            return
+        }
+        try await until("legacy BGE coverage automatically queued Gemma verification") { self.exists("model-check-started") }
+        try check(model.embeddingState == .verifying && !exists("embeddings-started"),
+                  "migration started writing before verification")
+        try signal("finish-model-check")
+        try await waitForEmbeddingBatch(1)
+        model.pauseEmbeddings(userInitiated: true)
+        try signal("finish-embedding-1")
+        try await until("legacy migration kept completed work when paused") {
+            model.embeddingState == .paused && model.gemmaCoverage?.embedded_chunks == 1
+        }
+        try check(!exists("embedding-2-started") && model.watchState == .running && watchLaunches() == 1,
+                  "migration ignored pause or disrupted live updates")
+    }
+
     private func verifyInstalledModel(_ app: AppDelegate) async throws {
         let model = app.model
-        model.semanticLanguage = language
-        model.verifyLocalModel()
-        try await until("packaged GUI found and verified installed BGE") { model.localModelState == .ready }
+        try await until("packaged GUI found offline Gemma resources and document scope") {
+            model.localModelState == .available && model.canBuildEmbeddings
+        }
+        try check(model.embeddingState == .idle && model.gemmaCoverage?.embedded_chunks == 0,
+                  "a fresh document index enabled semantic indexing without consent")
         model.buildEmbeddings()
-        try await until("GUI built the actual local semantic index") {
-            model.embeddingBatch?.new_embeddings == 2 && model.embeddingBatch?.has_more == false
+        try await until("GUI built and verified the local Gemma index", seconds: 40) {
+            model.localModelState == .ready && model.gemmaCoverage?.complete == true &&
+                model.gemmaCoverage?.embedded_chunks == 2
         }
-        let query = language == "zh" ? "屋顶降水如何透入绿地？" : "How can a new recruit learn the job quickly?"
-        try type(query, into: app)
-        try await until("real BGE GUI automatically returned the related original excerpt") {
-            model.selectedHit?.name == "entry-a.md" &&
-                model.selectedHit?.isSemanticCandidate == true &&
-                model.selectedHit?.snippet?.contains(language == "zh" ? "种植带" : "experienced teammate") == true
+        let idleFrame = app.panel.frame
+        try type("x", into: app)
+        try await until("initial nonempty query expanded the launcher") { app.panel.frame.height > idleFrame.height }
+        let frame = app.panel.frame
+        for (query, filename, original) in [
+            ("怎样摆放太阳能板才能让它朝着正午阳光？", "entry-a.md", "midday sun"),
+            ("How do I get the clock to run after its battery died?", "entry-b.md", "换上新的电池"),
+        ] {
+            try type(query, into: app)
+            try await until("real Gemma returned the cross-language source for \(filename)", seconds: 30) {
+                model.selectedHit?.name == filename &&
+                    model.selectedHit?.isSemanticCandidate == true &&
+                    model.selectedHit?.snippet?.contains(original) == true
+            }
+            try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
+            try await until("Finder action revalidated the real Gemma preview", seconds: 30) {
+                self.revealed?.lastPathComponent == filename
+            }
+            revealed = nil
+            try check(app.panel.frame == frame, "Gemma result resized the search panel")
         }
-        try check(!NSApp.isActive && self.opened == nil, "model test activated the GUI or opened a document")
-        print("Installed BGE GUI smoke passed (\(language))")
+        let semanticQuery = model.query
+        try type("x", into: app)
+        let pending = corpus.appendingPathComponent("pending.md")
+        try Data("A textbook on currents and seasonal ocean tides.".utf8).write(to: pending)
+        try await until("the real watcher reported partial Gemma coverage", seconds: 15) {
+            model.gemmaCoverage?.pending == true && model.gemmaCoverage?.embedded_chunks == 2
+        }
+        try type(semanticQuery, into: app)
+        try await until("the real partial index still returned its covered source", seconds: 30) {
+            model.selectedHit?.name == "entry-b.md" && model.selectedHit?.isSemanticCandidate == true
+        }
+        try check(app.panel.frame == frame, "the watcher or partial Gemma coverage resized the launcher")
+        try check(!NSApp.isActive && opened == nil, "Gemma test activated the GUI or opened a document")
+        print("Installed Gemma GUI smoke passed (Chinese-to-English, English-to-Chinese, and partial coverage)")
     }
 
     private func verifyTiming(_ app: AppDelegate) async throws {
@@ -312,25 +396,134 @@ final class LauncherSmoke {
                   "typing or result lane delivery resized or replaced the launcher")
     }
 
+    private func verifySettings(_ app: AppDelegate) async throws {
+        let model = app.model
+        let session = app.settingsSession
+        let excluded = corpus.appendingPathComponent("Excluded", isDirectory: true)
+        let protected = corpus.appendingPathComponent("Scoped", isDirectory: true)
+        let child = protected.appendingPathComponent("Allowed Child", isDirectory: true)
+        let file = child.appendingPathComponent("protected-neighbor.md")
+        let excludedPath = IndexScope.folderPath(excluded)
+        let protectedPath = IndexScope.folderPath(protected)
+        let childPath = IndexScope.folderPath(child)
+        try await until("saved index scope loaded before editing") {
+            model.canSearch && model.savedScope?.deny == [excludedPath]
+        }
+        let settingsKey = try event(kVK_ANSI_Comma, ",", in: app, flags: [.command])
+        try check(app.panel.performKeyEquivalent(with: settingsKey) && app.settings != nil && !app.searchPresented,
+                  "Command–comma did not open settings from Search")
+        guard let settings = app.settings else { throw Failure("settings panel is missing") }
+        try check(!settings.isVisible && !NSApp.isActive && !wasActivated,
+                  "settings smoke activated the app or displayed a window")
+        try check(session.page == .general &&
+                  NSApp.mainMenu?.items.first?.submenu?.items.contains(where: {
+                      $0.action == #selector(AppDelegate.showSettings) && $0.keyEquivalent == ","
+                  }) == true, "the initial page or the app menu Settings shortcut is missing")
+        app.recordShortcut(settingsKey)
+        guard case .app? = model.hotKeyIssue else { throw Failure("launcher shortcut could override Settings") }
+        app.disableShortcut()
+
+        session.page = .index
+        let original = model.savedScope
+        let initialWatchStarts = watchLaunches()
+        try check(!session.canApply && session.scope.deny == [excludedPath],
+                  "the editor did not start with the persisted scope")
+        chosenSettingsDirectories = [child, child]
+        app.chooseSettingsDirectories(.include)
+        try check(session.scope.allow == [childPath], "directory selection was duplicated or altered")
+        session.remove(childPath, from: .include)
+        try check(!session.hasChanges, "removing a staged folder did not restore the initial scope")
+        app.chooseSettingsDirectories(.exclude)
+        try check(!session.hasChanges, "canceling the directory selector edited scope")
+
+        chosenSettingsDirectories = [child]
+        app.chooseSettingsDirectories(.include)
+        chosenSettingsDirectories = [protected]
+        app.chooseSettingsDirectories(.exclude)
+        session.setDocuments(true)
+        session.setDocuments(false)
+        try check(session.hasChanges && model.savedScope == original && watchLaunches() == initialWatchStarts &&
+                  !model.scopePending && model.canSearch,
+                  "a draft changed the active index or watcher")
+        session.page = .about
+        chosenDiagnosticFile = file
+        app.chooseDiagnosticFile()
+        try await until("the signed CLI diagnosed the explicitly selected synthetic file") {
+            if case .result(file.lastPathComponent, let result) = model.fileDiagnosis {
+                return result.name == "indexed" && result.text == "text_disabled" && result.semantic == "text_disabled"
+            }
+            return false
+        }
+        if exists("capture-settings") { try await captureSettings(settings, session: session) }
+
+        app.showSearch()
+        try type("protected-neighbor", into: app)
+        try await until("the draft did not hide live results") { model.selectedHit?.name == "protected-neighbor.md" }
+        session.page = .about
+        try check(session.canRebuild, "advanced maintenance did not recognize a saved scope")
+        model.rebuildSavedIndex()
+        try await until("rebuild used the saved scope and resumed watch") {
+            model.indexWork == nil && model.watchState == .running && self.watchLaunches() == initialWatchStarts + 1
+        }
+        try check(model.savedScope == original && session.hasChanges,
+                  "maintenance used or discarded the unapplied draft")
+        try await until("the existing scope survived rebuilding") { model.selectedHit?.name == "protected-neighbor.md" }
+
+        session.page = .index
+        session.apply()
+        try check(model.scopePending && model.hits.isEmpty && !session.hasChanges,
+                  "Apply did not immediately retire results or committed the wrong draft")
+        try await until("Apply persisted the two lists and resumed watch") {
+            model.indexWork == nil && model.watchState == .running && !model.searching &&
+                model.savedScope?.deny.contains(protectedPath) == true && model.savedScope?.allow == [childPath]
+        }
+        try check(model.canSearch && model.hits.isEmpty,
+                  "a selected child overrode its excluded parent")
+        session.page = .about
+        chosenDiagnosticFile = file
+        app.chooseDiagnosticFile()
+        try await until("file diagnostics reflected the newly saved exclusion") {
+            if case .result(file.lastPathComponent, let result) = model.fileDiagnosis {
+                return [result.name, result.text, result.semantic].allSatisfy { $0 == "excluded" }
+            }
+            return false
+        }
+        settings.close()
+        if case .idle = model.fileDiagnosis {} else { throw Failure("closing settings retained a selected file report") }
+        print("Settings smoke passed (four pages, shortcut, draft, exact-scope rebuild, Apply, and file diagnostics)")
+    }
+
+    private func captureSettings(_ window: NSPanel, session: SettingsSession) async throws {
+        for page in SettingsPage.allCases {
+            session.page = page
+            try await Task.sleep(for: .milliseconds(100))
+            for (style, appearance) in [("light", NSAppearance.Name.aqua), ("dark", .darkAqua)] {
+                try capture("settings-\(page.rawValue)-\(style).png", appearance: appearance, window: window)
+            }
+        }
+        window.appearance = nil
+        try check(!window.isVisible && !NSApp.isActive, "settings screenshots activated the app")
+    }
+
     private func captureSnapshots(_ app: AppDelegate) async throws {
         try type("", into: app)
         try await until("idle launcher is 84 points tall") { app.panel.frame.height == 84 }
-        try capture("lumen-idle-light.png", appearance: .aqua, app: app)
+        try capture("lumen-idle-light.png", appearance: .aqua, window: app.panel)
         try type("design", into: app)
         try await until("eight visible result rows are laid out") {
             app.model.hits.count >= 8 && !app.model.searching && app.panel.frame.height == 436
         }
-        try capture("lumen-results-light.png", appearance: .aqua, app: app)
-        try capture("lumen-results-dark.png", appearance: .darkAqua, app: app)
+        try capture("lumen-results-light.png", appearance: .aqua, window: app.panel)
+        try capture("lumen-results-dark.png", appearance: .darkAqua, window: app.panel)
         app.panel.appearance = nil
         try check(!NSApp.isActive && !app.panel.isVisible, "offscreen snapshots activated the app")
     }
 
-    private func capture(_ filename: String, appearance: NSAppearance.Name, app: AppDelegate) throws {
-        guard let surface = app.panel.contentView, let appearance = NSAppearance(named: appearance) else {
+    private func capture(_ filename: String, appearance: NSAppearance.Name, window: NSWindow) throws {
+        guard let surface = window.contentView, let appearance = NSAppearance(named: appearance) else {
             throw Failure("could not configure snapshot appearance")
         }
-        app.panel.appearance = appearance
+        window.appearance = appearance
         surface.layoutSubtreeIfNeeded()
         let bounds = surface.bounds
         guard let image = surface.bitmapImageRepForCachingDisplay(in: bounds) else {
@@ -416,11 +609,11 @@ final class LauncherSmoke {
                   Set(model.hits.map(\.path)).count == model.hits.count && app.panel.frame == frame,
                   "related excerpts duplicated results, changed direct rank, stole selection, or resized the panel")
         guard let hit = model.hits.first(where: { $0.name == "notes.md" && $0.isSemanticCandidate })
-        else { throw Failure("missing BGE candidate") }
+        else { throw Failure("missing Gemma candidate") }
         try check(model.relatedExcerptsLabel == "相关原文", "candidate label did not say related excerpts")
         var resolved: URL?
         model.resolve(hit, revealInFinder: false) { resolved = $0 }
-        try await until("candidate action rechecked the query through BGE") { resolved?.path == hit.path }
+        try await until("candidate action rechecked the query through explicit Gemma") { resolved?.path == hit.path }
         try Data("Replacement body".utf8).write(to: corpus.appendingPathComponent("notes.md"), options: .atomic)
         try signal("update-watch")
         try await until("watch replaced a stale semantic excerpt") {
@@ -436,6 +629,23 @@ final class LauncherSmoke {
         try await until("obsolete related query could not attach to newly typed text") {
             model.hits.count == 1 && model.selectedHit?.name == "青山月报.md" && !model.semanticBusy
         }
+        try check(lineCount("semantic-serve-launches") == 1 && exists("explicit-gemma-query-started"),
+                  "refinements did not reuse one worker or result action skipped explicit Gemma")
+
+        try signal("gemma-cap")
+        try signal("update-watch")
+        try await until("watch reported the Gemma storage limit") {
+            model.gemmaCoverage?.limited == true && model.gemmaCoverage?.hasResults == true
+        }
+        try check(!model.canBuildEmbeddings, "capped coverage would start more embedding batches")
+        try type("health examination", into: app)
+        try await until("stored Gemma vectors remained searchable at the storage cap") {
+            model.hits.contains { $0.isSemanticCandidate && $0.name == "notes.md" } &&
+                self.exists("capped-gemma-query-started")
+        }
+        try check(lineCount("semantic-serve-launches") == 1 && app.panel.frame == frame,
+                  "capped search restarted the worker or resized the panel")
+
     }
 
     private func verifyMissingPath(_ app: AppDelegate) async throws {
@@ -480,6 +690,8 @@ final class LauncherSmoke {
 
     private func verifyEmbeddingRun(_ app: AppDelegate) async throws {
         let model = app.model
+        try await until("document coverage permits an intentional build") { model.canBuildEmbeddings }
+        try check(!exists("embeddings-started"), "first use enabled semantic indexing without consent")
         model.buildEmbeddings()
         try await waitForEmbeddingBatch(1)
         try type("duringbatch", into: app)
@@ -509,6 +721,11 @@ final class LauncherSmoke {
         }
         try check(!exists("embedding-5-started"), "completed indexing queued another batch")
 
+        try await until("coverage reports current indexed text") { model.gemmaCoverage?.complete == true }
+        try check(!model.canBuildEmbeddings, "completed coverage offered another full build")
+        try signal("gemma-pending")
+        try signal("update-watch")
+        try await until("new text became eligible for embedding") { model.canBuildEmbeddings }
         model.buildEmbeddings()
         try await waitForEmbeddingBatch(5)
         try signal("finish-embedding-5")
@@ -528,20 +745,14 @@ final class LauncherSmoke {
 
         model.buildEmbeddings()
         try await waitForEmbeddingBatch(7)
-        model.semanticLanguage = "zh"
-        try check(model.embeddingState == .pausing, "changing language did not stop future batches")
-        try signal("finish-embedding-7")
-        try await until("old language batch drained") { model.indexWork == nil && model.embeddingState == .idle }
-        try check(!exists("embedding-8-started"), "changing language queued a batch for the old profile")
-
-        model.semanticLanguage = "en"
-        model.buildEmbeddings()
-        try await waitForEmbeddingBatch(8)
-        model.scope.deny = corpus.appendingPathComponent("Excluded").path
+        model.scope.deny = [corpus.appendingPathComponent("Excluded").path]
         try check(model.embeddingState == .pausing, "editing scope did not stop future batches")
-        try signal("finish-embedding-8")
+        try signal("finish-embedding-7")
+        (try? FileManager.default.removeItem(at: directory.appendingPathComponent("gemma-pending")))
+        try signal("update-watch")
         try await until("old scope batch drained") { model.indexWork == nil && model.embeddingState == .paused }
-        try check(!exists("embedding-9-started"), "editing scope queued a batch for the old scope")
+        try check(!exists("embedding-8-started"), "editing scope queued a batch for the old scope")
+        try await until("document coverage settled after controlled batches") { model.gemmaCoverage?.complete == true }
         try check(model.watchState == .running && watchLaunches() == 1, "embedding generation restarted the watcher")
     }
 
@@ -554,33 +765,32 @@ final class LauncherSmoke {
         try type("archive", into: app)
         try await until("name results visible without model resources") { model.selectedHit?.name == "archive-one.txt" }
         model.verifyLocalModel()
-        try await until("missing local language resources diagnosed") { model.localModelState == .unavailable(.profile) }
-        let label = model.modelDiagnostic(.profile)
-        try check(label.contains("BGE") && !label.contains("synthetic-account") && !label.contains("/Users/"),
+        try await until("missing local runtime diagnosed") { model.localModelState == .unavailable(.runtime) }
+        let label = model.modelDiagnostic(.runtime)
+        try check(label.contains("Gemma") && !label.contains("synthetic-account") && !label.contains("/Users/"),
                   "model diagnostic exposed a raw path or account")
-        try check(model.selectedHit?.name == "archive-one.txt" && !exists("bge-query-started"),
+        try check(model.selectedHit?.name == "archive-one.txt" && !exists("semantic-serve-launches"),
                   "missing model cleared lexical results or started the semantic backend")
         model.buildEmbeddings()
-        try await until("missing resources prevented embedding") { model.localModelState == .unavailable(.profile) }
+        try await until("missing resources prevented embedding") { model.localModelState == .unavailable(.runtime) }
         try check(!exists("embeddings-started"), "embedding ran without a verified model")
 
-        try signal("unverified-zh")
+        try signal("gemma-unverified")
         model.verifyLocalModel()
         try await until("present but unverified model rejected") { model.localModelState == .unavailable(.verification) }
         try type("archive appears", into: app)
         try await until("full-text search still worked with an unverified model") { model.selectedHit?.matched_by == "text" }
 
-        model.semanticLanguage = "en"
-        try check(model.localModelState == .unchecked, "language change retained an old model verification")
+        try signal("gemma-present")
         model.verifyLocalModel()
-        try await until("English BGE verification held by fixture") { self.exists("model-check-started") }
+        try await until("Gemma verification held by fixture") { self.exists("model-check-started") }
         try type("archive", into: app)
         try await until("name search continued during model verification") {
             !model.searching && model.hits.prefix(2).map(\.name) == ["archive-one.txt", "archive-two.txt"]
         }
         try signal("finish-model-check")
-        try await until("verified English backend is ready") { model.localModelState == .ready }
-        try check(!exists("bge-query-started") && model.selectedHit?.name == "notes.md",
+        try await until("verified Gemma backend is ready") { model.localModelState == .ready }
+        try check(!exists("semantic-serve-launches") && model.selectedHit?.name == "notes.md",
                   "verification launched an unrelated semantic request")
     }
 
@@ -590,7 +800,7 @@ final class LauncherSmoke {
         try type("privateneedle", into: app)
         if !startsWithIndex {
             try await until("excluded target visible before applying scope") { model.selectedHit?.name == "privateneedle.txt" }
-            model.scope.deny = excluded.path
+            model.scope.deny = [excluded.path]
             model.buildIndex()
             try check(model.scopePending && model.hits.isEmpty && model.selection == nil, "applying scope retained a visible result")
             try await until("narrowed scope committed and watch resumed") {
@@ -616,7 +826,7 @@ final class LauncherSmoke {
         }
         opened = nil
         try signal("reject-scope")
-        model.scope.deny = corpus.appendingPathComponent("Excluded").path
+        model.scope.deny = [corpus.appendingPathComponent("Excluded").path]
         model.buildIndex()
         try check(model.scopePending && !model.canSearch && model.hits.isEmpty && model.selection == nil,
                   "applying scope did not immediately block old results")
@@ -642,7 +852,7 @@ final class LauncherSmoke {
             !model.scopePending && model.watchState == .running && self.watchLaunches() == 2
         }
         try signal("reject-scope")
-        model.scope.deny = corpus.path
+        model.scope.deny = [corpus.path]
         model.buildIndex()
         try await until("second apply held before commit for process termination") { self.exists("scope-started") }
         try check(model.scopePending && !model.canSearch && model.hits.isEmpty && model.selection == nil,
@@ -660,8 +870,10 @@ final class LauncherSmoke {
                   "relaunch searched or launched a watcher with the previous scope")
     }
 
-    private func watchLaunches() -> Int {
-        let url = directory.appendingPathComponent("watch-launches")
+    private func watchLaunches() -> Int { lineCount("watch-launches") }
+
+    private func lineCount(_ file: String) -> Int {
+        let url = directory.appendingPathComponent(file)
         return ((try? String(contentsOf: url, encoding: .utf8)) ?? "").split(whereSeparator: \.isNewline).count
     }
 
@@ -742,8 +954,8 @@ final class LauncherSmoke {
         try Data().write(to: directory.appendingPathComponent(name))
     }
 
-    private func until(_ message: String, _ condition: () -> Bool) async throws {
-        let deadline = ContinuousClock.now + .seconds(6)
+    private func until(_ message: String, seconds: Int = 6, _ condition: () -> Bool) async throws {
+        let deadline = ContinuousClock.now + .seconds(seconds)
         while !condition() && ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(20))
         }

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Exercise the signed app's native controls using a synthetic corpus without desktop input."""
 import argparse
+import json
+import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -102,9 +104,11 @@ if action == "watch":
     if "--help" in args:
         print("  --progress  Report JSON lines on stderr")
         sys.exit(0)
-    assert args == ["--progress"], "watch must only receive the progress option and use saved scope"
+    assert args == ["--bundled-pdf-helper", "--progress"], "watch must use the saved scope and current app helper"
     with (work / "watch-launches").open("a") as handle:
         handle.write("start\\n")
+    if (work / "hold-startup-watch").exists():
+        gate("startup-watch")
     print(json.dumps({"event": "ready"}), flush=True)
     while True:
         marker = work / "update-watch"
@@ -122,44 +126,61 @@ if action == "watch":
             print(json.dumps({"event": "updated"}), flush=True)
         time.sleep(0.02)
 
+def check_gemma_options(options):
+    assert len(options) == 2 and options[0] == "--gemma-home", options
+    assert Path(options[1]).resolve() == work / "missing-gemma", options
+
+
+if action == "status":
+    status = json.loads(subprocess.check_output([engine, db, database, action, *args]))
+    documents = "--documents" in json.loads((work / "index-args.json").read_text())
+    limited = (work / "gemma-cap").exists()
+    pending = documents and (limited or (work / "gemma-pending").exists() or not (work / "finish-embedding-4").exists())
+    status["gemma"] = dict(documents_enabled=documents,
+                           embedded_chunks=43000 if limited else 2 if (work / "finish-embedding-3").exists()
+                           else 1 if (work / "finish-embedding-1").exists() else 0,
+                           skipped_chunks=0, pending=pending, limited=limited, chunk_limit=43000)
+    if (work / "legacy-bge-consent").exists():
+        status["embedded_chunks"] = 2
+    print(json.dumps(status))
+    sys.exit(0)
+
 if action == "model-status":
-    assert args in (["--language", "zh", "--verify"], ["--language", "en", "--verify"])
-    if args[1] == "zh":
-        present = (work / "unverified-zh").exists()
-        diagnostic = None if present else "BGE zh profile is missing model.safetensors: /Users/synthetic-account/private"
-        print(json.dumps({"available": present, "verified": False, "diagnostic": diagnostic}))
-    else:
-        if not (work / "finish-model-check").exists():
-            gate("model-check")
-        print(json.dumps({"available": True, "verified": True, "diagnostic": None}))
+    verify = "--verify" in args
+    assert args[:-2] == ["--gemma", *(["--verify"] if verify else [])], args
+    check_gemma_options(args[-2:])
+    present = (work / "gemma-present").exists()
+    unverified = not present and (work / "gemma-unverified").exists()
+    diagnostic = None if present or unverified else "Gemma resource directory is missing: /Users/synthetic-account/private"
+    if present and verify and not (work / "finish-model-check").exists():
+        gate("model-check")
+    print(json.dumps({"available": present or unverified, "verified": present and verify, "diagnostic": diagnostic}))
     sys.exit(0)
 
 if action == "embed":
-    assert args == ["--bge", "--language", "en", "--max", "32"]
+    assert args[:-2] == ["--gemma", "--max", "32"], args
+    check_gemma_options(args[-2:])
     launches = work / "embeddings-started"
     batch = len(launches.read_text().splitlines()) + 1 if launches.exists() else 1
     with launches.open("a") as handle:
         handle.write(f"{batch}\\n")
-    assert batch <= 8, "unexpected extra semantic batch"
+    assert batch <= 7, "unexpected extra semantic batch"
     gate(f"embedding-{batch}")
     if batch == 6:
-        sys.exit("isolated BGE runtime is missing")
+        sys.exit("Gemma resource directory is missing")
     indexed = 0 if batch in (2, 5) else 1
     skipped = 2 if batch == 2 else 0
     print(json.dumps({"new_embeddings": indexed, "skipped_chunks": skipped, "has_more": batch != 4}))
     sys.exit(0)
 
-if action == "query" and args[:2] == ["--mode", "semantic"]:
-    assert args[:-1] == ["--mode", "semantic", "--bge", "--language", "en", "--limit", "12", "--"]
-    (work / "bge-query-started").touch()
-    term = args[-1]
+
+def related_hits(term):
     if term == "outdated semantic request":
         gate("stale-semantic")
     elif term == "health examination" and not (work / "finish-semantic-enrichment").exists():
         gate("semantic-enrichment")
     if term not in ("health examination", "outdated semantic request"):
-        print("[]")
-        sys.exit(0)
+        return []
     documents = indexed_documents()
     hits = []
     for name in ("health examination roster.txt", "notes.md", "notes.md", "related-one.md",
@@ -169,7 +190,26 @@ if action == "query" and args[:2] == ["--mode", "semantic"]:
         hits.append({"path": str(path), "name": path.name, "kind": "file", "availability": "local",
                      "matched_by": "semantic_candidate", "snippet": document["text"],
                      "document_stamp": document["stamp"]})
-    print(json.dumps(hits))
+    return hits
+
+
+if action == "semantic-serve":
+    check_gemma_options(args)
+    with (work / "semantic-serve-launches").open("a") as handle:
+        handle.write("start\\n")
+    for line in sys.stdin:
+        req = json.loads(line)
+        assert req["mode"] == "semantic" and req["limit"] == 12
+        if (work / "gemma-cap").exists():
+            (work / "capped-gemma-query-started").touch()
+        print(json.dumps({"id": req["id"], "hits": related_hits(req["query"])}), flush=True)
+    sys.exit(0)
+
+if action == "query" and args[:2] == ["--mode", "semantic"]:
+    assert args[:-4] == ["--mode", "semantic", "--gemma", "--limit", "12"] and args[-2] == "--", args
+    check_gemma_options(args[-4:-2])
+    (work / "explicit-gemma-query-started").touch()
+    print(json.dumps(related_hits(args[-1])))
     sys.exit(0)
 
 if action == "query":
@@ -236,24 +276,44 @@ def make_corpus(root):
         file.write_text(content, encoding="utf-8")
 
 
-def run(root, language):
-    subprocess.run([str(APP), "--gui-smoke", str(root), language], check=True, timeout=45)
+def install_fixture(root):
+    script = root / "fixture-engine"
+    script.write_text(FIXTURE_ENGINE, encoding="utf-8")
+    script.chmod(0o700)
+    resources = BUNDLE / "Resources"
+    (root / "native-engine").symlink_to(resources / "lumen")
+    (root / "LumenPdfExtractor").symlink_to(resources / "LumenPdfExtractor")
+    return script
+
+
+def run(root, language, gemma_home=None):
+    environment = os.environ.copy()
+    environment.pop("LUMEN_GEMMA_TEST_HOME", None)
+    if gemma_home is not None:
+        environment["LUMEN_GEMMA_TEST_HOME"] = str(gemma_home)
+    subprocess.run([str(APP), "--gui-smoke", str(root), language], check=True, env=environment,
+                   timeout=150 if gemma_home is not None else 45)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--watch-engine", type=Path, help="Also test an integrated lumen binary with persisted watch scopes")
-    parser.add_argument("--real-bge", action="store_true", help="Also verify the packaged GUI with installed offline BGE profiles")
+    parser.add_argument("--real-gemma", type=Path,
+                        help="Also verify the signed GUI with pinned offline Gemma resources in this directory")
     parser.add_argument("--snapshots", type=Path, help="Save offscreen PNGs to this directory")
     args = parser.parse_args()
     if args.watch_engine and not args.watch_engine.is_file():
         parser.error("--watch-engine must point to a lumen binary")
+    if args.real_gemma and not args.real_gemma.is_dir():
+        parser.error("--real-gemma must point to a pinned Gemma resource directory")
     if not APP.is_file():
         raise SystemExit("Build the app first with scripts/build-app.sh")
     with tempfile.TemporaryDirectory(prefix="lumen-gui-") as tmp:
         root = Path(tmp)
         make_corpus(root)
-        subprocess.run([str(APP), "--verify-resident-startup", str(root), "en"], check=True, timeout=10)
+        environment = os.environ.copy()
+        environment.pop("LUMEN_GEMMA_TEST_HOME", None)
+        subprocess.run([str(APP), "--verify-resident-startup", str(root), "en"], check=True, env=environment, timeout=10)
         run(root, "en")
         run(root, "zh")
     with tempfile.TemporaryDirectory(prefix="lumen-gui-") as tmp:
@@ -273,18 +333,45 @@ def main():
             (crowd / f"item-{index:02}.txt").write_text("Weak path fixture.", encoding="utf-8")
         (root / "corpus/crowded needle spec.txt").write_text("Strong filename fixture.", encoding="utf-8")
         (root / "corpus/body-match.md").write_text("A crowded needle reference in the body.", encoding="utf-8")
-        script = root / "fixture-engine"
-        script.write_text(FIXTURE_ENGINE, encoding="utf-8")
-        script.chmod(0o700)
-        resources = BUNDLE / "Resources"
-        (root / "native-engine").symlink_to(resources / "lumen")
-        (root / "LumenPdfExtractor").symlink_to(resources / "LumenPdfExtractor")
+        install_fixture(root)
         run(root, "zh")
         if args.snapshots:
             args.snapshots.mkdir(parents=True, exist_ok=True)
             for name in ("lumen-idle-light.png", "lumen-results-light.png", "lumen-results-dark.png"):
                 shutil.copyfile(root / name, args.snapshots / name)
         run(root, "en")
+    with tempfile.TemporaryDirectory(prefix="lumen-gui-settings-") as tmp:
+        root = Path(tmp).resolve()
+        make_corpus(root)
+        protected = root / "corpus/Scoped/Allowed Child"
+        protected.mkdir(parents=True)
+        (protected / "protected-neighbor.md").write_text("Synthetic scope test.", encoding="utf-8")
+        fixture = install_fixture(root)
+        (root / "settings-scenario").touch()
+        if args.snapshots:
+            (root / "capture-settings").touch()
+        subprocess.run([str(fixture), "--db", str(root / "index.sqlite"), "index",
+                        "--root", str(root / "corpus"), "--deny", str(root / "corpus/Excluded")],
+                       check=True, timeout=15, capture_output=True)
+        public_status = subprocess.check_output([str(BUNDLE / "Resources/lumen"), "--db",
+                                                 str(root / "index.sqlite"), "status"], timeout=10)
+        assert "scope" not in json.loads(public_status), "ordinary status exposed directory rules"
+        run(root, "en")
+        if args.snapshots:
+            for image in root.glob("settings-*.png"):
+                shutil.copyfile(image, args.snapshots / image.name)
+    for documents in (True, False):
+        with tempfile.TemporaryDirectory(prefix="lumen-gui-migrate-") as tmp:
+            root = Path(tmp).resolve()
+            make_corpus(root)
+            fixture = install_fixture(root)
+            for marker in ("legacy-bge-consent", "gemma-present", "finish-documents"):
+                (root / marker).touch()
+            subprocess.run([str(fixture), "--db", str(root / "index.sqlite"), "index",
+                            "--root", str(root / "corpus"), *(["--documents"] if documents else [])],
+                           check=True, timeout=15, capture_output=True)
+            (root / "hold-startup-watch").touch()
+            run(root, "en")
     if args.watch_engine:
         help_text = subprocess.check_output([str(args.watch_engine.resolve()), "watch", "--help"], text=True, timeout=10)
         with tempfile.TemporaryDirectory(prefix="lumen-gui-") as tmp:
@@ -310,24 +397,18 @@ def main():
             run(root, "en")
 
 
-    if args.real_bge:
-        samples = {
-            "zh": ("雨水花园可吸收屋顶径流并通过种植带降低地表积水。", "栽培郁金香应使用排水良好的花土。"),
-            "en": ("An experienced teammate helps new hires practice their routine work and reviews progress regularly.",
-                   "Quantum optics interferometry studies photons and polarization."),
-        }
-        for language, (target, distraction) in samples.items():
-            with tempfile.TemporaryDirectory(prefix="lumen-gui-bge-") as tmp:
-                root = Path(tmp).resolve()
-                corpus = root / "corpus"
-                corpus.mkdir()
-                (corpus / "entry-a.md").write_text(target, encoding="utf-8")
-                (corpus / "entry-b.md").write_text(distraction, encoding="utf-8")
-                (root / "actual-bge").touch()
-                subprocess.run([str(BUNDLE / "Resources/lumen"), "--db", str(root / "index.sqlite"),
-                                "index", "--root", str(corpus), "--documents"], check=True,
-                               timeout=15, stdout=subprocess.DEVNULL)
-                run(root, language)
+    if args.real_gemma:
+        with tempfile.TemporaryDirectory(prefix="lumen-gui-gemma-") as tmp:
+            root = Path(tmp).resolve()
+            corpus = root / "corpus"
+            corpus.mkdir()
+            (corpus / "entry-a.md").write_text("Orient the solar panel toward the midday sun.", encoding="utf-8")
+            (corpus / "entry-b.md").write_text("给闹钟换上新的电池以后重新调准时间。", encoding="utf-8")
+            (root / "actual-gemma").touch()
+            subprocess.run([str(BUNDLE / "Resources/lumen"), "--db", str(root / "index.sqlite"),
+                            "index", "--root", str(corpus), "--documents"], check=True,
+                           timeout=15, stdout=subprocess.DEVNULL)
+            run(root, "zh", gemma_home=args.real_gemma.resolve())
 
 
 if __name__ == "__main__":

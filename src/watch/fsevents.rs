@@ -43,6 +43,8 @@ unsafe extern "C" {
         callbacks: *const ArrayCallbacks,
     ) -> Cf;
     fn CFRelease(object: Cf);
+    fn CFUUIDCreateString(allocator: Cf, uuid: Cf) -> Cf;
+    fn CFStringGetCString(value: Cf, output: *mut u8, size: isize, encoding: u32) -> u8;
 }
 
 #[link(name = "CoreServices", kind = "framework")]
@@ -56,6 +58,18 @@ unsafe extern "C" {
         latency: f64,
         flags: u32,
     ) -> NativeStream;
+    fn FSEventStreamCreateRelativeToDevice(
+        allocator: Cf,
+        callback: Callback,
+        context: *mut Context,
+        device: libc::dev_t,
+        paths: Cf,
+        since_when: u64,
+        latency: f64,
+        flags: u32,
+    ) -> NativeStream;
+    fn FSEventsCopyUUIDForDevice(device: libc::dev_t) -> Cf;
+    fn FSEventsGetCurrentEventId() -> u64;
     fn FSEventStreamSetDispatchQueue(stream: NativeStream, queue: DispatchQueue);
     fn FSEventStreamStart(stream: NativeStream) -> u8;
     fn FSEventStreamStop(stream: NativeStream);
@@ -72,6 +86,7 @@ const SINCE_NOW: u64 = u64::MAX;
 const NO_DEFER: u32 = 0x02;
 const WATCH_ROOT: u32 = 0x04;
 const FILE_EVENTS: u32 = 0x10;
+const FULL_HISTORY: u32 = 0x80;
 
 const MUST_SCAN_SUBDIRS: u32 = 0x0001;
 const LOST_EVENTS: u32 = 0x0002 | 0x0004 | 0x0008; // user dropped, kernel dropped, IDs wrapped
@@ -88,13 +103,47 @@ impl Drop for CfObject {
     }
 }
 
+pub(super) fn uuid(device: libc::dev_t) -> Option<String> {
+    let uuid = unsafe { FSEventsCopyUUIDForDevice(device) };
+    if uuid.is_null() {
+        return None;
+    }
+    let uuid = CfObject(uuid);
+    let string = unsafe { CFUUIDCreateString(null(), uuid.0) };
+    if string.is_null() {
+        return None;
+    }
+    let string = CfObject(string);
+    let mut output = [0; 37];
+    let ok = unsafe { CFStringGetCString(string.0, output.as_mut_ptr(), 37, 0x0800_0100) };
+    if ok == 0 {
+        return None;
+    }
+    unsafe { CStr::from_ptr(output.as_ptr().cast()) }
+        .to_str()
+        .ok()
+        .map(str::to_owned)
+}
+
+pub(super) fn current_id() -> Option<u64> {
+    // IDs are generated system-wide. A full walk covers the state through
+    // this pre-subscription fence. Its volume UUID and boot session bound it
+    // to the current host and journal.
+    let id = unsafe { FSEventsGetCurrentEventId() };
+    (id != 0 && id != SINCE_NOW).then_some(id)
+}
+
 pub(super) struct Stream {
     stream: NativeStream,
     started: bool,
 }
 
 impl Stream {
-    pub(super) fn start(paths: &[PathBuf], sink: &Arc<Sink>) -> Result<Self> {
+    pub(super) fn start(
+        paths: &[PathBuf],
+        sink: &Arc<Sink>,
+        replay: Option<(libc::dev_t, u64)>,
+    ) -> Result<Self> {
         let strings = paths
             .iter()
             .map(|path| {
@@ -127,16 +176,30 @@ impl Stream {
             release: Some(release),
             copy_description: None,
         };
+        let flags = NO_DEFER | WATCH_ROOT | FILE_EVENTS;
         let stream = unsafe {
-            FSEventStreamCreate(
-                null(),
-                callback,
-                &mut context,
-                array.0,
-                SINCE_NOW,
-                0.18,
-                NO_DEFER | WATCH_ROOT | FILE_EVENTS,
-            )
+            if let Some((device, since)) = replay {
+                FSEventStreamCreateRelativeToDevice(
+                    null(),
+                    callback,
+                    &mut context,
+                    device,
+                    array.0,
+                    since,
+                    0.18,
+                    flags | FULL_HISTORY,
+                )
+            } else {
+                FSEventStreamCreate(
+                    null(),
+                    callback,
+                    &mut context,
+                    array.0,
+                    SINCE_NOW,
+                    0.18,
+                    flags,
+                )
+            }
         };
         if stream.is_null() {
             bail!("could not create FSEvents stream");
@@ -186,7 +249,7 @@ unsafe extern "C" fn callback(
     count: usize,
     raw_paths: *mut c_void,
     flags: *const u32,
-    _: *const u64,
+    ids: *const u64,
 ) {
     if count == 0 {
         return;
@@ -194,10 +257,19 @@ unsafe extern "C" fn callback(
     let sink = unsafe { &*info.cast::<Sink>() };
     let paths = unsafe { std::slice::from_raw_parts(raw_paths.cast::<*const c_char>(), count) };
     let flags = unsafe { std::slice::from_raw_parts(flags, count) };
-    for (&raw_path, &flag) in paths.iter().zip(flags) {
+    let ids = unsafe { std::slice::from_raw_parts(ids, count) };
+    let mut watermark = 0;
+    for ((&raw_path, &flag), &id) in paths.iter().zip(flags).zip(ids) {
         if flag & LOST_EVENTS != 0 {
             sink.lost();
-        } else if flag & HISTORY_DONE == 0 {
+        } else if flag & HISTORY_DONE != 0 {
+            sink.checkpoint(watermark, true);
+            watermark = 0;
+        } else {
+            if raw_path.is_null() {
+                sink.lost();
+                continue;
+            }
             let path = unsafe { CStr::from_ptr(raw_path) }.to_bytes();
             let path = Path::new(std::ffi::OsStr::from_bytes(path));
             let rearm = flag & (ROOT_CHANGED | VOLUME_CHANGED) != 0;
@@ -205,7 +277,12 @@ unsafe extern "C" fn callback(
                 || flag & MUST_SCAN_SUBDIRS != 0
                 || flag == 0
                 || flag & IS_DIRECTORY != 0 && flag & TREE_CHANGED != 0;
-            sink.change(path, subtree, rearm);
+            if sink.native_change(path, subtree, rearm, flag & MUST_SCAN_SUBDIRS != 0) {
+                watermark = watermark.max(id);
+            }
         }
+    }
+    if watermark != 0 {
+        sink.checkpoint(watermark, false);
     }
 }

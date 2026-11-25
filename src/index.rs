@@ -1,8 +1,8 @@
 use super::{
-    MAX_DOCUMENT, ScanPhase, ScanProgressReporter, ScanStats, Scope, absolute, docx, norm,
-    open_write, platform, with_suffix,
+    MAX_DOCUMENT, PdfHelperPolicy, ScanPhase, ScanProgressReporter, ScanStats, Scope, absolute,
+    docx, norm, open_write, platform, with_suffix,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::{
     collections::{HashMap, HashSet},
@@ -14,11 +14,107 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+const APP_PDF_HELPER: &str = "LumenPdfExtractor";
+// Bump this only when PDF extraction changes the indexed text format. Binary
+// rebuilds, code signatures and app installs are compatible with this ID.
+const APP_PDF_FORMAT: &str = "lumen-pdf:pdfkit-text-v1";
+
+fn is_app_pdf_helper(path: &Path) -> bool {
+    let Some(resources) = path.parent() else {
+        return false;
+    };
+    let Some(contents) = resources.parent() else {
+        return false;
+    };
+    path.file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case(APP_PDF_HELPER))
+        && resources
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("Resources"))
+        && contents
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("Contents"))
+        && contents
+            .parent()
+            .and_then(Path::extension)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+}
+
+#[derive(PartialEq, Eq)]
+struct PdfExtractor {
+    executable: PathBuf,
+    format: String,
+    bundled_binary: Option<String>,
+}
+
+impl PdfExtractor {
+    fn bundled() -> Result<Self> {
+        let engine = fs::canonicalize(std::env::current_exe()?)?;
+        let executable = engine.with_file_name(APP_PDF_HELPER);
+        ensure!(
+            is_app_pdf_helper(&executable),
+            "--bundled-pdf-helper must be run from the app's Contents/Resources"
+        );
+        let bundled_binary = Self::bundled_binary_stamp(&executable)?;
+        Ok(Self {
+            executable,
+            format: APP_PDF_FORMAT.into(),
+            bundled_binary: Some(bundled_binary),
+        })
+    }
+
+    fn manual(path: &Path) -> Self {
+        let metadata = fs::metadata(path).ok();
+        Self {
+            executable: path.to_owned(),
+            format: format!("{path:?}:{:?}", metadata.as_ref().map(stamp)),
+            bundled_binary: None,
+        }
+    }
+
+    fn bundled_binary_stamp(path: &Path) -> Result<String> {
+        let metadata =
+            fs::symlink_metadata(path).context("read the current app's bundled PDF extractor")?;
+        ensure!(
+            metadata.is_file() && metadata.mode() & 0o111 != 0,
+            "the current app's PDF extractor must be an executable regular file"
+        );
+        Ok(stamp(&metadata))
+    }
+
+    fn executable(&self) -> Result<&Path> {
+        if let Some(binary) = &self.bundled_binary {
+            ensure!(
+                *binary == Self::bundled_binary_stamp(&self.executable)?,
+                "bundled PDF extractor changed while running; restart from the current app"
+            );
+        }
+        Ok(&self.executable)
+    }
+
+    fn can_restamp_legacy(&self, previous: &str, document_stamp: &str) -> bool {
+        self.bundled_binary.is_some()
+            && previous
+                .strip_prefix(document_stamp)
+                .is_some_and(|suffix| suffix.starts_with(":\""))
+    }
+}
+
+pub(super) const INDEX_SIDECARS: [&str; 4] = ["-wal", "-shm", "-journal", "-watch-lock"];
+
+pub(super) fn is_index_path(path: &Path, database: &Path, sidecars: &[PathBuf]) -> bool {
+    path == database
+        || sidecars.iter().any(|sidecar| path == sidecar)
+        || database
+            .parent()
+            .is_some_and(|p| p.ends_with("Lumen") && path.starts_with(p))
+}
+
 pub(super) struct Coverage {
     pub scope: Scope,
     database: PathBuf,
     sidecars: [PathBuf; 4],
-    pdf_stamp: Option<String>,
+    pdf: Option<PdfExtractor>,
 }
 
 impl Coverage {
@@ -28,31 +124,50 @@ impl Coverage {
                 .map(|p| absolute(p).map(|p| platform::filesystem_spelling(&p)))
                 .collect()
         };
+        let managed = scope.pdf_helper_policy == Some(PdfHelperPolicy::Bundled);
+        ensure!(
+            !managed || scope.documents,
+            "--bundled-pdf-helper requires document indexing in the requested or saved scope"
+        );
+        ensure!(
+            !managed || scope.pdf_helper.is_none(),
+            "bundled and manual PDF helpers are mutually exclusive"
+        );
         let scope = Scope {
             roots: paths(&scope.roots())?,
             allow: paths(&scope.allow)?,
             deny: paths(&scope.deny)?,
             documents: scope.documents,
             pdf_helper: scope.pdf_helper.as_deref().map(absolute).transpose()?,
+            pdf_helper_policy: scope
+                .pdf_helper_policy
+                .or_else(|| scope.pdf_helper.as_ref().map(|_| PdfHelperPolicy::Manual)),
         };
         let database = platform::filesystem_spelling(&database);
-        let sidecars = ["-wal", "-shm", "-journal", "-watch-lock"]
-            .map(|suffix| with_suffix(&database, suffix));
-        let pdf_stamp = scope.pdf_helper.as_ref().map(|path| {
-            let metadata = fs::metadata(path).ok();
-            format!("{path:?}:{:?}", metadata.as_ref().map(stamp))
-        });
+        let sidecars = INDEX_SIDECARS.map(|suffix| with_suffix(&database, suffix));
+        let pdf = if managed {
+            Some(PdfExtractor::bundled()?)
+        } else {
+            scope.pdf_helper.as_deref().map(PdfExtractor::manual)
+        };
         Ok(Self {
             scope,
             database,
             sidecars,
-            pdf_stamp,
+            pdf,
         })
     }
 
     #[cfg(target_os = "macos")]
     pub fn refreshed(&self) -> Result<Self> {
-        Self::new(self.database.clone(), &self.scope)
+        let refreshed = Self::new(self.database.clone(), &self.scope)?;
+        if self.scope.pdf_helper_policy == Some(PdfHelperPolicy::Bundled) {
+            ensure!(
+                self.pdf == refreshed.pdf,
+                "bundled PDF extractor changed during watch; restart from the current app"
+            );
+        }
+        Ok(refreshed)
     }
 
     fn contains(&self, path: &Path) -> bool {
@@ -60,13 +175,7 @@ impl Coverage {
     }
 
     pub fn allows(&self, path: &Path) -> bool {
-        self.scope.allows(path)
-            && path != self.database
-            && !self.sidecars.iter().any(|sidecar| path == sidecar)
-            && !self
-                .database
-                .parent()
-                .is_some_and(|p| p.ends_with("Lumen") && path.starts_with(p))
+        self.scope.allows(path) && !is_index_path(path, &self.database, &self.sidecars)
     }
 }
 
@@ -98,7 +207,23 @@ pub(super) fn startup_scope(conn: &Connection, requested: &Scope) -> Result<Scop
             .query_row("SELECT value FROM info WHERE key='scope'", [], |r| r.get(0))
             .optional()?;
         if let Some(stored) = stored {
-            return serde_json::from_str(&stored).context("read saved watch scope");
+            let mut saved: Scope =
+                serde_json::from_str(&stored).context("read saved watch scope")?;
+            if requested.pdf_helper_policy == Some(PdfHelperPolicy::Bundled)
+                && saved.documents
+                && saved.pdf_helper_policy != Some(PdfHelperPolicy::Manual)
+            {
+                saved.pdf_helper = None;
+                saved.pdf_helper_policy = Some(PdfHelperPolicy::Bundled);
+            } else if saved.pdf_helper_policy == Some(PdfHelperPolicy::Bundled)
+                || (saved.pdf_helper_policy.is_none()
+                    && saved.pdf_helper.as_deref().is_some_and(is_app_pdf_helper))
+            {
+                bail!(
+                    "saved scope uses an app PDF extractor; use --bundled-pdf-helper from the current app or supply an explicit --pdf-helper with its scope"
+                );
+            }
+            return Ok(saved);
         }
         let legacy: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM info WHERE key='scan')",
@@ -114,13 +239,7 @@ pub(super) fn startup_scope(conn: &Connection, requested: &Scope) -> Result<Scop
             "no saved scope; pass --root or --allow to start an index (use --root / for the startup volume)"
         );
     }
-    Ok(Scope {
-        roots: requested.roots.clone(),
-        allow: requested.allow.clone(),
-        deny: requested.deny.clone(),
-        documents: requested.documents,
-        pdf_helper: requested.pdf_helper.clone(),
-    })
+    Ok(requested.clone())
 }
 
 /// Apply a newly narrowed scope before reading the filesystem. Clients which
@@ -225,9 +344,6 @@ pub(super) fn reconcile(
                 [],
             )?;
             purge(&tx)?;
-        }
-        if manual {
-            crate::semantic::clear_model(&tx)?;
         }
     }
     hide_unverified(&tx)?;
@@ -653,7 +769,7 @@ impl<'a> Walk<'a> {
         let Some(kind) = DocumentKind::for_path(path) else {
             return Ok(());
         };
-        let available = kind != DocumentKind::Pdf || self.coverage.pdf_stamp.is_some();
+        let available = kind != DocumentKind::Pdf || self.coverage.pdf.is_some();
         if !self.coverage.scope.documents || directory || !available {
             // A prior scope may have allowed extraction of this path.
             return self.clear_document(id);
@@ -673,7 +789,11 @@ impl<'a> Walk<'a> {
             let extractor = match kind {
                 DocumentKind::Text => "",
                 DocumentKind::Docx => "docx-v1",
-                DocumentKind::Pdf => self.coverage.pdf_stamp.as_deref().unwrap_or(""),
+                DocumentKind::Pdf => self
+                    .coverage
+                    .pdf
+                    .as_ref()
+                    .map_or("", |pdf| pdf.format.as_str()),
             };
             format!("{}:{extractor}", stamp(meta))
         };
@@ -699,7 +819,17 @@ impl<'a> Walk<'a> {
                     self.stats.documents += 1;
                     return Ok(());
                 }
-                let body = match kind.extract(path, self.coverage.scope.pdf_helper.as_deref()) {
+                let pdf = if kind == DocumentKind::Pdf {
+                    self.coverage.pdf.as_ref()
+                } else {
+                    None
+                };
+                let extractor = pdf.map(PdfExtractor::executable).transpose()?;
+                let body = kind.extract(path, extractor);
+                if let Some(pdf) = pdf {
+                    pdf.executable()?;
+                }
+                let body = match body {
                     Err(error)
                         if error.downcast_ref::<std::io::Error>().is_some_and(|io| {
                             io.kind() == std::io::ErrorKind::PermissionDenied
@@ -719,7 +849,18 @@ impl<'a> Walk<'a> {
                             && version(&m) == current
                     })
                 {
-                    let unchanged_legacy = previous.is_none()
+                    // The old stamp identified a binary path, not an extraction
+                    // format. Verify its text once with the current app. Existing
+                    // vectors are valid only if the exact same text was produced.
+                    let legacy = previous.is_none()
+                        || (kind == DocumentKind::Pdf
+                            && previous.as_deref().is_some_and(|prior| {
+                                self.coverage
+                                    .pdf
+                                    .as_ref()
+                                    .is_some_and(|pdf| pdf.can_restamp_legacy(prior, &stamp(meta)))
+                            }));
+                    let unchanged_legacy = legacy
                         && self
                             .tx
                             .prepare_cached(
@@ -738,7 +879,7 @@ impl<'a> Walk<'a> {
                         self.changed = true;
                     }
                     self.tx
-                        .prepare_cached("INSERT INTO document_state VALUES(?,?)")?
+                        .prepare_cached("INSERT INTO document_state VALUES(?,?) ON CONFLICT(id) DO UPDATE SET stamp=excluded.stamp")?
                         .execute(params![id, current])?;
                     self.stats.documents += 1;
                     return Ok(());
@@ -779,7 +920,7 @@ fn confirmed_absent(error: &std::io::Error) -> bool {
     )
 }
 
-fn stamp(meta: &fs::Metadata) -> String {
+pub(super) fn stamp(meta: &fs::Metadata) -> String {
     format!(
         "{}:{}:{}:{}:{}:{}:{}",
         meta.dev(),
@@ -793,14 +934,14 @@ fn stamp(meta: &fs::Metadata) -> String {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum DocumentKind {
+pub(super) enum DocumentKind {
     Text,
     Docx,
     Pdf,
 }
 
 impl DocumentKind {
-    fn for_path(path: &Path) -> Option<Self> {
+    pub(super) fn for_path(path: &Path) -> Option<Self> {
         match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
             "txt" | "md" | "markdown" => Some(Self::Text),
             "docx" => Some(Self::Docx),

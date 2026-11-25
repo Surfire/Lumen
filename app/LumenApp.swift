@@ -30,7 +30,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var languageChange: AnyCancellable?
     private var presentationChange: AnyCancellable?
     private var presentationScheduled = false
-    private var settings: NSPanel?
+    private(set) var settings: NSPanel?
+    private(set) lazy var settingsSession = SettingsSession(model: model)
     private var configuredKey: HotKey?
     private(set) var searchPresented = false
     #if LUMEN_EXTENSIONS
@@ -68,6 +69,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
         panel.delegate = self
         panel.onCancel = { [weak self] in self?.dismissSearch() }
+        panel.onSettings = { [weak self] in self?.showSettings() }
         panel.onReveal = { [weak self] in
             guard let self, let hit = self.model.selectedHit else { return }
             self.revealInFinder(hit)
@@ -142,7 +144,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         let executable = smoke?.executable ?? resources.appendingPathComponent("lumen")
         let database = smoke?.database ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/Lumen/index.sqlite")
-        let engine = LauncherEngine(executable: executable, database: database, syntheticRoot: smoke?.corpus)
+        let engine = LauncherEngine(executable: executable, database: database,
+                                    syntheticRoot: smoke?.corpus, gemmaHome: smoke?.gemmaHome)
         model = Launcher(engine: engine, defaults: defaults, locale: smoke?.language)
     }
 
@@ -245,7 +248,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     @objc func startBackgroundIndex() {
-        model.buildIndex()
+        if model.indexPhase == .ready, model.watchState == .needsSetup, model.savedScope == nil, !model.scopePending {
+            settingsSession.page = .index
+            showSettings()
+            return
+        }
+        model.applyScope(model.settingsScope)
         if model.isIndexing { dismissSearch() }
     }
 
@@ -299,26 +307,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     @objc func showSettings() {
         if smoke == nil { NSApp.activate() }
         if settings == nil {
-            let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 570, height: 570),
+            let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 770, height: 568),
                                  styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
             window.hidesOnDeactivate = false
-            window.minSize = NSSize(width: 480, height: 450)
+            window.contentMinSize = NSSize(width: 700, height: 488)
             window.delegate = self
             window.contentView = NSHostingView(rootView: LauncherSettings(
                 model: model,
+                session: settingsSession,
                 recordShortcut: { [weak self] in self?.recordShortcut($0) },
-                disableShortcut: { [weak self] in self?.disableShortcut() }
+                disableShortcut: { [weak self] in self?.disableShortcut() },
+                chooseDirectories: { [weak self] in self?.chooseSettingsDirectories($0) },
+                chooseDiagnosticFile: { [weak self] in self?.chooseDiagnosticFile() }
             ))
-            window.center()
+            if smoke == nil { window.center() }
+            else { window.setFrameOrigin(NSPoint(x: -12_000, y: -12_000)) }
             settings = window
         }
         settings?.title = model.t("Lumen 设置", "Lumen Settings")
         if smoke == nil { settings?.makeKeyAndOrderFront(nil) }
+        if searchPresented { dismissSearch() }
+    }
+
+    func chooseSettingsDirectories(_ group: ScopeFolders) {
+        guard let settings else { return }
+        if let smoke {
+            if let urls = smoke.chosenSettingsDirectories {
+                smoke.chosenSettingsDirectories = nil
+                settingsSession.add(urls, to: group)
+            }
+            return
+        }
+        let open = NSOpenPanel()
+        open.canChooseFiles = false
+        open.canChooseDirectories = true
+        open.allowsMultipleSelection = true
+        open.resolvesAliases = false
+        open.prompt = model.t("添加", "Add")
+        open.message = model.t("选择要添加的目录。更改会在应用后生效。",
+                               "Choose folders to add. Changes take effect when you apply them.")
+        open.beginSheetModal(for: settings) { [weak self] result in
+            guard result == .OK else { return }
+            self?.settingsSession.add(open.urls, to: group)
+        }
+    }
+
+    func chooseDiagnosticFile() {
+        guard let settings, !model.scopePending else { return }
+        if let smoke {
+            if let file = smoke.chosenDiagnosticFile {
+                smoke.chosenDiagnosticFile = nil
+                model.diagnoseFile(file)
+            }
+            return
+        }
+        let open = NSOpenPanel()
+        open.canChooseFiles = true
+        open.canChooseDirectories = false
+        open.resolvesAliases = false
+        open.prompt = model.t("检查", "Check")
+        open.message = model.t("选择一个要查看索引状态的文件。", "Choose a file to check its indexing status.")
+        open.beginSheetModal(for: settings) { [weak self] result in
+            guard result == .OK, let file = open.url else { return }
+            self?.model.diagnoseFile(file)
+        }
     }
 
     func windowWillClose(_ notification: Notification) {
-        if let settings, (notification.object as? NSWindow) === settings { settings.makeFirstResponder(nil) }
+        if let settings, (notification.object as? NSWindow) === settings {
+            settings.makeFirstResponder(nil)
+            model.clearFileDiagnosis()
+        }
     }
 
     #if LUMEN_EXTENSIONS
@@ -445,6 +505,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         let main = NSMenu()
         let application = NSMenuItem()
         let appMenu = NSMenu()
+        appMenu.addItem(withTitle: model.t("设置…", "Settings…"), action: #selector(showSettings),
+                        keyEquivalent: ",").target = self
+        appMenu.addItem(.separator())
         appMenu.addItem(withTitle: model.t("退出 Lumen", "Quit Lumen"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         application.submenu = appMenu
         main.addItem(application)
@@ -516,23 +579,29 @@ final class SearchBackdrop: NSVisualEffectView {
 final class SearchPanel: NSPanel {
     var onCancel: (() -> Void)?
     var onReveal: (() -> Void)?
+    var onSettings: (() -> Void)?
     override var canBecomeKey: Bool { true }
 
-    private func handleReveal(_ event: NSEvent) -> Bool {
+    private func handleCommand(_ event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
         guard event.type == .keyDown, modifiers == [.command],
-              event.keyCode == kVK_Return || event.keyCode == kVK_ANSI_KeypadEnter,
               (firstResponder as? NSTextView)?.hasMarkedText() != true else { return false }
-        onReveal?()
+        if event.charactersIgnoringModifiers == "," {
+            onSettings?()
+        } else if event.keyCode == kVK_Return || event.keyCode == kVK_ANSI_KeypadEnter {
+            onReveal?()
+        } else {
+            return false
+        }
         return true
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        handleReveal(event) || super.performKeyEquivalent(with: event)
+        handleCommand(event) || super.performKeyEquivalent(with: event)
     }
 
     override func sendEvent(_ event: NSEvent) {
-        if handleReveal(event) { return }
+        if handleCommand(event) { return }
         let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
         if event.type == .keyDown, event.keyCode == kVK_Escape, modifiers.isEmpty,
            (firstResponder as? NSTextView)?.hasMarkedText() != true {

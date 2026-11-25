@@ -1,5 +1,7 @@
 //! Independent local index. The CLI and native launcher share this implementation.
+mod diagnose;
 mod docx;
+mod gemma;
 mod index;
 mod model;
 mod name_fast;
@@ -8,14 +10,19 @@ mod progress;
 mod semantic;
 mod watch;
 
+pub use diagnose::{Diagnosis, Reason as DiagnoseReason, diagnose};
+pub use gemma::{GemmaModel, ID as GEMMA_MODEL_ID};
 pub use index::{scan, scan_with_progress};
 pub use model::{BgeModel, Model, ModelBackend};
 pub use progress::{ScanPhase, ScanProgress, ScanProgressReporter};
-pub use semantic::{EmbedBatch, embed, embed_batch, embed_with_backend};
+pub use semantic::{
+    EmbedBatch, GemmaCoverage, GemmaSearchSession, embed, embed_batch, embed_with_backend,
+    gemma_coverage,
+};
 pub use watch::{WatchEvent, watch, watch_with_progress};
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -36,13 +43,22 @@ pub fn standard_database() -> PathBuf {
     home.join("Library/Application Support/Lumen/index.sqlite")
 }
 
-#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
     pub roots: Vec<PathBuf>,
     pub allow: Vec<PathBuf>,
     pub deny: Vec<PathBuf>,
     pub documents: bool,
     pub pdf_helper: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdf_helper_policy: Option<PdfHelperPolicy>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PdfHelperPolicy {
+    Manual,
+    Bundled,
 }
 
 impl Scope {
@@ -66,21 +82,24 @@ impl Scope {
     }
 
     pub fn allows(&self, path: &Path) -> bool {
-        // Deny always wins, including when allow contains a descendant.
-        !self.deny.iter().any(|p| platform::denied_by(path, p))
+        !self.excludes(path)
             && (self.allow.is_empty()
                 || self
                     .allow
                     .iter()
                     .any(|p| path.starts_with(p) || p.starts_with(path)))
-            && !sensitive_path(path)
-            && (!system_path(path)
-                || self
+    }
+
+    fn excludes(&self, path: &Path) -> bool {
+        self.deny.iter().any(|p| platform::denied_by(path, p))
+            || sensitive_path(path)
+            || (system_path(path)
+                && !self
                     .roots
                     .iter()
                     .any(|root| is_temp_path(root) && path.starts_with(root)))
-            && (!path.starts_with("/Volumes")
-                || self
+            || (path.starts_with("/Volumes")
+                && !self
                     .roots
                     .iter()
                     .any(|root| root.starts_with("/Volumes") && path.starts_with(root)))
@@ -234,6 +253,7 @@ fn open_write(path: &Path, exclusive_indexer: bool) -> Result<(Connection, Optio
         conn.execute_batch(semantic::SCHEMA)?;
     }
     conn.execute_batch(semantic::SKIP_SCHEMA)?;
+    conn.execute_batch(semantic::VERSIONED_SCHEMA)?;
     conn.execute_batch("COMMIT;")?;
     Ok((conn, lease))
 }
@@ -500,6 +520,33 @@ fn search_with_names(
         }
     }
     Ok(hits)
+}
+
+/// Return complete saved scope rules only. Older or malformed indexes have no
+/// authority to provide defaults for an exact-scope rebuild.
+pub fn saved_index_scope(conn: &Connection) -> Result<Option<Scope>> {
+    let stored: Option<String> = conn
+        .query_row("SELECT value FROM info WHERE key='scope'", [], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    Ok(stored
+        .as_deref()
+        .and_then(|scope| serde_json::from_str::<Scope>(scope).ok())
+        .filter(|scope| {
+            !scope.roots.is_empty()
+                && scope
+                    .roots
+                    .iter()
+                    .chain(&scope.allow)
+                    .chain(&scope.deny)
+                    .all(|path| {
+                        path.is_absolute()
+                            && !path
+                                .components()
+                                .any(|part| part == std::path::Component::ParentDir)
+                    })
+        }))
 }
 
 pub fn status(conn: &Connection) -> Result<serde_json::Value> {

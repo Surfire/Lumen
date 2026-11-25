@@ -48,7 +48,11 @@ fn provider(path: &Path) -> bool {
 #[cfg(target_os = "macos")]
 fn dataless(meta: &fs::Metadata) -> bool {
     use std::os::macos::fs::MetadataExt;
-    meta.st_flags() & 0x4000_0000 != 0 // SF_DATALESS, Darwin <sys/stat.h>.
+    dataless_flags(meta.st_flags())
+}
+#[cfg(target_os = "macos")]
+pub(super) fn dataless_flags(flags: u32) -> bool {
+    flags & 0x4000_0000 != 0 // SF_DATALESS, Darwin <sys/stat.h>.
 }
 #[cfg(not(target_os = "macos"))]
 fn dataless(_: &fs::Metadata) -> bool {
@@ -367,17 +371,29 @@ pub fn children(path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
         .collect()
 }
 
+#[cfg(target_os = "macos")]
+pub(super) fn descriptor_path(fd: &File) -> Option<std::path::PathBuf> {
+    use std::{
+        ffi::{CStr, OsStr},
+        os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    };
+    let mut bytes = [0u8; libc::PATH_MAX as usize];
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETPATH, bytes.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let result = CStr::from_bytes_until_nul(&bytes).ok()?;
+    let path = Path::new(OsStr::from_bytes(result.to_bytes()));
+    path.is_absolute().then(|| {
+        path.strip_prefix("/System/Volumes/Data")
+            .map_or_else(|_| path.to_path_buf(), |rest| Path::new("/").join(rest))
+    })
+}
+
 /// APFS can resolve a path whose spelling differs from the spelling FSEvents
 /// delivers. Resolve only through the nearest real, reachable prefix.
 #[cfg(target_os = "macos")]
 pub fn filesystem_spelling(path: &Path) -> std::path::PathBuf {
-    use std::{
-        ffi::{CStr, OsStr},
-        os::{
-            fd::AsRawFd,
-            unix::{ffi::OsStrExt, fs::OpenOptionsExt},
-        },
-    };
+    use std::os::unix::fs::OpenOptionsExt;
     for prefix in path.ancestors() {
         let Ok(fd) = fs::OpenOptions::new()
             .read(true)
@@ -386,23 +402,13 @@ pub fn filesystem_spelling(path: &Path) -> std::path::PathBuf {
         else {
             continue;
         };
-        let mut bytes = [0u8; libc::PATH_MAX as usize];
-        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETPATH, bytes.as_mut_ptr()) } == 0
-            && let Ok(result) = CStr::from_bytes_until_nul(&bytes)
-        {
-            let canonical = Path::new(OsStr::from_bytes(result.to_bytes()));
+        if let Some(canonical) = descriptor_path(&fd) {
             let suffix = path.strip_prefix(prefix).expect("ancestor prefix");
-            if canonical.is_absolute() {
-                let canonical = canonical.strip_prefix("/System/Volumes/Data").map_or_else(
-                    |_| canonical.to_path_buf(),
-                    |rest| Path::new("/").join(rest),
-                );
-                return if suffix.as_os_str().is_empty() {
-                    canonical
-                } else {
-                    canonical.join(suffix)
-                };
-            }
+            return if suffix.as_os_str().is_empty() {
+                canonical
+            } else {
+                canonical.join(suffix)
+            };
         }
     }
     path.to_path_buf()

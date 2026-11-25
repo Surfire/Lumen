@@ -1,5 +1,5 @@
 use crate::{
-    Hit, Model, ModelBackend, absolute, document_stamp_sql,
+    Hit, Model, ModelBackend, absolute, document_stamp_sql, gemma,
     model::{Role, Unencodable},
     open_write, read_document_stamp, row_hit,
 };
@@ -66,6 +66,295 @@ pub(super) const SKIP_SCHEMA: &str = "
         DELETE FROM semantic_skip WHERE chunk_id=old.id;
     END;
 ";
+
+// Additive to the legacy BGE/helper slot. The versioned store allows upgrades
+// without changing the legacy vectors or stranding them on rollback.
+pub(super) const VERSIONED_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS semantic_vector(
+        model TEXT NOT NULL, chunk_id INTEGER NOT NULL,
+        vector BLOB, PRIMARY KEY(model,chunk_id)
+    ) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS semantic_vector_chunk ON semantic_vector(chunk_id);
+    CREATE TABLE IF NOT EXISTS semantic_vector_count(
+        model TEXT PRIMARY KEY, vectors INTEGER NOT NULL CHECK(vectors>=0)
+    ) WITHOUT ROWID;
+    CREATE TRIGGER IF NOT EXISTS semantic_versioned_chunk_deleted AFTER DELETE ON semantic_chunk
+    BEGIN
+        DELETE FROM semantic_vector WHERE chunk_id=old.id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS semantic_versioned_vector_inserted AFTER INSERT ON semantic_vector
+        WHEN new.vector IS NOT NULL
+    BEGIN
+        INSERT INTO semantic_vector_count VALUES(new.model,1)
+            ON CONFLICT(model) DO UPDATE SET vectors=vectors+1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS semantic_versioned_vector_deleted AFTER DELETE ON semantic_vector
+        WHEN old.vector IS NOT NULL
+    BEGIN
+        UPDATE semantic_vector_count SET vectors=vectors-1 WHERE model=old.model;
+    END;
+";
+
+#[derive(serde::Serialize)]
+pub struct GemmaCoverage {
+    pub documents_enabled: bool,
+    pub embedded_chunks: i64,
+    pub skipped_chunks: i64,
+    pub pending: bool,
+    pub limited: bool,
+    pub chunk_limit: i64,
+}
+
+impl GemmaCoverage {
+    pub fn searchable(&self) -> bool {
+        self.documents_enabled && self.embedded_chunks > 0
+    }
+}
+
+pub fn gemma_coverage(conn: &Connection) -> Result<GemmaCoverage> {
+    let tx = conn
+        .is_autocommit()
+        .then(|| conn.unchecked_transaction())
+        .transpose()?;
+    let coverage = read_gemma_coverage(tx.as_deref().unwrap_or(conn))?;
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
+    Ok(coverage)
+}
+
+fn read_gemma_coverage(conn: &Connection) -> Result<GemmaCoverage> {
+    let mut coverage = GemmaCoverage {
+        documents_enabled: documents_enabled(conn)?,
+        embedded_chunks: 0,
+        skipped_chunks: 0,
+        pending: false,
+        limited: false,
+        chunk_limit: gemma_limit(),
+    };
+    if !coverage.documents_enabled {
+        return Ok(coverage);
+    }
+    if !has_gemma_store(conn)? {
+        coverage.pending = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM document JOIN item USING(id) WHERE availability='local')",
+            [],
+            |row| row.get(0),
+        )?;
+        return Ok(coverage);
+    }
+    (coverage.embedded_chunks, coverage.skipped_chunks) = conn.prepare_cached(&format!(
+        "SELECT count(*) FILTER (WHERE {GEMMA_VECTOR}), count(*) FILTER (WHERE v.vector IS NULL) {GEMMA_LIVE}"
+    ))?.query_row(params![gemma::ID, GEMMA_VECTOR_BYTES], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    coverage.pending = gemma_pending(conn)?;
+    coverage.limited = coverage.pending && gemma_count(conn)? >= coverage.chunk_limit;
+    Ok(coverage)
+}
+
+fn has_gemma_store(conn: &Connection) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT count(*)=2 FROM sqlite_schema
+         WHERE type='table' AND name IN ('semantic_vector','semantic_chunk')",
+        )?
+        .query_row([], |row| row.get(0))?)
+}
+
+fn gemma_searchable(conn: &Connection) -> Result<bool> {
+    let tx = conn
+        .is_autocommit()
+        .then(|| conn.unchecked_transaction())
+        .transpose()?;
+    let snapshot = tx.as_deref().unwrap_or(conn);
+    let searchable = documents_enabled(snapshot)?
+        && has_gemma_store(snapshot)?
+        && snapshot
+            .prepare_cached(&format!(
+                "SELECT EXISTS(SELECT 1 {GEMMA_LIVE} AND {GEMMA_VECTOR})"
+            ))?
+            .query_row(params![gemma::ID, GEMMA_VECTOR_BYTES], |row| {
+                row.get::<_, bool>(0)
+            })?;
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
+    Ok(searchable)
+}
+
+const GEMMA_VECTOR_BYTES: i64 = (gemma::DIMENSIONS * size_of::<f32>()) as i64;
+
+const GEMMA_LIVE: &str = "FROM semantic_vector v JOIN semantic_chunk c ON c.id=v.chunk_id
+    JOIN item i ON i.id=c.document_id JOIN document_state ds ON ds.id=c.document_id
+    WHERE v.model=?1 AND i.availability='local'";
+const GEMMA_VECTOR: &str = "typeof(v.vector)='blob' AND length(v.vector)=?2";
+
+fn documents_enabled(conn: &Connection) -> Result<bool> {
+    let saved: Option<String> = conn
+        .query_row("SELECT value FROM info WHERE key='scope'", [], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    Ok(saved
+        .as_deref()
+        .map(serde_json::from_str::<crate::Scope>)
+        .transpose()?
+        .is_some_and(|scope| scope.documents))
+}
+
+const GEMMA_QUEUE: &str = "FROM semantic_chunk c JOIN item i ON i.id=c.document_id
+    JOIN document_state ds ON ds.id=c.document_id WHERE i.availability='local' AND NOT EXISTS
+       (SELECT 1 FROM semantic_vector v INDEXED BY semantic_vector_chunk WHERE v.model=?1 AND v.chunk_id=c.id)";
+
+fn gemma_pending(conn: &Connection) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(&format!(
+            "SELECT EXISTS(SELECT 1 {GEMMA_QUEUE}) OR EXISTS(
+            SELECT 1 FROM semantic_document p JOIN item i ON i.id=p.document_id
+            JOIN document_state ds ON ds.id=p.document_id
+            WHERE p.prepared=0 AND i.availability='local')"
+        ))?
+        .query_row([gemma::ID], |row| row.get(0))?)
+}
+
+fn gemma_count(conn: &Connection) -> Result<i64> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT coalesce((SELECT vectors FROM semantic_vector_count WHERE model=?1),0)",
+        )?
+        .query_row([gemma::ID], |row| row.get(0))?)
+}
+
+pub(super) fn diagnose_gemma(conn: &Connection, document: i64) -> Result<crate::diagnose::Reason> {
+    use crate::diagnose::Reason;
+    if !has_gemma_store(conn)? {
+        return Ok(Reason::PendingGemma);
+    }
+    let (total, indexed, skipped, marked): (i64, i64, i64, i64) = conn
+        .prepare_cached(&format!(
+            "SELECT count(c.id),count(*) FILTER (WHERE {GEMMA_VECTOR}),
+            count(v.chunk_id) FILTER (WHERE v.vector IS NULL),count(v.chunk_id)
+         FROM semantic_chunk c LEFT JOIN semantic_vector v ON v.chunk_id=c.id AND v.model=?1
+         WHERE c.document_id=?3"
+        ))?
+        .query_row(params![gemma::ID, GEMMA_VECTOR_BYTES, document], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?;
+    if indexed > 0 {
+        return Ok(Reason::Indexed);
+    }
+    if marked > skipped {
+        return Ok(Reason::Unknown);
+    }
+    let prepared: Option<bool> = conn
+        .prepare_cached("SELECT prepared FROM semantic_document WHERE document_id=?1")?
+        .query_row([document], |r| r.get(0))
+        .optional()?;
+    if prepared == Some(true) && total == skipped {
+        return Ok(Reason::GemmaSkipped);
+    }
+    if gemma_count(conn)? >= gemma_limit() {
+        return Ok(Reason::GemmaLimited);
+    }
+    Ok(Reason::PendingGemma)
+}
+
+fn gemma_limit() -> i64 {
+    vector_limit(gemma::DIMENSIONS as i64)
+}
+
+fn embed_gemma(conn: &mut Connection, model: &crate::GemmaModel, max: usize) -> Result<EmbedBatch> {
+    ensure!(
+        documents_enabled(conn)?,
+        "Gemma requires explicit document indexing scope"
+    );
+    let mut report = EmbedBatch::default();
+    if gemma_count(conn)? >= gemma_limit() || !gemma_pending(conn)? {
+        return Ok(report);
+    }
+    let mut encoder = ModelBackend::Gemma(model).connect()?;
+    let max = max.clamp(1, MAX_BATCH);
+    let mut prepared = 0;
+    let mut after = 0_i64;
+    for _ in 0..max {
+        if !documents_enabled(conn)? || gemma_count(conn)? >= gemma_limit() {
+            break;
+        }
+        let next = loop {
+            let row: Option<(i64, String)> = conn.prepare_cached(&format!(
+                "WITH next AS (SELECT c.id,c.document_id,c.start_byte,c.end_byte {GEMMA_QUEUE} AND c.id>?2 ORDER BY c.id LIMIT 1)
+                 SELECT c.id, CAST(substr(CAST(d.body AS BLOB),c.start_byte+1,c.end_byte-c.start_byte) AS TEXT)
+                 FROM next c JOIN document d ON d.id=c.document_id"
+            ))?.query_row(params![gemma::ID, after], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+            if row.is_some() || prepared >= max.max(32) || !prepare_next_document(conn, true)? {
+                break row;
+            }
+            prepared += 1;
+        };
+        let Some((id, text)) = next else {
+            break;
+        };
+        after = id;
+        let vector = match encoder.encode(Role::Passage, &text) {
+            Ok(vector) => Some(
+                vector
+                    .iter()
+                    .flat_map(|n| n.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            ),
+            Err(error) if error.is::<Unencodable>() => None,
+            Err(error) => return Err(error).context("compute next Gemma document chunk"),
+        };
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !documents_enabled(&tx)? || gemma_count(&tx)? >= gemma_limit() {
+            break;
+        }
+        let saved = tx.execute(
+            "INSERT OR IGNORE INTO semantic_vector(model,chunk_id,vector)
+             SELECT ?1,c.id,?3 FROM semantic_chunk c JOIN item i ON i.id=c.document_id
+             JOIN document_state ds ON ds.id=c.document_id WHERE c.id=?2 AND i.availability='local'",
+            params![gemma::ID, id, vector],
+        )?;
+        tx.commit()?;
+        if vector.is_some() {
+            report.new_embeddings += saved;
+        } else {
+            report.skipped_chunks += saved;
+        }
+    }
+    report.has_more =
+        documents_enabled(conn)? && gemma_count(conn)? < gemma_limit() && gemma_pending(conn)?;
+    Ok(report)
+}
+
+pub struct GemmaSearchSession {
+    conn: Connection,
+    worker: gemma::GemmaWorker,
+}
+
+impl GemmaSearchSession {
+    pub fn open(database: &Path, model: &crate::GemmaModel) -> Result<Self> {
+        let conn = crate::open_read(database)?;
+        ensure!(
+            gemma_searchable(&conn)?,
+            "no current Gemma paragraph embeddings: run lumen embed --gemma first"
+        );
+        let mut worker = model.start()?;
+        worker.probe()?;
+        ensure!(
+            gemma_searchable(&conn)?,
+            "Gemma document coverage changed while starting the runtime"
+        );
+        Ok(Self { conn, worker })
+    }
+
+    pub fn search(&mut self, query: &str, limit: usize) -> Result<Vec<Hit>> {
+        let query = query.trim();
+        if query.is_empty() || query.len() > 512 {
+            return Ok(Vec::new());
+        }
+        search_gemma(&self.conn, query, limit.clamp(1, 100), &mut self.worker)
+    }
+}
 
 pub(super) fn clear_model(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -143,6 +432,7 @@ pub(super) fn add_status(conn: &Connection, status: &mut serde_json::Value) -> R
     status["embeddings"] = documents.into();
     status["embedded_chunks"] = chunks.into();
     status["embedding_chunk_limit"] = limit.into();
+    status["gemma"] = serde_json::to_value(gemma_coverage(conn)?)?;
     Ok(())
 }
 
@@ -162,7 +452,16 @@ pub struct EmbedBatch {
 }
 
 pub fn embed_batch(database: &Path, model: ModelBackend<'_>, max: usize) -> Result<EmbedBatch> {
+    if matches!(model, ModelBackend::Gemma(_)) {
+        ensure!(
+            crate::open_read(database).and_then(|conn| documents_enabled(&conn))?,
+            "Gemma requires explicit document indexing scope"
+        );
+    }
     let (mut conn, _lease) = open_write(&absolute(database)?, false)?;
+    if let ModelBackend::Gemma(model) = model {
+        return embed_gemma(&mut conn, model, max);
+    }
     let mut encoder = model.connect()?;
     let signature = encoder.signature().to_owned();
     let mut expected = State::read(&conn)?.model;
@@ -180,7 +479,7 @@ pub fn embed_batch(database: &Path, model: ModelBackend<'_>, max: usize) -> Resu
             break;
         }
         let Some((id, text)) = next_chunk(&conn, reuse, &signature)? else {
-            if prepared >= extra_budget || !prepare_next_document(&mut conn)? {
+            if prepared >= extra_budget || !prepare_next_document(&mut conn, false)? {
                 break;
             }
             prepared += 1;
@@ -260,15 +559,16 @@ fn save_skip(
     Ok(new)
 }
 
-fn prepare_next_document(conn: &mut Connection) -> Result<bool> {
+fn prepare_next_document(conn: &mut Connection, require_stamp: bool) -> Result<bool> {
     let document: Option<(i64, String)> = conn
         .prepare_cached(
             "SELECT d.id,d.body FROM semantic_document p
              JOIN document d ON d.id=p.document_id JOIN item i ON i.id=d.id
-             WHERE p.prepared=0 AND i.availability<>'unverified'
+             WHERE p.prepared=0 AND i.availability='local'
+             AND (NOT ?1 OR EXISTS(SELECT 1 FROM document_state ds WHERE ds.id=p.document_id))
              ORDER BY p.document_id LIMIT 1",
         )?
-        .query_row([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_row([require_stamp], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
     let Some((id, body)) = document else {
         return Ok(false);
@@ -279,9 +579,10 @@ fn prepare_next_document(conn: &mut Connection) -> Result<bool> {
         .prepare_cached(
             "UPDATE semantic_document SET prepared=1 WHERE document_id=?1 AND prepared=0
          AND EXISTS(SELECT 1 FROM document d JOIN item i USING(id)
-                    WHERE d.id=?1 AND d.body=?2 AND i.availability<>'unverified')",
+                    WHERE d.id=?1 AND d.body=?2 AND i.availability='local'
+                    AND (NOT ?3 OR EXISTS(SELECT 1 FROM document_state ds WHERE ds.id=d.id)))",
         )?
-        .execute(params![id, body])?;
+        .execute(params![id, body, require_stamp])?;
     if new != 0 {
         let mut insert = tx.prepare_cached(
             "INSERT INTO semantic_chunk(document_id,start_byte,end_byte) VALUES(?,?,?)",
@@ -352,6 +653,13 @@ pub(super) fn search(
     limit: usize,
     model: ModelBackend<'_>,
 ) -> Result<Vec<Hit>> {
+    if let ModelBackend::Gemma(model) = model {
+        ensure!(
+            gemma_searchable(conn)?,
+            "no current Gemma paragraph embeddings: run lumen embed --gemma first"
+        );
+        return search_gemma(conn, query, limit, &mut model.start()?);
+    }
     let mut encoder = model.connect()?;
     let signature = encoder.signature().to_owned();
     let validate = |conn: &Connection| -> Result<State> {
@@ -379,13 +687,72 @@ pub(super) fn search(
         state.dimensions == Some(vector.len() as i64),
         "stored and query embedding dimensions differ"
     );
+    let hits = rank(
+        snapshot,
+        &vector,
+        limit,
+        encoder.match_reason(),
+        LEGACY,
+        [],
+        |score| encoder.includes(score),
+    )?;
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
+    Ok(hits)
+}
+
+fn search_gemma(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    worker: &mut gemma::GemmaWorker,
+) -> Result<Vec<Hit>> {
+    let vector = match worker.encode(Role::Query, query) {
+        Ok(vector) => vector,
+        Err(error) if error.is::<Unencodable>() => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let tx = conn
+        .is_autocommit()
+        .then(|| conn.unchecked_transaction())
+        .transpose()?;
+    let snapshot = tx.as_deref().unwrap_or(conn);
+    let hits = if documents_enabled(snapshot)? {
+        rank(
+            snapshot,
+            &vector,
+            limit,
+            "semantic_candidate",
+            &format!("SELECT c.document_id,c.id,i.path,v.vector {GEMMA_LIVE} AND {GEMMA_VECTOR}"),
+            params![gemma::ID, GEMMA_VECTOR_BYTES],
+            |score| score > 0.0,
+        )?
+    } else {
+        Vec::new()
+    };
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
+    Ok(hits)
+}
+
+const LEGACY: &str = "SELECT c.document_id, c.id, i.path, c.vector FROM semantic_chunk c
+    JOIN item i ON i.id=c.document_id WHERE i.availability<>'unverified' AND c.vector IS NOT NULL";
+
+fn rank(
+    snapshot: &Connection,
+    vector: &[f32],
+    limit: usize,
+    reason: &str,
+    sql: &str,
+    parameters: impl rusqlite::Params,
+    includes: impl Fn(f32) -> bool,
+) -> Result<Vec<Hit>> {
     let mut best = HashMap::<i64, (f32, i64, String)>::new();
     {
-        let mut statement = snapshot.prepare_cached(
-            "SELECT c.document_id, c.id, i.path, c.vector FROM semantic_chunk c
-             JOIN item i ON i.id=c.document_id WHERE i.availability<>'unverified' AND c.vector IS NOT NULL",
-        )?;
-        let mut rows = statement.query([])?;
+        let mut statement = snapshot.prepare_cached(sql)?;
+        let mut rows = statement.query(parameters)?;
         while let Some(row) = rows.next()? {
             let bytes = row.get_ref(3)?.as_blob()?;
             ensure!(
@@ -394,10 +761,10 @@ pub(super) fn search(
             );
             let score = bytes
                 .chunks_exact(4)
-                .zip(&vector)
+                .zip(vector)
                 .map(|(word, q)| f32::from_le_bytes(word.try_into().expect("four bytes")) * q)
                 .sum::<f32>();
-            if score.is_finite() && encoder.includes(score) {
+            if score.is_finite() && includes(score) {
                 let document = row.get(0)?;
                 let id: i64 = row.get(1)?;
                 if best.get(&document).is_none_or(|(prior, prior_id, _)| {
@@ -423,16 +790,13 @@ pub(super) fn search(
         let mut hit = snapshot.prepare_cached(&sql)?;
         for (score, id, _) in ranked.into_iter().take(limit) {
             hits.push(hit.query_row([id], |r| {
-                let mut record = row_hit(r, encoder.match_reason())?;
+                let mut record = row_hit(r, reason)?;
                 record.snippet = r.get(4)?;
                 record.document_stamp = read_document_stamp(r)?;
                 record.score = Some(score.into());
                 Ok(record)
             })?);
         }
-    }
-    if let Some(tx) = tx {
-        tx.commit()?;
     }
     Ok(hits)
 }
@@ -491,6 +855,46 @@ fn split_paragraph(mut text: &str, mut offset: usize, ranges: &mut Vec<Range<usi
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gemma_eligibility_uses_current_model_visible_stamp_and_vector_shape() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE item(id INTEGER PRIMARY KEY,availability TEXT);
+            CREATE TABLE document(id INTEGER PRIMARY KEY,body TEXT);
+            CREATE TABLE document_state(id INTEGER PRIMARY KEY,stamp TEXT);
+            CREATE TABLE embedding(id INTEGER PRIMARY KEY,vector BLOB);
+            CREATE TABLE info(key TEXT PRIMARY KEY,value TEXT);
+            INSERT INTO info VALUES('scope','{\"roots\":[],\"allow\":[],\"deny\":[],\"documents\":true,\"pdf_helper\":null}');
+            INSERT INTO item VALUES(1,'local'),(2,'unverified'),(3,'local'),(4,'local');
+            INSERT INTO document VALUES(1,'stale model'),(2,'unverified'),(3,'unstamped'),(4,'visible');
+            INSERT INTO document_state VALUES(1,'1:2:3:4:5:6:7'),(2,'1:2:3:4:5:6:7'),(4,'1:2:3:4:5:6:7');").unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(VERSIONED_SCHEMA).unwrap();
+        conn.execute_batch(
+            "INSERT INTO semantic_chunk(id,document_id,start_byte,end_byte)
+            VALUES(1,1,0,1),(2,2,0,1),(3,3,0,1),(4,4,0,1);
+            INSERT INTO semantic_vector VALUES('old-gemma',1,zeroblob(3072));",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO semantic_vector VALUES(?1,2,zeroblob(3072)),(?1,3,zeroblob(3072)),(?1,4,'wrong type')", [gemma::ID]).unwrap();
+        assert!(!gemma_searchable(&conn).unwrap());
+        assert!(!gemma_coverage(&conn).unwrap().searchable());
+        conn.execute("DELETE FROM semantic_vector WHERE chunk_id=4", [])
+            .unwrap();
+        let mut vector = vec![0_u8; GEMMA_VECTOR_BYTES as usize];
+        vector[..4].copy_from_slice(&1.0_f32.to_le_bytes());
+        conn.execute(
+            "INSERT INTO semantic_vector VALUES(?1,4,?2)",
+            params![gemma::ID, vector],
+        )
+        .unwrap();
+        let coverage = gemma_coverage(&conn).unwrap();
+        assert_eq!(coverage.embedded_chunks, 1);
+        assert!(coverage.searchable() && coverage.pending);
+        assert!(gemma_searchable(&conn).unwrap());
+        conn.execute("DELETE FROM document WHERE id=4", []).unwrap();
+        assert!(!gemma_searchable(&conn).unwrap());
+    }
+
     use super::*;
 
     #[test]

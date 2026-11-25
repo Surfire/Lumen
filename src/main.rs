@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use lumen::{BgeModel, Mode, Model, ModelBackend, Scope};
+use lumen::{BgeModel, GemmaModel, Mode, Model, ModelBackend, PdfHelperPolicy, Scope};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -48,22 +48,37 @@ struct ScopeArgs {
     documents: bool,
     #[arg(long, requires = "documents")]
     pdf_helper: Option<PathBuf>,
+    /// Use this app bundle's PDF extractor and its stable extraction format.
+    #[arg(long, conflicts_with = "pdf_helper")]
+    bundled_pdf_helper: bool,
 }
 
 impl From<ScopeArgs> for Scope {
     fn from(args: ScopeArgs) -> Self {
+        let pdf_helper_policy = if args.bundled_pdf_helper {
+            Some(PdfHelperPolicy::Bundled)
+        } else {
+            args.pdf_helper.as_ref().map(|_| PdfHelperPolicy::Manual)
+        };
         Self {
             roots: args.root,
             allow: args.allow,
             deny: args.deny,
             documents: args.documents,
             pdf_helper: args.pdf_helper,
+            pdf_helper_policy,
         }
     }
 }
 
 #[derive(Args)]
 struct SemanticArgs {
+    /// Select EmbeddingGemma 2 explicitly, including a partially built index for a diagnostic query.
+    #[arg(long, conflicts_with_all = ["helper", "bge", "language"])]
+    gemma: bool,
+    /// Override the isolated EmbeddingGemma 2 resource directory.
+    #[arg(long, conflicts_with_all = ["helper", "bge", "language"], value_name = "DIR")]
+    gemma_home: Option<PathBuf>,
     /// Existing local model executable, or the BGE worker script with --bge-model.
     #[arg(long)]
     helper: Option<PathBuf>,
@@ -87,10 +102,16 @@ struct SemanticArgs {
 enum ConfiguredModel {
     Helper(Model),
     Bge(BgeModel),
+    Gemma(GemmaModel),
 }
 
 impl SemanticArgs {
     fn configure(self) -> Result<Option<ConfiguredModel>> {
+        if self.gemma {
+            return Ok(Some(ConfiguredModel::Gemma(GemmaModel::installed(
+                self.gemma_home.as_deref(),
+            )?)));
+        }
         if self.bge {
             let model = BgeModel::installed(
                 self.bge_home.as_deref(),
@@ -124,6 +145,7 @@ impl ConfiguredModel {
         match self {
             Self::Helper(model) => ModelBackend::Helper(model),
             Self::Bge(model) => ModelBackend::Bge(model),
+            Self::Gemma(model) => ModelBackend::Gemma(model),
         }
     }
 }
@@ -144,7 +166,9 @@ enum Action {
         #[command(flatten)]
         semantic: SemanticArgs,
     },
-    /// Embed the next batch of document chunks using an explicitly chosen local helper.
+    /// Explain one explicitly selected path using only metadata and the saved index.
+    Diagnose { path: PathBuf },
+    /// Embed the next batch of document chunks locally (defaults to Gemma).
     Embed {
         #[command(flatten)]
         semantic: SemanticArgs,
@@ -152,8 +176,12 @@ enum Action {
         #[arg(long, default_value_t = 32)]
         max: usize,
     },
-    /// Detect installed BGE candidate retrieval resources without modifying the index.
+    /// Check installed local semantic resources without modifying the index.
     ModelStatus {
+        #[arg(long, conflicts_with = "bge_home")]
+        gemma: bool,
+        #[arg(long, requires = "gemma", value_name = "DIR")]
+        gemma_home: Option<PathBuf>,
         #[arg(long, default_value = "zh")]
         language: String,
         #[arg(long, value_name = "DIR")]
@@ -162,8 +190,25 @@ enum Action {
         #[arg(long)]
         verify: bool,
     },
+    /// Check whether Gemma has indexed the opted-in document scope and is ready for the launcher.
+    GemmaStatus {
+        #[arg(long, value_name = "DIR")]
+        gemma_home: Option<PathBuf>,
+        /// Run a local bilingual retrieval health check before reporting ready.
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Reuse a verified Gemma worker for newline-delimited JSON semantic queries on stdio.
+    SemanticServe {
+        #[arg(long, value_name = "DIR")]
+        gemma_home: Option<PathBuf>,
+    },
     /// Report scan coverage and embedding counts.
-    Status,
+    Status {
+        /// Include the saved absolute directory rules and document setting.
+        #[arg(long)]
+        include_scope: bool,
+    },
     /// Persistent newline-delimited JSON query transport on stdio for the desktop launcher.
     Serve,
 }
@@ -195,6 +240,63 @@ fn scan_progress(enabled: bool) -> io::Result<Option<lumen::ScanProgressReporter
         .transpose()
 }
 
+fn gemma_status(
+    inspection: Result<()>,
+    verify: bool,
+    coverage: Option<lumen::GemmaCoverage>,
+) -> serde_json::Value {
+    let available = inspection.is_ok();
+    let verified = verify && available;
+    let ready = verified
+        && coverage
+            .as_ref()
+            .is_some_and(lumen::GemmaCoverage::searchable);
+    json!({
+        "backend": "gemma_candidate",
+        "model_id": lumen::GEMMA_MODEL_ID,
+        "available": available,
+        "verified": verified,
+        "ready": ready,
+        "coverage": coverage,
+        "diagnostic": inspection.err().map(|error| format!("{error:#}")),
+    })
+}
+
+const SEMANTIC_REQUEST_LIMIT: u64 = 16 * 1024;
+
+fn serve_gemma(
+    mut input: impl BufRead,
+    mut output: impl Write,
+    mut search: impl FnMut(&str, usize) -> Result<Vec<lumen::Hit>>,
+) -> Result<()> {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if std::io::Read::take(&mut input, SEMANTIC_REQUEST_LIMIT + 1)
+            .read_until(b'\n', &mut line)?
+            == 0
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            line.len() as u64 <= SEMANTIC_REQUEST_LIMIT && line.ends_with(b"\n"),
+            "invalid semantic request frame"
+        );
+        match serde_json::from_slice::<Request>(&line) {
+            Ok(q) => match search(&q.query, q.limit.unwrap_or(20)) {
+                Ok(hits) => serde_json::to_writer(&mut output, &SearchReply { id: q.id, hits })?,
+                Err(error) => serde_json::to_writer(
+                    &mut output,
+                    &json!({"id":q.id,"error":error.to_string()}),
+                )?,
+            },
+            Err(error) => serde_json::to_writer(&mut output, &json!({"error":error.to_string()}))?,
+        }
+        writeln!(output)?;
+        output.flush()?;
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let db = cli.db.unwrap_or_else(lumen::standard_database);
@@ -221,29 +323,73 @@ fn main() -> Result<()> {
             limit,
             semantic,
         } => {
+            let gemma_home = semantic.gemma_home.clone();
             let model = semantic.configure()?;
-            let conn =
-                lumen::open_read(&db).with_context(|| "no usable index; run lumen index first")?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&lumen::search_with_backend(
+            let hits = if model.is_none() && matches!(mode, SearchMode::Semantic) {
+                lumen::GemmaSearchSession::open(
+                    &db,
+                    &GemmaModel::installed(gemma_home.as_deref())?,
+                )?
+                .search(&text, limit)?
+            } else {
+                let conn =
+                    lumen::open_read(&db).context("no usable index; run lumen index first")?;
+                lumen::search_with_backend(
                     &conn,
                     &text,
                     mode.into(),
                     limit,
                     model.as_ref().map(ConfiguredModel::backend),
-                )?)?
-            );
+                )?
+            };
+            println!("{}", serde_json::to_string_pretty(&hits)?);
+        }
+        Action::Diagnose { path } => {
+            println!("{}", serde_json::to_string(&lumen::diagnose(&db, &path))?);
         }
         Action::Embed { semantic, max } => {
-            let model = semantic.configure()?.context("embed requires --helper")?;
+            let gemma_home = semantic.gemma_home.clone();
+            let model = match semantic.configure()? {
+                Some(model) => model,
+                None => ConfiguredModel::Gemma(GemmaModel::installed(gemma_home.as_deref())?),
+            };
             println!(
                 "{}",
                 serde_json::to_string(&lumen::embed_batch(&db, model.backend(), max)?)?
             );
         }
         Action::ModelStatus {
+            gemma: true,
+            gemma_home,
+            verify,
+            ..
+        } => {
+            let inspection = GemmaModel::installed(gemma_home.as_deref())
+                .and_then(|model| model.inspect(verify));
+            println!("{}", gemma_status(inspection, verify, None));
+        }
+        Action::GemmaStatus { gemma_home, verify } => {
+            let conn = lumen::open_read(&db)?;
+            let inspection = GemmaModel::installed(gemma_home.as_deref())
+                .and_then(|model| model.inspect(verify));
+            let coverage = lumen::gemma_coverage(&conn)?;
+            println!("{}", gemma_status(inspection, verify, Some(coverage)));
+        }
+        Action::SemanticServe { gemma_home } => {
+            let mut session = lumen::GemmaSearchSession::open(
+                &db,
+                &GemmaModel::installed(gemma_home.as_deref())?,
+            )?;
+            serve_gemma(
+                io::stdin().lock(),
+                io::BufWriter::new(io::stdout().lock()),
+                |query, limit| session.search(query, limit),
+            )?;
+        }
+        Action::ModelStatus {
             language,
+            gemma: false,
+            gemma_home: _,
             bge_home,
             verify,
         } => {
@@ -265,11 +411,18 @@ fn main() -> Result<()> {
                 })
             );
         }
-        Action::Status => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&lumen::status(&lumen::open_read(&db)?)?)?
-            );
+        Action::Status { include_scope } => {
+            let conn = lumen::open_read(&db)?;
+            let mut report = lumen::status(&conn)?;
+            if include_scope && let Some(scope) = lumen::saved_index_scope(&conn)? {
+                report["scope"] = json!({
+                    "roots": scope.roots,
+                    "allow": scope.allow,
+                    "deny": scope.deny,
+                    "documents": scope.documents,
+                });
+            }
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Action::Serve => {
             let mut search = lumen::SearchSession::open(&db)
@@ -295,4 +448,56 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn semantic_json_lines_keep_their_limit_and_request_identity() {
+        let prefix = br#"{"id":1,"query":"first","limit":9}"#;
+        let limit = SEMANTIC_REQUEST_LIMIT as usize;
+        let mut input = prefix.to_vec();
+        input.resize(limit - 1, b' ');
+        input.push(b'\n');
+        input.extend_from_slice(b"invalid json\n{\"id\":2,\"query\":\"second\"}\n");
+        let mut seen = Vec::new();
+        let mut output = Vec::new();
+        serve_gemma(Cursor::new(input), &mut output, |query, limit| {
+            seen.push((query.to_owned(), limit));
+            Ok(Vec::new())
+        })
+        .unwrap();
+        assert_eq!(seen, [("first".into(), 9), ("second".into(), 20)]);
+        let replies: Vec<serde_json::Value> = output
+            .split_inclusive(|&byte| byte == b'\n')
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(replies.len(), 3);
+        assert_eq!(replies[0], json!({"id":1,"hits":[]}));
+        assert!(replies[1]["error"].is_string());
+        assert_eq!(replies[2], json!({"id":2,"hits":[]}));
+    }
+
+    #[test]
+    fn semantic_framing_stops_before_reading_or_processing_an_excess_line() {
+        let limit = SEMANTIC_REQUEST_LIMIT as usize;
+        for (input, bytes_read) in [(vec![b' '; limit * 2], limit + 1), (b"{}".to_vec(), 2)] {
+            let mut input = Cursor::new(input);
+            let mut output = Vec::new();
+            let result = serve_gemma(&mut input, &mut output, |_, _| {
+                panic!("invalid frame reached the worker")
+            });
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid semantic request frame")
+            );
+            assert_eq!(input.position(), bytes_read as u64);
+            assert!(output.is_empty());
+        }
+    }
 }

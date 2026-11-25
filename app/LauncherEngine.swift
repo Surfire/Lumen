@@ -49,13 +49,28 @@ struct SearchHit: Decodable, Equatable, Identifiable {
     }
 }
 
-struct IndexReport: Decodable {
+struct IndexReport: Decodable, Equatable {
     let items: Int
     let entries_unreadable: Int?
     let placeholders: Int?
     let documents: Int?
     let documents_not_read: Int?
     let embedded_chunks: Int?
+    let gemma: GemmaCoverage?
+    let scope: IndexScope?
+    let unverified: Int?
+}
+
+struct GemmaCoverage: Decodable, Equatable {
+    let documents_enabled: Bool
+    let embedded_chunks: Int
+    let skipped_chunks: Int
+    let pending: Bool
+    let limited: Bool
+    let chunk_limit: Int
+
+    var hasResults: Bool { documents_enabled && embedded_chunks > 0 }
+    var complete: Bool { hasResults && !pending }
 }
 
 struct IndexProgress: Decodable, Equatable {
@@ -77,23 +92,33 @@ struct IndexProgress: Decodable, Equatable {
     }
 }
 
-struct IndexScope: Equatable {
-    var allow = ""
-    var deny = ""
+struct IndexScope: Decodable, Equatable {
+    var roots: [String] = []
+    var allow: [String] = []
+    var deny: [String] = []
     var documents = false
 
-    private func paths(_ value: String) -> [String] {
-        value.components(separatedBy: .newlines)
+    static func storedPaths(_ key: String, in defaults: UserDefaults?) -> [String] {
+        if let paths = defaults?.stringArray(forKey: key + "Paths") { return paths }
+        return (defaults?.string(forKey: key) ?? "").components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
     }
 
-    var hasAbsolutePaths: Bool { (paths(allow) + paths(deny)).allSatisfy { $0.hasPrefix("/") } }
+    static func folderPath(_ url: URL) -> String {
+        let path = url.standardizedFileURL.path
+        // Match the engine's spelling for macOS's two fixed aliases.
+        if path == "/tmp" || path.hasPrefix("/tmp/") || path == "/var" || path.hasPrefix("/var/") {
+            return "/private" + path
+        }
+        return path
+    }
 
-    func arguments(pdfHelper: String) -> [String] {
-        paths(allow).flatMap { ["--allow", $0] }
-            + paths(deny).flatMap { ["--deny", $0] }
-            + (documents ? ["--documents", "--pdf-helper", pdfHelper] : [])
+    var hasAbsolutePaths: Bool { (roots + allow + deny).allSatisfy { $0.hasPrefix("/") } }
+
+    var arguments: [String] {
+        allow.flatMap { ["--allow", $0] } + deny.flatMap { ["--deny", $0] }
+            + (documents ? ["--documents", "--bundled-pdf-helper"] : [])
     }
 }
 
@@ -114,12 +139,15 @@ final class LauncherEngine {
     let database: URL
     private let root: URL?
     private var connection: SearchConnection?
+    private var semanticConnection: SearchConnection?
+    private let gemmaHome: URL?
     private var nextID: UInt64 = 0
 
-    init(executable: URL, database: URL, syntheticRoot: URL? = nil) {
+    init(executable: URL, database: URL, syntheticRoot: URL? = nil, gemmaHome: URL? = nil) {
         self.executable = executable
         self.database = database
         self.root = syntheticRoot
+        self.gemmaHome = gemmaHome
     }
 
     var hasDatabase: Bool {
@@ -149,13 +177,10 @@ final class LauncherEngine {
     }
 
     func indexArguments(scope: IndexScope) -> [String] {
-        ["index"] + (root.map { ["--root", $0.path] } ?? [])
-            + scope.arguments(pdfHelper: helper("LumenPdfExtractor"))
+        let roots = root.map { [$0.path] } ?? scope.roots
+        return ["index"] + roots.flatMap { ["--root", $0] } + scope.arguments
     }
 
-    func helper(_ name: String) -> String {
-        executable.deletingLastPathComponent().appendingPathComponent(name).path
-    }
 
     func run(
         _ command: [String], onLine: ((Data) -> Void)? = nil,
@@ -220,25 +245,46 @@ final class LauncherEngine {
     }
 
     func search(_ query: String, mode: String, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
+        submit(query, mode: mode, limit: 60, to: &connection, command: ["serve"], complete: complete)
+    }
+
+    func searchSemantic(_ query: String, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
+        submit(query, mode: "semantic", limit: 12, to: &semanticConnection,
+               command: ["semantic-serve"] + gemmaOptions, idleTimeout: .seconds(45), complete: complete)
+    }
+
+    var gemmaOptions: [String] { gemmaHome.map { ["--gemma-home", $0.path] } ?? [] }
+
+    private func submit(_ query: String, mode: String, limit: Int, to connection: inout SearchConnection?,
+                        command: [String], idleTimeout: Duration? = nil,
+                        complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
         nextID &+= 1
         if connection?.isRunning != true {
             do {
-                let new = SearchConnection(executable: executable, arguments: arguments(["serve"]))
+                let new = SearchConnection(executable: executable, arguments: arguments(command), idleTimeout: idleTimeout)
                 try new.start()
                 connection = new
             } catch {
-                complete(.failure(SearchFailure(error.localizedDescription)))
+                // Leave the caller's inout connection before the completion can reenter the engine.
+                DispatchQueue.main.async { complete(.failure(SearchFailure(error.localizedDescription))) }
                 return
             }
         }
-        connection?.enqueue(SearchRequest(id: nextID, query: query, mode: mode), complete: complete)
+        connection?.enqueue(SearchRequest(id: nextID, query: query, mode: mode, limit: limit), complete: complete)
     }
 
     func discardQueuedSearch() { connection?.discardQueued() }
+    func discardQueuedSemantic() { semanticConnection?.discardQueued() }
+
+    func closeSemantic() {
+        semanticConnection?.stop()
+        semanticConnection = nil
+    }
 
     func close() {
         connection?.stop()
         connection = nil
+        closeSemantic()
     }
 
     nonisolated static func readLines(_ file: FileHandle, line: (Data) -> Void) {
@@ -263,7 +309,7 @@ private struct SearchRequest: Encodable {
     let id: UInt64
     let query: String
     let mode: String
-    let limit = 60
+    let limit: Int
 }
 
 private struct SearchReply: Decodable {
@@ -283,10 +329,14 @@ private final class SearchConnection {
     private let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
     private var active: Pending?
     private var queued: Pending?
+    private let idleTimeout: Duration?
+    private var deadline: Task<Void, Never>?
+    private var stopped = false
 
-    var isRunning: Bool { process.isRunning }
+    var isRunning: Bool { !stopped && process.isRunning }
 
-    init(executable: URL, arguments: [String]) {
+    init(executable: URL, arguments: [String], idleTimeout: Duration?) {
+        self.idleTimeout = idleTimeout
         process.executableURL = executable
         process.arguments = arguments
         process.standardInput = stdin
@@ -302,7 +352,12 @@ private final class SearchConnection {
         let output = stdout.fileHandleForReading
         let errors = stderr.fileHandleForReading
         let diagnostic = Task.detached(priority: .utility) {
-            (try? errors.readToEnd()) ?? Data()
+            var tail = Data()
+            while case let chunk = errors.availableData, !chunk.isEmpty {
+                tail.append(chunk.suffix(65_536))
+                if tail.count > 65_536 { tail.removeFirst(tail.count - 65_536) }
+            }
+            return tail
         }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             LauncherEngine.readLines(output) { bytes in
@@ -324,6 +379,9 @@ private final class SearchConnection {
     func discardQueued() { queued = nil }
 
     func stop() {
+        stopped = true
+        deadline?.cancel()
+        deadline = nil
         active = nil
         queued = nil
         if process.isRunning { process.terminate() }
@@ -334,6 +392,7 @@ private final class SearchConnection {
         guard active == nil, let next = queued else { return }
         queued = nil
         active = next
+        armDeadline(active: true)
         let input = stdin.fileHandleForWriting
         let request = next.request
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -361,7 +420,19 @@ private final class SearchConnection {
         self.active = nil
         if let hits = reply.hits { active.complete(.success(hits)) }
         else { active.complete(.failure(SearchFailure(reply.error ?? ""))) }
+        if !stopped && self.active == nil && queued == nil { armDeadline(active: false) }
         sendNext()
+    }
+
+    private func armDeadline(active: Bool) {
+        guard let idleTimeout else { return }
+        deadline?.cancel()
+        deadline = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: active ? .seconds(20) : idleTimeout)
+            guard !Task.isCancelled, let self else { return }
+            if active { self.fail(SearchFailure("Semantic search worker timed out")) }
+            else { self.stop() }
+        }
     }
 
     private func fail(_ error: SearchFailure) {

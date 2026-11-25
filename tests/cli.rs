@@ -540,6 +540,207 @@ mod live {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
+    #[test]
+    fn bundled_pdf_upgrade_restamps_legacy_once_and_keeps_compatible_vectors() {
+        let f = Fixture::new();
+        let root = f.0.join("scope");
+        let db = f.0.join("test.sqlite");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("review.pdf"), b"%PDF-synthetic input").unwrap();
+        let copier = |name: &str| {
+            let resources = f.0.join(name).join("Contents/Resources");
+            fs::create_dir_all(&resources).unwrap();
+            let engine = resources.join("lumen");
+            fs::copy(env!("CARGO_BIN_EXE_lumen"), &engine).unwrap();
+            (engine, resources.join("LumenPdfExtractor"))
+        };
+        let (first_engine, first_helper) = copier("Lumen Old.app");
+        let (second_engine, second_helper) = copier("Lumen Current.app");
+        let installs = [&first_helper, &second_helper];
+        for helper in installs {
+            executable(
+                helper,
+                "#!/bin/sh\ncat >/dev/null\n echo called >> \"$0.calls\"\nprintf 'cedar archive review'\n",
+            );
+        }
+        let calls = |helper: &Path| {
+            fs::read_to_string(helper.with_extension("calls")).map_or(0, |log| log.lines().count())
+        };
+        let root = root.to_str().unwrap();
+        let docs = ["index", "--root", root, "--documents"];
+        let first = first_helper.to_str().unwrap();
+        assert_eq!(
+            f.run(&[&docs[..], &["--pdf-helper", first]].concat())["documents"],
+            1
+        );
+        assert_eq!(calls(&first_helper), 1);
+        let vector_helper = f.0.join("vector-helper");
+        executable(
+            &vector_helper,
+            "#!/bin/sh\ncat >/dev/null\nprintf '[1,0,0,0,0,0,0,0]'\n",
+        );
+        assert_eq!(
+            f.run(&["embed", "--helper", vector_helper.to_str().unwrap()])["new_embeddings"],
+            1
+        );
+        let raw = rusqlite::Connection::open(&db).unwrap();
+        let mut gemma_vector = vec![0_u8; 768 * 4];
+        gemma_vector[..4].copy_from_slice(&1.0_f32.to_le_bytes());
+        raw.execute(
+            "INSERT INTO semantic_vector SELECT ?1,id,?2 FROM semantic_chunk",
+            rusqlite::params![lumen::GEMMA_MODEL_ID, gemma_vector],
+        )
+        .unwrap();
+        let counts = || {
+            let status = f.run(&["status"]);
+            (
+                status["embedded_chunks"].as_u64().unwrap(),
+                status["gemma"]["embedded_chunks"].as_u64().unwrap(),
+            )
+        };
+        let stamp = || {
+            raw.query_row("SELECT stamp FROM document_state", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap()
+        };
+        let saved = || {
+            raw.query_row("SELECT value FROM info WHERE key='scope'", [], |r| {
+                Ok(serde_json::from_str::<Value>(&r.get::<_, String>(0)?).unwrap())
+            })
+            .unwrap()
+        };
+        let legacy_stamp = stamp();
+        assert!(legacy_stamp.contains("Lumen Old.app"));
+        assert_eq!(
+            saved()["pdf_helper"],
+            fs::canonicalize(&first_helper).unwrap().to_str().unwrap()
+        );
+        assert_eq!(saved()["pdf_helper_policy"], "manual");
+        drop(watch(&f, &[]));
+        assert_eq!(calls(&first_helper), 1);
+
+        // Simulate the original release's scope JSON, which did not say
+        // whether a bundle-shaped helper came from the app or the CLI.
+        raw.execute(
+            "UPDATE info SET value=json_remove(value,'$.pdf_helper_policy') WHERE key='scope'",
+            [],
+        )
+        .unwrap();
+        let app = |engine: &Path| {
+            let mut cmd = Command::new(engine);
+            cmd.arg("--db").arg(&db);
+            cmd
+        };
+        let rejected = || {
+            let mut process =
+                Process::launch(app(&second_engine).arg("watch").stderr(Stdio::piped()));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = process.child.try_wait().unwrap() {
+                    assert!(!status.success());
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "watch accepted an unauthorized saved app helper"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            let error = std::io::read_to_string(process.child.stderr.take().unwrap()).unwrap();
+            assert!(
+                error.contains("saved scope uses an app PDF extractor"),
+                "{error}"
+            );
+        };
+        rejected();
+        assert_eq!(stamp(), legacy_stamp);
+        assert_eq!(calls(&first_helper), 1);
+        assert_eq!(calls(&second_helper), 0);
+
+        // The second installation may migrate the saved scope, but it may
+        // only run its own helper. The same verified text preserves vectors.
+        let watcher = Process::launch(app(&second_engine).args(["watch", "--bundled-pdf-helper"]));
+        assert_eq!(watcher.json(), serde_json::json!({"event":"ready"}));
+        drop(watcher);
+        assert_eq!(calls(&first_helper), 1);
+        assert_eq!(calls(&second_helper), 1);
+        let managed_stamp = stamp();
+        assert!(managed_stamp.ends_with(":lumen-pdf:pdfkit-text-v1"));
+        assert_eq!(saved()["pdf_helper_policy"], "bundled");
+        assert!(saved()["pdf_helper"].is_null());
+        assert_eq!(counts(), (1, 1));
+        rejected();
+
+        // Different absolute path, inode and timestamps, same governed format.
+        fs::File::open(&first_helper)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1)),
+            )
+            .unwrap();
+        assert_ne!(
+            fs::metadata(&first_helper).unwrap().mtime(),
+            fs::metadata(&second_helper).unwrap().mtime()
+        );
+        assert_ne!(
+            fs::metadata(&first_helper).unwrap().ino(),
+            fs::metadata(&second_helper).unwrap().ino()
+        );
+        let refresh = |engine: &Path| {
+            let output = app(engine)
+                .args(docs)
+                .arg("--bundled-pdf-helper")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        refresh(&first_engine);
+        assert_eq!(stamp(), managed_stamp);
+        assert_eq!(calls(&first_helper), 1);
+        assert_eq!(counts(), (1, 1));
+
+        // Simulate a persisted incompatible format and a new helper output.
+        raw.execute(
+            "UPDATE document_state SET stamp=replace(stamp,'pdfkit-text-v1','pdfkit-text-v0')",
+            [],
+        )
+        .unwrap();
+        executable(
+            &second_helper,
+            "#!/bin/sh\ncat >/dev/null\necho called >> \"$0.calls\"\nprintf 'spruce revised passage'\n",
+        );
+        refresh(&second_engine);
+        assert_eq!(calls(&second_helper), 2);
+        assert_eq!(stamp(), managed_stamp);
+        assert_eq!(counts(), (0, 0));
+        assert_eq!(
+            f.run(&["query", "cedar archive", "--mode", "text"]),
+            serde_json::json!([])
+        );
+        assert_eq!(
+            f.run(&["query", "spruce revised", "--mode", "text"])[0]["name"],
+            "review.pdf"
+        );
+
+        // A leaf symlink back to the old app must not act as a bundled helper.
+        fs::remove_file(&second_helper).unwrap();
+        symlink(&first_helper, &second_helper).unwrap();
+        let failed = app(&second_engine)
+            .args(docs)
+            .arg("--bundled-pdf-helper")
+            .output()
+            .unwrap();
+        assert!(!failed.status.success());
+        assert!(String::from_utf8_lossy(&failed.stderr).contains("executable regular file"));
+        assert_eq!(calls(&first_helper), 1);
+        assert_eq!(stamp(), managed_stamp);
+    }
+
     fn index_progress(f: &Fixture, args: &[&str]) -> (Value, Vec<Value>) {
         let output = f
             .cli()
@@ -640,6 +841,113 @@ mod live {
                 && event["estimated_total"] == 2
                 && event["estimate_basis"] == "previous_scan"
         }));
+    }
+
+    #[test]
+    fn watcher_seeds_legacy_catalog_and_resumes_persisted_native_events() {
+        let f = Fixture::new();
+        let root = f.0.join("scope");
+        let private = root.join("private");
+        fs::create_dir_all(&private).unwrap();
+        for name in ["to-rename.txt", "to-delete.txt"] {
+            fs::write(root.join(name), name).unwrap();
+        }
+        fs::write(
+            private.join("protected.txt"),
+            "historical permissions evidence",
+        )
+        .unwrap();
+        let r = root.to_str().unwrap();
+        f.run(&["index", "--root", r, "--documents"]);
+        let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+        let get_info = |key: &str| -> Option<String> {
+            use rusqlite::OptionalExtension;
+            db.query_row("SELECT value FROM info WHERE key=?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()
+            .unwrap()
+        };
+        assert!(get_info("watch_checkpoint_v1").is_none());
+        let seed = watch(&f, &[]);
+        let scan = get_info("scan").unwrap();
+        let checkpoint = get_info("watch_checkpoint_v1").expect("native startup volume checkpoint");
+        drop(seed);
+        fs::rename(root.join("to-rename.txt"), root.join("renamed.txt")).unwrap();
+        fs::remove_file(root.join("to-delete.txt")).unwrap();
+        fs::write(root.join("new-file.txt"), "created offline").unwrap();
+        fs::write(root.join("second-new-file.txt"), "created offline too").unwrap();
+        thread::sleep(Duration::from_millis(650));
+
+        let resumed = watch(&f, &[]);
+        assert_eq!(
+            get_info("scan").unwrap(),
+            scan,
+            "historical replay should not reconcile"
+        );
+        let current = get_info("watch_checkpoint_v1").unwrap();
+        assert_ne!(current, checkpoint);
+        let mut serve = Serve::new(&f);
+        for query in ["to-rename", "to-delete"] {
+            assert!(serve.names(query, "name").is_empty(), "{query}");
+        }
+        assert_eq!(serve.names("renamed", "name"), ["renamed.txt"]);
+        assert_eq!(
+            serve.names("second-new-file", "name"),
+            ["second-new-file.txt"]
+        );
+        drop(resumed);
+
+        // A future ID is invalid even when the boot, journal and scope match.
+        let mut invalid: Value = serde_json::from_str(&current).unwrap();
+        invalid[2] = serde_json::json!(u64::MAX);
+        db.execute(
+            "UPDATE info SET value=?1 WHERE key='watch_checkpoint_v1'",
+            [invalid.to_string()],
+        )
+        .unwrap();
+        let fallback = watch(&f, &[]);
+        let refreshed = get_info("scan").unwrap();
+        let refreshed: Value = serde_json::from_str(&refreshed).unwrap();
+        let scan: Value = serde_json::from_str(&scan).unwrap();
+        assert_ne!(refreshed["items"], scan["items"]);
+        assert_ne!(
+            get_info("watch_checkpoint_v1").unwrap(),
+            invalid.to_string()
+        );
+        drop(fallback);
+
+        if unsafe { libc::geteuid() } != 0 {
+            struct RestoreMode<'a>(&'a Path);
+            impl Drop for RestoreMode<'_> {
+                fn drop(&mut self) {
+                    let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o700));
+                }
+            }
+            let restore = RestoreMode(&private);
+            fs::set_permissions(&private, fs::Permissions::from_mode(0o0)).unwrap();
+            thread::sleep(Duration::from_millis(650));
+            let closed = watch(&f, &[]);
+            let denied_scan: Value = serde_json::from_str(&get_info("scan").unwrap()).unwrap();
+            assert!(denied_scan["entries_unreadable"].as_u64().unwrap() > 0);
+            assert!(serve.names("protected", "name").is_empty());
+            assert!(serve.names("historical permissions", "text").is_empty());
+            drop(closed);
+            drop(restore);
+        }
+
+        let _restricted = watch(
+            &f,
+            &[
+                "--root",
+                r,
+                "--deny",
+                private.to_str().unwrap(),
+                "--documents",
+            ],
+        );
+        assert!(serve.names("protected", "all").is_empty());
+        assert!(serve.names("historical permissions", "text").is_empty());
     }
 
     #[test]
@@ -1544,5 +1852,440 @@ printf '[1,0,0,0,0,0,0,0]'
             0
         );
         assert_eq!(f.run(&embed)["new_embeddings"], 1);
+    }
+    #[test]
+    fn missing_or_bad_gemma_leaves_name_and_text_search_independent() {
+        let f = Fixture::new();
+        let root = f.0.join("scope");
+        let resources = f.0.join("model");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("ledger.md"), "The rare mineral dust was blue.").unwrap();
+        let root = root.to_str().unwrap();
+        let home = resources.to_str().unwrap();
+        f.run(&["index", "--root", root]);
+        let status = f.run(&["gemma-status", "--gemma-home", home, "--verify"]);
+        assert_eq!(status["ready"], false);
+        assert_eq!(status["coverage"]["documents_enabled"], false);
+        let denied = f
+            .cli()
+            .args(["embed", "--gemma", "--gemma-home", home])
+            .output()
+            .unwrap();
+        assert!(!denied.status.success());
+        assert!(
+            String::from_utf8_lossy(&denied.stderr).contains("explicit document indexing scope")
+        );
+
+        fs::create_dir_all(resources.join("runtime")).unwrap();
+        fs::write(
+            resources.join("embeddinggemma-2-Q8_0.gguf"),
+            b"invalid model",
+        )
+        .unwrap();
+        f.run(&["index", "--root", root, "--documents"]);
+        let status = f.run(&["gemma-status", "--gemma-home", home, "--verify"]);
+        assert_eq!(status["available"], false);
+        assert_eq!(status["coverage"]["pending"], true);
+        assert!(status["diagnostic"].as_str().unwrap().contains("asset"));
+        let failed = f
+            .cli()
+            .args(["embed", "--gemma", "--gemma-home", home])
+            .output()
+            .unwrap();
+        assert!(!failed.status.success());
+        assert_eq!(f.run(&["query", "ledger.md"])[0]["name"], "ledger.md");
+        assert_eq!(
+            f.run(&["query", "mineral dust", "--mode", "text"])[0]["name"],
+            "ledger.md"
+        );
+        assert_eq!(
+            f.run(&["query", "mineral dust", "--mode", "all"])[0]["name"],
+            "ledger.md"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires pinned assets installed in LUMEN_GEMMA_TEST_HOME"]
+    fn real_gemma_cli_preserves_legacy_bge_and_replaces_only_changed_document_vectors() {
+        let resources =
+            std::env::var("LUMEN_GEMMA_TEST_HOME").expect("install the pinned Gemma assets first");
+        let home = resources.as_str();
+        let f = Fixture::new();
+        let root = f.0.join("scope");
+        fs::create_dir(&root).unwrap();
+        let en = "Orient the solar panel toward the midday sun.";
+        let zh = "给闹钟换上新的电池以后重新调准时间。";
+        let english_query = "How do I get the clock to run after its battery died?";
+        let chinese_query = "怎样摆放太阳能板才能让它朝着正午阳光？";
+        fs::write(root.join("a.md"), en).unwrap();
+        fs::write(root.join("b.md"), zh).unwrap();
+        let root_path = root.to_str().unwrap();
+        let index = ["index", "--root", root_path, "--documents"];
+        f.run(&index);
+
+        let adapter = f.0.join("bge-worker");
+        let interpreter = f.0.join("bge-runtime");
+        executable(&interpreter, "#!/bin/sh\nshift\nexec /bin/sh \"$@\"\n");
+        let vector = |one| {
+            serde_json::to_string(
+                &(0..512)
+                    .map(|index| u8::from(index == one))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        executable(
+            &adapter,
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' '{{"protocol":1,"language":"zh","fingerprint":"{}","dimensions":512}}'
+while IFS= read -r request; do
+    case "$request" in
+        *'solar panel'*) printf '%s\n' '{{"vector":{}}}' ;;
+        *) printf '%s\n' '{{"vector":{}}}' ;;
+    esac
+done
+"#,
+                "a".repeat(64),
+                vector(0),
+                vector(1)
+            ),
+        );
+        let bge_args = [
+            "--helper",
+            adapter.to_str().unwrap(),
+            "--bge-python",
+            interpreter.to_str().unwrap(),
+            "--bge-model",
+            root_path,
+        ];
+        assert_eq!(
+            f.run(&[&["embed"][..], &bge_args].concat())["new_embeddings"],
+            2
+        );
+        let raw = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+        raw.execute_batch(
+            "DROP TRIGGER semantic_versioned_chunk_deleted;
+                           DROP TABLE semantic_vector; DROP TABLE semantic_vector_count;",
+        )
+        .unwrap();
+        let before = f.run(&["gemma-status", "--gemma-home", home]);
+        assert_eq!(before["ready"], false);
+        assert_eq!(before["coverage"]["pending"], true);
+        let embed = ["embed", "--gemma", "--gemma-home", home, "--max", "1"];
+        assert_eq!(
+            f.run(&embed),
+            serde_json::json!({"new_embeddings":1,"skipped_chunks":0,"has_more":true})
+        );
+        assert_eq!(
+            f.run(&embed),
+            serde_json::json!({"new_embeddings":1,"skipped_chunks":0,"has_more":false})
+        );
+        let ready = f.run(&["gemma-status", "--gemma-home", home, "--verify"]);
+        assert_eq!(ready["ready"], true);
+        assert_eq!(ready["coverage"]["embedded_chunks"], 2);
+        let default = f.run(&[
+            "query",
+            chinese_query,
+            "--mode",
+            "semantic",
+            "--gemma-home",
+            home,
+        ]);
+        assert_eq!(default[0]["snippet"], en);
+        let vector_sizes: i64 = raw
+            .query_row(
+                "SELECT count(*) FROM semantic_vector WHERE length(vector)=3072",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vector_sizes, 2);
+
+        let mut session = f
+            .cli()
+            .args(["semantic-serve", "--gemma-home", home])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = session.stdin.take().unwrap();
+        for (id, query) in [chinese_query, english_query].into_iter().enumerate() {
+            writeln!(
+                input,
+                "{}",
+                serde_json::json!({"id":id,"query":query,"mode":"semantic","limit":3})
+            )
+            .unwrap();
+        }
+        drop(input);
+        let output = session.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let lines: Vec<Value> = BufReader::new(output.stdout.as_slice())
+            .lines()
+            .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        for (id, (reply, snippet)) in lines.into_iter().zip([en, zh]).enumerate() {
+            assert_eq!(reply["id"], id);
+            assert_eq!(reply["hits"][0]["snippet"], snippet);
+            assert_eq!(reply["hits"][0]["matched_by"], "semantic_candidate");
+            assert!(reply["hits"][0]["document_stamp"].is_string());
+        }
+        let bge_query = [
+            &["query", "solar panel", "--mode", "semantic"][..],
+            &bge_args,
+        ]
+        .concat();
+        assert_eq!(f.run(&bge_query)[0]["snippet"], en);
+        assert_eq!(f.run(&["status"])["embedded_chunks"], 2);
+
+        fs::write(root.join("replace"), "A clay teapot should dry slowly.").unwrap();
+        fs::rename(root.join("replace"), root.join("b.md")).unwrap();
+        f.run(&index);
+        let status = f.run(&["status"]);
+        assert_eq!(status["gemma"]["embedded_chunks"], 1);
+        assert_eq!(status["gemma"]["pending"], true);
+        assert_eq!(status["embedded_chunks"], 1);
+        let during = f.run(&["gemma-status", "--gemma-home", home, "--verify"]);
+        assert_eq!(during["ready"], true);
+        assert_eq!(during["coverage"]["pending"], true);
+        let live = f.run(&[
+            "query",
+            chinese_query,
+            "--mode",
+            "semantic",
+            "--gemma-home",
+            home,
+        ]);
+        assert_eq!(live.as_array().unwrap().len(), 1);
+        assert_eq!(live[0]["snippet"], en);
+        assert_eq!(f.run(&bge_query)[0]["snippet"], en);
+        assert_eq!(f.run(&embed)["new_embeddings"], 1);
+        assert_eq!(
+            f.run(&["gemma-status", "--gemma-home", home, "--verify"])["ready"],
+            true
+        );
+
+        let corrupt = f.0.join("bad-runtime");
+        let corrupt_runtime = corrupt.join("runtime");
+        fs::create_dir_all(&corrupt_runtime).unwrap();
+        let real = Path::new(home);
+        let model_name = "embeddinggemma-2-Q8_0.gguf";
+        if fs::hard_link(real.join(model_name), corrupt.join(model_name)).is_err() {
+            fs::copy(real.join(model_name), corrupt.join(model_name)).unwrap();
+        }
+        for item in fs::read_dir(real.join("runtime")).unwrap() {
+            let item = item.unwrap();
+            fs::copy(item.path(), corrupt_runtime.join(item.file_name())).unwrap();
+        }
+        let altered = corrupt_runtime.join("llama-server");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(altered)
+            .unwrap()
+            .write_all(b"bad runtime")
+            .unwrap();
+        let bad = f.run(&[
+            "gemma-status",
+            "--gemma-home",
+            corrupt.to_str().unwrap(),
+            "--verify",
+        ]);
+        assert_eq!(bad["ready"], false);
+        assert!(
+            bad["diagnostic"]
+                .as_str()
+                .unwrap()
+                .contains("failed SHA-256")
+        );
+        assert_eq!(f.run(&["query", "a.md"])[0]["name"], "a.md");
+
+        f.run(&["index", "--root", root_path]);
+        assert_eq!(f.run(&["status"])["gemma"]["embedded_chunks"], 0);
+        assert_eq!(
+            raw.query_row("SELECT count(*) FROM semantic_vector", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(f.run(&["query", "a.md"])[0]["name"], "a.md");
+    }
+    #[test]
+    fn diagnose_reports_scoped_metadata_without_following_aliases_or_writing_the_index() {
+        let f = Fixture::new();
+        let root = f.0.join("scope");
+        let allowed = root.join("allowed");
+        let denied = allowed.join("Private");
+        let provider = allowed.join("Library/CloudStorage/OneDrive-Test");
+        fs::create_dir_all(&denied).unwrap();
+        fs::create_dir_all(&provider).unwrap();
+        let local = allowed.join("paper.md");
+        let outside = root.join("private-neighbor.md");
+        let cloud = provider.join("remote.md");
+        for path in [&local, &outside, &cloud, &denied.join("blocked.md")] {
+            fs::write(path, "Synthetic body must not appear in diagnostics").unwrap();
+        }
+        symlink(&denied, allowed.join("aliased-parent")).unwrap();
+        symlink(&outside, allowed.join("aliased-file.md")).unwrap();
+        let root = root.to_str().unwrap();
+        let allow = allowed.to_str().unwrap();
+        let deny = denied.to_str().unwrap();
+        let args = ["index", "--root", root, "--allow", allow, "--deny", deny];
+        f.run(&args);
+        let explain = |path: &Path| f.run(&["diagnose", "--", path.to_str().unwrap()]);
+        let blocked = |reason| serde_json::json!({"name":reason,"text":reason,"semantic":reason});
+        let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+        let generation = || {
+            db.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        let before = generation();
+        assert_eq!(
+            explain(&local),
+            serde_json::json!({"name":"indexed","text":"text_disabled","semantic":"text_disabled","availability":"local"})
+        );
+        assert_eq!(
+            explain(&cloud),
+            serde_json::json!({"name":"indexed","text":"cloud_name_only","semantic":"cloud_name_only","availability":"provider_metadata_only"})
+        );
+        assert_eq!(explain(&outside), blocked("outside_scope"));
+        assert_eq!(
+            explain(&allowed.join("PRIVATE/nonexistent.md")),
+            blocked("excluded")
+        );
+        assert_eq!(
+            explain(&allowed.join("aliased-parent/blocked.md")),
+            blocked("symlink")
+        );
+        assert_eq!(
+            explain(&allowed.join("aliased-file.md")),
+            blocked("symlink")
+        );
+        assert_eq!(
+            explain(&allowed.join("aliased-parent/../paper.md")),
+            blocked("unknown")
+        );
+        assert_eq!(explain(&allowed.join("missing.md")), blocked("missing"));
+        assert_eq!(explain(&allowed), blocked("not_file"));
+        assert_eq!(generation(), before);
+
+        let locked = allowed.join("locked");
+        fs::create_dir(&locked).unwrap();
+        let hidden = locked.join("hidden.md");
+        fs::write(&hidden, "Synthetic unreadable path").unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            let actual = explain(&hidden);
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(actual, blocked("unreadable"));
+        }
+        db.execute("DELETE FROM info WHERE key='scope'", [])
+            .unwrap();
+        assert_eq!(explain(&local), blocked("scope_unknown"));
+        let empty = Fixture::new();
+        assert_eq!(
+            empty.run(&["diagnose", "--", local.to_str().unwrap()]),
+            blocked("index_unavailable")
+        );
+        assert!(!empty.0.join("test.sqlite").exists());
+    }
+
+    #[test]
+    fn diagnose_distinguishes_current_text_and_gemma_from_pending_or_stale_rows() {
+        let f = Fixture::new();
+        let scope = f.0.join("scope");
+        fs::create_dir(&scope).unwrap();
+        let file = scope.join("paper.md");
+        let pdf = scope.join("no-helper.pdf");
+        let unsupported = scope.join("photo.jpg");
+        for path in [&file, &pdf, &unsupported] {
+            fs::write(path, "Synthetic secret text should never be emitted.").unwrap();
+        }
+        let args = ["index", "--root", scope.to_str().unwrap(), "--documents"];
+        f.run(&args);
+        let explain = |path: &Path| f.run(&["diagnose", "--", path.to_str().unwrap()]);
+        assert_eq!(
+            explain(&file),
+            serde_json::json!({"name":"indexed","text":"indexed","semantic":"pending_gemma","availability":"local"})
+        );
+        assert_eq!(explain(&pdf)["text"], "pdf_helper_unconfigured");
+        assert_eq!(explain(&unsupported)["text"], "unsupported");
+        let late = scope.join("new.md");
+        fs::write(&late, "added after the scan").unwrap();
+        assert_eq!(explain(&late)["name"], "not_indexed");
+        assert_eq!(explain(&late)["text"], "not_indexed");
+
+        let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+        let id: i64 = db
+            .query_row("SELECT id FROM item WHERE display='paper.md'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        db.execute(
+            "INSERT INTO semantic_chunk(document_id,start_byte,end_byte) VALUES(?1,0,10)",
+            [id],
+        )
+        .unwrap();
+        let chunk = db.last_insert_rowid();
+        db.execute(
+            "UPDATE semantic_document SET prepared=1 WHERE document_id=?1",
+            [id],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO semantic_vector VALUES('prior-model',?1,zeroblob(3072))",
+            [chunk],
+        )
+        .unwrap();
+        assert_eq!(explain(&file)["semantic"], "pending_gemma");
+        db.execute(
+            "INSERT INTO semantic_vector_count VALUES(?1,43690)",
+            [lumen::GEMMA_MODEL_ID],
+        )
+        .unwrap();
+        assert_eq!(explain(&file)["semantic"], "gemma_limited");
+        db.execute(
+            "DELETE FROM semantic_vector_count WHERE model=?1",
+            [lumen::GEMMA_MODEL_ID],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO semantic_vector VALUES(?1,?2,'invalid shape')",
+            rusqlite::params![lumen::GEMMA_MODEL_ID, chunk],
+        )
+        .unwrap();
+        assert_eq!(explain(&file)["semantic"], "unknown");
+        let mut vector = vec![0_u8; 3072];
+        vector[..4].copy_from_slice(&1.0_f32.to_le_bytes());
+        db.execute(
+            "UPDATE semantic_vector SET vector=?1 WHERE model=?2",
+            rusqlite::params![vector, lumen::GEMMA_MODEL_ID],
+        )
+        .unwrap();
+        assert_eq!(explain(&file)["semantic"], "indexed");
+        db.execute(
+            "UPDATE semantic_vector SET vector=NULL WHERE model=?1",
+            [lumen::GEMMA_MODEL_ID],
+        )
+        .unwrap();
+        assert_eq!(explain(&file)["semantic"], "gemma_skipped");
+
+        db.execute(
+            "UPDATE item SET availability='unverified' WHERE id=?1",
+            [id],
+        )
+        .unwrap();
+        assert_eq!(explain(&file)["name"], "unverified");
+        assert_eq!(explain(&file)["text"], "unverified");
+        db.execute("UPDATE item SET availability='local' WHERE id=?1", [id])
+            .unwrap();
+        let replacement = scope.join("replacement");
+        fs::write(&replacement, "same path, new inode").unwrap();
+        fs::rename(replacement, &file).unwrap();
+        let stale = explain(&file);
+        assert_eq!(stale["name"], "indexed");
+        assert_eq!(stale["text"], "stale");
+        assert_eq!(stale["semantic"], "stale");
     }
 }

@@ -4,11 +4,13 @@ use std::path::Path;
 
 #[cfg(target_os = "macos")]
 mod fsevents;
+#[cfg(target_os = "macos")]
+mod resume;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum WatchEvent {
-    /// The initial reconciliation is committed and search clients can connect.
+    /// Startup replay or reconciliation is committed and search clients can connect.
     Ready,
     /// A committed change is available to existing search clients.
     Updated,
@@ -34,7 +36,7 @@ pub fn watch_with_progress(
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::{Path, Result, ScanProgressReporter, Scope, WatchEvent, fsevents};
+    use super::{Path, Result, ScanProgressReporter, Scope, WatchEvent, fsevents, resume};
     use crate::index::{Coverage, apply_changes, reconcile, restrict_scope, startup_scope};
     use crate::{ScanStats, absolute, open_write, platform};
     use anyhow::Context;
@@ -46,7 +48,7 @@ mod macos {
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
-            mpsc::{self, RecvTimeoutError, SyncSender, TrySendError},
+            mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
         },
         time::{Duration, Instant},
     };
@@ -60,6 +62,7 @@ mod macos {
     const MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(300);
     const QUEUE_CAPACITY: usize = 8192;
     const BATCH_SIZE: usize = 512;
+    const REPLAY_LIMIT: Duration = Duration::from_secs(4);
 
     pub fn watch_with_progress(
         database: &Path,
@@ -86,7 +89,123 @@ mod macos {
             periodic: Duration::from_secs(30 * 60),
             recovery_cooldown: Duration::from_secs(30),
         };
-        maintain(&mut conn, coverage, timing, progress, start_stream, emit)
+        resume::install_invalidation(&conn)?;
+        maintain(
+            &mut conn,
+            coverage,
+            timing,
+            progress,
+            true,
+            start_stream,
+            emit,
+        )
+    }
+
+    struct Subscription<S> {
+        sink: Arc<Sink>,
+        receiver: Receiver<Event>,
+        _stream: S,
+        journal: Option<resume::Journal>,
+        cursor: u64,
+    }
+
+    impl<S> Subscription<S> {
+        fn start(
+            conn: &mut Connection,
+            coverage: &Arc<Coverage>,
+            persistent: bool,
+            allow_resume: bool,
+            start: &impl Fn(&Arc<Sink>, Option<(&resume::Journal, u64)>) -> Result<S>,
+        ) -> Result<(Self, bool)> {
+            let roots = configured_watches(coverage);
+            let journal = persistent
+                .then(|| resume::Journal::open(coverage, &roots))
+                .flatten();
+            if let Some(journal) = journal {
+                let previous = if allow_resume {
+                    journal.load(conn, &coverage.scope)?
+                } else {
+                    None
+                };
+                if let Some(cursor) = previous.or_else(|| journal.current_id()) {
+                    let (sink, receiver) = Sink::new(coverage, roots.clone(), true);
+                    match start(&sink, Some((&journal, cursor))) {
+                        Ok(stream) => {
+                            return Ok((
+                                Self {
+                                    sink,
+                                    receiver,
+                                    _stream: stream,
+                                    journal: Some(journal),
+                                    cursor,
+                                },
+                                previous.is_some(),
+                            ));
+                        }
+                        Err(error) => {
+                            eprintln!("lumen watch: could not open volume journal: {error:#}")
+                        }
+                    }
+                }
+            }
+
+            let (sink, receiver) = Sink::new(coverage, roots, false);
+            let stream = match start(&sink, None) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    if persistent {
+                        resume::invalidate(conn)?;
+                        resume::verify_access(conn, Some(&sink.roots))?;
+                    }
+                    return Err(error);
+                }
+            };
+            Ok((
+                Self {
+                    sink,
+                    receiver,
+                    _stream: stream,
+                    journal: None,
+                    cursor: 0,
+                },
+                false,
+            ))
+        }
+
+        fn replay(&self) -> Option<(BTreeMap<PathBuf, bool>, u64)> {
+            let deadline = Instant::now() + REPLAY_LIMIT;
+            let mut targets = BTreeMap::new();
+            let mut cursor = self.cursor;
+            // Build a bounded set before applying it. Incomplete history,
+            // topology changes and queue overflow all require reconciliation.
+            for _ in 0..QUEUE_CAPACITY {
+                if self.sink.lost.load(Ordering::Acquire) {
+                    return None;
+                }
+                let timeout = deadline.checked_duration_since(Instant::now())?;
+                match self.receiver.recv_timeout(timeout).ok()? {
+                    Event::Change(change) if !change.rearm && !change.uncertain => {
+                        add_target(&mut targets, change)
+                    }
+                    Event::Checkpoint { id, history_done } => {
+                        cursor = cursor.max(id);
+                        if history_done && !self.sink.lost.load(Ordering::Acquire) {
+                            return Some((targets, cursor));
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            None
+        }
+
+        fn save(&mut self, conn: &Connection, cursor: u64) -> Result<()> {
+            if let Some(journal) = &self.journal {
+                journal.save(conn, &self.sink.coverage.scope, cursor)?;
+                self.cursor = cursor;
+            }
+            Ok(())
+        }
     }
 
     fn maintain<S>(
@@ -94,29 +213,51 @@ mod macos {
         mut coverage: Arc<Coverage>,
         timing: Timing,
         progress: Option<&ScanProgressReporter>,
-        start: impl Fn(&Arc<Sink>) -> Result<S>,
+        persistent: bool,
+        start: impl Fn(&Arc<Sink>, Option<(&resume::Journal, u64)>) -> Result<S>,
         mut emit: impl FnMut(WatchEvent) -> Result<()>,
     ) -> Result<()> {
-        let roots = configured_watches(&coverage);
-        let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
-        let sink = Arc::new(Sink {
-            sender,
-            lost: AtomicBool::new(false),
-            coverage: coverage.clone(),
-            roots,
-        });
-        let mut sink = sink;
-        let mut _stream = start(&sink).context("start filesystem notifications")?;
-
-        // Subscribe first, then reconcile. Changes during this pass are queued
-        // independently on the FSEvents dispatch queue, even on a large volume.
-        let stats =
-            reconcile(conn, &coverage, false, progress).context("startup index reconciliation")?;
-        report_unreadable(&stats);
+        let (mut sub, attempt_resume) =
+            Subscription::start(conn, &coverage, persistent, true, &start)?;
+        let mut resumed = false;
+        if attempt_resume && let Some((targets, cursor)) = sub.replay() {
+            let mut had_access_errors = false;
+            if !targets.is_empty() {
+                let (stats, _) = apply_changes(conn, &coverage, targets)
+                    .context("commit historical filesystem changes")?;
+                report_unreadable(&stats);
+                had_access_errors = stats.entries_unreadable != 0;
+            }
+            if resume::verify_access(conn, Some(&sub.sink.roots))?
+                && !had_access_errors
+                && sub
+                    .journal
+                    .as_ref()
+                    .is_some_and(|journal| journal.unchanged(&coverage, &sub.sink.roots))
+                && !sub.sink.lost.load(Ordering::Acquire)
+            {
+                sub.save(conn, cursor)?;
+                resumed = true;
+            }
+        }
+        if !resumed {
+            if persistent {
+                resume::invalidate(conn)?;
+                if attempt_resume {
+                    coverage = Arc::new(coverage.refreshed()?);
+                    restrict_scope(conn, &coverage).context("apply refreshed watch scope")?;
+                    (sub, _) = Subscription::start(conn, &coverage, persistent, false, &start)?;
+                }
+            }
+            if persistent && coverage.scope.documents {
+                resume::verify_access(conn, None)?;
+            }
+            reconcile_startup(conn, &coverage, &mut sub, progress)?;
+        }
         emit(WatchEvent::Ready).context("emit watch ready event")?;
 
         let mut last_reconciled = Instant::now();
-        let mut last_emitted = last_reconciled;
+        let mut last_emitted = Instant::now();
         let mut pending_recovery = false;
         let mut pending_update = false;
         loop {
@@ -129,8 +270,8 @@ mod macos {
             if pending_update {
                 wait = wait.min(MIN_UPDATE_INTERVAL.saturating_sub(last_emitted.elapsed()));
             }
-            let first = match receiver.recv_timeout(wait) {
-                Ok(change) => Some(change),
+            let first = match sub.receiver.recv_timeout(wait) {
+                Ok(event) => Some(event),
                 Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => {
                     anyhow::bail!("filesystem notification queue closed")
@@ -138,68 +279,56 @@ mod macos {
             };
             let mut targets = BTreeMap::new();
             let mut rearm = false;
-            for change in first
+            let mut cursor = sub.cursor;
+            for event in first
                 .into_iter()
-                .chain(receiver.try_iter().take(BATCH_SIZE - 1))
+                .chain(sub.receiver.try_iter().take(BATCH_SIZE - 1))
             {
-                if change.path.as_os_str().is_empty() {
-                    continue;
+                match event {
+                    Event::Change(change) => {
+                        rearm |= change.rearm;
+                        add_target(&mut targets, change);
+                    }
+                    Event::Checkpoint { id, .. } => cursor = cursor.max(id),
+                    Event::Lost => {}
                 }
-                rearm |= change.rearm;
-                targets
-                    .entry(change.path)
-                    .and_modify(|subtree| *subtree |= change.subtree)
-                    .or_insert(change.subtree);
             }
-            if sink.lost.swap(false, Ordering::AcqRel) && !pending_recovery {
+            if sub.sink.lost.swap(false, Ordering::AcqRel) && !pending_recovery {
+                if persistent {
+                    resume::invalidate(conn)?;
+                }
                 eprintln!("lumen watch: filesystem notifications lost; checking configured roots");
                 pending_recovery = true;
             }
-            let mut full = last_reconciled.elapsed() >= timing.periodic
+            let full = rearm
+                || last_reconciled.elapsed() >= timing.periodic
                 || pending_recovery && last_reconciled.elapsed() >= timing.recovery_cooldown;
-            if rearm || full {
-                // A watched root can move even if its textual path still
-                // exists. Refresh its actual spelling and overlap the streams.
-                let refreshed = Arc::new(coverage.refreshed()?);
-                let scope_changed = refreshed.scope != coverage.scope;
-                let replacement = if scope_changed {
-                    Arc::new(Sink {
-                        sender: sink.sender.clone(),
-                        lost: AtomicBool::new(false),
-                        coverage: refreshed.clone(),
-                        roots: configured_watches(&refreshed),
-                    })
-                } else {
-                    sink.clone()
-                };
-                match start(&replacement) {
-                    Ok(stream) => {
-                        _stream = stream;
-                        sink = replacement;
-                        coverage = refreshed;
-                        if scope_changed {
-                            restrict_scope(conn, &coverage)
-                                .context("apply refreshed watch scope")?;
-                            full = true;
-                        }
-                    }
-                    Err(error) => eprintln!(
-                        "lumen watch: could not renew filesystem notifications: {error:#}"
-                    ),
-                };
-            }
             if full {
-                let stats = reconcile(conn, &coverage, false, None)
-                    .context("reconcile configured watch roots")?;
-                report_unreadable(&stats);
+                if persistent {
+                    resume::invalidate(conn)?;
+                }
+                // Subscribe with a fresh queue before scanning. No cursor from
+                // the stream that lost events can advance the new checkpoint.
+                coverage = Arc::new(coverage.refreshed()?);
+                restrict_scope(conn, &coverage).context("apply refreshed watch scope")?;
+                (sub, _) = Subscription::start(conn, &coverage, persistent, false, &start)?;
+                reconcile_startup(conn, &coverage, &mut sub, None)?;
                 last_reconciled = Instant::now();
                 pending_recovery = false;
                 pending_update = true;
-            } else if !targets.is_empty() {
-                let (stats, changed) = apply_changes(conn, &coverage, targets)
-                    .context("commit filesystem changes to watch index")?;
-                report_unreadable(&stats);
-                pending_update |= changed;
+            } else {
+                if !targets.is_empty() {
+                    let (stats, changed) = apply_changes(conn, &coverage, targets)
+                        .context("commit filesystem changes to watch index")?;
+                    report_unreadable(&stats);
+                    pending_update |= changed;
+                }
+                if cursor > sub.cursor
+                    && !pending_recovery
+                    && !sub.sink.lost.load(Ordering::Acquire)
+                {
+                    sub.save(conn, cursor)?;
+                }
             }
             if pending_update && last_emitted.elapsed() >= MIN_UPDATE_INTERVAL {
                 emit(WatchEvent::Updated).context("emit watch update event")?;
@@ -207,6 +336,37 @@ mod macos {
                 pending_update = false;
             }
         }
+    }
+
+    fn add_target(targets: &mut BTreeMap<PathBuf, bool>, change: Change) {
+        targets
+            .entry(change.path)
+            .and_modify(|subtree| *subtree |= change.subtree)
+            .or_insert(change.subtree);
+    }
+
+    fn reconcile_startup<S>(
+        conn: &mut Connection,
+        coverage: &Coverage,
+        sub: &mut Subscription<S>,
+        progress: Option<&ScanProgressReporter>,
+    ) -> Result<()> {
+        // A seed is captured before subscribing and scanning. Events that
+        // arrive during the walk remain queued and are replayable after a crash.
+        let stats = reconcile(conn, coverage, false, progress)
+            .context("reconcile configured watch roots")?;
+        report_unreadable(&stats);
+        if !sub.sink.lost.load(Ordering::Acquire)
+            && sub
+                .journal
+                .as_ref()
+                .is_some_and(|journal| journal.unchanged(coverage, &sub.sink.roots))
+        {
+            sub.save(conn, sub.cursor)?;
+        } else {
+            sub.journal = None;
+        }
+        Ok(())
     }
 
     fn report_unreadable(stats: &ScanStats) {
@@ -218,7 +378,14 @@ mod macos {
         }
     }
 
-    fn start_stream(sink: &Arc<Sink>) -> Result<Option<fsevents::Stream>> {
+    fn start_stream(
+        sink: &Arc<Sink>,
+        replay: Option<(&resume::Journal, u64)>,
+    ) -> Result<Option<fsevents::Stream>> {
+        if let Some((journal, cursor)) = replay {
+            return fsevents::Stream::start(&journal.paths(), sink, Some((journal.device, cursor)))
+                .map(Some);
+        }
         let roots = sink
             .roots
             .iter()
@@ -228,7 +395,7 @@ mod macos {
         if paths.is_empty() {
             return Ok(None);
         }
-        fsevents::Stream::start(&paths, sink).map(Some)
+        fsevents::Stream::start(&paths, sink, None).map(Some)
     }
 
     fn configured_watches(coverage: &Coverage) -> Vec<PathBuf> {
@@ -288,65 +455,118 @@ mod macos {
         path: PathBuf,
         subtree: bool,
         rearm: bool,
+        uncertain: bool,
+    }
+
+    enum Event {
+        Change(Change),
+        Checkpoint { id: u64, history_done: bool },
+        Lost,
     }
 
     pub(super) struct Sink {
-        sender: SyncSender<Change>,
+        sender: SyncSender<Event>,
         lost: AtomicBool,
         coverage: Arc<Coverage>,
         roots: Vec<PathBuf>,
+        volume_relative: bool,
     }
 
     impl Sink {
+        fn new(
+            coverage: &Arc<Coverage>,
+            roots: Vec<PathBuf>,
+            volume_relative: bool,
+        ) -> (Arc<Self>, Receiver<Event>) {
+            let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
+            (
+                Arc::new(Self {
+                    sender,
+                    lost: AtomicBool::new(false),
+                    coverage: coverage.clone(),
+                    roots,
+                    volume_relative,
+                }),
+                receiver,
+            )
+        }
+
         pub(super) fn lost(&self) {
             self.lost.store(true, Ordering::Release);
             // A full queue already wakes the worker. A native loss notice may
             // arrive on an idle stream: queue a sentinel to wake it in that case.
-            let _ = self.sender.try_send(Change {
-                path: PathBuf::new(),
-                subtree: false,
-                rearm: false,
-            });
+            let _ = self.sender.try_send(Event::Lost);
         }
 
-        pub(super) fn change(&self, path: &Path, subtree: bool, rearm: bool) {
-            // Events on the startup data volume may use its physical path.
-            // The index itself uses the logical path through the APFS firmlinks.
+        pub(super) fn checkpoint(&self, id: u64, history_done: bool) {
+            if self.volume_relative {
+                self.send(Event::Checkpoint { id, history_done });
+            }
+        }
+
+        pub(super) fn native_change(
+            &self,
+            path: &Path,
+            subtree: bool,
+            rearm: bool,
+            uncertain: bool,
+        ) -> bool {
+            // Device callbacks provide paths relative to the Data volume;
+            // host callbacks can instead use its physical mount prefix.
             let logical;
             let path = if let Ok(rest) = path.strip_prefix("/System/Volumes/Data") {
                 logical = Path::new("/").join(rest);
+                &logical
+            } else if self.volume_relative && !path.is_absolute() {
+                logical = Path::new("/").join(path);
                 &logical
             } else {
                 path
             };
             if !path.is_absolute() {
                 self.lost();
-                return;
+                return false;
             }
             let structural = subtree || rearm;
             let below_watch = self.roots.iter().any(|root| path.starts_with(root));
             let above_watch = structural && self.roots.iter().any(|root| root.starts_with(path));
             if !below_watch && !above_watch {
-                return;
+                return false;
             }
             let scan_roots = &self.coverage.scope.roots;
             if scan_roots.iter().any(|root| path.starts_with(root)) && self.coverage.allows(path) {
-                self.send(path, subtree, rearm || above_watch && !below_watch);
+                self.change(
+                    path,
+                    subtree,
+                    rearm || above_watch && !below_watch,
+                    uncertain,
+                );
+                true
             } else if above_watch {
+                let mut sent = false;
                 for root in scan_roots {
                     if root.starts_with(path) && self.coverage.allows(root) {
-                        self.send(root, true, true);
+                        self.change(root, true, true, uncertain);
+                        sent = true;
                     }
                 }
+                sent
+            } else {
+                false
             }
         }
 
-        fn send(&self, path: &Path, subtree: bool, rearm: bool) {
-            if let Err(TrySendError::Full(_)) = self.sender.try_send(Change {
+        fn change(&self, path: &Path, subtree: bool, rearm: bool, uncertain: bool) {
+            self.send(Event::Change(Change {
                 path: path.into(),
                 subtree,
                 rearm,
-            }) {
+                uncertain,
+            }));
+        }
+
+        fn send(&self, event: Event) {
+            if let Err(TrySendError::Full(_)) = self.sender.try_send(event) {
                 self.lost.store(true, Ordering::Release);
             }
         }
@@ -418,7 +638,8 @@ mod macos {
                 coverage,
                 timing,
                 None,
-                |s| {
+                false,
+                |s, _| {
                     *sink.borrow_mut() = Some(s.clone());
                     Ok(())
                 },
@@ -429,7 +650,7 @@ mod macos {
                         WatchEvent::Ready => {
                             fs::write(&target, "this notification is delivered")?;
                             fs::write(&missed, "there is no notification for this path")?;
-                            sink.change(&target, false, false);
+                            sink.change(&target, false, false, false);
                         }
                         WatchEvent::Updated => {
                             updates += 1;

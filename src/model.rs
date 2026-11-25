@@ -130,6 +130,7 @@ fn bge_language(language: &str) -> Result<&'static str> {
 pub enum ModelBackend<'a> {
     Helper(&'a Model),
     Bge(&'a BgeModel),
+    Gemma(&'a crate::GemmaModel),
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -147,6 +148,7 @@ pub(super) struct Encoder<'a> {
 enum EncoderKind<'a> {
     Helper(&'a Model),
     Bge(BgeWorker),
+    Gemma(crate::gemma::GemmaWorker),
 }
 
 impl<'a> ModelBackend<'a> {
@@ -155,6 +157,10 @@ impl<'a> ModelBackend<'a> {
             Self::Helper(model) => Ok(Encoder {
                 signature: model.signature()?,
                 kind: EncoderKind::Helper(model),
+            }),
+            Self::Gemma(model) => Ok(Encoder {
+                signature: crate::gemma::ID.into(),
+                kind: EncoderKind::Gemma(model.start()?),
             }),
             Self::Bge(model) => {
                 let (worker, signature) = BgeWorker::start(model)?;
@@ -176,6 +182,7 @@ impl Encoder<'_> {
         let mut vector = match &mut self.kind {
             EncoderKind::Helper(model) => model.encode(text)?,
             EncoderKind::Bge(worker) => worker.encode(role, text)?,
+            EncoderKind::Gemma(worker) => worker.encode(role, text)?,
         };
         ensure!(
             (8..=4096).contains(&vector.len()) && vector.iter().all(|x| x.is_finite()),
@@ -195,14 +202,14 @@ impl Encoder<'_> {
     pub fn match_reason(&self) -> &'static str {
         match self.kind {
             EncoderKind::Helper(_) => "semantic",
-            EncoderKind::Bge(_) => "semantic_candidate",
+            EncoderKind::Bge(_) | EncoderKind::Gemma(_) => "semantic_candidate",
         }
     }
 
     pub fn includes(&self, score: f32) -> bool {
         match self.kind {
             EncoderKind::Helper(_) => score > 0.25,
-            EncoderKind::Bge(_) => score > 0.0,
+            EncoderKind::Bge(_) | EncoderKind::Gemma(_) => score > 0.0,
         }
     }
 }

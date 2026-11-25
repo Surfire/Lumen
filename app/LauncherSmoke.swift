@@ -1406,9 +1406,17 @@ final class LauncherSmoke {
         try await until("reordered words with a bare extension returned the same files") {
             !model.searching && Set(model.hits.map(\.name)) == expected
         }
-        try type("pptx", into: app)
-        try await until("a bare extension filtered by actual file suffix") {
+        try type(".pptx", into: app)
+        try await until("an explicit extension filtered by actual file suffix") {
             !model.searching && Set(model.hits.map(\.name)) == expected.union(["Other project.pptx"])
+        }
+        try type("ext:pptx", into: app)
+        try await until("an ext: filter matched by actual file suffix") {
+            !model.searching && Set(model.hits.map(\.name)) == expected.union(["Other project.pptx"])
+        }
+        try type("pptx", into: app)
+        try await until("a bare single-word extension searched file and folder names") {
+            !model.searching && Set(model.hits.map(\.name)) == expected.union(["Other project.pptx", "成都 卫健委.pptx.bak", "成都 卫健委目录.pptx"])
         }
         print("Raw AppKit multiword and bare-extension queries passed")
     }

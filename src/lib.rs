@@ -44,8 +44,8 @@ use std::{
 use unicode_normalization::UnicodeNormalization;
 
 pub const MAX_DOCUMENT: u64 = 2 * 1024 * 1024;
-const SCHEMA_VERSION: i64 = 3;
-const LEGACY_SCHEMA_VERSIONS: std::ops::RangeInclusive<i64> = 1..=2;
+const SCHEMA_VERSION: i64 = 4;
+const LEGACY_SCHEMA_VERSIONS: std::ops::RangeInclusive<i64> = 1..=3;
 const DATABASE_APPLICATION_ID: i64 = 0x4c554d4e; // LUMN
 
 pub fn standard_database() -> PathBuf {
@@ -346,6 +346,9 @@ fn migrate_catalog(conn: &mut Connection) -> Result<()> {
     tx.execute_batch(semantic::SKIP_SCHEMA)?;
     tx.execute_batch(semantic::VERSIONED_SCHEMA)?;
     tx.execute_batch(content::SCHEMA)?;
+    if !name_fast::has_mtime(&tx)? {
+        tx.execute_batch("ALTER TABLE item ADD COLUMN mtime INTEGER NOT NULL DEFAULT 0;")?;
+    }
     name_fast::install_generation(&tx)?;
     if !uninitialized {
         // Retain the user's scope settings, but require a policy pass and a
@@ -550,6 +553,14 @@ impl SearchSession {
         Ok(Self { conn, names })
     }
 
+    /// Check previously presented hits in order without reopening the main catalog.
+    pub fn validate(&self, hits: &[(&str, &str, &str, Option<&str>)]) -> Vec<bool> {
+        let Some(database) = self.conn.path().filter(|path| !path.is_empty()) else {
+            return vec![false; hits.len()];
+        };
+        diagnose::validate_session_hits(&self.conn, Path::new(database), hits)
+    }
+
     pub fn search(&mut self, query: &str, mode: Mode, limit: usize) -> Result<Vec<Hit>> {
         let mut hits =
             search_with_names(&self.conn, query, mode, limit, None, Some(&mut self.names))?;
@@ -579,25 +590,33 @@ fn search_with_names(
         return Ok(vec![]);
     }
     let limit = limit.clamp(1, 100);
-    if let Some(terms) = query::Terms::parse(&q) {
-        let mut hits = if mode != Mode::Semantic {
-            query::search(conn, &terms, mode, limit)?
+    let terms = query::Terms::parse(&q);
+    let cached = if matches!(mode, Mode::Name | Mode::All) {
+        match names {
+            Some(names) => names.search(conn, &q, terms.as_ref(), limit)?,
+            None => None,
+        }
+    } else {
+        None
+    };
+    if let Some(terms) = terms {
+        let (generation, cached_names) =
+            cached.map_or((None, None), |(v, hits)| (Some(v), Some(hits)));
+        let mut hits = if mode == Mode::Name && cached_names.is_some() {
+            cached_names.unwrap_or_default()
+        } else if mode != Mode::Semantic {
+            query::search(conn, &terms, mode, limit, cached_names)?
         } else {
             Vec::new()
         };
         if terms.permits_semantic() {
             append_semantic_hits(conn, query, mode, limit, model, &mut hits)?;
         }
+        if generation.is_some() && generation != name_fast::name_generation(conn)? {
+            return search_with_names(conn, query, mode, limit, model, None);
+        }
         return Ok(hits);
     }
-    let cached = if matches!(mode, Mode::Name | Mode::All) {
-        match names {
-            Some(names) => names.search(conn, &q, limit)?,
-            None => None,
-        }
-    } else {
-        None
-    };
     let (version, mut hits) = cached.map_or((None, Vec::new()), |(v, hits)| (Some(v), hits));
     if version.is_none() && matches!(mode, Mode::Name | Mode::All) {
         hits = name_fast::search_disk(conn, &q, limit)?;

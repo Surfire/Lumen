@@ -362,6 +362,52 @@ fn explicit_rename_delete_reindex_and_native_launcher_transport() {
 }
 
 #[test]
+fn serve_bounds_frames_and_recovers_from_malformed_requests() {
+    let f = Fixture::new();
+    let root = f.0.join("scope");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("frame.txt"), "").unwrap();
+    f.run(&["index", "--root", root.to_str().unwrap()]);
+    let run = |bytes: &[u8]| {
+        let mut child = f
+            .cli()
+            .arg("serve")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(bytes).unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let mut boundary = br#"{"id":1,"op":"search","query":"frame"}"#.to_vec();
+    boundary.resize(16 * 1024 - 1, b' ');
+    boundary.extend_from_slice(b"\ninvalid\n{\"id\":2,\"op\":\"bogus\",\"query\":\"frame\"}\n{\"id\":3,\"op\":\"validate\",\"hits\":[]}\n{\"id\":4,\"query\":\"frame\"}\n");
+    let output = run(&boundary);
+    assert!(output.status.success(), "{:?}", output);
+    let replies: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(replies.len(), 5);
+    assert_eq!(replies[0]["hits"][0]["name"], "frame.txt");
+    assert!(replies[1]["error"].is_string());
+    assert!(replies[2]["error"].is_string());
+    assert_eq!(replies[3], serde_json::json!({"id":3,"valid":[]}));
+    assert_eq!(replies[4]["hits"][0]["name"], "frame.txt");
+    for frame in [
+        vec![b' '; 16 * 1024 + 1],
+        b"{\"id\":1,\"query\":\"frame\"}".to_vec(),
+    ] {
+        let output = run(&frame);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("invalid serve request frame"));
+    }
+}
+
+#[test]
 fn disk_name_order_migrates_existing_indexes_and_respects_scope() {
     let f = Fixture::new();
     let root = f.0.join("scope");
@@ -596,6 +642,116 @@ mod live {
                 thread::sleep(Duration::from_millis(20));
             }
         }
+    }
+
+    #[test]
+    fn unified_serve_search_override_and_ordered_validation_share_a_session() {
+        let f = Fixture::new();
+        let root = f.0.join("scope");
+        fs::create_dir(&root).unwrap();
+        let path = root.join("session-note.txt");
+        fs::write(&path, "session searchable body").unwrap();
+        f.run(&["index", "--root", root.to_str().unwrap(), "--documents"]);
+        let mut serve = Serve::launch(&f, &["--check-access"]);
+        let request = |serve: &mut Serve, value: Value| {
+            writeln!(serve.input, "{value}").unwrap();
+            let reply = serve.process.json();
+            assert_eq!(reply["id"], value["id"]);
+            reply
+        };
+        let text = request(
+            &mut serve,
+            serde_json::json!({
+                "id":1,"op":"search","query":"session searchable body","mode":"text"
+            }),
+        );
+        assert_eq!(text["hits"][0]["name"], "session-note.txt");
+        assert!(text["hits"][0]["document_stamp"].is_string());
+        let hit = text["hits"][0].clone();
+        let invalid = serde_json::json!({"path":path,"kind":"directory","availability":"local"});
+        let valid = request(
+            &mut serve,
+            serde_json::json!({
+                "id":2,"op":"validate","hits":[hit,invalid,hit]
+            }),
+        );
+        assert_eq!(valid, serde_json::json!({"id":2,"valid":[true,false,true]}));
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            request(
+                &mut serve,
+                serde_json::json!({
+                    "id":3,"op":"validate","hits":[hit]
+                })
+            ),
+            serde_json::json!({"id":3,"valid":[false]})
+        );
+        assert!(
+            request(
+                &mut serve,
+                serde_json::json!({
+                    "id":4,"query":"session-note","mode":"name"
+                })
+            )["hits"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            request(
+                &mut serve,
+                serde_json::json!({
+                    "id":5,"query":"session-note","mode":"name","check_access":false
+                })
+            )["hits"][0]["name"],
+            "session-note.txt"
+        );
+        // The already-running reader must observe the next committed catalog.
+        f.run(&["index", "--root", root.to_str().unwrap(), "--documents"]);
+        assert!(
+            request(
+                &mut serve,
+                serde_json::json!({
+                    "id":6,"op":"search","query":"session-note","check_access":false
+                })
+            )["hits"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        fs::write(&path, "replacement text").unwrap();
+        f.run(&["index", "--root", root.to_str().unwrap(), "--documents"]);
+        assert_eq!(
+            request(
+                &mut serve,
+                serde_json::json!({
+                    "id":7,"op":"validate","hits":[hit]
+                })
+            )["valid"],
+            serde_json::json!([false])
+        );
+        assert_eq!(
+            request(
+                &mut serve,
+                serde_json::json!({
+                    "id":8,"op":"validate","hits":[]
+                })
+            ),
+            serde_json::json!({"id":8,"valid":[]})
+        );
+        let mut unchecked = Serve::new(&f);
+        fs::remove_file(&path).unwrap();
+        assert!(
+            request(
+                &mut unchecked,
+                serde_json::json!({
+                    "id":9,"query":"session-note","check_access":true
+                })
+            )["hits"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

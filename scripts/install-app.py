@@ -21,6 +21,7 @@ HELPERS = {
     "lumen": f"{BUNDLE_ID}.engine",
     "LumenLocalEmbedding": f"{BUNDLE_ID}.embedding",
     "LumenPdfExtractor": f"{BUNDLE_ID}.pdf",
+    "LumenImageOcrExtractor": f"{BUNDLE_ID}.image-ocr",
     "lumen-extensions": f"{BUNDLE_ID}.extensions",
 }
 DEFAULT_SOURCE = Path(__file__).resolve().parents[1] / "target/Lumen.app"
@@ -50,11 +51,13 @@ def checked(*args):
     return result.stdout
 
 
-def code_layout(bundle):
+def code_layout(bundle, *, allow_missing_ocr=False):
     metadata = bundle / "Contents/Info.plist"
     executable = bundle / "Contents/MacOS/Lumen"
     resources = bundle / "Contents/Resources"
-    helpers = [(resources / name, identifier) for name, identifier in HELPERS.items()]
+    helpers = [(resources / name, identifier) for name, identifier in HELPERS.items()
+               if not (allow_missing_ocr and name == "LumenImageOcrExtractor"
+                       and not os.path.lexists(resources / name))]
     for path in (bundle, bundle / "Contents", executable.parent, resources):
         if path.is_symlink() or not path.is_dir():
             raise InstallError(f"Expected a bundle directory at {path}")
@@ -89,7 +92,9 @@ def inspect_signature(path):
 
 
 def verify_bundle(bundle, *, legacy_ad_hoc=False):
-    layout = code_layout(bundle)
+    # Accept signed bundles from before OCR for upgrades and backup restores.
+    # A helper that is present still has to pass every verification check.
+    layout = code_layout(bundle, allow_missing_ocr=True)
     checked("/usr/bin/codesign", "--verify", "--deep", "--strict", "--all-architectures", bundle)
     for path, _ in layout[:-1]:
         checked("/usr/bin/codesign", "--verify", "--strict", "--all-architectures", path)
@@ -142,7 +147,12 @@ def check_upgrade(previous, candidate, migrate_ad_hoc):
         return
     if migrate_ad_hoc:
         raise InstallError("--migrate-ad-hoc cannot replace an already named-signed build.")
-    for old, new in zip(previous, candidate):
+    # verify_bundle has already verified each candidate helper, including new ones.
+    previous_by_id = {signature.identifier: signature for signature in previous}
+    for new in candidate:
+        old = previous_by_id.get(new.identifier)
+        if old is None:
+            continue
         if old.certificate != new.certificate:
             raise InstallError(f"Signing identity changed for {new.identifier}. Existing Lumen was preserved.")
         for code, requirement in ((old.path, new.requirement), (new.path, old.requirement)):

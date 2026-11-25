@@ -71,8 +71,10 @@ pub struct Scope {
     pub pdf_helper_policy: Option<PdfHelperPolicy>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub image_ocr: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image_ocr_helper: Option<PathBuf>,
+    // Keep existing Scope literals source-compatible without accepting a helper path.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub image_ocr_helper: Option<std::convert::Infallible>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,7 +94,6 @@ impl Scope {
             && !self.documents
             && self.pdf_helper.is_none()
             && !self.image_ocr
-            && self.image_ocr_helper.is_none()
     }
 
     pub fn roots(&self) -> Vec<PathBuf> {

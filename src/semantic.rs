@@ -1,7 +1,10 @@
 use crate::{
-    Hit, Model, ModelBackend, absolute, document_stamp_sql, gemma,
+    Hit, Model, ModelBackend, PdfHelperPolicy, Scope, absolute,
+    diagnose::read_snapshot,
+    document_stamp_sql, gemma,
+    index::DocumentKind,
     model::{Role, Unencodable},
-    open_write, read_document_stamp, row_hit,
+    open_write, read_document_stamp, row_hit, saved_index_scope,
     vector::{Matrix, MatrixCache, adaptive_floor, pack},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -709,29 +712,23 @@ pub(super) fn search(
     let vector = encoder.encode(Role::Query, query)?;
     // Read scores and original snippets from the same snapshot while watch
     // may replace documents in the background.
-    let tx = conn
-        .is_autocommit()
-        .then(|| conn.unchecked_transaction())
-        .transpose()?;
-    let snapshot = tx.as_deref().unwrap_or(conn);
-    let state = validate(snapshot)?;
-    ensure!(
-        state.dimensions == Some(vector.len() as i64),
-        "stored and query embedding dimensions differ"
-    );
-    let matrix = load_paragraphs(snapshot, vector.len(), LEGACY, [])?;
-    let hits = rank(
-        snapshot,
-        &matrix,
-        matrix.scores(&vector),
-        limit,
-        encoder.match_reason(),
-        |score| encoder.includes(score),
-    )?;
-    if let Some(tx) = tx {
-        tx.commit()?;
-    }
-    Ok(hits)
+    Ok(read_snapshot(conn, |snapshot| {
+        let state = validate(snapshot)?;
+        ensure!(
+            state.dimensions == Some(vector.len() as i64),
+            "stored and query embedding dimensions differ"
+        );
+        let matrix = load_paragraphs(snapshot, vector.len(), LEGACY, [], |_| true)?;
+        rank(
+            snapshot,
+            &matrix,
+            matrix.scores(&vector),
+            limit,
+            encoder.match_reason(),
+            |score| encoder.includes(score),
+        )
+    })?
+    .unwrap_or_default())
 }
 
 fn search_gemma(
@@ -746,16 +743,10 @@ fn search_gemma(
         Err(error) if error.is::<Unencodable>() => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    let tx = conn
-        .is_autocommit()
-        .then(|| conn.unchecked_transaction())
-        .transpose()?;
-    let snapshot = tx.as_deref().unwrap_or(conn);
-    let hits = rank_gemma(snapshot, &vector, limit, matrix)?;
-    if let Some(tx) = tx {
-        tx.commit()?;
-    }
-    Ok(hits)
+    Ok(read_snapshot(conn, |snapshot| {
+        rank_gemma(snapshot, &vector, limit, matrix)
+    })?
+    .unwrap_or_default())
 }
 
 const LEGACY: &str = "SELECT c.document_id, c.id, i.path, c.vector FROM semantic_chunk c
@@ -772,15 +763,20 @@ fn load_paragraphs(
     dims: usize,
     sql: &str,
     parameters: impl rusqlite::Params,
+    allows: impl Fn(&Path) -> bool,
 ) -> Result<Matrix<Paragraph>> {
     let mut matrix = Matrix::new(dims);
     let mut statement = snapshot.prepare_cached(sql)?;
     let mut rows = statement.query(parameters)?;
     while let Some(row) = rows.next()? {
+        let path = row.get_ref(2)?.as_str()?;
+        if !allows(Path::new(path)) {
+            continue;
+        }
         let meta = Paragraph {
             document: row.get(0)?,
             chunk: row.get(1)?,
-            path: row.get_ref(2)?.as_str()?.into(),
+            path: path.into(),
         };
         ensure!(
             matrix.push(meta, row.get_ref(3)?.as_blob()?),
@@ -790,6 +786,25 @@ fn load_paragraphs(
     Ok(matrix)
 }
 
+fn gemma_path_allowed(scope: &Scope, path: &Path) -> bool {
+    !crate::external::is_external(path)
+        && scope.roots.iter().any(|root| path.starts_with(root))
+        && scope.allows(path)
+        && scope.content_roots.as_ref().is_none_or(|roots| {
+            roots
+                .iter()
+                .any(|root| path != root && path.starts_with(root))
+        })
+        && DocumentKind::for_path(path).is_some_and(|kind| match kind {
+            DocumentKind::Image => scope.image_ocr,
+            DocumentKind::Pdf => {
+                scope.pdf_helper.is_some()
+                    || scope.pdf_helper_policy == Some(PdfHelperPolicy::Bundled)
+            }
+            _ => true,
+        })
+}
+
 fn rank_gemma(
     snapshot: &Connection,
     query: &[f32],
@@ -797,14 +812,18 @@ fn rank_gemma(
     cache: &mut MatrixCache<Paragraph>,
 ) -> Result<Vec<Hit>> {
     let matrix = cache.get(snapshot, |snapshot| {
-        if !documents_enabled(snapshot)? || !has_gemma_store(snapshot)? {
+        let Some(scope) = saved_index_scope(snapshot)?.filter(|scope| scope.documents) else {
+            return Ok(Matrix::new(gemma::DIMENSIONS));
+        };
+        if !has_gemma_store(snapshot)? {
             return Ok(Matrix::new(gemma::DIMENSIONS));
         }
         load_paragraphs(
             snapshot,
             gemma::DIMENSIONS,
-            &format!("SELECT c.document_id,c.id,i.path,v.vector {GEMMA_LIVE} AND {GEMMA_VECTOR}"),
+            &format!("SELECT c.document_id,c.id,i.path,v.vector {GEMMA_LIVE} AND {GEMMA_VECTOR} AND i.kind='file'"),
             params![gemma::ID, GEMMA_VECTOR_BYTES],
+            |path| gemma_path_allowed(&scope, path),
         )
     })?;
     let scores: Vec<_> = matrix.scores(query).collect();
@@ -853,20 +872,28 @@ fn rank(
                CAST(substr(CAST(d.body AS BLOB), c.start_byte+1, c.end_byte-c.start_byte) AS TEXT),
                {stamp} AS document_stamp,{page}
              FROM semantic_chunk c JOIN document d ON d.id=c.document_id JOIN item i ON i.id=d.id
-             {state_join} WHERE c.id=?"
+             {state_join} WHERE c.id=?1 AND i.id=?2 AND i.path=?3 AND i.availability<>'unverified'"
         );
         let mut hit = snapshot.prepare_cached(&sql)?;
-        for (score, meta) in ranked.into_iter().take(limit) {
-            hits.push(hit.query_row([meta.chunk], |r| {
-                let mut record = row_hit(r, reason)?;
-                record.snippet = r.get(4)?;
-                record.document_stamp = read_document_stamp(r)?;
-                if record.document_stamp.is_some() {
-                    record.pdf_page = r.get(6)?;
-                }
-                record.score = Some(score.into());
-                Ok(record)
-            })?);
+        for (score, meta) in ranked {
+            if hits.len() == limit {
+                break;
+            }
+            if let Some(record) = hit
+                .query_row(params![meta.chunk, meta.document, &*meta.path], |r| {
+                    let mut record = row_hit(r, reason)?;
+                    record.snippet = r.get(4)?;
+                    record.document_stamp = read_document_stamp(r)?;
+                    if record.document_stamp.is_some() {
+                        record.pdf_page = r.get(6)?;
+                    }
+                    record.score = Some(score.into());
+                    Ok(record)
+                })
+                .optional()?
+            {
+                hits.push(record);
+            }
         }
     }
     Ok(hits)
@@ -1064,9 +1091,31 @@ mod tests {
         // The held WAL read transaction remains coherent during a writer commit.
         assert_eq!(lookup(&snapshot, &mut cache), first);
         snapshot.commit().unwrap();
-        let snapshot = reader.unchecked_transaction().unwrap();
-        assert_eq!(lookup(&snapshot, &mut cache), first[..1]);
-        snapshot.commit().unwrap();
+        let warm = read_snapshot(&reader, |snapshot| Ok(lookup(snapshot, &mut cache)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(warm, first[..1]);
+        let mut attempts = 0;
+        let hits = read_snapshot(&reader, |snapshot| {
+            let hits = lookup(snapshot, &mut cache);
+            attempts += 1;
+            if attempts == 1 {
+                assert_eq!(hits, warm);
+                let tx = writer.transaction()?;
+                // Revoke via scope rules alone, leaving the cached vectors and
+                // item intact; also mark another item's access unverified.
+                tx.execute("UPDATE info SET value=json_set(value,'$.deny',json_array(?1)) WHERE key='scope'", [root.join("docs/doc-0.txt").to_str().unwrap()])?;
+                tx.execute("UPDATE item SET availability='unverified' WHERE display='doc-1.txt'", [])?;
+                tx.commit()?;
+            }
+            Ok(hits)
+        }).unwrap().unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(hits.len(), 6);
+        assert!(
+            hits.iter()
+                .all(|(name, _, _)| name != "doc-0.txt" && name != "doc-1.txt")
+        );
         writer.execute("UPDATE info SET value=json_set(value,'$.documents',json('false')) WHERE key='scope'", []).unwrap();
         let snapshot = reader.unchecked_transaction().unwrap();
         assert!(lookup(&snapshot, &mut cache).is_empty());

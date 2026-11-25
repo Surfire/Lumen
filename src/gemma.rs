@@ -1,9 +1,9 @@
 //! Owns a pinned llama.cpp child over a private Unix socket.
 use crate::model::{Role, Unencodable};
 use anyhow::{Context, Result, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Read, Write},
     os::unix::{
@@ -13,7 +13,6 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{LazyLock, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -21,6 +20,8 @@ use std::{
 pub const DIMENSIONS: usize = 768;
 pub const ID: &str = "gemma2/text/q8_0/b11457/retrieval-v1/768/l2/2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135";
 const MODEL_FILE: &str = "embeddinggemma-2-Q8_0.gguf";
+const VERIFICATION_CACHE: &str = ".verified-assets-v1.json";
+const MAX_CACHE_BYTES: u64 = 64 * 1024;
 const MAX_FRAME: usize = 128 * 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 const ENCODE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -62,30 +63,58 @@ impl GemmaModel {
             let mut worker = self.start()?;
             return worker.probe();
         }
-        self.assets(false)
+        self.assets(false, None)
     }
 
-    fn assets(&self, verify: bool) -> Result<()> {
+    fn assets(&self, verify: bool, projector: Option<&Path>) -> Result<()> {
         ensure!(
             cfg!(all(target_os = "macos", target_arch = "aarch64")),
             "Gemma requires Apple Silicon macOS"
         );
         let manifest: Manifest =
             serde_json::from_str(include_str!("../scripts/gemma-assets.json"))?;
-        let runtime = self.home.join("runtime");
-        for directory in [&self.home, &runtime] {
-            let mode =
-                fs::symlink_metadata(directory).context("Gemma resource directory is missing")?;
-            ensure!(
-                mode.is_dir() && mode.permissions().mode() & 0o022 == 0,
-                "Gemma resource directory must be a non-symlink writable only by its owner"
-            );
-        }
-        asset(&self.home.join(MODEL_FILE), &manifest.model, verify)?;
-        for (name, expected) in &manifest.runtime {
-            asset(&runtime.join(name), expected, verify)?;
-        }
+        self.check_assets(&manifest, verify, projector)?;
         Ok(())
+    }
+
+    // Return the number of assets actually hashed, not including cache hits.
+    fn check_assets(
+        &self,
+        manifest: &Manifest,
+        verify: bool,
+        projector: Option<&Path>,
+    ) -> Result<usize> {
+        let runtime = self.home.join("runtime");
+        let private_home = check_directory(&self.home)?.uid() == unsafe { libc::geteuid() };
+        check_directory(&runtime)?;
+        let cache_path = self.home.join(VERIFICATION_CACHE);
+        let mut cache = if verify && private_home {
+            read_verifications(&cache_path).unwrap_or_default()
+        } else {
+            Verifications::new()
+        };
+        let mut hashed = usize::from(asset(
+            &self.home.join(MODEL_FILE),
+            &manifest.model,
+            verify,
+            &mut cache,
+        )?);
+        for (name, expected) in &manifest.runtime {
+            hashed += usize::from(asset(&runtime.join(name), expected, verify, &mut cache)?);
+        }
+        if let Some(projector) = projector {
+            hashed += usize::from(asset(
+                projector,
+                &manifest.image_projector,
+                verify,
+                &mut cache,
+            )?);
+        }
+        if hashed != 0 && private_home {
+            // A read-only home or a failed cache write must not block verified assets.
+            let _ = write_verifications(&self.home, &cache_path, &cache);
+        }
+        Ok(hashed)
     }
 
     pub(crate) fn start(&self) -> Result<GemmaWorker> {
@@ -97,12 +126,7 @@ impl GemmaModel {
     }
 
     fn start_profile(&self, projector: Option<PathBuf>) -> Result<GemmaWorker> {
-        self.assets(true)?;
-        if let Some(path) = &projector {
-            let manifest: Manifest =
-                serde_json::from_str(include_str!("../scripts/gemma-assets.json"))?;
-            asset(path, &manifest.image_projector, true)?;
-        }
+        self.assets(true, projector.as_deref())?;
         let mut random = [0_u8; 32];
         File::open("/dev/urandom")?.read_exact(&mut random)?;
         let address: String = random[..16]
@@ -192,7 +216,16 @@ IFS= read -r owner || :
     }
 }
 
-#[derive(PartialEq, Eq)]
+fn check_directory(path: &Path) -> Result<fs::Metadata> {
+    let meta = fs::symlink_metadata(path).context("Gemma resource directory is missing")?;
+    ensure!(
+        meta.is_dir() && meta.mode() & 0o022 == 0,
+        "Gemma resource directory must be a non-symlink writable only by its owner"
+    );
+    Ok(meta)
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 struct AssetMetadata {
     dev: u64,
     ino: u64,
@@ -215,16 +248,59 @@ impl From<&fs::Metadata> for AssetMetadata {
     }
 }
 
+#[derive(Deserialize, Serialize)]
 struct Verification {
     metadata: AssetMetadata,
     sha256: String,
 }
 
-static VERIFIED_ASSETS: LazyLock<Mutex<HashMap<PathBuf, Verification>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+type Verifications = BTreeMap<String, Verification>;
+
+fn read_verifications(path: &Path) -> Result<Verifications> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = file.metadata()?;
+    ensure!(
+        meta.is_file() && meta.mode() & 0o777 == 0o600 && meta.uid() == unsafe { libc::geteuid() },
+        "unsafe Gemma verification cache"
+    );
+    let mut bytes = Vec::new();
+    file.take(MAX_CACHE_BYTES + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_CACHE_BYTES,
+        "oversized Gemma verification cache"
+    );
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn write_verifications(home: &Path, path: &Path, cache: &Verifications) -> Result<()> {
+    let mut nonce = [0_u8; 8];
+    File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+    let temporary = home.join(format!(
+        "{VERIFICATION_CACHE}.{:016x}.tmp",
+        u64::from_ne_bytes(nonce)
+    ));
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    // Publish complete JSON in one rename without following an existing symlink.
+    let result = (|| -> Result<()> {
+        serde_json::to_writer(file, cache)?;
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
 
 // Return whether this call actually hashed the asset.
-fn asset(path: &Path, expected: &Asset, verify: bool) -> Result<bool> {
+fn asset(path: &Path, expected: &Asset, verify: bool, cache: &mut Verifications) -> Result<bool> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -246,10 +322,9 @@ fn asset(path: &Path, expected: &Asset, verify: bool) -> Result<bool> {
     }
     let canonical = fs::canonicalize(path)?;
     let metadata = AssetMetadata::from(&meta);
-    if VERIFIED_ASSETS
-        .lock()
-        .unwrap()
-        .get(&canonical)
+    if canonical
+        .to_str()
+        .and_then(|path| cache.get(path))
         .is_some_and(|cached| cached.metadata == metadata && cached.sha256 == expected.sha256)
     {
         return Ok(false);
@@ -273,13 +348,15 @@ fn asset(path: &Path, expected: &Asset, verify: bool) -> Result<bool> {
         metadata == AssetMetadata::from(&file.metadata()?),
         "Gemma asset changed during SHA-256 verification"
     );
-    VERIFIED_ASSETS.lock().unwrap().insert(
-        canonical,
-        Verification {
-            metadata,
-            sha256: expected.sha256.clone(),
-        },
-    );
+    if let Some(path) = canonical.to_str() {
+        cache.insert(
+            path.into(),
+            Verification {
+                metadata,
+                sha256: expected.sha256.clone(),
+            },
+        );
+    }
     Ok(true)
 }
 
@@ -495,43 +572,76 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn asset_digest_cache_reuses_verified_bytes_and_invalidates_on_metadata_or_digest_change() {
-        let path = std::env::temp_dir().join(format!("lumen-gemma-digest-{}", std::process::id()));
+    fn verification_cache_survives_fresh_models_and_invalidates_on_metadata_or_digest_change() {
+        let home = std::env::temp_dir().join(format!("lumen-gemma-digest-{}", std::process::id()));
+        DirBuilder::new().mode(0o700).create(&home).unwrap();
+        DirBuilder::new()
+            .mode(0o700)
+            .create(home.join("runtime"))
+            .unwrap();
+        let path = home.join(MODEL_FILE);
+        let projector = home.join("projector.gguf");
         fs::write(&path, b"abc").unwrap();
-        let expected = Asset {
+        fs::write(&projector, b"abc").unwrap();
+        let sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let expected = || Asset {
             size: 3,
-            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+            sha256: sha256.into(),
         };
-        assert!(!asset(&path, &expected, false).unwrap());
-        assert!(asset(&path, &expected, true).unwrap());
-        assert!(!asset(&path, &expected, true).unwrap());
-        let wrong = Asset {
-            size: 3,
-            sha256: "0".repeat(64),
+        let mut manifest = Manifest {
+            model: expected(),
+            image_projector: expected(),
+            runtime: BTreeMap::new(),
         };
+        let check = |manifest: &Manifest, verify, projector: Option<&Path>| {
+            GemmaModel::installed(Some(&home))
+                .unwrap()
+                .check_assets(manifest, verify, projector)
+        };
+        let cache = home.join(VERIFICATION_CACHE);
+        assert_eq!(check(&manifest, false, None).unwrap(), 0);
+        assert!(!cache.exists());
+        assert_eq!(check(&manifest, true, None).unwrap(), 1);
+        assert_eq!(fs::metadata(&cache).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(check(&manifest, true, Some(&projector)).unwrap(), 1);
+        assert_eq!(check(&manifest, true, Some(&projector)).unwrap(), 0);
+        assert_eq!(check(&manifest, true, None).unwrap(), 0);
+
+        // An unsafe cache is a miss. Publishing a fresh cache must not follow
+        // a symlink or modify its target, even if it contains valid entries.
+        let target = home.join("moved-cache");
+        fs::rename(&cache, &target).unwrap();
+        let contents = fs::read(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &cache).unwrap();
+        assert_eq!(check(&manifest, true, Some(&projector)).unwrap(), 2);
+        assert_eq!(fs::read(&target).unwrap(), contents);
+        assert!(fs::symlink_metadata(&cache).unwrap().is_file());
+
+        manifest.model.sha256 = "0".repeat(64);
         assert!(
-            asset(&path, &wrong, true)
+            check(&manifest, true, None)
                 .unwrap_err()
                 .to_string()
                 .contains("failed SHA-256")
         );
+        manifest.model = expected();
         let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
         let mtime: SystemTime = UNIX_EPOCH + Duration::new(1_700_000_000, 123456789);
         file.set_times(FileTimes::new().set_modified(mtime))
             .unwrap();
-        assert!(asset(&path, &expected, true).unwrap());
-        assert!(!asset(&path, &expected, true).unwrap());
+        assert_eq!(check(&manifest, true, None).unwrap(), 1);
+        assert_eq!(check(&manifest, true, None).unwrap(), 0);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).unwrap();
-        assert!(asset(&path, &expected, true).unwrap());
+        assert_eq!(check(&manifest, true, None).unwrap(), 1);
         (&file).write_all(b"bad").unwrap();
         file.set_times(FileTimes::new().set_modified(mtime))
             .unwrap();
         assert!(
-            asset(&path, &expected, true)
+            check(&manifest, true, None)
                 .unwrap_err()
                 .to_string()
                 .contains("failed SHA-256")
         );
-        fs::remove_file(&path).unwrap();
+        fs::remove_dir_all(&home).unwrap();
     }
 }

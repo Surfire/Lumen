@@ -1,9 +1,9 @@
 use crate::index::{
-    Coverage, DocumentKind, can_open_document, check_document_access, document_version,
-    extract_document, remove_document, restrict_scope, save_document,
+    Coverage, DocumentKind, ImageOcrExtractor, can_open_document, check_document_access,
+    document_version, extract_document, remove_document, restrict_scope, save_document,
 };
 use crate::{MAX_DOCUMENT, PdfHelperPolicy, Scope, absolute, open_read, open_write, platform};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -245,12 +245,10 @@ pub fn index_content(database: &Path, max: usize) -> Result<ContentBatch> {
     let (mut conn, _) = open_write(&database, false)?;
     let (scope_identity, scope) = saved_scope(&conn)?;
     let configured = Coverage::new(database, &scope)?;
-    if let Some(helper) = &configured.image_ocr_helper {
-        ensure!(
-            helper.is_file(),
-            "image OCR requires the bundled LumenImageOcrExtractor; run content from Lumen.app"
-        );
-    }
+    let ocr = scope
+        .image_ocr
+        .then(ImageOcrExtractor::bundled)
+        .transpose()?;
     let mut batch = ContentBatch::default();
     let started = std::time::Instant::now();
     let (cursor, upper): (i64, i64) = conn.query_row(
@@ -293,12 +291,15 @@ pub fn index_content(database: &Path, max: usize) -> Result<ContentBatch> {
             after = id;
             // Both metadata passes and extraction must finish before acquiring the
             // SQLite write lock. Recheck the database scope and job under that lock.
-            let update = match prepare_update(&conn, &configured, id, Path::new(&path)) {
-                Ok(Some(update)) => update,
-                Ok(None) => continue,
-                Err(error) if has_io_error(&error, ErrorKind::PermissionDenied) => Update::Denied,
-                Err(error) => return Err(error),
-            };
+            let update =
+                match prepare_update(&conn, &configured, ocr.as_ref(), id, Path::new(&path)) {
+                    Ok(Some(update)) => update,
+                    Ok(None) => continue,
+                    Err(error) if has_io_error(&error, ErrorKind::PermissionDenied) => {
+                        Update::Denied
+                    }
+                    Err(error) => return Err(error),
+                };
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             if saved_scope(&tx)?.0 != scope_identity {
                 break 'batch;
@@ -361,6 +362,7 @@ enum Update {
 fn prepare_update(
     conn: &Connection,
     coverage: &Coverage,
+    ocr: Option<&ImageOcrExtractor>,
     id: i64,
     path: &Path,
 ) -> Result<Option<Update>> {
@@ -390,7 +392,11 @@ fn prepare_update(
         false
     };
     let extracted = if let Some(meta) = before.as_ref().filter(|_| !unchanged) {
-        match extract_document(coverage, path, kind, meta) {
+        let extracted = match kind {
+            DocumentKind::Image => ocr.context("image OCR is not enabled")?.extract(path, meta),
+            _ => extract_document(coverage, path, kind),
+        };
+        match extracted {
             Ok(extracted) => Some(extracted).filter(|item| !item.body.trim().is_empty()),
             Err(error) if has_io_error(&error, ErrorKind::PermissionDenied) => return Err(error),
             Err(error) if has_io_error(&error, ErrorKind::TimedOut) => return Ok(None),
@@ -618,6 +624,58 @@ mod tests {
         let recovered = index_content(&database, 1).unwrap();
         assert_eq!(recovered.indexed, 1);
         assert_eq!(recovered.pending, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn saved_ocr_helper_paths_are_ignored_and_not_reserialized() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-content-ocr-trust-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let docs = root.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(docs.join("sample.png"), b"image fixture").unwrap();
+        let helper = root.join("LumenImageOcrExtractor");
+        fs::write(
+            &helper,
+            "#!/bin/sh\ncat >/dev/null\nprintf 'untrusted OCR'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        let database = root.join("index.db");
+        crate::scan(
+            &database,
+            &Scope {
+                roots: vec![docs.clone()],
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        let report =
+            apply_content_scope_with_image_ocr(&database, vec![docs.clone()], false, true).unwrap();
+        assert_eq!(report["content"]["pending"], 1);
+        let writer = Connection::open(&database).unwrap();
+        writer
+            .execute(
+                "UPDATE info SET value=json_set(value,'$.image_ocr_helper',?1) WHERE key='scope'",
+                [helper.to_str().unwrap()],
+            )
+            .unwrap();
+        let error = index_content(&database, 1)
+            .err()
+            .expect("a standalone engine cannot run OCR");
+        assert!(
+            error
+                .to_string()
+                .contains("requires the bundled LumenImageOcrExtractor")
+        );
+        let report =
+            apply_content_scope_with_image_ocr(&database, vec![docs], false, true).unwrap();
+        assert_eq!(report["content"]["pending"], 1);
+        let (raw, _) = saved_scope(&writer).unwrap();
+        assert!(!raw.contains("image_ocr_helper"));
+        drop(writer);
         fs::remove_dir_all(root).unwrap();
     }
 

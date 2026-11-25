@@ -1,7 +1,7 @@
 use crate::{
     GemmaModel, Hit, Scope, absolute,
     content::has_table,
-    diagnose::local_stamp,
+    diagnose::{local_stamp, read_snapshot},
     gemma::{DIMENSIONS, GemmaWorker},
     image_decode::{MAX_FILE_BYTES, supported_path, thumbnail},
     model::Role,
@@ -377,10 +377,10 @@ impl<'a> ImageSearchSession<'a> {
                 .insert(self.model.start_images(&self.projector)?),
         };
         let query = worker.encode(Role::Query, text)?;
-        let snapshot = self.conn.unchecked_transaction()?;
-        let hits = search_in_snapshot(&snapshot, &query, limit, &mut self.matrix)?;
-        snapshot.commit()?;
-        Ok(hits)
+        Ok(read_snapshot(&self.conn, |snapshot| {
+            search_in_snapshot(snapshot, &query, limit, &mut self.matrix)
+        })?
+        .unwrap_or_default())
     }
 }
 
@@ -570,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn image_snapshot_retries_and_observes_latest_catalog() {
+    fn image_snapshot_never_publishes_hits_after_concurrent_scope_clear() {
         let root = fs::canonicalize(std::env::temp_dir())
             .unwrap()
             .join(format!("lumen-image-snapshot-{}", std::process::id()));
@@ -605,25 +605,44 @@ mod tests {
             )
             .unwrap();
         let reader = open_read(&database).unwrap();
-        let mut attempts = 0;
         let mut cache = MatrixCache::default();
-        let hits = crate::diagnose::read_snapshot(&reader, |snapshot| {
-            attempts += 1;
-            let hits = search_in_snapshot(snapshot, &query, 20, &mut cache)?;
-            if attempts < 3 {
+        let rank =
+            |snapshot: &Connection, cache: &mut _| search_in_snapshot(snapshot, &query, 20, cache);
+        let mut edits = 0;
+        let warm = read_snapshot(&reader, |snapshot| {
+            let hits = rank(snapshot, &mut cache)?;
+            if edits < 2 {
+                edits += 1;
                 writer.execute(
                     "UPDATE item SET display=?1 WHERE path=?2",
-                    params![format!("latest-{attempts}"), path.to_str().unwrap()],
+                    params![format!("latest-{edits}"), path.to_str().unwrap()],
                 )?;
             }
             Ok(hits)
         })
         .unwrap()
         .unwrap();
-        assert_eq!(attempts, 3);
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].name, "latest-2");
-        assert_eq!(hits[0].path, path.to_str().unwrap());
+        assert_eq!(edits, 2);
+        assert_eq!(warm.len(), 1);
+        assert_eq!(warm[0].name, "latest-2");
+        assert_eq!(warm[0].path, path.to_str().unwrap());
+
+        let mut attempts = 0;
+        let hits = read_snapshot(&reader, |snapshot| {
+            attempts += 1;
+            let hits = rank(snapshot, &mut cache)?;
+            if attempts == 1 {
+                assert_eq!(hits[0].path, path.to_str().unwrap());
+                // Commit on a different connection while the WAL reader still
+                // holds the snapshot used by the warm matrix and its hits.
+                image_scope(&database, None)?;
+            }
+            Ok(hits)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert!(hits.is_empty());
         drop(reader);
         drop(writer);
         fs::remove_dir_all(root).unwrap();

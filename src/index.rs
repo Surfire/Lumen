@@ -21,6 +21,10 @@ const APP_IMAGE_OCR_HELPER: &str = "LumenImageOcrExtractor";
 const APP_PDF_FORMAT: &str = "lumen-pdf:pdfkit-text-v2";
 
 fn is_app_pdf_helper(path: &Path) -> bool {
+    is_app_resource_helper(path, APP_PDF_HELPER)
+}
+
+fn is_app_resource_helper(path: &Path, helper: &str) -> bool {
     let Some(resources) = path.parent() else {
         return false;
     };
@@ -28,7 +32,7 @@ fn is_app_pdf_helper(path: &Path) -> bool {
         return false;
     };
     path.file_name()
-        .is_some_and(|name| name.eq_ignore_ascii_case(APP_PDF_HELPER))
+        .is_some_and(|name| name.eq_ignore_ascii_case(helper))
         && resources
             .file_name()
             .is_some_and(|name| name.eq_ignore_ascii_case("Resources"))
@@ -39,6 +43,64 @@ fn is_app_pdf_helper(path: &Path) -> bool {
             .parent()
             .and_then(Path::extension)
             .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+}
+
+pub(super) struct ImageOcrExtractor {
+    executable: PathBuf,
+    binary_stamp: String,
+}
+
+impl ImageOcrExtractor {
+    pub(super) fn bundled() -> Result<Self> {
+        let engine = fs::canonicalize(std::env::current_exe()?)?;
+        let executable = engine.with_file_name(APP_IMAGE_OCR_HELPER);
+        ensure!(
+            is_app_resource_helper(&executable, APP_IMAGE_OCR_HELPER),
+            "image OCR requires the bundled LumenImageOcrExtractor; run content from Lumen.app"
+        );
+        let binary_stamp = Self::binary_stamp(&executable)?;
+        Ok(Self {
+            executable,
+            binary_stamp,
+        })
+    }
+
+    fn binary_stamp(path: &Path) -> Result<String> {
+        let metadata = fs::symlink_metadata(path)
+            .context("read the current app's bundled image OCR extractor")?;
+        ensure!(
+            metadata.is_file() && metadata.mode() & 0o111 != 0,
+            "the current app's image OCR extractor must be an executable regular file"
+        );
+        Ok(stamp(&metadata))
+    }
+
+    pub(super) fn extract(
+        &self,
+        path: &Path,
+        meta: &fs::Metadata,
+    ) -> Result<crate::content::Extracted> {
+        let bytes = platform::read_local_checked(
+            path,
+            crate::image_decode::MAX_FILE_BYTES,
+            Some(&stamp(meta)),
+        )?;
+        ensure!(
+            self.binary_stamp == Self::binary_stamp(&self.executable)?,
+            "bundled image OCR extractor changed while running; restart from the current app"
+        );
+        // A cold Vision model load can outlast the PDFKit extraction budget.
+        let text = run_extractor(
+            &mut Command::new(&self.executable),
+            bytes,
+            MAX_DOCUMENT,
+            Duration::from_secs(30),
+        )?;
+        Ok(crate::content::Extracted {
+            body: String::from_utf8(text)?,
+            pages: Vec::new(),
+        })
+    }
 }
 
 #[derive(PartialEq, Eq)]
@@ -145,7 +207,6 @@ pub(super) struct Coverage {
     database: PathBuf,
     sidecars: [PathBuf; INDEX_SIDECARS.len()],
     pub(super) pdf: Option<PdfExtractor>,
-    pub(super) image_ocr_helper: Option<PathBuf>,
     external: Option<crate::external::Boundary>,
 }
 
@@ -199,11 +260,7 @@ impl Coverage {
                 .pdf_helper_policy
                 .or_else(|| scope.pdf_helper.as_ref().map(|_| PdfHelperPolicy::Manual)),
             image_ocr: scope.image_ocr,
-            image_ocr_helper: scope
-                .image_ocr_helper
-                .as_deref()
-                .map(absolute)
-                .transpose()?,
+            image_ocr_helper: None,
         };
         let database = platform::filesystem_spelling(&database);
         let sidecars = INDEX_SIDECARS.map(|suffix| with_suffix(&database, suffix));
@@ -212,22 +269,11 @@ impl Coverage {
         } else {
             scope.pdf_helper.as_deref().map(PdfExtractor::manual)
         };
-        let image_ocr_helper = if scope.image_ocr {
-            Some(match &scope.image_ocr_helper {
-                Some(path) => path.clone(),
-                None => {
-                    fs::canonicalize(std::env::current_exe()?)?.with_file_name(APP_IMAGE_OCR_HELPER)
-                }
-            })
-        } else {
-            None
-        };
         Ok(Self {
             scope,
             database,
             sidecars,
             pdf,
-            image_ocr_helper,
             external: None,
         })
     }
@@ -375,7 +421,6 @@ pub(super) fn startup_scope(conn: &Connection, requested: &Scope) -> Result<Scop
                 saved.pdf_helper = None;
                 saved.pdf_helper_policy = None;
                 saved.image_ocr = false;
-                saved.image_ocr_helper = None;
             }
             if requested.pdf_helper_policy == Some(PdfHelperPolicy::Bundled)
                 && saved.documents
@@ -1192,7 +1237,7 @@ impl<'a> Walk<'a> {
                     LegacyDocument::Unreadable
                 });
             }
-            let extracted = extract_document(self.coverage, path, kind, meta);
+            let extracted = extract_document(self.coverage, path, kind);
             if kind == DocumentKind::Pdf
                 && let Some(pdf) = &self.coverage.pdf
             {
@@ -1313,30 +1358,7 @@ pub(super) fn extract_document(
     coverage: &Coverage,
     path: &Path,
     kind: DocumentKind,
-    meta: &fs::Metadata,
 ) -> Result<crate::content::Extracted> {
-    if kind == DocumentKind::Image {
-        let bytes = platform::read_local_checked(
-            path,
-            crate::image_decode::MAX_FILE_BYTES,
-            Some(&stamp(meta)),
-        )?;
-        let helper = coverage
-            .image_ocr_helper
-            .as_ref()
-            .context("image OCR is not enabled")?;
-        // A cold Vision model load can outlast the PDFKit extraction budget.
-        let text = run_extractor(
-            &mut Command::new(helper),
-            bytes,
-            MAX_DOCUMENT,
-            Duration::from_secs(30),
-        )?;
-        return Ok(crate::content::Extracted {
-            body: String::from_utf8(text)?,
-            pages: Vec::new(),
-        });
-    }
     let pdf = (kind == DocumentKind::Pdf)
         .then_some(coverage.pdf.as_ref())
         .flatten();

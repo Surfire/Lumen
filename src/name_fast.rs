@@ -84,8 +84,94 @@ fn ranked_prefix(conn: &Connection, query: &str, limit: usize) -> Result<Option<
     Ok((hits.len() == limit).then_some(hits))
 }
 
+// Filenames are normalized display basenames, so a two-Han suffix in a
+// name is also a suffix of its normalized absolute path. The partial index
+// stores only such endings, including extensionless names and directories.
+const CREATE_HAN_ENDING: &str =
+    "CREATE INDEX IF NOT EXISTS item_name_han_ending ON item(substr(name,-2))
+     WHERE availability<>'unverified' AND substr(name,-2) GLOB '[㐀-鿿][㐀-鿿]'";
+
+pub(super) fn install_han_ending(conn: &Connection) {
+    if let Err(error) = conn.execute_batch(CREATE_HAN_ENDING) {
+        eprintln!("lumen: could not build short Han name index: {error}");
+    }
+}
+
+const MAX_HAN_OCCURRENCES: i64 = 8192;
+
+// For any occurrence that is not at the end of a field, its next scalar is
+// the third scalar of an existing FTS5 trigram. Seek that prefix in the
+// vocabulary and union its item IDs with the indexed terminal occurrences.
+// Keep the bounded candidate check, visibility filter and ranking in one
+// statement, so a concurrently committed change can't split their snapshots.
+const SHORT_HAN_SQL: &str = "
+    WITH occurrences AS MATERIALIZED (
+        SELECT doc AS id FROM temp.lumen_name_terms WHERE term>=?1 AND term<?2 LIMIT (?4+1)
+    ), endings AS MATERIALIZED (
+        SELECT id FROM item INDEXED BY item_name_han_ending
+        WHERE availability<>'unverified' AND substr(name,-2) GLOB '[㐀-鿿][㐀-鿿]'
+          AND substr(name,-2)=?1 LIMIT (?4+1)
+    ), checked AS MATERIALIZED (
+        SELECT (SELECT count(*) FROM occurrences)+(SELECT count(*) FROM endings)>?4 AS too_many
+    ), candidates AS MATERIALIZED (
+        SELECT id FROM occurrences WHERE NOT (SELECT too_many FROM checked)
+        UNION
+        SELECT id FROM endings WHERE NOT (SELECT too_many FROM checked)
+    ), ranked AS MATERIALIZED (
+        SELECT i.path,i.display,i.kind,i.availability,
+               CASE WHEN instr(i.name,?1)>0 THEN 'name'
+                    WHEN instr(i.full,?1)>0 OR instr(i.initials,?1)>0 THEN 'pinyin'
+                    ELSE 'path' END AS matched_by,
+               CASE WHEN i.name=?1 THEN 0 WHEN instr(i.name,?1)=1 THEN 1
+                    WHEN instr(i.name,?1)>0 THEN 2
+                    WHEN instr(i.full,?1)>0 OR instr(i.initials,?1)>0 THEN 3 ELSE 4 END AS rank,
+               length(i.display) AS width
+        FROM candidates c JOIN item i ON i.id=c.id
+        WHERE i.availability<>'unverified'
+          AND (instr(i.name,?1)>0 OR instr(i.full,?1)>0 OR instr(i.initials,?1)>0
+               OR instr(i.searchable_path,?1)>0)
+        ORDER BY rank,width,i.path LIMIT ?3
+    )
+    SELECT path,display,kind,availability,matched_by,rank,width FROM ranked
+    UNION ALL
+    SELECT NULL,NULL,NULL,NULL,NULL,-1,0 FROM checked WHERE too_many
+    ORDER BY rank,width,path";
+
+fn ranked_short_han(conn: &Connection, query: &str, limit: usize) -> Result<Option<Vec<Hit>>> {
+    let mut chars = query.chars();
+    let han = |c| matches!(c, '㐀'..='鿿');
+    if !(chars.next().is_some_and(han) && chars.next().is_some_and(han) && chars.next().is_none()) {
+        return Ok(None);
+    }
+    let installed: bool = conn
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='item_name_han_ending' AND type='index')")?
+        .query_row([], |row| row.get(0))?;
+    if !installed {
+        return Ok(None);
+    }
+    // The vocabulary is a view of committed FTS postings in this connection,
+    // so this does not add a table to the catalog or need a writer at query time.
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS temp.lumen_name_terms USING fts5vocab(main, name_fts, instance)",
+    )?;
+    let upper = prefix_end(query).expect("a two-Han query has an upper bound");
+    let mut stmt = conn.prepare_cached(SHORT_HAN_SQL)?;
+    let mut rows = stmt.query(params![query, upper, limit as i64, MAX_HAN_OCCURRENCES])?;
+    let mut hits = Vec::new();
+    while let Some(row) = rows.next()? {
+        if row.get::<_, i64>(5)? < 0 {
+            return Ok(None);
+        }
+        hits.push(row_hit(row, &row.get::<_, String>(4)?)?);
+    }
+    Ok(Some(hits))
+}
+
 pub(super) fn search_disk(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Hit>> {
     if let Some(hits) = ranked_prefix(conn, query, limit)? {
+        return Ok(hits);
+    }
+    if let Some(hits) = ranked_short_han(conn, query, limit)? {
         return Ok(hits);
     }
     const LONG: &str = "SELECT i.path,i.display,i.kind,i.availability,CASE WHEN instr(i.name,?2)>0 THEN 'name' WHEN instr(i.full,?2)>0 OR instr(i.initials,?2)>0 THEN 'pinyin' ELSE 'path' END FROM name_fts JOIN item i ON i.id=name_fts.rowid WHERE name_fts MATCH ?1 AND i.availability<>'unverified' ORDER BY CASE WHEN i.name=?2 THEN 0 WHEN instr(i.name,?2)=1 THEN 1 WHEN instr(i.name,?2)>0 THEN 2 WHEN instr(i.full,?2)>0 OR instr(i.initials,?2)>0 THEN 3 ELSE 4 END,length(i.display),i.path LIMIT ?3";
@@ -526,5 +612,39 @@ impl NameIndex {
             }
         }
         hits
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_han_candidate_limit_falls_back_without_truncating() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE item(id INTEGER PRIMARY KEY, path TEXT, display TEXT, kind TEXT,
+                              availability TEXT, name TEXT, full TEXT, initials TEXT, searchable_path TEXT);
+             CREATE VIRTUAL TABLE name_fts USING fts5(name,full,initials,searchable_path,tokenize='trigram');",
+        )?;
+        install_han_ending(&conn);
+        conn.execute(
+            "WITH RECURSIVE seq(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM seq WHERE id<?1)
+             INSERT INTO item
+             SELECT id,'/scope/'||id||'鹿鸣',id||'鹿鸣','file','local',
+                    id||'鹿鸣','','','/scope/'||id||'鹿鸣'
+             FROM seq",
+            [MAX_HAN_OCCURRENCES + 1],
+        )?;
+        conn.execute(
+            "INSERT INTO name_fts(rowid,name,full,initials,searchable_path)
+                      SELECT id,name,full,initials,searchable_path FROM item",
+            [],
+        )?;
+        assert!(ranked_short_han(&conn, "鹿鸣", 60)?.is_none());
+        let hits = search_disk(&conn, "鹿鸣", 60)?;
+        assert_eq!(hits.len(), 60);
+        assert_eq!(hits[0].name, "1鹿鸣");
+        Ok(())
     }
 }

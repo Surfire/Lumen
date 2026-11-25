@@ -390,6 +390,7 @@ pub(super) fn reconcile(
     if let Err(error) = conn.execute_batch(crate::name_fast::CREATE_NAME_ORDER) {
         eprintln!("lumen: could not build name ordering index: {error}");
     }
+    crate::name_fast::install_han_ending(conn);
     if let Some(progress) = progress {
         progress.phase(ScanPhase::Done, entries, Some(entries));
     }

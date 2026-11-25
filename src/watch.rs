@@ -253,6 +253,9 @@ mod macos {
                 resume::verify_access(conn, None)?;
             }
             reconcile_startup(conn, &coverage, &mut sub, progress)?;
+        } else {
+            // Existing catalogs can migrate without forcing a full walk.
+            crate::name_fast::install_han_ending(conn);
         }
         emit(WatchEvent::Ready).context("emit watch ready event")?;
 

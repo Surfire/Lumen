@@ -79,6 +79,101 @@ pub fn diagnose(database: &Path, path: &Path) -> Diagnosis {
     inspect(&snapshot, &database, &path)
 }
 
+/// Check one previously presented hit against the committed catalog and the
+/// current filesystem. The lookup uses the exact saved path and reads no bytes.
+pub fn validate_hit(
+    database: &Path,
+    path: &Path,
+    kind: &str,
+    availability: &str,
+    stamp: Option<&str>,
+) -> bool {
+    #[cfg(target_os = "macos")]
+    let Ok(_io) = crate::platform::NoMaterialization::enter() else {
+        return false;
+    };
+    if !path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
+        return false;
+    }
+    let result = (|| -> crate::Result<bool> {
+        let database = absolute(database)?;
+        let conn = open_read(&database)?;
+        let before = crate::name_fast::data_version(&conn)?;
+        let snapshot = conn.unchecked_transaction()?;
+        let visible = validate_in_snapshot(&snapshot, &database, path, kind, availability, stamp)?;
+        drop(snapshot);
+        Ok(visible && before == crate::name_fast::data_version(&conn)?)
+    })();
+    result.unwrap_or(false)
+}
+
+fn validate_in_snapshot(
+    conn: &Connection,
+    database: &Path,
+    path: &Path,
+    kind: &str,
+    availability: &str,
+    stamp: Option<&str>,
+) -> crate::Result<bool> {
+    if !matches!(kind, "file" | "directory")
+        || !matches!(
+            availability,
+            "local" | "provider_metadata_only" | "placeholder"
+        )
+    {
+        return Ok(false);
+    }
+    let Some(scope) = saved_index_scope(conn)? else {
+        return Ok(false);
+    };
+    let sidecars = INDEX_SIDECARS.map(|suffix| with_suffix(database, suffix));
+    let path = absolute(path)?;
+    if !scope.roots.iter().any(|root| path.starts_with(root))
+        || !scope.allows(&path)
+        || is_index_path(&path, database, &sidecars)
+    {
+        return Ok(false);
+    }
+    let Some(text) = path.to_str() else {
+        return Ok(false);
+    };
+    let id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM item WHERE path=?1 AND kind=?2 AND availability=?3
+             AND availability<>'unverified'",
+            [text, kind, availability],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(id) = id else {
+        return Ok(false);
+    };
+    let Ok(file) = selected_metadata(&path, kind == "directory") else {
+        return Ok(false);
+    };
+    // Require the same path spelling, so a replacement or alias cannot
+    // direct the action at a different entry allowed by the filesystem.
+    if file.path != path || file.availability != availability {
+        return Ok(false);
+    }
+    let Some(stamp) = stamp else {
+        return Ok(true);
+    };
+    if !scope.documents || file.stamp.as_deref() != Some(stamp) {
+        return Ok(false);
+    }
+    let (column, join) = document_stamp_sql(conn)?;
+    let stored = conn
+        .query_row(
+            &format!("SELECT {column} AS document_stamp FROM document d {join} WHERE d.id=?1"),
+            [id],
+            read_document_stamp,
+        )
+        .optional()?
+        .flatten();
+    Ok(stored.as_deref() == Some(stamp))
+}
+
 fn inspect(conn: &Connection, database: &Path, path: &Path) -> Diagnosis {
     let Ok(Some(scope)) = saved_index_scope(conn) else {
         return Diagnosis::blocked(Reason::ScopeUnknown);
@@ -98,7 +193,7 @@ fn inspect(conn: &Connection, database: &Path, path: &Path) -> Diagnosis {
     if let Some(reason) = ruled_out(path) {
         return Diagnosis::blocked(reason);
     }
-    let file = match selected_metadata(path) {
+    let file = match selected_metadata(path, false) {
         Ok(file) => file,
         Err(reason) => return Diagnosis::blocked(reason),
     };
@@ -206,7 +301,7 @@ struct Selected {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn selected_metadata(_: &Path) -> Result<Selected, Reason> {
+fn selected_metadata(_: &Path, _: bool) -> Result<Selected, Reason> {
     Err(Reason::Unknown)
 }
 
@@ -220,7 +315,7 @@ fn metadata_availability(path: &Path, flags: u32, leaf: bool) -> Result<&'static
 }
 
 #[cfg(target_os = "macos")]
-fn selected_metadata(path: &Path) -> Result<Selected, Reason> {
+fn selected_metadata(path: &Path, directory_hit: bool) -> Result<Selected, Reason> {
     use crate::platform::descriptor_path;
     use std::{
         ffi::CString,
@@ -274,7 +369,12 @@ fn selected_metadata(path: &Path) -> Result<Selected, Reason> {
         if file_type == libc::S_IFLNK {
             return Err(Reason::Symlink);
         }
-        if leaf && file_type != libc::S_IFREG {
+        let expected_leaf = if directory_hit {
+            libc::S_IFDIR
+        } else {
+            libc::S_IFREG
+        };
+        if leaf && file_type != expected_leaf {
             return Err(Reason::NotFile);
         }
         if !leaf && file_type != libc::S_IFDIR {
@@ -293,10 +393,10 @@ fn selected_metadata(path: &Path) -> Result<Selected, Reason> {
                 stamp: None,
             });
         }
-        let flags = if leaf {
-            METADATA_ONLY
-        } else {
+        let flags = if !leaf || directory_hit {
             METADATA_ONLY | libc::O_DIRECTORY
+        } else {
+            METADATA_ONLY
         };
         let fd = unsafe {
             libc::openat(

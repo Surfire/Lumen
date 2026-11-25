@@ -47,6 +47,10 @@ struct EmbeddingBatch: Decodable {
     let has_more: Bool
 }
 
+private struct HitValidation: Decodable {
+    let valid: Bool
+}
+
 private struct WatchEvent: Decodable {
     enum Kind: String, Decodable { case ready, updated }
     let event: Kind
@@ -131,7 +135,9 @@ final class Launcher: ObservableObject {
     private var modelInspection: Process?
     private var diagnosisProcess: Process?
     private var diagnosisGeneration: UInt64 = 0
-    private var debounce: Task<Void, Never>?
+    private var textDebounce: Task<Void, Never>?
+    private var nameBypassDelay: Task<Void, Never>?
+    private var nameBypassProcess: Process?
     private var semanticDebounce: Task<Void, Never>?
     private var firstNamesReady = false
     // An existing index may contain paths hidden by permission changes while Lumen was closed.
@@ -147,6 +153,7 @@ final class Launcher: ObservableObject {
     private var modelCheckGeneration: UInt64 = 0
     private var actionProcess: Process?
     private var actionIntent: UInt64 = 0
+    private var supportsTargetedValidation = true
     private var closed = false
 
     var zh: Bool {
@@ -209,7 +216,8 @@ final class Launcher: ObservableObject {
 
     func close() {
         closed = true
-        debounce?.cancel()
+        textDebounce?.cancel()
+        cancelNameBypass()
         semanticDebounce?.cancel()
         cancelCoverageRead()
         cancelModelCheck()
@@ -264,6 +272,10 @@ final class Launcher: ObservableObject {
 
     func retrySearch() { scheduleSearch() }
 
+    func warmNameSearch() {
+        if canSearch && !closed { engine.warmNameSearch() }
+    }
+
     func clear() {
         query = ""
         scheduleSearch(clearRows: true)
@@ -272,7 +284,8 @@ final class Launcher: ObservableObject {
     private func invalidateSearch(clearRows: Bool = true, keepAction: Bool = false) {
         revision &+= 1
         rejectedPaths.removeAll()
-        debounce?.cancel()
+        textDebounce?.cancel()
+        cancelNameBypass()
         cancelRelatedExcerpts()
         engine.discardQueuedSearch()
         if textProcess?.isRunning == true { textProcess?.terminate() }
@@ -299,77 +312,123 @@ final class Launcher: ObservableObject {
         guard shouldSearch else { return }
         searching = true
         let current = revision
-        debounce = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(35))
-            guard !Task.isCancelled, let self, self.revision == current else { return }
-            self.search(revision: current)
-        }
+        search(revision: current, watchRefresh: keepAction)
     }
 
-    private func search(revision: UInt64) {
+    private func search(revision: UInt64, watchRefresh: Bool) {
+        let term = query
+        let keepStablePreviewRows = watchRefresh && presentedQuery == term && hits.contains(where: \.hasPreview)
         var names: Result<[SearchHit], SearchFailure>?
         var text: Result<[SearchHit], SearchFailure>?
-        var delivery = 0
+        var related: [SearchHit] = []
+        let oldRelated = presentedQuery == term && localModelState == .ready
+            ? hits.filter(\.isSemanticCandidate) : []
+        // Short text falls back to a document scan. A one-character edit is a name lookup.
+        let searchesText = term.trimmingCharacters(in: .whitespacesAndNewlines).count >= 2 &&
+            gemmaCoverage?.documents_enabled != false
+        if !searchesText { text = .success([]) }
 
-        let publish = { [weak self] (allowPartial: Bool) in
-            guard let self, self.revision == revision, !self.closed, let names, allowPartial || text != nil else { return }
-            let complete = text != nil
-            let nameHits = (try? names.get()) ?? []
-            guard complete || !nameHits.isEmpty else { return }
-            delivery += 1
-            let snapshot = delivery
-            let textHits = (try? text?.get()) ?? []
+        let publish = { [weak self] in
+            guard let self, self.revision == revision, !self.closed else { return }
+            let complete = names != nil && text != nil
+            // Keep the same query's preview rows in place during a watch refresh.
+            // They remain nonactionable until refreshed, and watch independently drops a stale stamp.
+            guard complete || !keepStablePreviewRows else { return }
+            let nameHits = (try? names?.get()) ?? []
             let strongNames = nameHits.filter { $0.matched_by != "path" }
-            let weakPaths = nameHits.filter { $0.matched_by == "path" }
+            let bodyHits = (try? text?.get()) ?? []
+            // Keep provisional path filler below body hits and out of the first result update.
+            let weakPaths = complete ? nameHits.filter { $0.matched_by == "path" } : []
             var seen = Set<String>()
-            let lexical = Array((strongNames + textHits + weakPaths).filter { seen.insert($0.path).inserted }.prefix(60))
-            let retained = self.presentedQuery == self.query && self.localModelState == .ready &&
-                self.shouldFindRelatedExcerpts(directCount: lexical.count)
-                ? self.hits.filter(\.isSemanticCandidate) : []
-            self.validatePreviews(lexical + retained, revision: revision) { [weak self] available in
-                guard let self, delivery == snapshot else { return }
-                self.presentedQuery = self.query
-                self.directHits = available.filter { !$0.isSemanticCandidate }
-                self.resultsRevision = revision
-                self.publishWithRelated(available.filter(\.isSemanticCandidate))
-                if complete {
-                    self.searching = false
-                    if case .failure(let error) = names, case .failure? = text {
-                        self.searchNotice = LauncherNotice(.search, error.detail)
-                    }
-                    self.queueRelatedExcerpts()
+            let lexical = Array((strongNames + bodyHits + weakPaths).filter { seen.insert($0.path).inserted }.prefix(60))
+            guard complete || !lexical.isEmpty else { return }
+            self.presentedQuery = term
+            self.directHits = lexical
+            self.resultsRevision = revision
+            self.publishWithRelated(self.shouldFindRelatedExcerpts(directCount: lexical.count) ? related : [])
+            if complete {
+                self.searching = false
+                if case .failure(let error) = names, case .failure? = text {
+                    self.searchNotice = LauncherNotice(.search, error.detail)
+                }
+                self.queueRelatedExcerpts()
+            }
+        }
+
+        if !oldRelated.isEmpty {
+            validatePreviews(oldRelated, revision: revision) { [weak self] available in
+                guard let self, self.relatedRevision != revision else { return }
+                related = available
+                publish()
+            }
+        }
+        // A previous one-character or unindexed query may still be running on the warm server.
+        // Two Han characters have a bounded disk fast path in the engine.
+        let scalars = term.trimmingCharacters(in: .whitespacesAndNewlines).unicodeScalars
+        let canBypass = engine.nameSearchBusy && scalars.count == 2 &&
+            scalars.allSatisfy { (0x3400...0x9fff).contains($0.value) }
+        var warmFinished = false
+        var bypassFinished = !canBypass
+        let acceptNames = { [weak self] (result: Result<[SearchHit], SearchFailure>, fromWarm: Bool) in
+            guard let self, self.revision == revision, !self.closed, names == nil else { return }
+            if fromWarm { warmFinished = true } else { bypassFinished = true }
+            switch result {
+            case .success(let hits):
+                // Name replies have no snippets to inspect on disk.
+                names = .success(hits.filter { !$0.hasPreview })
+                if fromWarm { self.cancelNameBypass() } else { self.engine.discardQueuedSearch() }
+            case .failure where warmFinished && bypassFinished:
+                names = result
+            case .failure:
+                return
+            }
+            publish()
+        }
+        engine.search(term, mode: "name") { acceptNames($0, true) }
+        if canBypass {
+            nameBypassDelay = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(30))
+                guard !Task.isCancelled, let self, self.revision == revision, names == nil else { return }
+                self.nameBypassProcess = self.engine.run(["query", "--mode", "name", "--limit", "60", "--", term]) { [weak self] response in
+                    guard let self, self.revision == revision else { return }
+                    self.nameBypassProcess = nil
+                    acceptNames(self.searchResult(from: response), false)
                 }
             }
         }
-
-        // Only the name lane needs the engine's persistent in-memory name index.
-        engine.search(query, mode: "name") { [weak self] result in
-            guard self?.revision == revision else { return }
-            names = result
-            publish(false)
-        }
-        let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Ignore single characters: the engine's short-text fallback scans all document bodies.
-        if term.count < 2 {
-            text = .success([])
-            publish(false)
-            return
-        }
-        textProcess = engine.run(["query", "--mode", "text", "--limit", "24", "--", query]) { [weak self] response in
-            guard let self, self.revision == revision, !self.closed else { return }
-            self.textProcess = nil
-            if response.succeeded, let hits = try? JSONDecoder().decode([SearchHit].self, from: response.output) {
-                text = .success(hits)
-            } else {
-                text = .failure(SearchFailure(response.diagnostic))
+        guard searchesText else { return }
+        textDebounce = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(55))
+            guard !Task.isCancelled, let self, self.revision == revision else { return }
+            self.textProcess = self.engine.run(["query", "--mode", "text", "--limit", "24", "--", term]) { [weak self] response in
+                guard let self, self.revision == revision, !self.closed else { return }
+                self.textProcess = nil
+                switch self.searchResult(from: response) {
+                case .success(let hits):
+                    self.validatePreviews(hits, revision: revision) { available in
+                        text = .success(available)
+                        publish()
+                    }
+                case .failure(let failure):
+                    text = .failure(failure)
+                    publish()
+                }
             }
-            publish(false)
         }
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(110))
-            guard self?.revision == revision, text == nil else { return }
-            publish(true)
+    }
+
+    private func cancelNameBypass() {
+        nameBypassDelay?.cancel()
+        nameBypassDelay = nil
+        if nameBypassProcess?.isRunning == true { nameBypassProcess?.terminate() }
+        nameBypassProcess = nil
+    }
+
+    private func searchResult(from response: EngineResponse) -> Result<[SearchHit], SearchFailure> {
+        if response.succeeded, let hits = try? JSONDecoder().decode([SearchHit].self, from: response.output) {
+            return .success(hits)
         }
+        return .failure(SearchFailure(response.diagnostic))
     }
 
     private func validatePreviews(_ hits: [SearchHit], revision: UInt64, complete: @escaping ([SearchHit]) -> Void) {
@@ -434,9 +493,25 @@ final class Launcher: ObservableObject {
     private func revalidate(_ hit: SearchHit, retry: Bool, complete: @escaping (URL) -> Void) {
         let current = revision
         let intent = actionIntent
-        let arguments = hit.isSemanticCandidate ? semanticArguments() :
-            ["query", "--mode", hit.matched_by == "text" ? "text" : "name",
-             "--limit", hit.matched_by == "text" ? "24" : "60", "--", query]
+        let text = hit.matched_by == "text"
+        let mode = text ? "text" : "name"
+        let targeted = !hit.isSemanticCandidate && supportsTargetedValidation
+        let arguments: [String]
+        if targeted {
+            var validation = ["validate-hit", "--kind", hit.kind, "--availability", hit.availability]
+            if text || hit.hasPreview {
+                guard let stamp = hit.document_stamp else {
+                    rejectStaleResult(hit)
+                    return
+                }
+                validation += ["--document-stamp", stamp]
+            }
+            arguments = validation + ["--", hit.path]
+        } else if hit.isSemanticCandidate {
+            arguments = semanticArguments()
+        } else {
+            arguments = ["query", "--mode", mode, "--limit", text ? "24" : "60", "--", query]
+        }
         let permitsDelivery = { [weak self] in
             guard let self, !self.closed, self.actionIntent == intent, self.canSearch else { return false }
             if self.revision == current { return true }
@@ -448,10 +523,18 @@ final class Launcher: ObservableObject {
             }
             return false
         }
-        actionProcess = engine.run(arguments) { [weak self] response in
+        actionProcess = engine.run(arguments, priority: .userInitiated) { [weak self] response in
             guard let self, permitsDelivery() else { return }
-            let fresh = try? JSONDecoder().decode([SearchHit].self, from: response.output)
-            guard response.succeeded, fresh?.contains(hit) == true else {
+            if targeted, !response.succeeded, response.diagnostic.contains("unrecognized subcommand 'validate-hit'") {
+                self.supportsTargetedValidation = false
+                self.revalidate(hit, retry: retry, complete: complete)
+                return
+            }
+            let decoder = JSONDecoder()
+            let confirmed = targeted
+                ? (try? decoder.decode(HitValidation.self, from: response.output))?.valid == true
+                : (try? decoder.decode([SearchHit].self, from: response.output))?.contains(hit) == true
+            guard response.succeeded, confirmed else {
                 if hit.isSemanticCandidate { recordModelFailure(response.diagnostic) }
                 self.rejectStaleResult(hit)
                 return

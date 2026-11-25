@@ -166,6 +166,16 @@ enum Action {
         #[command(flatten)]
         semantic: SemanticArgs,
     },
+    /// Confirm a previously presented hit by exact path without repeating search.
+    ValidateHit {
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        availability: String,
+        #[arg(long)]
+        document_stamp: Option<String>,
+        path: PathBuf,
+    },
     /// Explain one explicitly selected path using only metadata and the saved index.
     Diagnose { path: PathBuf },
     /// Embed the next batch of document chunks locally (defaults to Gemma).
@@ -343,6 +353,16 @@ fn main() -> Result<()> {
                 )?
             };
             println!("{}", serde_json::to_string_pretty(&hits)?);
+        }
+        Action::ValidateHit {
+            path,
+            kind,
+            availability,
+            document_stamp,
+        } => {
+            let valid =
+                lumen::validate_hit(&db, &path, &kind, &availability, document_stamp.as_deref());
+            println!("{}", json!({"valid":valid}));
         }
         Action::Diagnose { path } => {
             println!("{}", serde_json::to_string(&lumen::diagnose(&db, &path))?);

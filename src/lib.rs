@@ -10,7 +10,7 @@ mod progress;
 mod semantic;
 mod watch;
 
-pub use diagnose::{Diagnosis, Reason as DiagnoseReason, diagnose};
+pub use diagnose::{Diagnosis, Reason as DiagnoseReason, diagnose, validate_hit};
 pub use gemma::{GemmaModel, ID as GEMMA_MODEL_ID};
 pub use index::{scan, scan_with_progress};
 pub use model::{BgeModel, Model, ModelBackend};
@@ -465,7 +465,13 @@ fn search_with_names(
     if mode == Mode::All && hits.len() < limit {
         seen.extend(hits.iter().map(|hit| hit.path.clone()));
     }
-    if matches!(mode, Mode::Text | Mode::All) && hits.len() < limit {
+    if matches!(mode, Mode::Text | Mode::All) && hits.len() < limit
+        // The short-text query can drive the join in item path order. An
+        // empty document table should not lead to a catalog-wide pass.
+        && (q.chars().count() >= 3 || conn.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM document)"
+        )?.query_row([], |row| row.get::<_, bool>(0))?)
+    {
         let (stamp, state_join) = document_stamp_sql(conn)?;
         let sql = if q.chars().count() >= 3 {
             format!("SELECT i.path,i.display,i.kind,i.availability,d.body,{stamp} AS document_stamp

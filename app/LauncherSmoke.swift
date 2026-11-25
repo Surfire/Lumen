@@ -15,7 +15,10 @@ final class LauncherSmoke {
     private let startsWithIndex: Bool
     private let controlledTiming: Bool
     var opened: URL?
-    var revealed: URL?
+    var revealed: URL? {
+        didSet { revealDispatch = revealed == nil ? nil : .now }
+    }
+    private var revealDispatch: ContinuousClock.Instant?
     var wasActivated = false
     var chosenSettingsDirectories: [URL]?
     var chosenDiagnosticFile: URL?
@@ -198,6 +201,7 @@ final class LauncherSmoke {
                     try await verifyInstalledModel(app)
                     return
                 }
+                if executable == nil && !startsWithIndex { try await measureBundledHan(app) }
                 try await verifyWatch(app)
                 try await verifyAppliedScope(app)
             }
@@ -365,10 +369,66 @@ final class LauncherSmoke {
         }
         try check(model.selection == selected, "body results stole selection")
 
+        try type("waiting old name", into: app)
+        try await until("an older name lookup was held") { self.exists("pre-han-name-started") }
+        let began: ContinuousClock.Instant = .now
+        var firstName: ContinuousClock.Instant?
+        let observeFirst = model.$hits.sink { hits in
+            if firstName == nil && hits.first?.name == "鹿鸣.md" {
+                firstName = .now
+            }
+        }
+        defer { observeFirst.cancel() }
+        try type("鹿鸣", into: app)
+        try await until("the Han body lookup was held independently") { self.exists("han-body-started") }
+        try await until("the Han filename became actionable while text was held") {
+            model.selectedHit?.name == "鹿鸣.md" && model.searching && self.exists("han-disk-name-started")
+        }
+        let enter: ContinuousClock.Instant = .now
+        try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
+        try await until("Finder dispatch did not wait for the held Han body query") {
+            self.revealed?.lastPathComponent == "鹿鸣.md" && model.searching && self.exists("han-validation-started")
+        }
+        guard let firstName, let revealDispatch else { throw Failure("missing search or Finder timestamps") }
+        print(String(format: "Han control-path timing: input to first name %.1f ms, Command–Return to dispatch %.1f ms",
+                     milliseconds(began.duration(to: firstName)), milliseconds(enter.duration(to: revealDispatch))))
+        revealed = nil
+        try signal("finish-pre-han-name")
+        try signal("finish-han-body")
+        try await until("the delayed Han body merged below the selected filename") {
+            !model.searching && model.selectedHit?.name == "鹿鸣.md" &&
+                model.hits.contains { $0.name == "local-field-notes.md" && $0.matched_by == "text" }
+        }
+
+        let stableHanRows = model.hits
+        try signal("hold-han-refresh-body")
+        try signal("update-watch")
+        try await until("watch started rechecking the visible Han body result") { self.exists("han-refresh-body-started") }
+        try check(model.hits == stableHanRows && model.selectedHit == nil,
+                  "the same query flashed its old rows or left the prior revision actionable during watch refresh")
+        try signal("finish-han-refresh-body")
+        try await until("watch published the same complete rows") {
+            !model.searching && model.hits == stableHanRows && model.selectedHit?.name == "鹿鸣.md"
+        }
+
+        try type("late lexical delivery", into: app)
+        try await until("the lexical name lane was held") { self.exists("late-name-started") }
+        try await until("validated text was shown while names were still held") {
+            model.searching && model.selectedHit?.name == "body-before-name.md" &&
+                model.selectedHit?.matched_by == "text"
+        }
+        let bodySelection = model.selection
+        try signal("finish-late-name")
+        try await until("late strong names ranked first without moving selection") {
+            !model.searching && model.hits.first?.name == "late lexical delivery.md" &&
+                model.selection == bodySelection
+        }
+        let latestSelection = model.selection
+
         try type("obsolete", into: app)
         try await until("obsolete reply intentionally held") { self.exists("obsolete-started") }
         try type("qingshan", into: app)
-        try check(model.selection == selected && !model.hits.isEmpty && model.selectedHit == nil,
+        try check(model.selection == latestSelection && !model.hits.isEmpty && model.selectedHit == nil,
                   "editing cleared the previous rows or kept an obsolete result actionable")
         try key(kVK_Return, "\r", in: app)
         try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
@@ -390,10 +450,37 @@ final class LauncherSmoke {
                   "a weaker path match outranked text or a strong name")
         model.selection = model.hits[body].path
         try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
-        try await until("body hit revalidated in its source lane") { self.revealed?.lastPathComponent == "body-match.md" }
+        try await until("body hit revalidated in its source lane") {
+            self.revealed?.lastPathComponent == "body-match.md" && self.exists("body-validation-started")
+        }
         revealed = nil
         try check(app.panel.frame == frame && app.panel.contentView === chrome && resizeCount == 0,
                   "typing or result lane delivery resized or replaced the launcher")
+    }
+
+    private func measureBundledHan(_ app: AppDelegate) async throws {
+        let model = app.model
+        var firstName: ContinuousClock.Instant?
+        let observe = model.$hits.sink { hits in
+            if firstName == nil && hits.first?.name == "鹿鸣.md" { firstName = .now }
+        }
+        defer { observe.cancel() }
+        let began: ContinuousClock.Instant = .now
+        try type("鹿鸣", into: app)
+        try await until("bundled engine returned the selected Han filename") {
+            model.selectedHit?.name == "鹿鸣.md"
+        }
+        let enter: ContinuousClock.Instant = .now
+        try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
+        try await until("bundled engine validated the Han Finder action") { self.revealed?.lastPathComponent == "鹿鸣.md" }
+        guard let firstName, let revealDispatch else { throw Failure("missing bundled search or Finder timestamps") }
+        print(String(format: "Bundled Han timing: input to first name %.1f ms, Command–Return to dispatch %.1f ms",
+                     milliseconds(began.duration(to: firstName)), milliseconds(enter.duration(to: revealDispatch))))
+        revealed = nil
+    }
+
+    private func milliseconds(_ duration: Duration) -> Double {
+        Double(duration.components.seconds) * 1_000 + Double(duration.components.attoseconds) / 1e15
     }
 
     private func verifySettings(_ app: AppDelegate) async throws {
@@ -458,7 +545,10 @@ final class LauncherSmoke {
 
         app.showSearch()
         try type("protected-neighbor", into: app)
-        try await until("the draft did not hide live results") { model.selectedHit?.name == "protected-neighbor.md" }
+        try await until("the draft did not hide live results") {
+            !model.searching && model.selectedHit?.name == "protected-neighbor.md"
+        }
+        try check(!exists("metadata-only-body-started"), "metadata-only scope launched a text query")
         session.page = .about
         try check(session.canRebuild, "advanced maintenance did not recognize a saved scope")
         model.rebuildSavedIndex()
@@ -788,10 +878,11 @@ final class LauncherSmoke {
         try await until("name search continued during model verification") {
             !model.searching && model.hits.prefix(2).map(\.name) == ["archive-one.txt", "archive-two.txt"]
         }
+        let selected = model.selection
         try signal("finish-model-check")
         try await until("verified Gemma backend is ready") { model.localModelState == .ready }
-        try check(!exists("semantic-serve-launches") && model.selectedHit?.name == "notes.md",
-                  "verification launched an unrelated semantic request")
+        try check(!exists("semantic-serve-launches") && model.selection == selected,
+                  "verification launched an unrelated semantic request or moved the selection")
     }
 
     private func verifyAppliedScope(_ app: AppDelegate) async throws {

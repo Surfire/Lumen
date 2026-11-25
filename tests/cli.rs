@@ -362,6 +362,71 @@ fn disk_name_order_migrates_existing_indexes_and_respects_scope() {
 }
 
 #[test]
+fn two_han_disk_search_preserves_rank_suffixes_and_scope() {
+    let f = Fixture::new();
+    let root = f.0.join("scope");
+    let exact = root.join("鹿鸣");
+    let denied = root.join("denied");
+    fs::create_dir_all(&exact).unwrap();
+    fs::create_dir_all(&denied).unwrap();
+    fs::write(exact.join("path-only.txt"), "").unwrap();
+    fs::write(denied.join("隐藏鹿鸣"), "").unwrap();
+    for name in ["鹿鸣前缀.txt", "新鹿鸣资料.txt", "尾鹿鸣"] {
+        fs::write(root.join(name), "").unwrap();
+    }
+    let r = root.to_str().unwrap();
+    f.run(&["index", "--root", r]);
+    let query = || f.run(&["query", "--mode", "name", "--limit", "60", "--", "鹿鸣"]);
+    let accelerated = query();
+    let names = |result: &Value| {
+        result
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["name"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        names(&accelerated),
+        [
+            "鹿鸣",
+            "鹿鸣前缀.txt",
+            "尾鹿鸣",
+            "隐藏鹿鸣",
+            "新鹿鸣资料.txt",
+            "path-only.txt"
+        ]
+    );
+    assert_eq!(accelerated[5]["matched_by"], "path");
+
+    let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+    db.execute("DROP INDEX item_name_han_ending", []).unwrap();
+    assert_eq!(query(), accelerated);
+    f.run(&["index", "--root", r, "--deny", denied.to_str().unwrap()]);
+    assert_eq!(
+        names(&query()),
+        [
+            "鹿鸣",
+            "鹿鸣前缀.txt",
+            "尾鹿鸣",
+            "新鹿鸣资料.txt",
+            "path-only.txt"
+        ]
+    );
+
+    // A retained FTS posting cannot make an unverified row visible.
+    db.execute(
+        "UPDATE item SET availability='unverified' WHERE display='新鹿鸣资料.txt'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        names(&query()),
+        ["鹿鸣", "鹿鸣前缀.txt", "尾鹿鸣", "path-only.txt"]
+    );
+}
+
+#[test]
 fn deny_invalid_database_without_touching_it() {
     let f = Fixture::new();
     let db = f.0.join("test.sqlite");
@@ -481,6 +546,62 @@ mod live {
                 thread::sleep(Duration::from_millis(20));
             }
         }
+    }
+
+    #[test]
+    fn validates_only_the_current_scoped_hit_for_an_action() {
+        let f = Fixture::new();
+        let root = f.0.join("scope");
+        let file = root.join("notes.txt");
+        let folder = root.join("directory");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(&file, "document-backed action proof").unwrap();
+        let r = root.to_str().unwrap();
+        f.run(&["index", "--root", r, "--documents"]);
+        let valid = |path: &Path, kind: &str, stamp: Option<&str>| {
+            let mut args = vec!["validate-hit", "--kind", kind, "--availability", "local"];
+            if let Some(stamp) = stamp {
+                args.extend(["--document-stamp", stamp]);
+            }
+            args.extend(["--", path.to_str().unwrap()]);
+            f.run(&args) == serde_json::json!({"valid":true})
+        };
+        let text = f.run(&["query", "--mode", "text", "action proof"]);
+        let stamp = text[0]["document_stamp"].as_str().unwrap();
+        assert!(valid(&file, "file", None));
+        assert!(valid(&file, "file", Some(stamp)));
+        assert!(valid(&folder, "directory", None));
+        assert!(!valid(&file, "directory", None));
+        assert!(!valid(&root.join("directory/../notes.txt"), "file", None));
+
+        // A file can change before the watcher commits, and stale preview
+        // stamps must fail even if the indexed path still exists.
+        fs::write(&file, "replacement document").unwrap();
+        assert!(!valid(&file, "file", Some(stamp)));
+        fs::remove_file(&file).unwrap();
+        assert!(!valid(&file, "file", None));
+        let outside = f.0.join("outside.txt");
+        fs::write(&outside, "outside scope").unwrap();
+        symlink(&outside, &file).unwrap();
+        assert!(!valid(&file, "file", None));
+        assert!(!valid(&outside, "file", None));
+
+        let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+        db.execute(
+            "UPDATE item SET availability='unverified' WHERE display='directory'",
+            [],
+        )
+        .unwrap();
+        assert!(!valid(&folder, "directory", None));
+        f.run(&[
+            "index",
+            "--root",
+            r,
+            "--deny",
+            folder.to_str().unwrap(),
+            "--documents",
+        ]);
+        assert!(!valid(&folder, "directory", None));
     }
 
     #[test]

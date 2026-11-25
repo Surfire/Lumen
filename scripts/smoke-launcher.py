@@ -212,13 +212,35 @@ if action == "query" and args[:2] == ["--mode", "semantic"]:
     print(json.dumps(related_hits(args[-1])))
     sys.exit(0)
 
+if action == "validate-hit":
+    assert args[0] == "--kind" and args[2] == "--availability" and args[-2] == "--", args
+    path = Path(args[-1])
+    assert path.is_absolute()
+    if path.name == "鹿鸣.md":
+        assert args[:-2] == ["--kind", "file", "--availability", "local"]
+        (work / "han-validation-started").touch()
+    if path.name == "body-match.md":
+        assert args[:5] == ["--kind", "file", "--availability", "local", "--document-stamp"]
+        assert args[5] == indexed_documents()[str(path)]["stamp"]
+        (work / "body-validation-started").touch()
+    if path.name == "cloudledger.txt" and (work / "hold-cloud-reveal").exists() and not (work / "finish-cloud-reveal").exists():
+        assert args[:-2] == ["--kind", "file", "--availability", "provider_metadata_only"]
+        gate("cloud-reveal")
+    os.execv(engine, [engine, db, database, action, *args])
+
 if action == "query":
     hits = query_hits(args)
-    if args[:2] == ["--mode", "name"] and args[-1] == "cloudledger":
-        if (work / "hold-cloud-reveal").exists() and not (work / "finish-cloud-reveal").exists():
-            gate("cloud-reveal")
+    if args[:2] == ["--mode", "name"] and args[-1] == "鹿鸣":
+        (work / "han-disk-name-started").touch()
     if args[:2] == ["--mode", "text"]:
         term = args[-1]
+        if term == "鹿鸣":
+            if (work / "hold-han-refresh-body").exists() and not (work / "finish-han-refresh-body").exists():
+                gate("han-refresh-body")
+            elif not (work / "finish-han-body").exists():
+                gate("han-body")
+        if term == "protected-neighbor" and (work / "settings-scenario").exists():
+            (work / "metadata-only-body-started").touch()
         if term == "archive" and (work / "hold-archive-text").exists() and not (work / "finish-archive-text").exists():
             gate("archive-text")
         if term == "privateneedle" and (work / "hold-scope-search").exists():
@@ -237,6 +259,10 @@ if action == "serve":
         assert req["mode"] == "name"
         if req["query"] == "obsolete" and not (work / "finish-obsolete").exists():
             gate("obsolete")
+        if req["query"] == "waiting old name" and not (work / "finish-pre-han-name").exists():
+            gate("pre-han-name")
+        if req["query"] == "late lexical delivery" and not (work / "finish-late-name").exists():
+            gate("late-name")
         try:
             hits = query_hits(["--mode", req["mode"], "--limit", str(req["limit"]), "--", req["query"]])
             reply = {"id": req["id"], "hits": hits}
@@ -264,7 +290,11 @@ def make_corpus(root):
         "content-safety-source.md": "A safety original paragraph for a replacement test.",
         "before-render.md": "A before render original paragraph for a stale reply test.",
         "missing-stamp.md": "A missing stamp original paragraph for a missing stamp test.",
-        "obsolete.txt": "Obsolete reply.",
+        "obsolete.txt": "Superseded synthetic response.",
+        "鹿鸣.md": "A filename match.",
+        "local-field-notes.md": "这一条正文提到了鹿鸣。",
+        "late lexical delivery.md": "A name reply held by the fixture.",
+        "body-before-name.md": "A late lexical delivery once produced this note.",
         "open-safety.txt": "Stale action fixture.",
         "Excluded/privateneedle.txt": "Synthetic excluded path.",
         "OneDrive - Synthetic/cloudledger.txt": "Synthetic provider path.",

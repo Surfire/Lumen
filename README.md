@@ -44,7 +44,7 @@ python3 scripts/smoke-launcher.py
 extensions/tests/smoke-panel.sh
 ```
 
-验证使用合成文件。macOS 命令环境若阻止 AppKit 或 FSEvents，不能把相应测试失败、跳过或模拟结果算成真实系统验收。历史开发基线见 [0.1 合成实测](docs/BASELINE-0.1.md)，本版核验见 [0.2.4 验证](docs/VERIFICATION-0.2.4.md)，模型及签名迁移见 [0.2.3 验证](docs/VERIFICATION-0.2.3.md)，统一搜索见 [0.2.2 验证](docs/VERIFICATION-0.2.2.md)，启动器历史验收见 [0.2.1 验证](docs/VERIFICATION-0.2.1.md)，上一版对照见 [0.2 验证](docs/VERIFICATION-0.2.md)，测量规则见 [基准协议](docs/BENCHMARK.md)。命令行或引擎级基准不能代替原生启动器的正确首帧，更不能概括竞品所有功能。
+验证使用合成文件。macOS 命令环境若阻止 AppKit 或 FSEvents，不能把相应测试失败、跳过或模拟结果算成真实系统验收。历史开发基线见 [0.1 合成实测](docs/BASELINE-0.1.md)，本版核验见 [0.2.5 验证](docs/VERIFICATION-0.2.5.md)，四页设置见 [0.2.4 验证](docs/VERIFICATION-0.2.4.md)，模型及签名迁移见 [0.2.3 验证](docs/VERIFICATION-0.2.3.md)，统一搜索见 [0.2.2 验证](docs/VERIFICATION-0.2.2.md)，启动器历史验收见 [0.2.1 验证](docs/VERIFICATION-0.2.1.md)，上一版对照见 [0.2 验证](docs/VERIFICATION-0.2.md)，测量规则见 [基准协议](docs/BENCHMARK.md)。命令行或引擎级基准不能代替原生启动器的正确首帧，更不能概括竞品所有功能。
 
 设计：[产品](docs/PRODUCT.md) · [架构](docs/ARCHITECTURE.md) · [兼容范围](docs/COMPATIBILITY.md) · [第三方依赖](THIRD_PARTY.md)。
 

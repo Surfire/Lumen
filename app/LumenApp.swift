@@ -213,6 +213,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             panel.setFrameOrigin(NSPoint(x: -12_000, y: -12_000))
         }
         focusSearch()
+        if firstShow {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.searchPresented else { return }
+                self.model.warmNameSearch()
+            }
+        }
     }
 
     func windowDidBecomeKey(_ notification: Notification) {

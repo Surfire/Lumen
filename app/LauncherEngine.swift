@@ -184,7 +184,7 @@ final class LauncherEngine {
 
     func run(
         _ command: [String], onLine: ((Data) -> Void)? = nil,
-        onProgress: ((IndexProgress) -> Void)? = nil,
+        onProgress: ((IndexProgress) -> Void)? = nil, priority: DispatchQoS.QoSClass = .utility,
         complete: @escaping (EngineResponse) -> Void
     ) -> Process? {
         let process = Process()
@@ -222,7 +222,7 @@ final class LauncherEngine {
             }
             return recent
         }
-        DispatchQueue.global(qos: .utility).async {
+        DispatchQueue.global(qos: priority).async {
             let output: Data
             if let onLine {
                 Self.readLines(stdout.fileHandleForReading) { data in
@@ -244,6 +244,12 @@ final class LauncherEngine {
         return process
     }
 
+    var nameSearchBusy: Bool { connection?.isBusy == true }
+
+    func warmNameSearch() {
+        _ = try? connect(&connection, command: ["serve"])
+    }
+
     func search(_ query: String, mode: String, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
         submit(query, mode: mode, limit: 60, to: &connection, command: ["serve"], complete: complete)
     }
@@ -259,18 +265,22 @@ final class LauncherEngine {
                         command: [String], idleTimeout: Duration? = nil,
                         complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
         nextID &+= 1
-        if connection?.isRunning != true {
-            do {
-                let new = SearchConnection(executable: executable, arguments: arguments(command), idleTimeout: idleTimeout)
-                try new.start()
-                connection = new
-            } catch {
-                // Leave the caller's inout connection before the completion can reenter the engine.
-                DispatchQueue.main.async { complete(.failure(SearchFailure(error.localizedDescription))) }
-                return
-            }
+        do {
+            let server = try connect(&connection, command: command, idleTimeout: idleTimeout)
+            server.enqueue(SearchRequest(id: nextID, query: query, mode: mode, limit: limit), complete: complete)
+        } catch {
+            // Leave the caller's inout connection before a completion can reenter the engine.
+            DispatchQueue.main.async { complete(.failure(SearchFailure(error.localizedDescription))) }
         }
-        connection?.enqueue(SearchRequest(id: nextID, query: query, mode: mode, limit: limit), complete: complete)
+    }
+
+    private func connect(_ connection: inout SearchConnection?, command: [String],
+                         idleTimeout: Duration? = nil) throws -> SearchConnection {
+        if let connection, connection.isRunning { return connection }
+        let started = SearchConnection(executable: executable, arguments: arguments(command), idleTimeout: idleTimeout)
+        try started.start()
+        connection = started
+        return started
     }
 
     func discardQueuedSearch() { connection?.discardQueued() }
@@ -334,6 +344,7 @@ private final class SearchConnection {
     private var stopped = false
 
     var isRunning: Bool { !stopped && process.isRunning }
+    var isBusy: Bool { active != nil }
 
     init(executable: URL, arguments: [String], idleTimeout: Duration?) {
         self.idleTimeout = idleTimeout

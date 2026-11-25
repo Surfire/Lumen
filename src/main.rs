@@ -49,6 +49,9 @@ struct ScopeArgs {
     /// Authorize document indexing only below this directory (repeatable).
     #[arg(long)]
     content_root: Vec<PathBuf>,
+    /// Recognize text in local images in the selected content folders (requires the app helper).
+    #[arg(long, requires = "content_root")]
+    image_ocr: bool,
     /// Keep an explicit content selection, including an empty selection.
     #[arg(long)]
     separate_content: bool,
@@ -79,6 +82,8 @@ impl From<ScopeArgs> for Scope {
             content_roots,
             pdf_helper: args.pdf_helper,
             pdf_helper_policy,
+            image_ocr: args.image_ocr,
+            image_ocr_helper: None,
         }
     }
 }
@@ -203,6 +208,9 @@ enum Action {
         content_root: Vec<PathBuf>,
         #[arg(long)]
         bundled_pdf_helper: bool,
+        /// Also index text in local images using the app's Apple Vision helper.
+        #[arg(long, requires = "content_root")]
+        image_ocr: bool,
     },
     /// Extract a resumable batch from the saved document scope.
     Content {
@@ -594,10 +602,16 @@ fn main() -> Result<()> {
         Action::ContentScope {
             content_root,
             bundled_pdf_helper,
+            image_ocr,
         } => {
             println!(
                 "{}",
-                lumen::apply_content_scope(&db, content_root, bundled_pdf_helper)?
+                lumen::apply_content_scope_with_image_ocr(
+                    &db,
+                    content_root,
+                    bundled_pdf_helper,
+                    image_ocr
+                )?
             );
         }
         Action::Content { max } => {

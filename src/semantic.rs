@@ -2,6 +2,7 @@ use crate::{
     Hit, Model, ModelBackend, absolute, document_stamp_sql, gemma,
     model::{Role, Unencodable},
     open_write, read_document_stamp, row_hit,
+    vector::{Matrix, MatrixCache, adaptive_floor, pack},
 };
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -186,7 +187,9 @@ const GEMMA_VECTOR_BYTES: i64 = (gemma::DIMENSIONS * size_of::<f32>()) as i64;
 const GEMMA_LIVE: &str = "FROM semantic_vector v JOIN semantic_chunk c ON c.id=v.chunk_id
     JOIN item i ON i.id=c.document_id JOIN document_state ds ON ds.id=c.document_id
     WHERE v.model=?1 AND i.availability='local'";
-const GEMMA_VECTOR: &str = "typeof(v.vector)='blob' AND length(v.vector)=?2";
+const GEMMA_VECTOR: &str = "typeof(v.vector)='blob' AND length(v.vector) IN (?2/2,?2)";
+const GEMMA_MIN_COSINE: f32 = f32::MIN_POSITIVE;
+const GEMMA_Z_THRESHOLD: f64 = 1.0;
 
 fn documents_enabled(conn: &Connection) -> Result<bool> {
     let saved: Option<String> = conn
@@ -295,12 +298,7 @@ fn embed_gemma(conn: &mut Connection, model: &crate::GemmaModel, max: usize) -> 
         };
         after = id;
         let vector = match encoder.encode(Role::Passage, &text) {
-            Ok(vector) => Some(
-                vector
-                    .iter()
-                    .flat_map(|n| n.to_le_bytes())
-                    .collect::<Vec<_>>(),
-            ),
+            Ok(vector) => Some(pack(&vector)),
             Err(error) if error.is::<Unencodable>() => None,
             Err(error) => return Err(error).context("compute next Gemma document chunk"),
         };
@@ -329,6 +327,7 @@ fn embed_gemma(conn: &mut Connection, model: &crate::GemmaModel, max: usize) -> 
 pub struct GemmaSearchSession {
     conn: Connection,
     worker: gemma::GemmaWorker,
+    matrix: MatrixCache<Paragraph>,
 }
 
 impl GemmaSearchSession {
@@ -344,7 +343,11 @@ impl GemmaSearchSession {
             gemma_searchable(&conn)?,
             "Gemma document coverage changed while starting the runtime"
         );
-        Ok(Self { conn, worker })
+        Ok(Self {
+            conn,
+            worker,
+            matrix: MatrixCache::default(),
+        })
     }
 
     pub fn search(&mut self, query: &str, limit: usize) -> Result<Vec<Hit>> {
@@ -352,7 +355,13 @@ impl GemmaSearchSession {
         if query.is_empty() || query.len() > 512 || !crate::query_allows_semantic(query) {
             return Ok(Vec::new());
         }
-        let mut hits = search_gemma(&self.conn, query, limit.clamp(1, 100), &mut self.worker)?;
+        let mut hits = search_gemma(
+            &self.conn,
+            query,
+            limit.clamp(1, 100),
+            &mut self.worker,
+            &mut self.matrix,
+        )?;
         hits.retain(|hit| !crate::external::is_external(Path::new(&hit.path)));
         Ok(hits)
     }
@@ -410,6 +419,7 @@ impl State {
 }
 
 fn vector_limit(dimensions: i64) -> i64 {
+    // Bound the decoded matrix, including catalogs that still store binary32.
     MAX_EMBEDDED_CHUNKS.min(MAX_VECTOR_BYTES / (dimensions * 4))
 }
 
@@ -648,7 +658,7 @@ fn save_vector(
             return Ok(false);
         }
     }
-    let bytes: Vec<u8> = vector.iter().flat_map(|n| n.to_le_bytes()).collect();
+    let bytes = pack(vector);
     let changed = tx.execute(
         "UPDATE semantic_chunk SET vector=? WHERE id=? AND vector IS NULL",
         params![bytes, id],
@@ -674,7 +684,13 @@ pub(super) fn search(
             gemma_searchable(conn)?,
             "no current Gemma paragraph embeddings: run lumen embed --gemma first"
         );
-        return search_gemma(conn, query, limit, &mut model.start()?);
+        return search_gemma(
+            conn,
+            query,
+            limit,
+            &mut model.start()?,
+            &mut MatrixCache::default(),
+        );
     }
     let mut encoder = model.connect()?;
     let signature = encoder.signature().to_owned();
@@ -703,13 +719,13 @@ pub(super) fn search(
         state.dimensions == Some(vector.len() as i64),
         "stored and query embedding dimensions differ"
     );
+    let matrix = load_paragraphs(snapshot, vector.len(), LEGACY, [])?;
     let hits = rank(
         snapshot,
-        &vector,
+        &matrix,
+        matrix.scores(&vector),
         limit,
         encoder.match_reason(),
-        LEGACY,
-        [],
         |score| encoder.includes(score),
     )?;
     if let Some(tx) = tx {
@@ -723,6 +739,7 @@ fn search_gemma(
     query: &str,
     limit: usize,
     worker: &mut gemma::GemmaWorker,
+    matrix: &mut MatrixCache<Paragraph>,
 ) -> Result<Vec<Hit>> {
     let vector = match worker.encode(Role::Query, query) {
         Ok(vector) => vector,
@@ -734,19 +751,7 @@ fn search_gemma(
         .then(|| conn.unchecked_transaction())
         .transpose()?;
     let snapshot = tx.as_deref().unwrap_or(conn);
-    let hits = if documents_enabled(snapshot)? {
-        rank(
-            snapshot,
-            &vector,
-            limit,
-            "semantic_candidate",
-            &format!("SELECT c.document_id,c.id,i.path,v.vector {GEMMA_LIVE} AND {GEMMA_VECTOR}"),
-            params![gemma::ID, GEMMA_VECTOR_BYTES],
-            |score| score > 0.0,
-        )?
-    } else {
-        Vec::new()
-    };
+    let hits = rank_gemma(snapshot, &vector, limit, matrix)?;
     if let Some(tx) = tx {
         tx.commit()?;
     }
@@ -756,43 +761,85 @@ fn search_gemma(
 const LEGACY: &str = "SELECT c.document_id, c.id, i.path, c.vector FROM semantic_chunk c
     JOIN item i ON i.id=c.document_id WHERE i.availability<>'unverified' AND c.vector IS NOT NULL";
 
-fn rank(
+struct Paragraph {
+    document: i64,
+    chunk: i64,
+    path: Box<str>,
+}
+
+fn load_paragraphs(
     snapshot: &Connection,
-    vector: &[f32],
-    limit: usize,
-    reason: &str,
+    dims: usize,
     sql: &str,
     parameters: impl rusqlite::Params,
+) -> Result<Matrix<Paragraph>> {
+    let mut matrix = Matrix::new(dims);
+    let mut statement = snapshot.prepare_cached(sql)?;
+    let mut rows = statement.query(parameters)?;
+    while let Some(row) = rows.next()? {
+        let meta = Paragraph {
+            document: row.get(0)?,
+            chunk: row.get(1)?,
+            path: row.get_ref(2)?.as_str()?.into(),
+        };
+        ensure!(
+            matrix.push(meta, row.get_ref(3)?.as_blob()?),
+            "invalid stored paragraph vector"
+        );
+    }
+    Ok(matrix)
+}
+
+fn rank_gemma(
+    snapshot: &Connection,
+    query: &[f32],
+    limit: usize,
+    cache: &mut MatrixCache<Paragraph>,
+) -> Result<Vec<Hit>> {
+    let matrix = cache.get(snapshot, |snapshot| {
+        if !documents_enabled(snapshot)? || !has_gemma_store(snapshot)? {
+            return Ok(Matrix::new(gemma::DIMENSIONS));
+        }
+        load_paragraphs(
+            snapshot,
+            gemma::DIMENSIONS,
+            &format!("SELECT c.document_id,c.id,i.path,v.vector {GEMMA_LIVE} AND {GEMMA_VECTOR}"),
+            params![gemma::ID, GEMMA_VECTOR_BYTES],
+        )
+    })?;
+    let scores: Vec<_> = matrix.scores(query).collect();
+    let floor = adaptive_floor(&scores, GEMMA_MIN_COSINE, GEMMA_Z_THRESHOLD);
+    rank(
+        snapshot,
+        matrix,
+        scores,
+        limit,
+        "semantic_candidate",
+        |score| f64::from(score) >= floor,
+    )
+}
+
+fn rank(
+    snapshot: &Connection,
+    matrix: &Matrix<Paragraph>,
+    scores: impl IntoIterator<Item = f32>,
+    limit: usize,
+    reason: &str,
     includes: impl Fn(f32) -> bool,
 ) -> Result<Vec<Hit>> {
-    let mut best = HashMap::<i64, (f32, i64, String)>::new();
-    {
-        let mut statement = snapshot.prepare_cached(sql)?;
-        let mut rows = statement.query(parameters)?;
-        while let Some(row) = rows.next()? {
-            let bytes = row.get_ref(3)?.as_blob()?;
-            ensure!(
-                bytes.len() == vector.len() * 4,
-                "invalid stored paragraph vector"
-            );
-            let score = bytes
-                .chunks_exact(4)
-                .zip(vector)
-                .map(|(word, q)| f32::from_le_bytes(word.try_into().expect("four bytes")) * q)
-                .sum::<f32>();
-            if score.is_finite() && includes(score) {
-                let document = row.get(0)?;
-                let id: i64 = row.get(1)?;
-                if best.get(&document).is_none_or(|(prior, prior_id, _)| {
-                    score > *prior || score == *prior && id < *prior_id
-                }) {
-                    best.insert(document, (score, id, row.get(2)?));
-                }
-            }
+    let mut best = HashMap::<i64, (f32, &Paragraph)>::new();
+    for (row, score) in matrix.rows.iter().zip(scores) {
+        if score.is_finite()
+            && includes(score)
+            && best.get(&row.document).is_none_or(|(prior, meta)| {
+                score > *prior || score == *prior && row.chunk < meta.chunk
+            })
+        {
+            best.insert(row.document, (score, row));
         }
     }
     let mut ranked: Vec<_> = best.into_values().collect();
-    ranked.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.2.cmp(&b.2)));
+    ranked.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.path.cmp(&b.1.path)));
     let mut hits = Vec::new();
     {
         let (stamp, state_join) = document_stamp_sql(snapshot)?;
@@ -809,8 +856,8 @@ fn rank(
              {state_join} WHERE c.id=?"
         );
         let mut hit = snapshot.prepare_cached(&sql)?;
-        for (score, id, _) in ranked.into_iter().take(limit) {
-            hits.push(hit.query_row([id], |r| {
+        for (score, meta) in ranked.into_iter().take(limit) {
+            hits.push(hit.query_row([meta.chunk], |r| {
                 let mut record = row_hit(r, reason)?;
                 record.snippet = r.get(4)?;
                 record.document_stamp = read_document_stamp(r)?;
@@ -924,6 +971,110 @@ mod tests {
     }
 
     use super::*;
+    use std::fs;
+
+    #[test]
+    fn gemma_searches_mixed_rows_caches_the_snapshot_and_gates_a_noisy_corpus() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-gemma-matrix-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let docs = root.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        for i in 0..8 {
+            fs::write(
+                docs.join(format!("doc-{i}.txt")),
+                format!("Body number {i}"),
+            )
+            .unwrap();
+        }
+        let database = root.join("index.sqlite");
+        crate::scan(
+            &database,
+            &crate::Scope {
+                roots: vec![docs],
+                documents: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut writer = Connection::open(&database).unwrap();
+        while prepare_next_document(&mut writer, true).unwrap() {}
+        let mut query = vec![0.0; gemma::DIMENSIONS];
+        query[0] = 1.0;
+        let store = |writer: &Connection, i: usize| {
+            let mut vector = vec![0.0_f32; gemma::DIMENSIONS];
+            vector[0] = if i == 0 { 0.9375 } else { 0.6875 };
+            vector[1] = (1.0 - vector[0].powi(2)).sqrt();
+            let bytes = if i.is_multiple_of(2) {
+                pack(&vector)
+            } else {
+                vector
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect()
+            };
+            assert_eq!(writer.execute(
+                "INSERT INTO semantic_vector SELECT ?1,c.id,?2 FROM semantic_chunk c JOIN item i ON i.id=c.document_id WHERE i.display=?3",
+                params![gemma::ID, bytes, format!("doc-{i}.txt")],
+            ).unwrap(), 1);
+        };
+        store(&writer, 0);
+        store(&writer, 1);
+        assert_eq!(gemma_coverage(&writer).unwrap().embedded_chunks, 2);
+        let reader = crate::open_read(&database).unwrap();
+        let mut cache = MatrixCache::default();
+        let lookup = |snapshot: &Connection, cache: &mut MatrixCache<_>| {
+            rank_gemma(snapshot, &query, 20, cache)
+                .unwrap()
+                .into_iter()
+                .map(|hit| (hit.name, hit.snippet.unwrap(), hit.score.unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let first = {
+            let snapshot = reader.unchecked_transaction().unwrap();
+            lookup(&snapshot, &mut cache)
+        };
+        assert_eq!(
+            first,
+            [
+                ("doc-0.txt".into(), "Body number 0".into(), 0.9375),
+                ("doc-1.txt".into(), "Body number 1".into(), 0.6875)
+            ]
+        );
+        let snapshot = reader.unchecked_transaction().unwrap();
+        cache
+            .get(&snapshot, |_| {
+                panic!("unchanged catalog reloaded the matrix")
+            })
+            .unwrap();
+        std::thread::scope(|thread| {
+            thread
+                .spawn(|| {
+                    let writer = Connection::open(&database).unwrap();
+                    let tx = writer.unchecked_transaction().unwrap();
+                    for i in 2..8 {
+                        store(&tx, i);
+                    }
+                    tx.commit().unwrap();
+                })
+                .join()
+                .unwrap()
+        });
+        // The held WAL read transaction remains coherent during a writer commit.
+        assert_eq!(lookup(&snapshot, &mut cache), first);
+        snapshot.commit().unwrap();
+        let snapshot = reader.unchecked_transaction().unwrap();
+        assert_eq!(lookup(&snapshot, &mut cache), first[..1]);
+        snapshot.commit().unwrap();
+        writer.execute("UPDATE info SET value=json_set(value,'$.documents',json('false')) WHERE key='scope'", []).unwrap();
+        let snapshot = reader.unchecked_transaction().unwrap();
+        assert!(lookup(&snapshot, &mut cache).is_empty());
+        drop(snapshot);
+        drop(reader);
+        drop(writer);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn long_documents_sample_their_tail_at_unicode_boundaries() {

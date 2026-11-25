@@ -3,16 +3,17 @@ use crate::model::{Role, Unencodable};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Read, Write},
     os::unix::{
-        fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         net::UnixStream,
         process::CommandExt,
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{LazyLock, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -191,7 +192,39 @@ IFS= read -r owner || :
     }
 }
 
-fn asset(path: &Path, expected: &Asset, verify: bool) -> Result<()> {
+#[derive(PartialEq, Eq)]
+struct AssetMetadata {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+    mode: u32,
+}
+
+impl From<&fs::Metadata> for AssetMetadata {
+    fn from(meta: &fs::Metadata) -> Self {
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.len(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+            mode: meta.mode(),
+        }
+    }
+}
+
+struct Verification {
+    metadata: AssetMetadata,
+    sha256: String,
+}
+
+static VERIFIED_ASSETS: LazyLock<Mutex<HashMap<PathBuf, Verification>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+// Return whether this call actually hashed the asset.
+fn asset(path: &Path, expected: &Asset, verify: bool) -> Result<bool> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -208,24 +241,46 @@ fn asset(path: &Path, expected: &Asset, verify: bool) -> Result<()> {
         "invalid Gemma asset type, size or permissions: {}",
         path.file_name().unwrap_or_default().to_string_lossy()
     );
-    if verify {
-        let output = Command::new("/usr/bin/openssl")
-            .args(["dgst", "-sha256", "-r"])
-            .env_clear()
-            .stdin(Stdio::from(file))
-            .output()
-            .context("verify Gemma SHA-256")?;
-        ensure!(
-            output.status.success()
-                && std::str::from_utf8(&output.stdout)?
-                    .split_whitespace()
-                    .next()
-                    == Some(expected.sha256.as_str()),
-            "Gemma asset failed SHA-256 verification: {}",
-            path.file_name().unwrap_or_default().to_string_lossy()
-        );
+    if !verify {
+        return Ok(false);
     }
-    Ok(())
+    let canonical = fs::canonicalize(path)?;
+    let metadata = AssetMetadata::from(&meta);
+    if VERIFIED_ASSETS
+        .lock()
+        .unwrap()
+        .get(&canonical)
+        .is_some_and(|cached| cached.metadata == metadata && cached.sha256 == expected.sha256)
+    {
+        return Ok(false);
+    }
+    let output = Command::new("/usr/bin/openssl")
+        .args(["dgst", "-sha256", "-r"])
+        .env_clear()
+        .stdin(Stdio::from(file.try_clone()?))
+        .output()
+        .context("verify Gemma SHA-256")?;
+    ensure!(
+        output.status.success()
+            && std::str::from_utf8(&output.stdout)?
+                .split_whitespace()
+                .next()
+                == Some(expected.sha256.as_str()),
+        "Gemma asset failed SHA-256 verification: {}",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    );
+    ensure!(
+        metadata == AssetMetadata::from(&file.metadata()?),
+        "Gemma asset changed during SHA-256 verification"
+    );
+    VERIFIED_ASSETS.lock().unwrap().insert(
+        canonical,
+        Verification {
+            metadata,
+            sha256: expected.sha256.clone(),
+        },
+    );
+    Ok(true)
 }
 
 pub(crate) struct GemmaWorker {
@@ -430,5 +485,53 @@ impl Drop for GemmaWorker {
         }
         let _ = fs::remove_file(&self.socket);
         let _ = fs::remove_dir(&self.private);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::FileTimes;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn asset_digest_cache_reuses_verified_bytes_and_invalidates_on_metadata_or_digest_change() {
+        let path = std::env::temp_dir().join(format!("lumen-gemma-digest-{}", std::process::id()));
+        fs::write(&path, b"abc").unwrap();
+        let expected = Asset {
+            size: 3,
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+        };
+        assert!(!asset(&path, &expected, false).unwrap());
+        assert!(asset(&path, &expected, true).unwrap());
+        assert!(!asset(&path, &expected, true).unwrap());
+        let wrong = Asset {
+            size: 3,
+            sha256: "0".repeat(64),
+        };
+        assert!(
+            asset(&path, &wrong, true)
+                .unwrap_err()
+                .to_string()
+                .contains("failed SHA-256")
+        );
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let mtime: SystemTime = UNIX_EPOCH + Duration::new(1_700_000_000, 123456789);
+        file.set_times(FileTimes::new().set_modified(mtime))
+            .unwrap();
+        assert!(asset(&path, &expected, true).unwrap());
+        assert!(!asset(&path, &expected, true).unwrap());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(asset(&path, &expected, true).unwrap());
+        (&file).write_all(b"bad").unwrap();
+        file.set_times(FileTimes::new().set_modified(mtime))
+            .unwrap();
+        assert!(
+            asset(&path, &expected, true)
+                .unwrap_err()
+                .to_string()
+                .contains("failed SHA-256")
+        );
+        fs::remove_file(&path).unwrap();
     }
 }

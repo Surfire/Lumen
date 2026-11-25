@@ -2487,6 +2487,25 @@ esac
         assert!(total > 6);
         assert_eq!(f.run(&["status"])["embeddings"], 1);
         assert_eq!(f.run(&["status"])["embedded_chunks"], total);
+        let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM semantic_chunk WHERE length(vector)=16",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            total as i64
+        );
+        // Leave the same document with both formats, as after an incremental upgrade.
+        let old_en: Vec<_> = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        assert_eq!(db.execute("UPDATE semantic_chunk SET vector=?1 WHERE id=(
+            SELECT c.id FROM semantic_chunk c JOIN document d ON d.id=c.document_id
+            WHERE substr(CAST(d.body AS BLOB),c.start_byte+1,c.end_byte-c.start_byte)=CAST(?2 AS BLOB))",
+            rusqlite::params![old_en, en]).unwrap(), 1);
         for (query, original) in [("distant orbit", en), ("红树林", zh)] {
             let result = f.run(&["query", query, "--mode", "semantic", "--helper", m]);
             assert_eq!(result.as_array().unwrap().len(), 1);
@@ -3019,7 +3038,7 @@ done
         assert_eq!(default[0]["snippet"], en);
         let vector_sizes: i64 = raw
             .query_row(
-                "SELECT count(*) FROM semantic_vector WHERE length(vector)=3072",
+                "SELECT count(*) FROM semantic_vector WHERE length(vector)=1536",
                 [],
                 |r| r.get(0),
             )
@@ -3312,6 +3331,114 @@ done
         assert_eq!(stale["text"], "stale");
         assert_eq!(stale["semantic"], "stale");
     }
+    #[test]
+    fn bundled_vision_ocr_is_opt_in_scoped_and_retired_when_disabled() {
+        let f = Fixture::new();
+        let resources = f.0.join("Fixture.app/Contents/Resources");
+        let root = f.0.join("scope");
+        let selected = root.join("selected");
+        let provider = selected.join("Library/CloudStorage/OneDrive-Fixture");
+        fs::create_dir_all(&resources).unwrap();
+        fs::create_dir_all(&provider).unwrap();
+        let engine = resources.join("lumen");
+        fs::copy(env!("CARGO_BIN_EXE_lumen"), &engine).unwrap();
+        let helper = resources.join("LumenImageOcrExtractor");
+        let checked = |output: std::process::Output| {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.stdout
+        };
+        checked(
+            Command::new("/usr/bin/xcrun")
+                .args(["swiftc", "-swift-version", "5", "-target"])
+                .arg(format!("{}-apple-macosx14.0", std::env::consts::ARCH))
+                .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("app/ExtractImageOcr.swift"))
+                .arg("-o")
+                .arg(&helper)
+                .output()
+                .unwrap(),
+        );
+        let png = f.0.join("fixture.png");
+        checked(Command::new("/usr/bin/xcrun").args(["swift", "-e", r#"
+import AppKit
+let image = NSImage(size: NSSize(width: 800, height: 240), flipped: false) { rect in
+    NSColor.white.setFill()
+    rect.fill()
+    ("Quartz Calibration" as NSString).draw(at: NSPoint(x: 40, y: 80), withAttributes: [.font: NSFont.systemFont(ofSize: 60), .foregroundColor: NSColor.black])
+    return true
+}
+let rep = NSBitmapImageRep(data: image.tiffRepresentation!)!
+try rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: CommandLine.arguments[1]))
+"#]).arg(&png).output().unwrap());
+        let image = selected.join("scan.HEIC");
+        checked(
+            Command::new("/usr/bin/sips")
+                .args(["-s", "format", "heic"])
+                .arg(&png)
+                .arg("--out")
+                .arg(&image)
+                .output()
+                .unwrap(),
+        );
+        for excluded in [provider.join("cloud.png"), root.join("outside.png")] {
+            fs::copy(&png, excluded).unwrap();
+        }
+        std::os::unix::fs::symlink(&png, selected.join("symlink.png")).unwrap();
+        let oversized = selected.join("oversized.png");
+        fs::copy(&png, &oversized).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(oversized)
+            .unwrap()
+            .set_len(12 * 1024 * 1024 + 1)
+            .unwrap();
+        let root = root.to_str().unwrap();
+        let selected = selected.to_str().unwrap();
+        let run = |args: &[&str]| -> Value {
+            serde_json::from_slice(&checked(
+                Command::new(&engine)
+                    .arg("--db")
+                    .arg(f.0.join("test.sqlite"))
+                    .args(args)
+                    .output()
+                    .unwrap(),
+            ))
+            .unwrap()
+        };
+        run(&["index", "--root", root, "--content-root", selected]);
+        let query = || {
+            run(&[
+                "query",
+                "quartz calibration",
+                "--mode",
+                "text",
+                "--check-access",
+            ])
+        };
+        assert_eq!(run(&["status"])["content"]["image_ocr"], false);
+        assert_eq!(run(&["content"])["indexed"], 0);
+        assert_eq!(query(), serde_json::json!([]));
+        let enabled = run(&["content-scope", "--content-root", selected, "--image-ocr"]);
+        assert_eq!(enabled["scope"]["image_ocr"], true);
+        assert_eq!(enabled["content"]["pending"], 2); // Local HEIC and oversized PNG only.
+        assert_eq!(run(&["content"])["indexed"], 1);
+        let hits = query();
+        assert_eq!(hits.as_array().unwrap().len(), 1);
+        assert_eq!(hits[0]["name"], "scan.HEIC");
+        assert_eq!(hits[0]["snippet"], "Quartz Calibration");
+        assert_eq!(
+            run(&["diagnose", image.to_str().unwrap()])["text"],
+            "indexed"
+        );
+        let cleared = run(&["content-scope", "--content-root", selected]);
+        assert_eq!(cleared["content"]["total"], 0);
+        assert_eq!(query(), serde_json::json!([]));
+        assert_eq!(run(&["query", "scan.HEIC"])[0]["name"], "scan.HEIC");
+    }
+
     #[test]
     fn separate_content_resumes_batches_and_narrows_without_retiring_names() {
         let f = Fixture::new();

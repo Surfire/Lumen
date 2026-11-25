@@ -3,9 +3,10 @@ use crate::{
     content::has_table,
     diagnose::local_stamp,
     gemma::{DIMENSIONS, GemmaWorker},
-    image_decode::thumbnail,
+    image_decode::{MAX_FILE_BYTES, supported_path, thumbnail},
     model::Role,
     open_read, open_write, platform, saved_index_scope,
+    vector::{Matrix, MatrixCache, adaptive_floor, pack},
 };
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -15,9 +16,13 @@ use std::path::{Path, PathBuf};
 pub const MODEL_ID: &str = "gemma2/image/imageio512-v1/q8_0/b11457/retrieval/768/l2/0531309472a6bc6f4b146c3736eee7795ec9db1903c25490d3c937490cef6dd8";
 const MAX_VECTORS: i64 = 4096;
 const MAX_BATCH: usize = 16;
-const MAX_FILE_BYTES: u64 = 12 * 1024 * 1024;
-// A candidate floor for this exact model, not an estimate of correctness.
-const CANDIDATE_FLOOR: f32 = 0.65;
+// A minimum cosine for this exact model, not an estimate of correctness.
+const MIN_COSINE: f32 = 0.65;
+const Z_THRESHOLD: f64 = 1.0;
+const LEGACY_VECTOR_BYTES: i64 = (DIMENSIONS * 4) as i64;
+const IMAGE_LIVE: &str = "FROM image_embedding e JOIN item i USING(id)
+    WHERE e.model=?1 AND i.path>=?2 AND i.path<?3 AND i.kind='file' AND i.availability='local'
+    AND typeof(e.vector)='blob' AND length(e.vector) IN (?4/2,?4)";
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS image_scope(id INTEGER PRIMARY KEY CHECK(id=1), root TEXT, epoch INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS image_embedding(
@@ -57,7 +62,10 @@ impl Rules {
     }
 
     fn allows(&self, path: &Path) -> bool {
-        path != Path::new(&self.root) && path.starts_with(&self.root) && named_in(&self.names, path)
+        supported_path(path)
+            && path.starts_with(&self.root)
+            && path != Path::new(&self.root)
+            && named_in(&self.names, path)
     }
 
     fn bounds(&self) -> (String, String) {
@@ -80,17 +88,14 @@ pub struct ImageScopeStatus {
 /// Inspect the saved image opt-in and stored vector count without changing the database.
 pub fn image_status(database: &Path) -> Result<ImageScopeStatus> {
     let conn = open_read(database)?;
-    let Some(rules) = Rules::read(&conn)? else {
+    let snapshot = conn.unchecked_transaction()?;
+    let Some(rules) = Rules::read(&snapshot)? else {
         return Ok(ImageScopeStatus {
             root: None,
             vectors: 0,
         });
     };
-    let vectors = conn.query_row(
-        "SELECT count(*) FROM image_embedding WHERE model=?1",
-        [MODEL_ID],
-        |row| row.get(0),
-    )?;
+    let vectors = count_images(&snapshot, &rules)?;
     Ok(ImageScopeStatus {
         root: Some(rules.root),
         vectors,
@@ -132,13 +137,22 @@ pub fn image_scope(database: &Path, root: Option<&Path>) -> Result<ImageScopeSta
     if changed != 0 {
         txn.execute("DELETE FROM image_embedding", [])?;
     }
-    let vectors = txn.query_row(
-        "SELECT count(*) FROM image_embedding WHERE model=?1",
-        [MODEL_ID],
-        |r| r.get(0),
-    )?;
+    let vectors = Rules::read(&txn)?
+        .as_ref()
+        .map_or(Ok(0), |rules| count_images(&txn, rules))?;
     txn.commit()?;
     Ok(ImageScopeStatus { root, vectors })
+}
+
+fn count_images(conn: &Connection, rules: &Rules) -> Result<i64> {
+    let (lower, upper) = rules.bounds();
+    let mut stmt = conn.prepare_cached(&format!("SELECT i.path {IMAGE_LIVE}"))?;
+    let mut rows = stmt.query(params![MODEL_ID, lower, upper, LEGACY_VECTOR_BYTES])?;
+    let mut count = 0;
+    while let Some(row) = rows.next()? {
+        count += i64::from(rules.allows(Path::new(row.get_ref(0)?.as_str()?)));
+    }
+    Ok(count)
 }
 
 #[derive(Serialize)]
@@ -179,15 +193,24 @@ pub fn image_batch(
         })?;
     let rows = {
         let mut stmt = snapshot.prepare(
-            "SELECT i.id,i.path,CASE WHEN e.model=?4 THEN e.stamp END,e.id IS NOT NULL
+            "SELECT i.id,i.path,CASE WHEN e.model=?4 AND typeof(e.vector)='blob'
+                AND length(e.vector) IN (?6/2,?6) THEN e.stamp END,e.id IS NOT NULL
              FROM item i LEFT JOIN image_embedding e ON i.id=e.id
              WHERE i.path>=?1 AND i.path<?2 AND i.path>?3
                AND i.kind='file' AND i.availability='local'
-               AND (substr(lower(i.path),-4) IN ('.png','.jpg') OR substr(lower(i.path),-5)='.jpeg')
+               AND (substr(lower(i.path),-4) IN ('.png','.jpg')
+                 OR substr(lower(i.path),-5) IN ('.jpeg','.heic','.heif','.webp'))
              ORDER BY i.path LIMIT ?5",
         )?;
         stmt.query_map(
-            params![lower, upper, after, MODEL_ID, max as i64 + 1],
+            params![
+                lower,
+                upper,
+                after,
+                MODEL_ID,
+                max as i64 + 1,
+                LEGACY_VECTOR_BYTES
+            ],
             |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
@@ -248,11 +271,7 @@ pub fn image_batch(
         };
         let vector = worker.encode_image(&bytes)?;
         available -= i64::from(!occupied);
-        let packed = vector
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>();
-        encoded.push((id, path, stamp, packed));
+        encoded.push((id, path, stamp, pack(&vector)));
     }
     if encoded.is_empty() {
         return Ok(batch);
@@ -298,11 +317,7 @@ pub fn image_batch(
 
 /// Called by the standard activation validator after current live metadata has matched.
 pub(crate) fn stored_match(conn: &Connection, id: i64, path: &Path, stamp: &str) -> Result<bool> {
-    if !path.extension().is_some_and(|ext| {
-        ["png", "jpg", "jpeg"]
-            .iter()
-            .any(|kind| ext.eq_ignore_ascii_case(kind))
-    }) {
+    if !supported_path(path) {
         return Ok(false);
     }
     let Some(rules) = Rules::read(conn)? else {
@@ -310,8 +325,9 @@ pub(crate) fn stored_match(conn: &Connection, id: i64, path: &Path, stamp: &str)
     };
     Ok(rules.allows(path)
         && conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM image_embedding WHERE id=?1 AND model=?2 AND stamp=?3)",
-            params![id, MODEL_ID, stamp],
+            "SELECT EXISTS(SELECT 1 FROM image_embedding WHERE id=?1 AND model=?2 AND stamp=?3
+             AND typeof(vector)='blob' AND length(vector) IN (?4/2,?4))",
+            params![id, MODEL_ID, stamp, LEGACY_VECTOR_BYTES],
             |r| r.get(0),
         )?)
 }
@@ -321,6 +337,7 @@ pub struct ImageSearchSession<'a> {
     model: &'a GemmaModel,
     projector: PathBuf,
     worker: Option<GemmaWorker>,
+    matrix: MatrixCache<ImageRow>,
 }
 
 impl<'a> ImageSearchSession<'a> {
@@ -330,6 +347,7 @@ impl<'a> ImageSearchSession<'a> {
             model,
             projector,
             worker: None,
+            matrix: MatrixCache::default(),
         })
     }
 
@@ -344,16 +362,13 @@ impl<'a> ImageSearchSession<'a> {
         {
             return Ok(Vec::new());
         }
-        let Some(_) = Rules::read(&self.conn)? else {
-            return Ok(Vec::new());
-        };
-        let present: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM image_embedding WHERE model=?1)",
-            [MODEL_ID],
-            |r| r.get(0),
-        )?;
-        if !present {
-            return Ok(Vec::new());
+        // Avoid starting a runtime for an empty/disabled scope. Don't hold a
+        // read transaction through model inference; recheck the version after it.
+        {
+            let snapshot = self.conn.unchecked_transaction()?;
+            if self.matrix.get(&snapshot, load_images)?.rows.is_empty() {
+                return Ok(Vec::new());
+            }
         }
         let worker = match &mut self.worker {
             Some(worker) => worker,
@@ -362,66 +377,76 @@ impl<'a> ImageSearchSession<'a> {
                 .insert(self.model.start_images(&self.projector)?),
         };
         let query = worker.encode(Role::Query, text)?;
-        Ok(crate::diagnose::read_snapshot(&self.conn, |snapshot| {
-            search_in_snapshot(snapshot, &query, limit)
-        })?
-        .unwrap_or_default())
+        let snapshot = self.conn.unchecked_transaction()?;
+        let hits = search_in_snapshot(&snapshot, &query, limit, &mut self.matrix)?;
+        snapshot.commit()?;
+        Ok(hits)
     }
 }
 
-fn search_in_snapshot(snapshot: &Connection, query: &[f32], limit: usize) -> Result<Vec<Hit>> {
+struct ImageRow {
+    path: Box<str>,
+    name: Box<str>,
+    stamp: Box<str>,
+}
+
+fn load_images(snapshot: &Connection) -> Result<Matrix<ImageRow>> {
+    let mut matrix = Matrix::new(DIMENSIONS);
     let Some(rules) = Rules::read(snapshot)? else {
-        return Ok(Vec::new());
+        return Ok(matrix);
     };
     let (lower, upper) = rules.bounds();
-    let mut hits = Vec::new();
-    {
-        let mut stmt = snapshot.prepare_cached(
-                "SELECT i.path,i.display,e.stamp,e.vector FROM image_embedding e JOIN item i USING(id)
-                 WHERE e.model=?1 AND i.path>=?2 AND i.path<?3 AND i.kind='file' AND i.availability='local'",
-            )?;
-        let mut rows = stmt.query(params![MODEL_ID, lower, upper])?;
-        while let Some(row) = rows.next()? {
-            let path: String = row.get(0)?;
-            if !rules.allows(Path::new(&path)) {
-                continue;
-            }
-            let vector = row.get_ref(3)?.as_blob()?;
-            if vector.len() != DIMENSIONS * 4 {
-                continue;
-            }
-            let score = vector
-                .chunks_exact(4)
-                .zip(query)
-                .map(|(bytes, q)| {
-                    f32::from_le_bytes(bytes.try_into().expect("four vector bytes")) * q
-                })
-                .sum::<f32>();
-            if score.is_finite() && score >= CANDIDATE_FLOOR {
-                hits.push((
-                    score,
-                    path,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ));
-            }
+    let mut stmt = snapshot.prepare_cached(&format!(
+        "SELECT i.path,i.display,e.stamp,e.vector {IMAGE_LIVE}"
+    ))?;
+    let mut rows = stmt.query(params![MODEL_ID, lower, upper, LEGACY_VECTOR_BYTES])?;
+    while let Some(row) = rows.next()? {
+        let path = row.get_ref(0)?.as_str()?;
+        if rules.allows(Path::new(path)) {
+            matrix.push(
+                ImageRow {
+                    path: path.into(),
+                    name: row.get_ref(1)?.as_str()?.into(),
+                    stamp: row.get_ref(2)?.as_str()?.into(),
+                },
+                row.get_ref(3)?.as_blob()?,
+            );
         }
     }
-    hits.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    Ok(matrix)
+}
+
+fn search_in_snapshot(
+    snapshot: &Connection,
+    query: &[f32],
+    limit: usize,
+    cache: &mut MatrixCache<ImageRow>,
+) -> Result<Vec<Hit>> {
+    let matrix = cache.get(snapshot, load_images)?;
+    let scores: Vec<_> = matrix.scores(query).collect();
+    let floor = adaptive_floor(&scores, MIN_COSINE, Z_THRESHOLD);
+    let mut hits: Vec<_> = scores
+        .into_iter()
+        .zip(&matrix.rows)
+        .filter(|(score, _)| score.is_finite() && f64::from(*score) >= floor)
+        .collect();
+    hits.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.path.cmp(&b.1.path)));
     let hits = hits
         .into_iter()
-        .filter_map(|(score, path, name, stamp)| {
-            if local_stamp(Path::new(&path), false).as_deref() != Some(&stamp) {
+        .filter_map(|(score, row)| {
+            if local_stamp(Path::new(row.path.as_ref()), false).as_deref()
+                != Some(row.stamp.as_ref())
+            {
                 return None;
             }
             Some(Hit {
-                path,
-                name,
+                path: row.path.to_string(),
+                name: row.name.to_string(),
                 kind: "file".into(),
                 availability: "local".into(),
                 matched_by: "image_embedding".into(),
                 snippet: None,
-                document_stamp: Some(stamp),
+                document_stamp: Some(row.stamp.to_string()),
                 pdf_page: None,
                 score: Some(score.into()),
             })
@@ -435,6 +460,114 @@ fn search_in_snapshot(snapshot: &Connection, query: &[f32], limit: usize) -> Res
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn image_cache_ranks_mixed_formats_and_refreshes_when_scope_changes() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-image-matrix-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let images = root.join("images");
+        fs::create_dir_all(&images).unwrap();
+        let paths: Vec<_> = [
+            "a.HEIC",
+            "b.heif",
+            "c.webp",
+            "d.png",
+            "e.jpg",
+            "f.jpeg",
+            "g.webp",
+            "h.png",
+            "malformed.webp",
+        ]
+        .into_iter()
+        .map(|name| {
+            let path = images.join(name);
+            fs::write(&path, "index entry for a precomputed vector").unwrap();
+            path
+        })
+        .collect();
+        let database = root.join("index.db");
+        crate::scan(
+            &database,
+            &Scope {
+                roots: vec![images.clone()],
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        image_scope(&database, Some(&images)).unwrap();
+        let writer = Connection::open(&database).unwrap();
+        let store = |i: usize| {
+            let mut v = vec![0.0_f32; DIMENSIONS];
+            v[0] = if i == 0 { 0.9375 } else { 0.6875 };
+            v[1] = (1.0 - v[0].powi(2)).sqrt();
+            let bytes = match i {
+                8 => vec![0_u8],
+                i if i.is_multiple_of(2) => pack(&v),
+                _ => v.into_iter().flat_map(f32::to_le_bytes).collect(),
+            };
+            let path = &paths[i];
+            let stamp = local_stamp(path, false).unwrap();
+            let id: i64 = writer
+                .query_row(
+                    "SELECT id FROM item WHERE path=?1",
+                    [path.to_str().unwrap()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "INSERT INTO image_embedding VALUES (?1,?2,?3,?4)",
+                    params![id, MODEL_ID, stamp, bytes],
+                )
+                .unwrap();
+            assert_eq!(stored_match(&writer, id, path, &stamp).unwrap(), i != 8);
+        };
+        for i in [0, 1, 2, 8] {
+            store(i);
+        }
+        assert_eq!(image_status(&database).unwrap().vectors, 3);
+        let reader = open_read(&database).unwrap();
+        let mut cache = MatrixCache::default();
+        let mut query = vec![0.0; DIMENSIONS];
+        query[0] = 1.0;
+        let lookup = |cache: &mut MatrixCache<_>| {
+            let snapshot = reader.unchecked_transaction().unwrap();
+            search_in_snapshot(&snapshot, &query, 20, cache)
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lookup(&mut cache), ["a.HEIC", "b.heif", "c.webp"]);
+        {
+            let snapshot = reader.unchecked_transaction().unwrap();
+            cache
+                .get(&snapshot, |_| {
+                    panic!("unchanged image scope reloaded the matrix")
+                })
+                .unwrap();
+        }
+        for i in 3..8 {
+            store(i);
+        }
+        assert_eq!(lookup(&mut cache), ["a.HEIC"]);
+        let batch = image_batch(
+            &database,
+            &GemmaModel::installed(None).unwrap(),
+            Path::new("unused-projector"),
+            None,
+            16,
+        )
+        .unwrap();
+        assert_eq!((batch.processed, batch.reused, batch.skipped), (9, 8, 1));
+        image_scope(&database, None).unwrap();
+        assert!(lookup(&mut cache).is_empty());
+        drop(reader);
+        drop(writer);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn image_snapshot_retries_and_observes_latest_catalog() {
@@ -473,9 +606,10 @@ mod tests {
             .unwrap();
         let reader = open_read(&database).unwrap();
         let mut attempts = 0;
+        let mut cache = MatrixCache::default();
         let hits = crate::diagnose::read_snapshot(&reader, |snapshot| {
             attempts += 1;
-            let hits = search_in_snapshot(snapshot, &query, 20)?;
+            let hits = search_in_snapshot(snapshot, &query, 20, &mut cache)?;
             if attempts < 3 {
                 writer.execute(
                     "UPDATE item SET display=?1 WHERE path=?2",

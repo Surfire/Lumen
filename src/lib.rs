@@ -14,9 +14,12 @@ mod platform;
 mod progress;
 mod query;
 mod semantic;
+mod vector;
 mod watch;
 
-pub use content::{ContentBatch, apply_content_scope, index_content};
+pub use content::{
+    ContentBatch, apply_content_scope, apply_content_scope_with_image_ocr, index_content,
+};
 pub use diagnose::verify_cached_access;
 pub use diagnose::{Diagnosis, Reason as DiagnoseReason, diagnose, validate_hit};
 pub use external::{VolumeStatus, forget_volume, index_volume, volumes};
@@ -66,6 +69,10 @@ pub struct Scope {
     pub pdf_helper: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdf_helper_policy: Option<PdfHelperPolicy>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub image_ocr: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_ocr_helper: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +91,8 @@ impl Scope {
             && self.content_roots.is_none()
             && !self.documents
             && self.pdf_helper.is_none()
+            && !self.image_ocr
+            && self.image_ocr_helper.is_none()
     }
 
     pub fn roots(&self) -> Vec<PathBuf> {
@@ -761,6 +770,9 @@ pub fn status(conn: &Connection) -> Result<serde_json::Value> {
     data["items"] = items.into();
     data["documents"] = documents.into();
     data["content"] = serde_json::to_value(content::coverage(conn)?)?;
+    data["content"]["image_ocr"] = saved_index_scope(conn)?
+        .is_some_and(|scope| scope.image_ocr)
+        .into();
     semantic::add_status(conn, &mut data)?;
     data["unverified"] = unverified.into();
     Ok(data)

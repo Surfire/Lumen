@@ -35,6 +35,15 @@ pub fn apply_content_scope(
     roots: Vec<PathBuf>,
     bundled_pdf: bool,
 ) -> Result<serde_json::Value> {
+    apply_content_scope_with_image_ocr(database, roots, bundled_pdf, false)
+}
+
+pub fn apply_content_scope_with_image_ocr(
+    database: &Path,
+    roots: Vec<PathBuf>,
+    bundled_pdf: bool,
+    image_ocr: bool,
+) -> Result<serde_json::Value> {
     #[cfg(target_os = "macos")]
     let _io = platform::NoMaterialization::enter()?;
     let database = absolute(database)?;
@@ -43,6 +52,7 @@ pub fn apply_content_scope(
     let (_, mut scope) = saved_scope(&conn)?;
     scope.documents = !roots.is_empty();
     scope.content_roots = Some(roots);
+    scope.image_ocr = image_ocr;
     scope.pdf_helper = if scope.documents && !bundled_pdf {
         scope.pdf_helper
     } else {
@@ -61,6 +71,7 @@ pub fn apply_content_scope(
     report["scope"] = serde_json::json!({
         "roots": coverage.scope.roots, "allow": coverage.scope.allow, "deny": coverage.scope.deny,
         "documents": coverage.scope.documents, "content_roots": coverage.scope.content_roots,
+        "image_ocr": coverage.scope.image_ocr,
     });
     Ok(report)
 }
@@ -115,8 +126,12 @@ pub(super) fn restrict_and_seed(conn: &Connection, coverage: &Coverage) -> Resul
     Ok(())
 }
 
-fn eligible_kind(coverage: &Coverage, path: &Path) -> Option<DocumentKind> {
-    DocumentKind::for_path(path).filter(|kind| *kind != DocumentKind::Pdf || coverage.pdf.is_some())
+pub(super) fn eligible_kind(coverage: &Coverage, path: &Path) -> Option<DocumentKind> {
+    DocumentKind::for_path(path).filter(|kind| match kind {
+        DocumentKind::Pdf => coverage.pdf.is_some(),
+        DocumentKind::Image => coverage.scope.image_ocr,
+        _ => true,
+    })
 }
 
 pub(super) struct Observation {
@@ -230,6 +245,12 @@ pub fn index_content(database: &Path, max: usize) -> Result<ContentBatch> {
     let (mut conn, _) = open_write(&database, false)?;
     let (scope_identity, scope) = saved_scope(&conn)?;
     let configured = Coverage::new(database, &scope)?;
+    if let Some(helper) = &configured.image_ocr_helper {
+        ensure!(
+            helper.is_file(),
+            "image OCR requires the bundled LumenImageOcrExtractor; run content from Lumen.app"
+        );
+    }
     let mut batch = ContentBatch::default();
     let started = std::time::Instant::now();
     let (cursor, upper): (i64, i64) = conn.query_row(
@@ -368,18 +389,11 @@ fn prepare_update(
     } else {
         false
     };
-    let extracted = if before.is_some() && !unchanged {
-        match extract_document(coverage, path, kind) {
+    let extracted = if let Some(meta) = before.as_ref().filter(|_| !unchanged) {
+        match extract_document(coverage, path, kind, meta) {
             Ok(extracted) => Some(extracted).filter(|item| !item.body.trim().is_empty()),
             Err(error) if has_io_error(&error, ErrorKind::PermissionDenied) => return Err(error),
-            Err(error)
-                if has_io_error(&error, ErrorKind::TimedOut)
-                    || error
-                        .chain()
-                        .any(|cause| cause.to_string() == "PDF extraction timed out") =>
-            {
-                return Ok(None);
-            }
+            Err(error) if has_io_error(&error, ErrorKind::TimedOut) => return Ok(None),
             Err(_) => None,
         }
     } else {

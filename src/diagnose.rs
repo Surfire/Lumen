@@ -470,6 +470,9 @@ fn text_state(
     let Some(kind) = DocumentKind::for_path(&file.path) else {
         return Reason::Unsupported;
     };
+    if kind == DocumentKind::Image && !scope.image_ocr {
+        return Reason::Unsupported;
+    }
     if kind == DocumentKind::Pdf
         && scope.pdf_helper.is_none()
         && scope.pdf_helper_policy != Some(PdfHelperPolicy::Bundled)

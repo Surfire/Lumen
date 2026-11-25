@@ -4,9 +4,9 @@ Status legend: `pending` | `in_progress` | `done`
 
 ---
 
-## Milestone 1: P0 Stop-the-Bleeding (`pending`)
+## Milestone 1: P0 Stop-the-Bleeding (`done`)
 
-### `T01` Hotkey & Search Panel Behavior (`pending`)
+### `T01` Hotkey & Search Panel Behavior (`done`)
 - **Worktree**: `m1-panel-ime`
 - **Allowed files**: `app/LauncherHotKey.swift`, `app/LumenApp.swift`, `app/LauncherViews.swift`, `app/MacInlinePreviewView.swift`, `app/LauncherInlinePreview.swift`
 - **Scope**:
@@ -16,7 +16,7 @@ Status legend: `pending` | `in_progress` | `done`
   - Position panel in the upper-third of the mouse-active screen (`NSScreen`), keeping the top edge anchored when height changes.
 - **Non-Goals**: No Rust changes; no edits to `LauncherEngine.swift`, `LauncherModel.swift`, or `LauncherActions.swift`.
 
-### `T02` IME Guard, Preview Session & PDF Open (`pending`)
+### `T02` IME Guard, Preview Session & PDF Open (`done`)
 - **Worktree**: `m1-panel-ime`
 - **Allowed files**: same as `T01`
 - **Scope**:
@@ -26,7 +26,7 @@ Status legend: `pending` | `in_progress` | `done`
   - Call `updatePresentation()` when closing inline preview; cache decoded preview `NSImage` off SwiftUI `body`; eliminate single-click row selection delay caused by stacked tap gestures.
 - **Non-Goals**: Same as `T01`.
 
-### `T03` App Search Icons, Symlinks, Fuzzy Match & Frecency (`pending`)
+### `T03` App Search Icons, Symlinks, Fuzzy Match & Frecency (`done`)
 - **Worktree**: `m1-apps-concurrency`
 - **Allowed files**: `app/LauncherActions.swift`, `app/LauncherEngine.swift`, `app/LauncherModel.swift`, `app/LauncherShortcuts.swift`, `app/TranslationClient.swift`, `app/TranslationModel.swift`, `app/TranslationPanel.swift`
 - **Scope**:
@@ -36,7 +36,7 @@ Status legend: `pending` | `in_progress` | `done`
   - Add lightweight persistent Frecency ranking for apps and files; remove synchronous pre-launch `mtime/ctime` check on `.app` bundles.
 - **Non-Goals**: No Rust changes; no edits to `LumenApp.swift`, `LauncherViews.swift`, or `LauncherHotKey.swift`.
 
-### `T04` Swift Concurrency, `serve` Timeout, Error Visibility & Proxy Fix (`pending`)
+### `T04` Swift Concurrency, `serve` Timeout, Error Visibility & Proxy Fix (`done`)
 - **Worktree**: `m1-apps-concurrency`
 - **Allowed files**: same as `T03`
 - **Scope**:
@@ -48,7 +48,7 @@ Status legend: `pending` | `in_progress` | `done`
   - Remove `connectionProxyDictionary = [:]` in `TranslationClient.swift`, accept `"length"` / `"end_turn"` finish reasons, support `"translate <text>"` / `"翻译 <text>"`, and allow deleting saved translation providers in Settings.
 - **Non-Goals**: Same as `T03`.
 
-### `T05` Rust Hot-Path & Correctness Fixes (`pending`)
+### `T05` Rust Hot-Path & Correctness Fixes (`done`)
 - **Worktree**: `m1-rust-hotpath`
 - **Allowed files**: `src/lib.rs`, `src/index.rs`, `src/name_fast.rs`, `src/query.rs`, `src/content.rs`, `src/watch.rs`, `src/watch/resume.rs`, `src/image_search.rs`, `src/diagnose.rs`, `src/platform.rs`, `src/main.rs`, `tests/cli.rs`
 - **Scope**:
@@ -59,7 +59,7 @@ Status legend: `pending` | `in_progress` | `done`
   - Fix `watch --cached-start` so `resume::verify_access` still reconciles revoked TCC permissions; over-fetch before `verify_cached_access()` applies `LIMIT`; set `pending_recovery = true` when live loop sees `entries_unreadable != 0`.
 - **Non-Goals**: No full SoA rewrite yet (`T08`); no Swift changes.
 
-### `T06` Default Scope Hygiene (`pending`)
+### `T06` Default Scope Hygiene (`done`)
 - **Worktree**: `m1-rust-hotpath`
 - **Allowed files**: same as `T05`
 - **Scope**:

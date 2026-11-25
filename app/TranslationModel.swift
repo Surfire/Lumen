@@ -131,10 +131,14 @@ final class TranslationPanelModel: ObservableObject {
     }
 
     var provider: TranslationProvider? { providers.first { $0.id == selected } }
-    func answerWithSavedProvider() -> LumenQuickAnswer.Answer? {
+    typealias StreamingAnswer = @MainActor (String, @escaping TranslationClient.Delta) async throws -> String
+
+    func answerWithSavedProvider() -> StreamingAnswer? {
         guard let provider, TranslationClient.isValidModel(provider.model),
               (try? TranslationEndpoint(provider.endpoint)) != nil else { return nil }
-        return { [client] question in try await client.answer(question, provider: provider) }
+        return { [client] question, onDelta in
+            try await client.answer(question, provider: provider, onDelta: onDelta)
+        }
     }
 
     var availableModels: [String] {
@@ -263,7 +267,10 @@ final class TranslationPanelModel: ObservableObject {
         copied = false
         start(.translating) { [client] model in
             let result = try await client.translate(command.text, source: command.source, target: command.target,
-                                                    provider: provider)
+                                                    provider: provider) { [weak model] delta in
+                guard !Task.isCancelled, let model, model.command == command else { return }
+                model.output += delta
+            }
             try Task.checkCancellation()
             guard model.command == command else { return }
             model.output = result
@@ -291,6 +298,7 @@ final class TranslationPanelModel: ObservableObject {
         generation += 1
         work?.cancel()
         work = nil
+        if activity == .translating { output = "" }
         activity = nil
         status = .canceled
     }
@@ -305,7 +313,10 @@ final class TranslationPanelModel: ObservableObject {
             guard let self else { return }
             do { try await perform(self) }
             catch {
-                if !Task.isCancelled, self.generation == current { self.showFailure(error) }
+                if !Task.isCancelled, self.generation == current {
+                    if activity == .translating { self.output = "" }
+                    self.showFailure(error)
+                }
             }
             if self.generation == current {
                 self.work = nil

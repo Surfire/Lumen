@@ -49,6 +49,9 @@ struct ScopeArgs {
     /// Authorize document indexing only below this directory (repeatable).
     #[arg(long)]
     content_root: Vec<PathBuf>,
+    /// Recognize text in local images in the selected content folders (requires the app helper).
+    #[arg(long, requires = "content_root")]
+    image_ocr: bool,
     /// Keep an explicit content selection, including an empty selection.
     #[arg(long)]
     separate_content: bool,
@@ -79,6 +82,8 @@ impl From<ScopeArgs> for Scope {
             content_roots,
             pdf_helper: args.pdf_helper,
             pdf_helper_policy,
+            image_ocr: args.image_ocr,
+            image_ocr_helper: None,
         }
     }
 }
@@ -195,6 +200,9 @@ enum Action {
         availability: String,
         #[arg(long)]
         document_stamp: Option<String>,
+        /// Identify the index that produced a stamped hit (required for images).
+        #[arg(long)]
+        matched_by: Option<String>,
         path: PathBuf,
     },
     /// Apply an explicit document scope without rebuilding the filename catalog.
@@ -203,6 +211,9 @@ enum Action {
         content_root: Vec<PathBuf>,
         #[arg(long)]
         bundled_pdf_helper: bool,
+        /// Also index text in local images using the app's Apple Vision helper.
+        #[arg(long, requires = "content_root")]
+        image_ocr: bool,
     },
     /// Extract a resumable batch from the saved document scope.
     Content {
@@ -337,6 +348,7 @@ struct ValidationHit {
     kind: String,
     availability: String,
     document_stamp: Option<String>,
+    matched_by: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -458,6 +470,7 @@ fn serve(
                                     hit.kind.as_str(),
                                     hit.availability.as_str(),
                                     hit.document_stamp.as_deref(),
+                                    hit.matched_by.as_deref(),
                                 )
                             })
                             .collect();
@@ -586,18 +599,31 @@ fn main() -> Result<()> {
             kind,
             availability,
             document_stamp,
+            matched_by,
         } => {
-            let valid =
-                lumen::validate_hit(&db, &path, &kind, &availability, document_stamp.as_deref());
+            let valid = lumen::validate_hit(
+                &db,
+                &path,
+                &kind,
+                &availability,
+                document_stamp.as_deref(),
+                matched_by.as_deref(),
+            );
             println!("{}", json!({"valid":valid}));
         }
         Action::ContentScope {
             content_root,
             bundled_pdf_helper,
+            image_ocr,
         } => {
             println!(
                 "{}",
-                lumen::apply_content_scope(&db, content_root, bundled_pdf_helper)?
+                lumen::apply_content_scope_with_image_ocr(
+                    &db,
+                    content_root,
+                    bundled_pdf_helper,
+                    image_ocr
+                )?
             );
         }
         Action::Content { max } => {

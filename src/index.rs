@@ -15,11 +15,16 @@ use std::{
 };
 
 const APP_PDF_HELPER: &str = "LumenPdfExtractor";
+const APP_IMAGE_OCR_HELPER: &str = "LumenImageOcrExtractor";
 // Bump this only when PDF extraction changes the indexed text format. Binary
 // rebuilds, code signatures and app installs are compatible with this ID.
 const APP_PDF_FORMAT: &str = "lumen-pdf:pdfkit-text-v2";
 
 fn is_app_pdf_helper(path: &Path) -> bool {
+    is_app_resource_helper(path, APP_PDF_HELPER)
+}
+
+fn is_app_resource_helper(path: &Path, helper: &str) -> bool {
     let Some(resources) = path.parent() else {
         return false;
     };
@@ -27,7 +32,7 @@ fn is_app_pdf_helper(path: &Path) -> bool {
         return false;
     };
     path.file_name()
-        .is_some_and(|name| name.eq_ignore_ascii_case(APP_PDF_HELPER))
+        .is_some_and(|name| name.eq_ignore_ascii_case(helper))
         && resources
             .file_name()
             .is_some_and(|name| name.eq_ignore_ascii_case("Resources"))
@@ -38,6 +43,64 @@ fn is_app_pdf_helper(path: &Path) -> bool {
             .parent()
             .and_then(Path::extension)
             .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+}
+
+pub(super) struct ImageOcrExtractor {
+    executable: PathBuf,
+    binary_stamp: String,
+}
+
+impl ImageOcrExtractor {
+    pub(super) fn bundled() -> Result<Self> {
+        let engine = fs::canonicalize(std::env::current_exe()?)?;
+        let executable = engine.with_file_name(APP_IMAGE_OCR_HELPER);
+        ensure!(
+            is_app_resource_helper(&executable, APP_IMAGE_OCR_HELPER),
+            "image OCR requires the bundled LumenImageOcrExtractor; run content from Lumen.app"
+        );
+        let binary_stamp = Self::binary_stamp(&executable)?;
+        Ok(Self {
+            executable,
+            binary_stamp,
+        })
+    }
+
+    fn binary_stamp(path: &Path) -> Result<String> {
+        let metadata = fs::symlink_metadata(path)
+            .context("read the current app's bundled image OCR extractor")?;
+        ensure!(
+            metadata.is_file() && metadata.mode() & 0o111 != 0,
+            "the current app's image OCR extractor must be an executable regular file"
+        );
+        Ok(stamp(&metadata))
+    }
+
+    pub(super) fn extract(
+        &self,
+        path: &Path,
+        meta: &fs::Metadata,
+    ) -> Result<crate::content::Extracted> {
+        let bytes = platform::read_local_checked(
+            path,
+            crate::image_decode::MAX_FILE_BYTES,
+            Some(&stamp(meta)),
+        )?;
+        ensure!(
+            self.binary_stamp == Self::binary_stamp(&self.executable)?,
+            "bundled image OCR extractor changed while running; restart from the current app"
+        );
+        // A cold Vision model load can outlast the PDFKit extraction budget.
+        let text = run_extractor(
+            &mut Command::new(&self.executable),
+            bytes,
+            MAX_DOCUMENT,
+            Duration::from_secs(30),
+        )?;
+        Ok(crate::content::Extracted {
+            body: String::from_utf8(text)?,
+            pages: Vec::new(),
+        })
+    }
 }
 
 #[derive(PartialEq, Eq)]
@@ -172,6 +235,11 @@ impl Coverage {
                 "document indexing requires an explicit folder; pass --content-root"
             );
         }
+        ensure!(
+            !scope.image_ocr
+                || (scope.documents && content_roots.as_ref().is_some_and(|r| !r.is_empty())),
+            "image OCR requires an explicit content folder"
+        );
         let managed = scope.pdf_helper_policy == Some(PdfHelperPolicy::Bundled);
         ensure!(
             !managed || scope.documents,
@@ -191,6 +259,8 @@ impl Coverage {
             pdf_helper_policy: scope
                 .pdf_helper_policy
                 .or_else(|| scope.pdf_helper.as_ref().map(|_| PdfHelperPolicy::Manual)),
+            image_ocr: scope.image_ocr,
+            image_ocr_helper: None,
         };
         let database = platform::filesystem_spelling(&database);
         let sidecars = INDEX_SIDECARS.map(|suffix| with_suffix(&database, suffix));
@@ -350,6 +420,7 @@ pub(super) fn startup_scope(conn: &Connection, requested: &Scope) -> Result<Scop
                 saved.content_roots = Some(Vec::new());
                 saved.pdf_helper = None;
                 saved.pdf_helper_policy = None;
+                saved.image_ocr = false;
             }
             if requested.pdf_helper_policy == Some(PdfHelperPolicy::Bundled)
                 && saved.documents
@@ -403,15 +474,15 @@ pub(super) fn restrict_scope(conn: &mut Connection, coverage: &Coverage) -> Resu
     if policy_reconciled && prior.as_deref() == Some(&requested) {
         return Ok(());
     }
+    let prior = prior
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Scope>(raw).ok());
     let same_names = policy_reconciled
-        && prior
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<Scope>(raw).ok())
-            .is_some_and(|scope| {
-                scope.roots == coverage.scope.roots
-                    && scope.allow == coverage.scope.allow
-                    && scope.deny == coverage.scope.deny
-            });
+        && prior.as_ref().is_some_and(|scope| {
+            scope.roots == coverage.scope.roots
+                && scope.allow == coverage.scope.allow
+                && scope.deny == coverage.scope.deny
+        });
     if !same_names {
         let mut items = tx.prepare("SELECT id,path FROM item")?;
         let mut rows = items.query([])?;
@@ -426,7 +497,7 @@ pub(super) fn restrict_scope(conn: &mut Connection, coverage: &Coverage) -> Resu
     purge(&tx)?;
     if !coverage.scope.documents {
         tx.execute_batch("DELETE FROM content_fts; DELETE FROM document; DELETE FROM document_state; DELETE FROM embedding; DELETE FROM content_job;")?;
-    } else if coverage.scope.content_roots.is_some() {
+    } else if coverage.scope.content_roots.is_some() || prior.is_some_and(|scope| scope.image_ocr) {
         crate::content::restrict_and_seed(&tx, coverage)?;
     }
     if !same_names {
@@ -866,8 +937,8 @@ impl<'a> Walk<'a> {
                 let mut content = None;
                 if !directory
                     && self.coverage.permits_content(&path)
-                    && let Some(kind) = DocumentKind::for_path(&path)
-                    && (kind != DocumentKind::Pdf || self.coverage.pdf.is_some())
+                    && let Some(kind) = crate::content::eligible_kind(self.coverage, &path)
+                    && kind.accepts_availability(availability)
                 {
                     // Bulk enumeration omits document version metadata. Fetch
                     // it here, before the pending batch can acquire a write lock.
@@ -1031,7 +1102,9 @@ impl<'a> Walk<'a> {
                             } else if let Some(observation) = content {
                                 self.changed |=
                                     crate::content::observe(self.tx(), id, observation)?;
-                            } else if DocumentKind::for_path(path).is_some() {
+                            } else if DocumentKind::for_path(path).is_some_and(|kind| {
+                                kind != DocumentKind::Image || self.coverage.scope.image_ocr
+                            }) {
                                 self.changed |= crate::content::retire(self.tx(), id)?;
                             }
                         }
@@ -1276,6 +1349,7 @@ pub(super) fn document_version(
         DocumentKind::Text => "",
         DocumentKind::Docx => "docx-v1",
         DocumentKind::Pdf => coverage.pdf.as_ref().map_or("", |pdf| pdf.format.as_str()),
+        DocumentKind::Image => "lumen-image-ocr:vision-text-v1",
     };
     format!("{}:{extractor}", stamp(meta))
 }
@@ -1369,6 +1443,7 @@ pub(super) enum DocumentKind {
     Text,
     Docx,
     Pdf,
+    Image,
 }
 
 impl DocumentKind {
@@ -1377,8 +1452,13 @@ impl DocumentKind {
             "txt" | "md" | "markdown" => Some(Self::Text),
             "docx" => Some(Self::Docx),
             "pdf" => Some(Self::Pdf),
+            _ if crate::image_decode::supported_path(path) => Some(Self::Image),
             _ => None,
         }
+    }
+
+    pub(super) fn accepts_availability(self, availability: &str) -> bool {
+        self != Self::Image || availability == "local"
     }
 
     fn extract(self, path: &Path, pdf: Option<&PdfExtractor>) -> Result<crate::content::Extracted> {
@@ -1386,6 +1466,7 @@ impl DocumentKind {
             Self::Text => String::from_utf8(platform::read_local(path, MAX_DOCUMENT)?)?,
             Self::Docx => docx::text(&platform::read_local(path, docx::MAX_ARCHIVE)?)?,
             Self::Pdf => return extract_pdf(path, pdf.context("missing PDF helper")?),
+            Self::Image => unreachable!("image OCR uses the observed file stamp"),
         };
         Ok(crate::content::Extracted {
             body,
@@ -1401,6 +1482,28 @@ fn extract_pdf(path: &Path, helper: &PdfExtractor) -> Result<crate::content::Ext
     if pages {
         command.arg("--pages-v1");
     }
+    let limit = if pages {
+        3 * MAX_DOCUMENT
+    } else {
+        MAX_DOCUMENT
+    };
+    let text = run_extractor(&mut command, bytes, limit, Duration::from_secs(15))?;
+    if pages {
+        crate::content::parse_pages(&text)
+    } else {
+        Ok(crate::content::Extracted {
+            body: String::from_utf8(text)?,
+            pages: Vec::new(),
+        })
+    }
+}
+
+fn run_extractor(
+    command: &mut Command,
+    bytes: Vec<u8>,
+    limit: u64,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
     let mut child = command
         .process_group(0)
         .stdin(Stdio::piped())
@@ -1409,11 +1512,6 @@ fn extract_pdf(path: &Path, helper: &PdfExtractor) -> Result<crate::content::Ext
         .spawn()?;
     // Input and output must be serviced concurrently to avoid pipe deadlock.
     let mut input = child.stdin.take().context("extractor input")?;
-    let limit = if pages {
-        3 * MAX_DOCUMENT
-    } else {
-        MAX_DOCUMENT
-    };
     let mut output = child
         .stdout
         .take()
@@ -1424,7 +1522,7 @@ fn extract_pdf(path: &Path, helper: &PdfExtractor) -> Result<crate::content::Ext
         let mut text = Vec::new();
         output.read_to_end(&mut text).map(|_| text)
     });
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) if reader.is_finished() && writer.is_finished() => break status,
@@ -1433,8 +1531,12 @@ fn extract_pdf(path: &Path, helper: &PdfExtractor) -> Result<crate::content::Ext
                 // Kill the helper group so inherited pipe descriptors also close.
                 unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
                 let _ = child.wait();
-                other.context("wait for PDF extractor")?;
-                bail!("PDF extraction timed out");
+                other.context("wait for extractor")?;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "extraction timed out",
+                )
+                .into());
             }
         }
     };
@@ -1444,17 +1546,11 @@ fn extract_pdf(path: &Path, helper: &PdfExtractor) -> Result<crate::content::Ext
     writer
         .join()
         .map_err(|_| anyhow::anyhow!("extractor input failed"))??;
-    if !status.success() || text.len() as u64 > limit {
-        bail!("PDF extraction failed or exceeded text limit");
-    }
-    if pages {
-        crate::content::parse_pages(&text)
-    } else {
-        Ok(crate::content::Extracted {
-            body: String::from_utf8(text)?,
-            pages: Vec::new(),
-        })
-    }
+    ensure!(
+        status.success() && text.len() as u64 <= limit,
+        "extraction failed or exceeded text limit"
+    );
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -1487,6 +1583,16 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dataless_bulk_metadata_cannot_queue_image_ocr() {
+        let path = Path::new("/private/tmp/local.heic");
+        let image = DocumentKind::for_path(path).unwrap();
+        let availability = |flags| platform::classify(path, platform::dataless_flags(flags));
+        assert!(image.accepts_availability(availability(0)));
+        assert!(!image.accepts_availability(availability(0x4000_0000))); // Darwin SF_DATALESS
     }
 
     #[test]

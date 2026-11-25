@@ -542,12 +542,14 @@ private struct ValidationHit: Encodable {
     let kind: String
     let availability: String
     let document_stamp: String?
+    let matched_by: String
 
     init(_ hit: SearchHit) {
         path = hit.path
         kind = hit.kind
         availability = hit.availability
         document_stamp = hit.document_stamp
+        matched_by = hit.matched_by
     }
 }
 

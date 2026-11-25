@@ -356,6 +356,7 @@ pub(super) fn append_hits(
                         &hit.kind,
                         &hit.availability,
                         None,
+                        None,
                     );
                 remaining -= usize::from(valid);
                 valid
@@ -512,7 +513,7 @@ pub(super) fn validate_batch(
     let external: Vec<_> = hits
         .iter()
         .enumerate()
-        .filter(|&(_, &(path, _, _, stamp))| stamp.is_none() && is_external(Path::new(path)))
+        .filter(|&(_, &(path, _, _, stamp, _))| stamp.is_none() && is_external(Path::new(path)))
         .collect();
     if external.is_empty() {
         return;
@@ -543,8 +544,15 @@ pub(super) fn validate_batch(
                 conn,
                 catalog,
                 selected,
-                |validator, &(_, &(path, kind, availability, _))| {
-                    validator.check(paths, Path::new(path), kind, availability, None)
+                |validator, &(_, &(path, kind, availability, stamp, matched_by))| {
+                    validator.check(
+                        paths,
+                        Path::new(path),
+                        kind,
+                        availability,
+                        stamp,
+                        matched_by,
+                    )
                 },
             )
         },

@@ -84,7 +84,7 @@ def main():
                     ip: {"NSExceptionAllowsInsecureHTTPLoads": True} for ip in ("127.0.0.1", "::1")
                 }},
             }, metadata)
-        sources = ["app/TranslationClient.swift", "app/TranslationModel.swift", "app/TranslationPanel.swift",
+        sources = ["app/LumenCommandCatalog.swift", "app/LumenQuickAnswer.swift", "app/TranslationClient.swift", "app/TranslationModel.swift", "app/TranslationPanel.swift",
                    "scripts/translation-smoke.swift"]
         subprocess.run(["xcrun", "swiftc", "-O", "-swift-version", "5", "-target", "arm64-apple-macosx14.0",
                         "-parse-as-library", *sources, "-o", str(exe)], cwd=ROOT, check=True, timeout=60)

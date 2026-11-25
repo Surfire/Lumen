@@ -15,14 +15,15 @@ enum FileAction: Equatable {
 }
 
 struct PreviewSnapshot {
-    private let directory: URL
+    let directory: URL
     let url: URL
 
-    private enum Failure: Error { case unavailable, tooLarge }
+    enum Failure: Error { case unavailable, tooLarge }
 
-    static func make(for hit: SearchHit) throws -> PreviewSnapshot {
-        let maximum: Int64 = 128 * 1024 * 1024
+    static func make(for hit: SearchHit, maximum: Int64 = 128 * 1024 * 1024,
+                     expectedStamp: String? = nil, requiresResidentMetadata: Bool = false) throws -> PreviewSnapshot {
         guard hit.isLocal, hit.kind == "file", let current = hit.pathStamp(),
+              expectedStamp == nil || expectedStamp == current,
               !hit.hasPreview || hit.document_stamp == current else { throw Failure.unavailable }
 
         let policy = IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES
@@ -31,6 +32,12 @@ struct PreviewSnapshot {
         guard prior >= 0, setiopolicy_np(policy, scope, IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0
         else { throw Failure.unavailable }
         defer { _ = setiopolicy_np(policy, scope, prior) }
+
+        if requiresResidentMetadata {
+            let url = URL(fileURLWithPath: hit.path)
+            guard let values = try? url.resourceValues(forKeys: [.isUbiquitousItemKey, .volumeIsLocalKey]),
+                  values.isUbiquitousItem != true, values.volumeIsLocal == true else { throw Failure.unavailable }
+        }
 
         guard let descriptor = LocalFile.openReadOnly(hit.path) else { throw Failure.unavailable }
         let input = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
@@ -60,6 +67,7 @@ struct PreviewSnapshot {
 
         var copied: Int64 = 0
         while let bytes = try input.read(upToCount: 256 * 1024), !bytes.isEmpty {
+            try Task.checkCancellation()
             copied += Int64(bytes.count)
             guard copied <= length else { throw Failure.unavailable }
             try output.write(contentsOf: bytes)

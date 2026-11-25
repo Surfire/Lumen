@@ -127,6 +127,12 @@ final class TranslationPanelModel: ObservableObject {
     }
 
     var provider: TranslationProvider? { providers.first { $0.id == selected } }
+    func answerWithSavedProvider() -> LumenQuickAnswer.Answer? {
+        guard let provider, TranslationClient.isValidModel(provider.model),
+              (try? TranslationEndpoint(provider.endpoint)) != nil else { return nil }
+        return { [client] question in try await client.answer(question, provider: provider) }
+    }
+
     var availableModels: [String] {
         guard let endpoint = try? TranslationEndpoint(draft.endpoint), endpoint == discoveredEndpoint else { return [] }
         return discovered

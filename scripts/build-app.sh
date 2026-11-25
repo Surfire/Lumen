@@ -23,6 +23,8 @@ done
 xcrun swiftc -O -swift-version 5 -target "$SWIFT_TARGET" -module-cache-path "$PWD/target/SwiftModuleCache" -parse-as-library -D LUMEN_EXTENSIONS \
     app/LumenApp.swift app/LauncherEngine.swift app/LauncherHotKey.swift app/LauncherModel.swift \
     app/LauncherViews.swift app/LauncherActions.swift app/LauncherPreview.swift app/LauncherShortcuts.swift app/LauncherCalculation.swift app/LauncherSmoke.swift \
+    app/LumenCommandCatalog.swift app/LumenQuickAnswer.swift app/LauncherCommands.swift \
+    app/InlinePreview.swift app/MacPreview.swift app/MacInlinePreviewView.swift app/LauncherInlinePreview.swift \
     app/TranslationClient.swift app/TranslationModel.swift app/TranslationPanel.swift app/LauncherExternalVolumes.swift extensions/LumenExtensionPanel.swift -o "$APP/Contents/MacOS/Lumen"
 xcrun swiftc -O -swift-version 5 -target "$SWIFT_TARGET" -module-cache-path "$PWD/target/SwiftModuleCache" app/LocalEmbedding.swift -o "$APP/Contents/Resources/LumenLocalEmbedding"
 xcrun swiftc -O -swift-version 5 -target "$SWIFT_TARGET" -module-cache-path "$PWD/target/SwiftModuleCache" app/ExtractPdf.swift -o "$APP/Contents/Resources/LumenPdfExtractor"

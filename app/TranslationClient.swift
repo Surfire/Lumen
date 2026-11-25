@@ -218,6 +218,19 @@ struct TranslationClient: Sendable {
         return result
     }
 
+    func answer(_ question: String, provider: TranslationProvider) async throws -> String {
+        guard Self.isValidInput(question), Self.isValidModel(provider.model) else { throw TranslationFailure.invalidInput }
+        let body = try JSONEncoder().encode(CompletionRequest(model: provider.model, messages: [
+            .init(role: "system", content: "Answer the user's question in its language. You have no live sources, tools, or local files. Acknowledge uncertainty and do not invent sources."),
+            .init(role: "user", content: question)
+        ]))
+        let data = try await response(provider, path: ["chat", "completions"], body: body)
+        guard let choice = try? JSONDecoder().decode(Completion.self, from: data).choices.first,
+              choice.finish_reason == nil || choice.finish_reason == "stop", let result = choice.message.content
+        else { throw TranslationFailure.incomplete }
+        return result
+    }
+
     static func isValidInput(_ text: String) -> Bool {
         text.utf8.count <= 16_384 && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }

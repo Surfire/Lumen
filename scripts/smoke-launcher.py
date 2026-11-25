@@ -26,8 +26,11 @@ class GuiTranslationFixture(BaseHTTPRequestHandler):
     def do_POST(self):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         source = request["messages"][1]["content"]
-        self.server.requests.append((self.path, request))
         root = self.server.root
+        if "You have no live sources" in request["messages"][0]["content"]:
+            self.reply_qa(request, source, root)
+            return
+        self.server.requests.append((self.path, request))
         (root / "translation-request-started").touch()
         assert self.headers["Authorization"] == "Bearer synthetic-smoke-key"
         denied = source == "模拟错误"
@@ -54,11 +57,36 @@ class GuiTranslationFixture(BaseHTTPRequestHandler):
         if slow:
             (root / f"{slow}-replied").touch()
 
+    def reply_qa(self, request, source, root):
+        assert self.headers["Authorization"] == "Bearer synthetic-smoke-key"
+        assert self.path == "/translated/v1/chat/completions"
+        assert set(request) == {"model", "messages", "stream"}
+        assert len(request["messages"]) == 2 and request["messages"][1]["role"] == "user"
+        self.server.qa_requests.append(source)
+        (root / "qa-request").touch()
+        slow = source == "synthetic slow"
+        if slow:
+            (root / "qa-slow").touch()
+            sleep(1.4)
+        answer = ("日本語の回答と中文示例です。内容用于验证滚动和换行。\n" * 25
+                  if source == "長い回答" else "Late answer" if slow else "Current answer")
+        body = json.dumps({"choices": [{"message": {"content": answer}, "finish_reason": "stop"}]}).encode()
+        try:
+            self.send_response(401 if source == "synthetic error" else 200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        if slow:
+            (root / "qa-late").touch()
+
 
 def verify_gui_translation(root, language):
     with ThreadingHTTPServer(("127.0.0.1", 0), GuiTranslationFixture) as server:
         server.root = root
         server.requests = []
+        server.qa_requests = []
         worker = Thread(target=server.serve_forever, daemon=True)
         worker.start()
         try:
@@ -74,6 +102,7 @@ def verify_gui_translation(root, language):
                 ("see you tomorrow", "English into Simplified Chinese"),
             ]
             assert len(server.requests) == len(expected), server.requests
+            assert server.qa_requests == ["長い回答", "synthetic error", "synthetic slow", "newer question"]
             for (path, request), (source, direction) in zip(server.requests, expected):
                 assert path == "/translated/v1/chat/completions"
                 assert request["model"] == "sandbox-model"
@@ -430,6 +459,21 @@ def run(root, language, gemma_home=None):
                    timeout=150 if gemma_home is not None else 45)
 
 
+def write_preview_png(path, size, color, accent=None):
+    def png_chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+
+    def row(y):
+        inner = size // 4 <= y < size * 3 // 4
+        return b"\x00" + b"".join(bytes(accent if accent and inner and size // 4 <= x < size * 3 // 4 else color)
+                                  for x in range(size))
+
+    rows = b"".join(row(y) for y in range(size))
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" +
+                     png_chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)) +
+                     png_chunk(b"IDAT", zlib.compress(rows)) + png_chunk(b"IEND", b""))
+
+
 def make_action_probe(root):
     application = root / "Applications/Lumen Action Probe.app/Contents"
     executable = application / "MacOS/probe"
@@ -445,12 +489,7 @@ def make_action_probe(root):
         }, handle)
     icon = application / "Resources/Probe.png"
     icon.parent.mkdir()
-    def png_chunk(tag, data):
-        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
-    rows = (b"\x00" + bytes((224, 38, 179, 255)) * 64) * 64
-    icon.write_bytes(b"\x89PNG\r\n\x1a\n" +
-                     png_chunk(b"IHDR", struct.pack(">IIBBBBB", 64, 64, 8, 6, 0, 0, 0)) +
-                     png_chunk(b"IDAT", zlib.compress(rows)) + png_chunk(b"IEND", b""))
+    write_preview_png(icon, 64, (224, 38, 179, 255))
     source = root / "probe.c"
     # The child can write only this synthetic test marker and then exits on its own.
     source.write_text("#include <stdio.h>\n#include <unistd.h>\n"
@@ -506,7 +545,7 @@ def make_page_pdf(path):
     path.write_bytes(pdf)
 
 
-def verify_content_pipeline():
+def verify_content_pipeline(snapshots=None):
     with tempfile.TemporaryDirectory(prefix="lumen-content-gui-") as tmp:
         root = Path(tmp).resolve()
         corpus = root / "corpus"
@@ -514,7 +553,14 @@ def verify_content_pipeline():
         denied = chosen / "Denied"
         denied.mkdir(parents=True)
         (root / "content-scenario").touch()
+        if snapshots:
+            (root / "capture-preview").touch()
         make_page_pdf(chosen / "report.pdf")
+        write_preview_png(chosen / "preview-fixture-a.png", 32, (200, 85, 40, 255))
+        write_preview_png(chosen / "preview-fixture-b.png", 32, (27, 102, 152, 255), (235, 192, 93, 255))
+        managed = corpus / "Dropbox"
+        managed.mkdir()
+        write_preview_png(managed / "cloud-preview-known.png", 32, (136, 36, 155, 255))
         (chosen / "notes.md").write_text("Synthetic included note.", encoding="utf-8")
         (denied / "secret.md").write_text("Synthetic excluded note.", encoding="utf-8")
         (corpus / "outside-report.md").write_text("outsideexclusivebody", encoding="utf-8")
@@ -522,6 +568,10 @@ def verify_content_pipeline():
                         "index", "--root", str(corpus), "--deny", str(denied), "--separate-content"],
                        check=True, timeout=15, stdout=subprocess.DEVNULL)
         run(root, "en")
+        if snapshots:
+            snapshots.mkdir(parents=True, exist_ok=True)
+            for image in root.glob("lumen-inline-*.png"):
+                shutil.copyfile(image, snapshots / image.name)
 
 
 def main():
@@ -551,7 +601,7 @@ def main():
                            check=True, timeout=15, capture_output=True)
             run(root, "en")
         return
-    verify_content_pipeline()
+    verify_content_pipeline(args.snapshots)
     if args.content_only:
         return
     with tempfile.TemporaryDirectory(prefix="lumen-gui-actions-") as tmp:

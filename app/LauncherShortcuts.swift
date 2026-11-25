@@ -14,6 +14,7 @@ struct SavedShortcut: Codable, Equatable, Identifiable {
     var target: Target
     var pinned: Bool
     var lastOpened: Date?
+    var queryParameter: String? = nil
     var rowID: String { "shortcut:" + id.uuidString }
 
     var symbol: String {
@@ -30,6 +31,11 @@ struct SavedShortcut: Codable, Equatable, Identifiable {
         case .folder(let path): return (path as NSString).abbreviatingWithTildeInPath
         case .web(let url): return url.absoluteString
         }
+    }
+
+    var queryLink: LumenHTTPSQueryLink? {
+        guard case .web(let url) = target, let queryParameter else { return nil }
+        return .init(commandID: rowID, keyword: alias, title: title, baseURL: url, queryKey: queryParameter)
     }
 
     static func webURL(_ value: String) -> URL? {
@@ -65,6 +71,12 @@ final class ShortcutLibrary: ObservableObject {
         case .application(let identifier): guard identifier.hasPrefix("app:") else { return false }
         case .folder(let path): guard SearchHit.pathStamp(at: path, kind: "directory") != nil else { return false }
         case .web(let url): guard SavedShortcut.webURL(url.absoluteString) == url else { return false }
+        }
+        if shortcut.queryParameter != nil {
+            guard let link = shortcut.queryLink,
+                  !["g", "qa", "tr", "translate"].contains(link.keyword),
+                  !entries.contains(where: { $0.id != shortcut.id && $0.queryLink?.keyword == link.keyword })
+            else { return false }
         }
         if let index = entries.firstIndex(where: { $0.id == shortcut.id }) {
             entries[index] = shortcut
@@ -165,6 +177,7 @@ struct QuicklinksView: View {
     @State private var title = ""
     @State private var alias = ""
     @State private var destination = ""
+    @State private var queryParameter = ""
     @State private var pinned = false
     @State private var invalid = false
 
@@ -214,6 +227,13 @@ struct QuicklinksView: View {
                 case .web:
                     TextField(model.t("网页地址", "Website URL"), text: $destination,
                               prompt: Text(verbatim: "https://example.com"))
+                    TextField(model.t("查询参数（可选）", "Query Parameter (Optional)"), text: $queryParameter,
+                              prompt: Text(verbatim: "q"))
+                    if !queryParameter.isEmpty {
+                        Text(model.t("用「别名 搜索词」打开 HTTPS 网页。网址请填写不含查询参数的地址。",
+                                     "Type the alias and a query to open an HTTPS page. Use a base URL without a query string."))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
                 Toggle(model.t("固定在空搜索页", "Pin to Empty Search"), isOn: $pinned)
                 HStack {
@@ -243,6 +263,7 @@ struct QuicklinksView: View {
         title = shortcut.title
         alias = shortcut.alias
         pinned = shortcut.pinned
+        queryParameter = shortcut.queryParameter ?? ""
         switch shortcut.target {
         case .application(let value), .folder(let value): destination = value
         case .web(let url): destination = url.absoluteString
@@ -255,6 +276,7 @@ struct QuicklinksView: View {
         title = ""
         alias = ""
         destination = ""
+        queryParameter = ""
         pinned = false
         invalid = false
     }
@@ -270,8 +292,10 @@ struct QuicklinksView: View {
             guard let url = SavedShortcut.webURL(destination) else { invalid = true; return }
             target = .web(url)
         }
+        let parameter = queryParameter.trimmingCharacters(in: .whitespacesAndNewlines)
         let shortcut = SavedShortcut(id: editing?.id ?? UUID(), title: title, alias: alias,
-                                     target: target, pinned: pinned, lastOpened: editing?.lastOpened)
+                                     target: target, pinned: pinned, lastOpened: editing?.lastOpened,
+                                     queryParameter: kind == .web && !parameter.isEmpty ? parameter : nil)
         if library.save(shortcut) { reset() } else { invalid = true }
     }
 }

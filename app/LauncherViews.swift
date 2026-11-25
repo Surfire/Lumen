@@ -7,6 +7,11 @@ struct SearchWindow: View {
     @ObservedObject var applicationIcons: ResultIconDisplay
     @ObservedObject var contextActions: ContextActions
     @ObservedObject var translation: TranslationPanelModel
+    @ObservedObject var commands: LauncherCommands
+    @ObservedObject var inlinePreview: LauncherInlinePreview
+    let activateCommand: () -> Void
+    let searchCommandAsFiles: () -> Void
+    let closeInlinePreview: () -> Void
     let activateTranslation: () -> Void
     let toggleContextActions: () -> Void
     let showSettings: () -> Void
@@ -18,13 +23,15 @@ struct SearchWindow: View {
     static let footerHeight: CGFloat = 28
     static let maximumVisibleRows = 8
 
-    static func height(for model: Launcher, contextCount: Int = 0, hasTranslation: Bool = false) -> CGFloat {
+    static func height(for model: Launcher, contextCount: Int = 0, hasTranslation: Bool = false,
+                       commandHeight: CGFloat? = nil, hasPreview: Bool = false) -> CGFloat {
         let shell = headerHeight + footerHeight
         if hasTranslation { return shell + 138 }
+        if let commandHeight { return shell + commandHeight }
         if contextCount > 0 { return shell + CGFloat(min(contextCount, maximumVisibleRows) * 44) }
         guard model.showsResults else { return shell }
         let rows = model.hasQuery ? maximumVisibleRows : min(model.visibleResults.count, maximumVisibleRows)
-        return shell + CGFloat(rows * 44)
+        return shell + max(CGFloat(rows * 44), hasPreview ? 176 : 0)
     }
 
     private static func rowHeight(_ hit: SearchHit) -> CGFloat { hit.hasPreview ? 60 : 44 }
@@ -34,8 +41,32 @@ struct SearchWindow: View {
             if let command = translation.command {
                 TranslationResultCard(model: translation, command: command, chinese: model.zh,
                                       activate: activateTranslation)
+            } else if commands.showsCard {
+                LauncherCommandCard(commands: commands, provider: translation, chinese: model.zh,
+                                    activate: activateCommand, openSettings: showSettings)
             } else if contextActions.isOpen {
                 contextRows
+            } else if let hit = inlinePreview.hit, model.selectedHit == hit, model.containsCurrentFile(hit) {
+                HStack(spacing: 0) {
+                    results
+                    Divider()
+                    VStack(alignment: .leading, spacing: 7) {
+                        HStack(spacing: 6) {
+                            Text(hit.name).font(.headline).lineLimit(1).truncationMode(.middle)
+                            Spacer(minLength: 2)
+                            Button(action: closeInlinePreview) {
+                                Image(systemName: "xmark.circle")
+                            }
+                            .buttonStyle(.borderless)
+                            .accessibilityLabel(model.t("关闭预览", "Close Preview"))
+                        }
+                        MacInlinePreviewView(state: inlinePreview.state,
+                                             language: model.zh ? .simplifiedChinese : .english)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(12)
+                    .frame(width: 295)
+                }
             } else if model.showsResults {
                 results.overlay {
                     if model.visibleResults.isEmpty {
@@ -63,6 +94,8 @@ struct SearchWindow: View {
                     keyHint("↵", model.t("翻译", "Translate"))
                 }
                 Spacer(minLength: 8)
+            } else if commands.showsCard {
+                commandFooter
             } else {
                 searchFooter
             }
@@ -82,13 +115,37 @@ struct SearchWindow: View {
         .overlay(alignment: .top) { Divider() }
     }
 
+    @ViewBuilder private var commandFooter: some View {
+        switch commands.resolution {
+        case .discovery:
+            keyHint("↑↓", model.t("选择", "Select"))
+            keyHint("↵", model.t("填入命令", "Fill Command"))
+        case .question:
+            switch commands.answer {
+            case .loading: keyHint("esc", model.t("取消", "Cancel"))
+            case .answer:
+                keyHint("↵", model.t("复制", "Copy"))
+                keyHint("⇞⇟", model.t("翻页", "Scroll"))
+                if commands.copied { Text(model.t("已复制", "Copied")) }
+            case .idle, .failed: EmptyView()
+            }
+        default: EmptyView()
+        }
+        Spacer(minLength: 8)
+        Button(model.t("搜索文件", "Search Files"), action: searchCommandAsFiles)
+            .buttonStyle(.borderless)
+    }
+
     @ViewBuilder private var searchFooter: some View {
         if model.showsResults {
             keyHint("↑↓", model.t("选择", "Select"))
             keyHint("↵", model.t("打开", "Open"))
             if let file = model.selectedHit {
                 keyHint("⌘↵", model.t("在 Finder 中显示", "Show in Finder"))
-                if file.isLocal && file.kind == "file" { keyHint("⌘Y", model.t("快速查看", "Quick Look")) }
+                if file.isLocal && file.kind == "file" {
+                    keyHint("⌘Y", LauncherInlinePreview.kind(file) == nil ? model.t("快速查看", "Quick Look")
+                            : model.t("预览", "Preview"))
+                }
             }
         }
         if let title = model.launcherActivityTitle,
@@ -111,7 +168,7 @@ struct SearchWindow: View {
                 .buttonStyle(.borderless).fontWeight(.semibold)
                 .accessibilityIdentifier("build-index")
         } else {
-            keyHint("esc", model.t("关闭", "Close"))
+            keyHint("esc", inlinePreview.isOpen ? model.t("关闭预览", "Close Preview") : model.t("关闭", "Close"))
         }
         if model.selectedResult != nil {
             Button(action: toggleContextActions) {

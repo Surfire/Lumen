@@ -355,7 +355,9 @@ final class LauncherSmoke {
         try check(dispatchedActions.first == probe.destination && !NSApp.isActive && !wasActivated,
                   "the app action dispatched elsewhere or activated Lumen")
 
+        try verifyUnconfiguredQA(app)
         try await verifyInlineTranslation(app)
+        try await verifyLauncherCommands(app)
 
         for (term, expected) in [
             ("无线局域网", "com.apple.wifi-settings-extension"),
@@ -443,6 +445,121 @@ final class LauncherSmoke {
         if exists("syntax-scenario") { try await verifyRawFileQuery(app) }
         if exists("quicklinks-scenario") { try await verifyQuicklinks(app) }
         print("Unified actions passed: real background app launch, routed Settings URLs, isolated file copies, and native local Quick Look input")
+    }
+
+    private func verifyUnconfiguredQA(_ app: AppDelegate) throws {
+        app.showSearch()
+        try type("qa 还没有配置", into: app)
+        try key(kVK_Return, "\r", in: app)
+        try check(app.commands.answer == .idle && !exists("translation-request-started"),
+                  "unconfigured QA sent a request")
+        if exists("capture-icons") {
+            try capture("lumen-qa-unconfigured.png", appearance: .aqua, window: app.panel)
+            app.panel.appearance = nil
+        }
+        app.dismissSearch()
+    }
+
+    private func verifyLauncherCommands(_ app: AppDelegate) async throws {
+        let commands = app.commands
+        let panel = app.panel
+        app.showSearch()
+        try type("?", into: app)
+        try check(commands.resolution == .discovery && commands.selectedEntry?.keyword == "qa", "missing command chooser")
+        if exists("capture-icons") {
+            try capture("lumen-command-chooser.png", appearance: .aqua, window: panel)
+            panel.appearance = nil
+        }
+        try key(kVK_DownArrow, "\u{f701}", in: app)
+        try check(commands.selectedEntry?.keyword == "tr", "arrows did not move in the chooser")
+        try key(kVK_UpArrow, "\u{f700}", in: app)
+        try key(kVK_Return, "\r", in: app)
+        try check(commands.resolution == .missingArgument(commandID: "qa"), "chooser submitted rather than filling")
+        let browserCount = dispatchedQuicklinks.count
+        try type("g 武汉 C++ &next=https://example.invalid/#猫", into: app)
+        try check(dispatchedQuicklinks.count == browserCount, "typing opened a browser")
+        try key(kVK_Return, "\r", in: app)
+        let destination = dispatchedQuicklinks.last.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }
+        try check(dispatchedQuicklinks.count == browserCount + 1 && destination?.host == "www.google.com" &&
+                  destination?.queryItems == [URLQueryItem(name: "q", value: "武汉 C++ &next=https://example.invalid/#猫")],
+                  "Google command split or changed the argument")
+        let shortcut = SavedShortcut(id: UUID(), title: "Synthetic Docs", alias: "docs",
+                                     target: .web(URL(string: "https://example.invalid/search")!),
+                                     pinned: false, lastOpened: nil, queryParameter: "keywords")
+        try check(app.model.shortcuts.save(shortcut), "could not save parameterized shortcut")
+        app.showSearch()
+        try type("docs 样本 & test", into: app)
+        try check(dispatchedQuicklinks.count == browserCount + 1, "shortcut opened while typing")
+        try key(kVK_Return, "\r", in: app)
+        let custom = dispatchedQuicklinks.last.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }
+        try check(dispatchedQuicklinks.count == browserCount + 2 && custom?.host == "example.invalid" &&
+                  custom?.queryItems == [URLQueryItem(name: "keywords", value: "样本 & test")], "custom command encoded incorrectly")
+        app.model.shortcuts.remove(shortcut)
+        dispatchedQuicklinks.removeLast(2)
+
+        app.showSearch()
+        let input = try editor(app)
+        let question = "qa 長い回答"
+        try type(question, into: app)
+        input.setMarkedText("kota", selectedRange: NSRange(location: 4, length: 0),
+                            replacementRange: NSRange(location: question.utf16.count - 1, length: 1))
+        try check(!app.control(app.searchField, textView: input, doCommandBy: #selector(NSResponder.insertNewline(_:))) &&
+                  !exists("qa-request"), "the marked question was sent")
+        input.insertText("答", replacementRange: input.markedRange())
+        input.unmarkText()
+        try check(input.string == question && !exists("qa-request"), "committing input contacted the QA provider")
+        try key(kVK_Return, "\r", in: app)
+        try await until("QA did not return a Japanese and Chinese answer") {
+            if case .answer(let output) = commands.answer { return output.contains("回答") && output.count > 400 }
+            return false
+        }
+        if exists("capture-icons") {
+            try capture("lumen-qa-answer.png", appearance: .aqua, window: panel)
+            try capture("lumen-qa-answer-dark.png", appearance: .darkAqua, window: panel)
+            panel.appearance = nil
+        }
+        func answerScroll(in view: NSView?) -> NSScrollView? {
+            guard let view else { return nil }
+            if view.identifier?.rawValue == "qa-answer-scroll" { return view as? NSScrollView }
+            return view.subviews.lazy.compactMap { answerScroll(in: $0) }.first
+        }
+        try key(kVK_PageDown, "\u{f72d}", in: app, throughPanel: true)
+        try await until("Page Down did not scroll the actual answer") {
+            (answerScroll(in: panel.contentView)?.contentView.bounds.minY ?? 0) > 0
+        }
+        try check(panel.firstResponder === input, "Page Down changed search focus")
+        try key(kVK_PageUp, "\u{f72c}", in: app, throughPanel: true)
+        try await until("Page Up did not return to the answer start") {
+            answerScroll(in: panel.contentView)?.contentView.bounds.minY == 0
+        }
+        try key(kVK_Return, "\r", in: app)
+        try check(commands.copied && filePasteboard.string(forType: .string)?.contains("回答") == true &&
+                  panel.firstResponder === input && app.searchPresented, "second Return did not copy in place")
+
+        try type("qa synthetic error", into: app)
+        try key(kVK_Return, "\r", in: app)
+        try await until("QA provider error was not shown") { commands.answer == .failed }
+        if exists("capture-icons") {
+            try capture("lumen-qa-error.png", appearance: .aqua, window: panel)
+            panel.appearance = nil
+        }
+        try type("qa synthetic slow", into: app)
+        try key(kVK_Return, "\r", in: app)
+        try await until("QA did not reach loading") { commands.answer == .loading && self.exists("qa-slow") }
+        if exists("capture-icons") {
+            try capture("lumen-qa-loading.png", appearance: .aqua, window: panel)
+            panel.appearance = nil
+        }
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try check(commands.answer == .idle && app.searchPresented, "Esc did not cancel QA in place")
+        try type("qa newer question", into: app)
+        try key(kVK_Return, "\r", in: app)
+        try await until("new QA answer was not delivered") { commands.answer == .answer("Current answer") }
+        try await until("old QA reply was not exercised") { self.exists("qa-late") }
+        try check(commands.answer == .answer("Current answer") && panel.firstResponder === input,
+                  "late QA answer or rendering changed the current result or focus")
+        try type("lumen action probe", into: app)
+        try check(commands.resolution == .search && commands.answer == .idle, "ordinary search did not recover")
     }
 
     private func verifyInlineTranslation(_ app: AppDelegate) async throws {
@@ -959,9 +1076,60 @@ final class LauncherSmoke {
             model.selectedHit?.name == "report.pdf" && model.selectedHit?.pdf_page == 2 &&
                 model.selectedHit?.snippet?.contains("zircon calibration") == true
         }
+        try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
+        try await until("inline PDF did not render the verified match page") {
+            if case .ready(_, let document) = app.inlinePreview.state,
+               case .pdf(_, 2, true)? = document.visual {
+                return document.evidence?.text.contains("zircon calibration") == true
+            }
+            return false
+        }
+        if exists("capture-preview") {
+            try capture("lumen-inline-pdf.png", appearance: .aqua, window: app.panel)
+            app.panel.appearance = nil
+        }
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try check(!app.inlinePreview.isOpen && model.query == "zircon calibration" && app.searchPresented,
+                  "Escape closed the launcher rather than its preview")
         try key(kVK_Return, "\r", in: app, throughPanel: true)
         try await until("Return opened the PDFKit view on page 2") { app.localPreview?.displayedPDFPage == 2 }
         app.localPreview?.close()
+        try type("included note", into: app)
+        try await until("verified text excerpt became selectable") { model.selectedHit?.snippet?.contains("included note") == true }
+        try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
+        try await until("inline text excerpt reused verified evidence") {
+            if case .ready(_, let result) = app.inlinePreview.state {
+                return result.visual == nil && result.evidence?.match == .literal
+            }
+            return false
+        }
+
+        try type("preview-fixture-", into: app)
+        try await until("local image fixtures became selectable") {
+            model.hits.filter { $0.name.hasPrefix("preview-fixture-") }.count == 2 && model.selectedHit != nil
+        }
+        try check(!app.inlinePreview.isOpen, "a query change retained the prior preview")
+        try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
+        try key(kVK_DownArrow, "\u{f701}", in: app)
+        guard let selectedImage = model.selectedHit?.path else { throw Failure("image navigation lost selection") }
+        try await until("rapid selection did not show the new image") {
+            if case .ready(let selection, let preview) = app.inlinePreview.state,
+               case .image? = preview.visual { return selection.id == selectedImage }
+            return false
+        }
+        if exists("capture-preview") {
+            try capture("lumen-inline-image.png", appearance: .darkAqua, window: app.panel)
+            app.panel.appearance = nil
+        }
+
+        try type("cloud-preview-known", into: app)
+        try await until("cloud fixture was not metadata only") { model.selectedHit?.isCloudReference == true }
+        try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
+        try check({
+            if case .unavailable(_, .notLocal) = app.inlinePreview.state { return true }
+            return false
+        }() && app.localPreview == nil, "cloud preview did not decline before reading")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
         try type("outsideexclusivebody", into: app)
         try await until("body remained outside the chosen scope") { !model.searching }
         try check(model.hits.isEmpty, "unselected text appeared as a hit")

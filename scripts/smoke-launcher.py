@@ -574,6 +574,28 @@ def verify_content_pipeline(snapshots=None):
                 shutil.copyfile(image, snapshots / image.name)
 
 
+def verify_image_search(fixtures, projector, gemma_home, snapshots):
+    with tempfile.TemporaryDirectory(prefix="lumen-image-gui-") as tmp:
+        root = Path(tmp).resolve()
+        corpus = root / "corpus"
+        chosen = corpus / "Chosen"
+        chosen.mkdir(parents=True)
+        for name in ("7e3d.png", "93a2.png", "a48f.png", "db1c.png"):
+            shutil.copyfile(fixtures / name, chosen / name)
+        (corpus / "sentinel-local-note.txt").write_text("Synthetic name search.", encoding="utf-8")
+        (root / "projector-path").write_text(str(projector.resolve()), encoding="utf-8")
+        (root / "image-scenario").touch()
+        if snapshots:
+            (root / "capture-preview").touch()
+        subprocess.run([str(BUNDLE / "Resources/lumen"), "--db", str(root / "index.sqlite"),
+                        "index", "--root", str(corpus), "--separate-content"],
+                       check=True, timeout=15, stdout=subprocess.DEVNULL)
+        run(root, "zh", gemma_home=gemma_home)
+        if snapshots:
+            snapshots.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(root / "lumen-image-search-preview.png", snapshots / "lumen-image-search-preview.png")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--watch-engine", type=Path, help="Also test an integrated lumen binary with persisted watch scopes")
@@ -582,6 +604,8 @@ def main():
     parser.add_argument("--content-only", action="store_true", help="Only verify selected content folders and native PDF page opening")
     parser.add_argument("--query-syntax", action="store_true", help="Also verify multiword and bare-extension queries in the unified field")
     parser.add_argument("--external-volumes", action="store_true", help="Run only the synthetic external volume panel scenario")
+    parser.add_argument("--image-fixtures", type=Path, help="Directory of opaque-filename image fixtures")
+    parser.add_argument("--image-projector", type=Path, help="Pinned local vision projector (requires --real-gemma)")
     parser.add_argument("--snapshots", type=Path, help="Save offscreen PNGs to this directory")
     args = parser.parse_args()
     if args.watch_engine and not args.watch_engine.is_file():
@@ -590,6 +614,11 @@ def main():
         parser.error("--real-gemma must point to a pinned Gemma resource directory")
     if not APP.is_file():
         raise SystemExit("Build the app first with scripts/build-app.sh")
+    if args.image_projector or args.image_fixtures:
+        if not args.real_gemma or not args.image_projector or not args.image_fixtures:
+            parser.error("image smoke requires --image-fixtures, --image-projector and --real-gemma")
+        verify_image_search(args.image_fixtures, args.image_projector, args.real_gemma.resolve(), args.snapshots)
+        return
     if args.external_volumes:
         with tempfile.TemporaryDirectory(prefix="lumen-gui-volumes-") as tmp:
             root = Path(tmp).resolve()

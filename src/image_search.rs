@@ -78,6 +78,26 @@ pub struct ImageScopeStatus {
     vectors: i64,
 }
 
+/// Inspect the saved image opt-in and stored vector count without changing the database.
+pub fn image_status(database: &Path) -> Result<ImageScopeStatus> {
+    let conn = open_read(database)?;
+    let Some(rules) = Rules::read(&conn)? else {
+        return Ok(ImageScopeStatus {
+            root: None,
+            vectors: 0,
+        });
+    };
+    let vectors = conn.query_row(
+        "SELECT count(*) FROM image_embedding WHERE model=?1",
+        [MODEL_ID],
+        |row| row.get(0),
+    )?;
+    Ok(ImageScopeStatus {
+        root: Some(rules.root),
+        vectors,
+    })
+}
+
 /// Set or clear an explicit image folder. No file bytes are read.
 pub fn image_scope(database: &Path, root: Option<&Path>) -> Result<ImageScopeStatus> {
     #[cfg(target_os = "macos")]

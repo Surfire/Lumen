@@ -13,6 +13,7 @@ struct SearchHit: Decodable, Equatable, Identifiable {
     var id: String { path }
     var isLocal: Bool { availability == "local" }
     var isCloudReference: Bool { availability == "placeholder" || availability == "provider_metadata_only" }
+    var isImageMatch: Bool { matched_by == "image_embedding" }
     var isSemanticCandidate: Bool { matched_by == "semantic_candidate" }
     var hasPreview: Bool { isLocal && snippet != nil }
 
@@ -198,6 +199,7 @@ final class LauncherEngine {
     private let root: URL?
     private var connection: SearchConnection?
     private var semanticConnection: SearchConnection?
+    private var imageConnection: SearchConnection?
     private let gemmaHome: URL?
     private var nextID: UInt64 = 0
 
@@ -317,6 +319,19 @@ final class LauncherEngine {
                command: ["semantic-serve"] + gemmaOptions, idleTimeout: .seconds(45), complete: complete)
     }
 
+    func searchImages(_ query: String, projector: URL, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
+        submit(query, mode: "semantic", limit: 5, to: &imageConnection,
+               command: ["image-serve", "--projector", projector.path] + gemmaOptions,
+               idleTimeout: .seconds(45), complete: complete)
+    }
+
+    func closeImages() {
+        imageConnection?.stop()
+        imageConnection = nil
+    }
+
+    func discardQueuedImages() { imageConnection?.discardQueued() }
+
     var gemmaOptions: [String] { gemmaHome.map { ["--gemma-home", $0.path] } ?? [] }
 
     private func submit(_ query: String, mode: String, limit: Int, to connection: inout SearchConnection?,
@@ -353,6 +368,7 @@ final class LauncherEngine {
         connection?.stop()
         connection = nil
         closeSemantic()
+        closeImages()
     }
 
     nonisolated static func readLines(_ file: FileHandle, line: (Data) -> Void) {

@@ -82,6 +82,8 @@ struct LauncherNotice {
 @MainActor
 final class Launcher: ObservableObject {
     @Published private(set) var query = ""
+    private var imageProjector: URL?
+    var isImageSearch: Bool { imageProjector != nil }
     @Published private(set) var hits: [SearchHit] = []
     @Published private(set) var launchMatches: [ActionMatch] = []
     @Published private(set) var calculation: CalculationResult?
@@ -193,6 +195,7 @@ final class Launcher: ObservableObject {
 
     var visibleResults: [LauncherResult] {
         guard hasQuery else { return shortcuts.home.map(LauncherResult.shortcut) }
+        if isImageSearch { return hits.map(LauncherResult.file) }
         let nativeScores = Dictionary(uniqueKeysWithValues: launchMatches.map { ($0.action.id, $0.score) })
         let shortcuts = shortcuts.matches(query).filter { match in
             guard case .application(let id) = match.record.target else { return true }
@@ -341,11 +344,16 @@ final class Launcher: ObservableObject {
     }
 
     func setQuery(_ text: String) {
-        guard text != query else { return }
+        let leavingImages = isImageSearch
+        if leavingImages {
+            imageProjector = nil
+            engine.closeImages()
+        }
+        guard text != query || leavingImages else { return }
         query = text
         calculation = CalculationResult.evaluate(text)
         updateLaunchMatches()
-        scheduleSearch()
+        scheduleSearch(clearRows: leavingImages)
         if let first = visibleResults.first {
             switch first {
             case .file: break
@@ -357,7 +365,18 @@ final class Launcher: ObservableObject {
         reconcileSelection()
     }
 
+    func setImageQuery(_ text: String, projector: URL) {
+        guard text != query || projector != imageProjector else { return }
+        if projector != imageProjector { engine.closeImages() }
+        imageProjector = projector
+        query = text
+        launchMatches = []
+        calculation = nil
+        scheduleSearch(clearRows: true)
+    }
+
     private func updateLaunchMatches() {
+        guard !isImageSearch else { return }
         let current = LaunchCatalog.matches(query, actions: builtInActions + appActions)
         if launchMatches != current { launchMatches = current }
     }
@@ -381,6 +400,7 @@ final class Launcher: ObservableObject {
     }
 
     func clear() {
+        if isImageSearch { imageProjector = nil; engine.closeImages() }
         query = ""
         calculation = nil
         launchMatches = []
@@ -394,6 +414,7 @@ final class Launcher: ObservableObject {
         cancelNameBypass()
         cancelRelatedExcerpts()
         engine.discardQueuedSearch()
+        engine.discardQueuedImages()
         if textProcess?.isRunning == true { textProcess?.terminate() }
         textProcess = nil
         if !keepAction {
@@ -411,7 +432,7 @@ final class Launcher: ObservableObject {
     }
 
     private func scheduleSearch(clearRows: Bool = false, keepAction: Bool = false) {
-        let shouldSearch = hasQuery && canSearch
+        let shouldSearch = hasQuery && canSearch && (!isImageSearch || !scopePending)
         // Keep the result surface intact while a replacement is pending. Old
         // rows are visual only until the current revision has been validated.
         invalidateSearch(clearRows: clearRows || !shouldSearch, keepAction: keepAction && shouldSearch)
@@ -423,6 +444,10 @@ final class Launcher: ObservableObject {
 
     private func search(revision: UInt64, watchRefresh: Bool) {
         let term = query
+        if let imageProjector {
+            searchImages(term, projector: imageProjector, revision: revision)
+            return
+        }
         let keepStablePreviewRows = watchRefresh && presentedQuery == term && hits.contains(where: \.hasPreview)
         var names: Result<[SearchHit], SearchFailure>?
         var text: Result<[SearchHit], SearchFailure>?
@@ -537,6 +562,44 @@ final class Launcher: ObservableObject {
         return .failure(SearchFailure(response.diagnostic))
     }
 
+    private func searchImages(_ query: String, projector: URL, revision: UInt64) {
+        textDebounce = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(170))
+            guard !Task.isCancelled, let self, self.revision == revision else { return }
+            self.engine.searchImages(query, projector: projector) { [weak self] response in
+                guard let self, self.revision == revision, self.isImageSearch, !self.closed else { return }
+                switch response {
+                case .failure:
+                    self.searching = false
+                    self.searchNotice = LauncherNotice(.search)
+                case .success(let results):
+                    let candidates = results.prefix(5).filter { $0.isImageMatch && $0.isLocal && $0.document_stamp != nil }
+                    let group = DispatchGroup()
+                    var confirmed = Set<String>()
+                    for hit in candidates {
+                        guard let stamp = hit.document_stamp else { continue }
+                        group.enter()
+                        _ = self.engine.run(["validate-hit", "--kind", hit.kind, "--availability", hit.availability,
+                                             "--document-stamp", stamp, "--", hit.path]) { result in
+                            defer { group.leave() }
+                            if result.succeeded, (try? JSONDecoder().decode(HitValidation.self, from: result.output))?.valid == true {
+                                confirmed.insert(hit.path)
+                            }
+                        }
+                    }
+                    group.notify(queue: .main) { [weak self] in
+                        guard let self, self.revision == revision, self.isImageSearch, !self.scopePending else { return }
+                        self.searching = false
+                        self.presentedQuery = query
+                        self.resultsRevision = revision
+                        self.directHits = candidates.filter { confirmed.contains($0.path) }
+                        self.publishHits(self.directHits)
+                    }
+                }
+            }
+        }
+    }
+
     private func validatePreviews(_ hits: [SearchHit], revision: UInt64, complete: @escaping ([SearchHit]) -> Void) {
         guard hits.contains(where: \.hasPreview) else {
             complete(hits)
@@ -624,11 +687,11 @@ final class Launcher: ObservableObject {
         let intent = actionIntent
         let text = hit.matched_by == "text"
         let mode = text ? "text" : "name"
-        let targeted = !hit.isSemanticCandidate && supportsTargetedValidation
+        let targeted = hit.isImageMatch || !hit.isSemanticCandidate && supportsTargetedValidation
         let arguments: [String]
         if targeted {
             var validation = ["validate-hit", "--kind", hit.kind, "--availability", hit.availability]
-            if text || hit.hasPreview {
+            if text || hit.hasPreview || hit.isImageMatch {
                 guard let stamp = hit.document_stamp else {
                     rejectStaleResult(hit)
                     return
@@ -654,7 +717,7 @@ final class Launcher: ObservableObject {
         }
         actionProcess = engine.run(arguments, priority: .userInitiated) { [weak self] response in
             guard let self, permitsDelivery() else { return }
-            if targeted, !response.succeeded, response.diagnostic.contains("unrecognized subcommand 'validate-hit'") {
+            if targeted, !hit.isImageMatch, !response.succeeded, response.diagnostic.contains("unrecognized subcommand 'validate-hit'") {
                 self.supportsTargetedValidation = false
                 self.revalidate(hit, retry: retry, complete: complete)
                 return
@@ -672,7 +735,7 @@ final class Launcher: ObservableObject {
                 let stamp = hit.pathStamp()
                 DispatchQueue.main.async { [weak self] in
                     guard let self, permitsDelivery() else { return }
-                    guard let stamp, !hit.hasPreview || hit.document_stamp == stamp else {
+                    guard let stamp, !(hit.hasPreview || hit.isImageMatch) || hit.document_stamp == stamp else {
                         self.rejectStaleResult(hit)
                         return
                     }

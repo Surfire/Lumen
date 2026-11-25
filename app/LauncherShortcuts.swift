@@ -74,7 +74,7 @@ final class ShortcutLibrary: ObservableObject {
         }
         if shortcut.queryParameter != nil {
             guard let link = shortcut.queryLink,
-                  !["g", "qa", "tr", "translate"].contains(link.keyword),
+                  !["g", "qa", "tr", "translate", "img"].contains(link.keyword),
                   !entries.contains(where: { $0.id != shortcut.id && $0.queryLink?.keyword == link.keyword })
             else { return false }
         }

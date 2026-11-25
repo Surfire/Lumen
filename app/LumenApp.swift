@@ -23,6 +23,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     let contextActions = ContextActions()
     let commands = LauncherCommands()
     let inlinePreview = LauncherInlinePreview()
+    let imageSearch: LauncherImageSearch
+    private var imageUpdates: AnyCancellable?
     private var literalCommand: String?
     private var providerUpdates: AnyCancellable?
     private var shortcutUpdates: AnyCancellable?
@@ -50,7 +52,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private(set) lazy var settingsSession = SettingsSession(model: model) { [weak self] oldPage, page in
         guard let self else { return }
         if oldPage == .translation { self.translation.endSettingsSession() }
-        if page == .index { self.externalVolumes.reload() }
+        if page == .index {
+            self.externalVolumes.reload()
+            self.imageSearch.ensureStatus()
+        }
     }
     private var configuredKey: HotKey?
     private var actionInFlight = false
@@ -129,6 +134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             translation: translation,
             commands: commands,
             inlinePreview: inlinePreview,
+            imageSearch: imageSearch,
             activateCommand: { [weak self] in self?.activateCommand() },
             searchCommandAsFiles: { [weak self] in self?.searchCommandAsFiles() },
             closeInlinePreview: { [weak self] in _ = self?.inlinePreview.close() },
@@ -181,6 +187,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                                     syntheticRoot: smoke?.corpus, gemmaHome: smoke?.gemmaHome)
         model = Launcher(engine: engine, defaults: defaults, locale: smoke?.language)
         externalVolumes = ExternalVolumeCatalog(engine: engine)
+        imageSearch = LauncherImageSearch(engine: engine, defaults: defaults)
         translation = smoke?.makeTranslationModel() ?? TranslationPanelModel()
     }
 
@@ -212,6 +219,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             guard let self else { return }
             self.catalog = LumenCommandCatalog(additionalLinks: entries.compactMap(\.queryLink))
             if self.searchPresented { self.searchFieldAction() }
+        }
+        imageUpdates = imageSearch.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.searchPresented, self.commands.isImageCommand else { return }
+                self.searchFieldAction()
+                self.updatePresentation()
+            }
         }
         updateLanguage()
         model.start()
@@ -265,6 +279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     func applicationWillTerminate(_ notification: Notification) {
         localPreview?.close()
         translation.cancel()
+        imageSearch.stop(refreshStatus: false)
         externalVolumes.stop()
         globalHotKey.close()
         model.close()
@@ -360,9 +375,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
         commands.update(next, raw: text, catalog: catalog)
         translation.setCommand(translationCommand)
-        if next == .search { model.setQuery(text) }
-        else if previousCommand == .search { model.clear() }
-        if hadCommandCard != commands.showsCard || (previousCommand == .translation) != (next == .translation) {
+        if case .image(let term) = next {
+            imageSearch.ensureStatus()
+            if let projector = imageSearch.readyProjector {
+                model.setImageQuery(term, projector: projector)
+            } else if model.hasQuery {
+                model.clear()
+            }
+        } else if next == .search {
+            model.setQuery(text)
+        } else if previousCommand == .search || model.isImageSearch {
+            model.clear()
+        }
+        if hadCommandCard != commands.showsCard || previousCommand != next && commands.isImageCommand ||
+            (previousCommand == .translation) != (next == .translation) {
             updatePresentation()
         }
     }
@@ -413,7 +439,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private func moveCurrentSelection(_ delta: Int) {
         if commands.resolution == .discovery { commands.move(delta); return }
-        guard translation.command == nil, !commands.showsCard else { return }
+        guard translation.command == nil, !commands.showsCard,
+              !commands.isImageCommand || model.isImageSearch else { return }
         if contextActions.isOpen { contextActions.move(delta) }
         else { model.moveSelection(delta); refreshInlinePreview() }
     }
@@ -427,7 +454,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func toggleContextActions() {
-        guard translation.command == nil, !commands.showsCard else { return }
+        guard translation.command == nil, !commands.showsCard,
+              !commands.isImageCommand || model.isImageSearch else { return }
         if contextActions.isOpen { contextActions.close(); return }
         guard let selected = model.selectedResult else { return }
         contextResultID = selected.id
@@ -494,6 +522,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func openSelection() {
+        if commands.isImageCommand && !model.isImageSearch { return }
         if commands.showsCard { activateCommand(); return }
         if translation.command != nil {
             activateTranslation()
@@ -508,7 +537,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func open(_ result: LauncherResult) {
-        guard translation.command == nil, !commands.showsCard else { return }
+        guard translation.command == nil, !commands.showsCard,
+              !commands.isImageCommand || model.isImageSearch else { return }
         switch result {
         case .file(let hit): openFile(hit)
         case .action(let action): runAction(action)
@@ -692,7 +722,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func showSearchSettings() {
-        presentSettings(page: translation.command != nil || isQuestion ? .translation : nil)
+        presentSettings(page: commands.isImageCommand ? .index : (translation.command != nil || isQuestion ? .translation : nil))
     }
 
     private func presentSettings(page: SettingsPage?) {
@@ -720,6 +750,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 session: settingsSession,
                 translation: translation,
                 volumes: externalVolumes,
+                images: imageSearch,
+                chooseImageFolder: { [weak self] in self?.chooseImageResource(folder: true) },
+                chooseImageProjector: { [weak self] in self?.chooseImageResource(folder: false) },
                 extensionContent: extensionContent,
                 chooseQuicklinkFolder: { [weak self] in self?.chooseQuicklinkFolder($0) },
                 recordShortcut: { [weak self] in self?.recordShortcut($0) },
@@ -734,6 +767,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         settings?.title = model.t("Lumen 设置", "Lumen Settings")
         if smoke == nil { settings?.makeKeyAndOrderFront(nil) }
         if searchPresented { dismissSearch() }
+    }
+
+    func chooseImageResource(folder: Bool) {
+        guard let settings else { return }
+        if let smoke {
+            if folder, let url = smoke.chosenImageFolder { imageSearch.setFolder(url) }
+            else if !folder, let url = smoke.chosenImageProjector { imageSearch.setProjector(url) }
+            return
+        }
+        let picker = NSOpenPanel()
+        picker.canChooseFiles = !folder
+        picker.canChooseDirectories = folder
+        picker.resolvesAliases = false
+        picker.canDownloadUbiquitousContents = false
+        picker.beginSheetModal(for: settings) { [weak self] result in
+            guard result == .OK, let url = picker.url else { return }
+            if folder { self?.imageSearch.setFolder(url) } else { self?.imageSearch.setProjector(url) }
+        }
     }
 
     func chooseSettingsDirectories(_ group: ScopeFolders) {
@@ -905,13 +956,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 button.setAccessibilityLabel(summary)
             }
         }
+        if model.scopePending, imageSearch.building { imageSearch.stop() }
         guard searchPresented else { return }
         refreshInlinePreview()
         if contextActions.isOpen, model.selectedResult?.id != contextResultID { contextActions.close() }
         var frame = panel.frame
         let height = SearchWindow.height(for: model, contextCount: contextActions.items.count,
                                          hasTranslation: translation.command != nil,
-                                         commandHeight: commands.showsCard ? 162 : nil,
+                                         commandHeight: commands.showsCard || (commands.isImageCommand && !model.isImageSearch) ? 162 : nil,
                                          hasPreview: inlinePreview.isOpen)
         guard frame.height != height else { return }
         frame.origin.y += frame.height - height

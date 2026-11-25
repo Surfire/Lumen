@@ -9,6 +9,7 @@ struct SearchWindow: View {
     @ObservedObject var translation: TranslationPanelModel
     @ObservedObject var commands: LauncherCommands
     @ObservedObject var inlinePreview: LauncherInlinePreview
+    @ObservedObject var imageSearch: LauncherImageSearch
     let activateCommand: () -> Void
     let searchCommandAsFiles: () -> Void
     let closeInlinePreview: () -> Void
@@ -41,6 +42,20 @@ struct SearchWindow: View {
             if let command = translation.command {
                 TranslationResultCard(model: translation, command: command, chinese: model.zh,
                                       activate: activateTranslation)
+            } else if commands.isImageCommand && !model.isImageSearch {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label(model.t("图像搜索", "Image Search"), systemImage: "photo")
+                        .font(.headline)
+                    Text(imageSearch.loading
+                         ? model.t("正在读取图像设置…", "Checking image settings…")
+                         : model.t("在「索引与隐私」选择本地目录和投影器，再建立图像索引。",
+                                   "Choose a local folder and projector in Index & Privacy, then build the image index."))
+                        .foregroundStyle(.secondary)
+                    Button(model.t("打开图像设置…", "Open Image Settings…"), action: showSettings)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 16).padding(.vertical, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
             } else if commands.showsCard {
                 LauncherCommandCard(commands: commands, provider: translation, chinese: model.zh,
                                     activate: activateCommand, openSettings: showSettings)
@@ -94,7 +109,7 @@ struct SearchWindow: View {
                     keyHint("↵", model.t("翻译", "Translate"))
                 }
                 Spacer(minLength: 8)
-            } else if commands.showsCard {
+            } else if commands.showsCard || commands.isImageCommand && !model.isImageSearch {
                 commandFooter
             } else {
                 searchFooter
@@ -125,9 +140,10 @@ struct SearchWindow: View {
             case .loading: keyHint("esc", model.t("取消", "Cancel"))
             case .answer:
                 keyHint("↵", model.t("复制", "Copy"))
-                keyHint("⇞⇟", model.t("翻页", "Scroll"))
+                keyHint("PgUp/PgDn", model.t("翻页", "Scroll"))
                 if commands.copied { Text(model.t("已复制", "Copied")) }
-            case .idle, .failed: EmptyView()
+            case .failed: keyHint("↵", model.t("重试", "Retry"))
+            case .idle: EmptyView()
             }
         default: EmptyView()
         }
@@ -137,6 +153,9 @@ struct SearchWindow: View {
     }
 
     @ViewBuilder private var searchFooter: some View {
+        if model.isImageSearch {
+            Label(model.t("图像内容", "Image Content"), systemImage: "photo")
+        }
         if model.showsResults {
             keyHint("↑↓", model.t("选择", "Select"))
             keyHint("↵", model.t("打开", "Open"))
@@ -271,11 +290,17 @@ struct SearchWindow: View {
     }
 
     private var emptyResultsLabel: String {
-        if let notice = model.searchNotice { return model.title(for: notice) }
+        if let notice = model.searchNotice {
+            if model.isImageSearch {
+                return model.t("图像搜索失败。请检查本机模型和投影器。", "Image search failed. Check the local model and projector.")
+            }
+            return model.title(for: notice)
+        }
         if model.searching || model.semanticBusy {
             return model.t("正在搜索…", "Searching…")
         }
-        return model.t("没有匹配结果", "No matches")
+        return model.isImageSearch ? model.t("没有足够接近的图像", "No close image matches")
+            : model.t("没有匹配结果", "No matches")
     }
 
     private func actionRow(_ action: LaunchAction) -> some View {
@@ -615,6 +640,9 @@ struct LauncherSettings: View {
     @ObservedObject var session: SettingsSession
     let translation: TranslationPanelModel
     let volumes: ExternalVolumeCatalog
+    let images: LauncherImageSearch
+    let chooseImageFolder: () -> Void
+    let chooseImageProjector: () -> Void
     let extensionContent: AnyView?
     let chooseQuicklinkFolder: (@escaping (URL) -> Void) -> Void
     let recordShortcut: (NSEvent) -> Void
@@ -807,6 +835,10 @@ struct LauncherSettings: View {
             folderRows(.exclude, empty: model.t("没有手动排除的目录。", "No folders excluded manually."))
         }
         .disabled(!session.canEditScope)
+        group(model.t("图像内容", "Image Content")) {
+            LauncherImageSettings(launcher: model, images: images, chooseFolder: chooseImageFolder,
+                                  chooseProjector: chooseImageProjector)
+        }
         group(model.t("外置卷", "External Volumes")) {
             LauncherExternalVolumes(launcher: model, catalog: volumes, changed: model.externalVolumesChanged)
                 .accessibilityIdentifier("settings.external-volumes")

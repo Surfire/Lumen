@@ -207,6 +207,8 @@ enum Action {
         #[arg(long, conflicts_with = "root")]
         clear: bool,
     },
+    /// Read the saved image folder and stored vector count.
+    ImageStatus,
     /// Embed the next bounded batch from the opted-in image folder.
     ImageIndex {
         #[arg(long, value_name = "FILE")]
@@ -502,6 +504,9 @@ fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string(&lumen::image_scope(&db, root.as_deref())?)?
             );
+        }
+        Action::ImageStatus => {
+            println!("{}", serde_json::to_string(&lumen::image_status(&db)?)?);
         }
         Action::ImageIndex {
             projector,

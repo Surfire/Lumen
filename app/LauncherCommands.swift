@@ -17,7 +17,8 @@ final class LauncherCommands: ObservableObject {
         return request
     }()
 
-    var showsCard: Bool { resolution != .search && resolution != .translation }
+    var isImageCommand: Bool { if case .image = resolution { return true }; return false }
+    var showsCard: Bool { resolution != .search && resolution != .translation && !isImageCommand }
     var selectedEntry: LumenCommandCatalog.Entry? { entries.indices.contains(selection) ? entries[selection] : nil }
 
     func update(_ next: LumenCommandResolution, raw: String, catalog: LumenCommandCatalog) {
@@ -130,6 +131,7 @@ struct LauncherCommandCard: View {
         case "qa": return t("问模型", "Ask Model")
         case "translate": return t("翻译", "Translate")
         case "google": return t("搜索 Google", "Search Google")
+        case "img": return t("按画面搜索图片", "Search Images by Description")
         default: return item.title
         }
     }
@@ -183,7 +185,9 @@ struct LauncherCommandCard: View {
         case .web(_, _, let url):
             if commands.webFailed { return t("未能打开浏览器。请检查默认浏览器后重试。", "Could not open the browser. Check your default browser and retry.") }
             return t("按回车将搜索词发送至 \(url.host() ?? "")。", "Press Return to send the search terms to \(url.host() ?? "").")
-        case .missingArgument: return t("在命令后输入内容。", "Enter text after the command.")
+        case .missingArgument(let id):
+            if id == "img" { return t("输入「img 红色帆船」按画面搜索。", "Try “img red sailboat” to search by image content.") }
+            return t("在命令后输入内容。", "Enter text after the command.")
         case .argumentTooLong(_, let max):
             return t("内容超出 \(max) 字节。", "The input exceeds \(max) bytes.")
         default: return ""

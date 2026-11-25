@@ -20,7 +20,7 @@ pub use content::{ContentBatch, apply_content_scope, index_content};
 pub use diagnose::{Diagnosis, Reason as DiagnoseReason, diagnose, validate_hit};
 pub use external::{VolumeStatus, forget_volume, index_volume, volumes};
 pub use gemma::{GemmaModel, ID as GEMMA_MODEL_ID};
-pub use image_search::{ImageSearchSession, image_batch, image_scope};
+pub use image_search::{ImageSearchSession, image_batch, image_scope, image_status};
 pub use index::{scan, scan_with_progress};
 pub use model::{BgeModel, Model, ModelBackend};
 pub use progress::{ScanPhase, ScanProgress, ScanProgressReporter};

@@ -8,6 +8,7 @@ public enum LumenCommandResolution: Equatable, Sendable {
     case missingArgument(commandID: String)
     case argumentTooLong(commandID: String, maximumUTF8Bytes: Int)
     case question(String)
+    case image(String)
     case web(commandID: String, title: String, url: URL)
 }
 
@@ -73,8 +74,8 @@ public struct LumenCommandCatalog: Sendable {
     /// through a settings decision; first definition wins, so existing verbs cannot be replaced.
     public init(includeOptionalLinks: Bool = false, additionalLinks: [LumenHTTPSQueryLink] = []) {
         var table: [String: LumenHTTPSQueryLink] = [:]
-        var usedIDs = Set(["qa", "translate", "discover"])
-        let reserved = Set(["qa", "tr", "translate"])
+        var usedIDs = Set(["qa", "translate", "discover", "img"])
+        let reserved = Set(["qa", "tr", "translate", "img"])
         for link in Self.builtInLinks(includeOptionalLinks: includeOptionalLinks) + additionalLinks {
             guard !reserved.contains(link.keyword), table[link.keyword] == nil,
                   usedIDs.insert(link.commandID).inserted else { continue }
@@ -86,7 +87,8 @@ public struct LumenCommandCatalog: Sendable {
     public var entries: [Entry] {
         [.init(keyword: "?", title: "Browse Commands", commandID: "discover", destinationHost: nil),
          .init(keyword: "qa", title: "Ask Model", commandID: "qa", destinationHost: nil),
-         .init(keyword: "tr", title: "Translate", commandID: "translate", destinationHost: nil)]
+         .init(keyword: "tr", title: "Translate", commandID: "translate", destinationHost: nil),
+         .init(keyword: "img", title: "Search Images", commandID: "img", destinationHost: nil)]
         + links.values.sorted { $0.keyword < $1.keyword }.map {
             Entry(keyword: $0.keyword, title: $0.title, commandID: $0.commandID, destinationHost: $0.destinationHost)
         }
@@ -104,6 +106,11 @@ public struct LumenCommandCatalog: Sendable {
         guard token.utf8.allSatisfy({ $0 < 128 }) else { return .search }
         let keyword = token.lowercased()
         let payload = input[input.index(after: delimiter)...].trimmingCharacters(in: .whitespacesAndNewlines)
+        if keyword == "img" {
+            if payload.isEmpty { return .missingArgument(commandID: "img") }
+            if payload.utf8.count > 8192 { return .argumentTooLong(commandID: "img", maximumUTF8Bytes: 8192) }
+            return .image(payload)
+        }
         if keyword == "qa" {
             if payload.isEmpty { return .missingArgument(commandID: "qa") }
             if payload.utf8.count > Self.maximumQuestionBytes {

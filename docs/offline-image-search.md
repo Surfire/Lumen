@@ -18,6 +18,7 @@ authenticated private Unix socket and a bounded request deadline.
 ```sh
 lumen --db "$db" index --root "$synthetic_name_root"
 lumen --db "$db" image-scope "$chosen_image_folder"
+lumen --db "$db" image-status
 lumen --db "$db" image-index --projector "$projector" --max 8
 lumen --db "$db" image-serve --projector "$projector"
 lumen --db "$db" image-scope --clear
@@ -39,9 +40,10 @@ vectors and takes effect for existing sessions. Search candidates use a 0.65
 cosine floor. The score is a similarity value, and the engineering fixture
 does not establish general retrieval accuracy or dependable abstention.
 
-The native app must explicitly offer the image folder and wire this separate
-search service. The backend leaves name and document results available if the
-vision asset is missing. For reproducible local verification, pass the
+In the native app, choose the folder and projector under Index & Privacy,
+then build the image index explicitly. Type \`img description\` in the regular
+launcher field. Name and document search remain available without the vision
+asset. For reproducible local verification, pass the
 synthetic handoff pack's `preview-fixtures` folder:
 
 ```sh

@@ -28,6 +28,8 @@ final class LauncherSmoke {
     var chosenQuicklinkFolder: URL?
     var chosenSettingsDirectories: [URL]?
     var chosenDiagnosticFile: URL?
+    var chosenImageFolder: URL?
+    var chosenImageProjector: URL?
 
     private lazy var translationSuite = "io.github.surfire.lumen.gui-smoke.\(UUID())"
     private lazy var translationPreferences = UserDefaults(suiteName: translationSuite)
@@ -131,6 +133,10 @@ final class LauncherSmoke {
                   "search field did not use requested language")
         _ = try editor(app)
 
+        if exists("image-scenario") {
+            try await verifyImageSearch(app)
+            return
+        }
         if exists("content-scenario") {
             try await verifyContentPipeline(app)
             return
@@ -1045,6 +1051,78 @@ final class LauncherSmoke {
 
     private func milliseconds(_ duration: Duration) -> Double {
         Double(duration.components.seconds) * 1_000 + Double(duration.components.attoseconds) / 1e15
+    }
+
+    private func verifyImageSearch(_ app: AppDelegate) async throws {
+        let model = app.model
+        let images = app.imageSearch
+        let folder = corpus.appendingPathComponent("Chosen", isDirectory: true)
+        let projector = try String(contentsOf: directory.appendingPathComponent("projector-path"), encoding: .utf8)
+        try await until("image fixture filename index did not become trusted") { model.canSearch && model.watchState == .running }
+        try type("img 浅蓝海面上有一条红色帆船", into: app)
+        try await until("unconfigured image command did not settle") { images.scope != nil && !images.loading }
+        try check(!model.isImageSearch && images.scope?.root == nil && !images.building, "image indexing started by default")
+        try key(kVK_ANSI_Comma, ",", in: app, throughPanel: true, flags: [.command])
+        try check(app.settingsSession.page == .index, "image settings opened outside Index & Privacy")
+        chosenImageFolder = folder
+        chosenImageProjector = URL(fileURLWithPath: projector)
+        app.chooseImageResource(folder: true)
+        try await until("explicit image folder was not saved") { images.scope?.root == IndexScope.folderPath(folder) && !images.loading }
+        app.chooseImageResource(folder: false)
+        try check(images.scope?.vectors == 0 && !images.building, "configuring resources read image pixels before Build")
+        images.build()
+        app.showSearch()
+        try type("sentinel-local-note", into: app)
+        try await until("name lookup stopped while indexing images") { model.selectedHit?.name == "sentinel-local-note.txt" }
+        try await until("real image vectors were not generated", seconds: 120) {
+            !images.building && !images.loading && (images.scope?.vectors ?? 0) == 4
+        }
+
+        let originalPanel = app.panel
+        let field = try editor(app)
+        let start = ContinuousClock.now
+        try type("img 浅蓝海面上有一条红色帆船", into: app)
+        try await until("cold image search did not settle", seconds: 34) {
+            !model.searching && (model.selectedHit != nil || model.searchNotice != nil)
+        }
+        try check(model.selectedHit?.name == "93a2.png" && model.selectedHit?.isImageMatch == true,
+                  "cold image search did not match the opaque red sailboat filename")
+        let cold = milliseconds(start.duration(to: .now))
+        try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
+        try await until("matching image did not preview in the original panel") {
+            if case .ready(let selection, let preview) = app.inlinePreview.state,
+               case .image? = preview.visual { return selection.id.hasSuffix("/93a2.png") && app.panel === originalPanel }
+            return false
+        }
+        try check(app.panel.firstResponder === field, "image preview took search focus")
+        if exists("capture-preview") {
+            try capture("lumen-image-search-preview.png", appearance: .aqua, window: app.panel)
+            app.panel.appearance = nil
+        }
+        try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
+        try await until("image match did not pass targeted Finder revalidation") { self.revealed?.lastPathComponent == "93a2.png" }
+        let warmStart = ContinuousClock.now
+        try type("img A black umbrella on a grey background", into: app)
+        try await until("warm English image search did not rank the opaque umbrella filename first") {
+            model.selectedHit?.name == "a48f.png" && !model.searching && !app.inlinePreview.isOpen
+        }
+        let warm = milliseconds(warmStart.duration(to: .now))
+        try type("sentinel-local-note", into: app)
+        try check(!model.hits.contains(where: \.isImageMatch), "name search kept visible image results")
+        try type("img 黄色背景上放着三个蓝色圆形", into: app)
+        try await Task.sleep(for: .milliseconds(190))
+        try type("sentinel-local-note", into: app)
+        try await until("ordinary names did not recover after leaving image search") {
+            model.selectedHit?.name == "sentinel-local-note.txt" && !model.isImageSearch && !model.searching
+        }
+        try await Task.sleep(for: .milliseconds(350))
+        try check(model.selectedHit?.name == "sentinel-local-note.txt" && !app.inlinePreview.isOpen,
+                  "obsolete image results appeared in name search")
+        images.setFolder(nil)
+        try await until("image opt-out did not remove vectors") {
+            images.scope?.root == nil && images.scope?.vectors == 0 && !images.loading
+        }
+        print(String(format: "Native local image search passed (cold %.1f ms, warm %.1f ms, in-panel preview and Finder)", cold, warm))
     }
 
     private func verifyContentPipeline(_ app: AppDelegate) async throws {

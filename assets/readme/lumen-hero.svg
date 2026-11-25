@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="396" viewBox="0 0 1200 396" role="img" aria-labelledby="title description">
+<title id="title">Lumen — Find it. Open it.</title><desc id="description">A ruby search panel illustrates finding files, apps, and macOS settings within one launcher.</desc>
+<defs>
+<linearGradient id="bg" x2="1" y2="1"><stop stop-color="#160d15"/><stop offset="1" stop-color="#431220"/></linearGradient>
+<radialGradient id="glow"><stop stop-color="#a83a58" stop-opacity=".44"/><stop offset="1" stop-color="#aa3450" stop-opacity="0"/></radialGradient>
+<clipPath id="frame"><rect width="1200" height="396" rx="24"/></clipPath>
+</defs>
+<g clip-path="url(#frame)">
+<rect width="1200" height="396" fill="url(#bg)"/><ellipse cx="1000" cy="200" rx="490" ry="345" fill="url(#glow)"/>
+<path d="M770 0 1200 320M850 0l350 256m-240-256 240 182M900 396l300-240m-205 240 205-156" stroke="#f894a4" stroke-opacity=".19" fill="none"/>
+<path d="M0 393h1200" stroke="#ed695e" stroke-width="6"/>
+</g>
+<g font-family="Helvetica,Arial,sans-serif">
+<path d="M75 76h12l11-17 8 11 10-11 8 17h17" fill="none" stroke="#ff8677" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="156" y="81" fill="#f5a6ad" font-size="20" letter-spacing="2.4" font-weight="700">LOCAL SEARCH FOR MAC</text>
+<text x="68" y="195" fill="#fff2f1" font-size="119" letter-spacing="-6" font-weight="750">Lumen</text>
+<text x="76" y="259" fill="#ffd7d6" font-size="43" font-weight="550" letter-spacing="-1">Find it. Open it.</text>
+<text x="77" y="320" fill="#edb6be" font-size="23" letter-spacing="1.2">Files · Apps · Settings</text>
+<g transform="translate(622 69)">
+ <rect x="11" y="13" width="498" height="271" rx="22" fill="#140b12" fill-opacity=".5"/>
+ <rect width="498" height="271" rx="22" fill="#281722" stroke="#955565"/>
+ <circle cx="33" cy="36" r="10" fill="none" stroke="#ff9387" stroke-width="2.4"/><path d="m39 42 7 7" stroke="#ff9387" stroke-width="2.4" stroke-linecap="round"/>
+ <text x="64" y="45" fill="#fff0f1" font-size="29" font-weight="530">project report pdf</text>
+ <path d="M310 21v31" stroke="#ff8a7f" stroke-width="2.5"/>
+ <path d="M0 72h498" stroke="#68414e"/>
+ <rect x="14" y="89" width="470" height="64" rx="11" fill="#592637" stroke="#8e4a5c"/>
+ <rect x="31" y="104" width="27" height="35" rx="5" fill="#9b4857"/>
+ <path d="M38 114h13m-13 6h13m-13 6h9" stroke="#ffe2df" stroke-width="1.7" stroke-linecap="round"/>
+ <text x="74" y="118" fill="#fff4f4" font-size="27" font-weight="700">Project report.pdf</text>
+ <text x="75" y="139" fill="#fabac1" font-size="18">Matches all keywords · PDF</text>
+ <rect x="31" y="165" width="27" height="31" rx="5" fill="#68384b"/>
+ <path d="M38 175h13m-13 6h10" stroke="#f8b9bd" stroke-width="1.7"/>
+ <text x="75" y="189" fill="#f9dbde" font-size="22">2026 Project reports.pdf</text>
+ <path d="M28 218h443" stroke="#61404c"/>
+ <text x="30" y="249" fill="#eebcc3" font-size="18" letter-spacing=".8">ONE SEARCH BOX. LOCAL BY DEFAULT.</text>
+</g></g></svg>

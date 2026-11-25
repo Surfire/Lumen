@@ -1,57 +1,82 @@
-# Lumen
+<img src="assets/readme/lumen-hero.svg" width="100%" alt="Lumen，本地 Mac 搜索。插画示意同一个输入框如何查找文件。">
 
-Lumen 是独立开发的 macOS 本地搜索工具。Rust 负责扫描、索引与检索，AppKit 和 SwiftUI 提供原生菜单栏启动器。产品设计参考 Tinycast、Oil Find、DigUp 与早期 Luminator Index，未复制其源码或资源。
+# Lumen · 鹿鸣
 
-## 在 Mac 上构建
+**一个快捷键，找到 Mac 上的文件、打开应用、直达系统设置。** 同一个输入框支持文件名、路径、拼音和已索引的正文，也可输入命令翻译、问模型或查找图片。
 
-Apple Silicon、macOS 14 或更新版本、Xcode 命令行工具和 Rust。实际验证环境为 Apple Silicon macOS 27.0.1。下面是开发构建，不会安装、替换 Spotlight、修改系统快捷键或注册登录项。日用版本请用同一签名身份并在[固定位置原位升级](docs/UPGRADING.md)，不要每版换一个 .app 路径。
+[快速上手](#快速上手) · [功能与边界](#功能与边界) · [开发与验证](#开发与验证) · [English](README.en.md)
+
+**v0.3.3** · **Apple Silicon** · **macOS 14+** · **Rust + 原生 macOS 界面**
+
+| 试着输入 | 会发生什么 |
+| :--- | :--- |
+| `年报 复盘 pdf` | 匹配两个关键词，按实际 PDF 扩展名过滤。可用双引号匹配连续短语。 |
+| `luming` / `lm` | 用全拼或首字母查找文件名「鹿鸣」。 |
+| `蓝牙` / `25 km in mi` | 直达系统设置，或在本机换算。无需先建文件索引。 |
+
+## 快速上手
+
+在仓库根目录构建。需要 Apple Silicon Mac、macOS 14+、Xcode 命令行工具和 Rust。
 
 ```sh
 scripts/build-app.sh
 open target/Lumen.app
 ```
 
-上述命令用于临时签名的开发构建。日用请使用[同路径签名安装和更新流程](docs/UPGRADING.md)，安装到 `~/Applications/Lumen.app` 并复用签名身份。
+这是使用临时签名（ad hoc）的开发构建。日用安装请用已有的命名签名身份，并在同一位置原位升级。首次从临时签名迁移时，macOS 可能再次询问文件访问权限。[本机签名、安装和回滚](docs/UPGRADING.md)
 
-启动后在菜单栏打开 Lumen，或使用默认快捷键 **Control + Shift + Space**；可在设置里修改或关闭。首次明确点击「建立索引」后，搜索窗会收起，索引留在后台；在菜单栏可看阶段、已扫描数量和耗时，有同范围样本时才显示估算剩余时间。可设置单修饰键组合（含 Command + 反引号）；该组合也是系统的窗口切换键，若被占用会保留原快捷键，菜单栏仍可打开搜索。白名单留空时使用启动盘可访问的范围，不必逐个选择文件夹；跳过系统、隐私、缓存、隐藏目录及默认范围外的卷。黑名单优先。支持简体中文、英语及随系统语言。
+用菜单栏打开 Lumen，或按默认快捷键 **⌃⇧Space**。可在「设置 → 通用与快捷键」录制或停用热键。应用和系统设置可立即搜索，找文件时先从菜单栏选择「在后台建立索引」。也可先在「索引与隐私」指定范围。建立索引后，菜单栏可查看阶段、扫描数量和耗时。
 
-## 搜索和文件更新
+### 在同一个搜索框里操作
 
-- 本地 App 和系统设置支持中文名、全拼和首字母；文件名新增常见多音词兼容。已有名称索引继续使用。菜单栏的「外置卷」可按需添加或刷新本机外接盘的名称索引，未连接时不展示其搜索结果。
-- 空搜索时显示手动固定项目；⌘K 打开当前项目的操作菜单。可为应用、项目文件夹和网页保存快捷链接与别名。计算及常见单位换算均在本机完成。
-- 输入「翻译」或从菜单打开翻译面板。可为本地 oMLX 和其他 OpenAI 兼容端点分别设置模型。只有主动提交的内容才会发给面板所示的服务。详见[翻译配置](docs/TRANSLATION.md)。
+| 输入或按键 | 动作 |
+| :--- | :--- |
+| `?` | 查看命令，方向键选择，回车填入搜索框。 |
+| `tr` | 输入 `tr:en 会议改期了`，回车提交翻译。也可输入 `tr 文本` 或「翻译」。 |
+| `qa` | 输入 `qa 如何制定阅读计划？`，回车把问题发给所选模型。再次回车复制回答，Esc 可取消请求。问答不会搜索网页、附加文件或读取剪贴板。 |
+| `g` | 输入 `g macOS 快捷键`，回车用默认浏览器打开 Google 搜索。可在「快捷链接」增加自定义 HTTPS 查询别名。 |
+| `img` | 输入 `img 红色帆船`，按描述搜索已建立图像索引的本机图片。 |
+| ↩ / ⌘↩ / ⌘K | 打开选中项、在 Finder 显示文件、打开当前结果的操作菜单。 |
+| ⌘Y / Esc | 在启动器预览本地图片、PDF 或已索引原文片段。PDF 有已定位的命中页时可跳到该页。Esc 先关闭预览。 |
+| ⇧⌘C / ⌥⌘C | 复制文件名或路径。 |
+| ⌘, | 打开设置。 |
 
-- 同一个搜索框找文件、目录、已安装的应用和常用 macOS 设置，不用选搜索模式。应用与系统设置不依赖文件索引，按回车启动应用或打开设置页，不改变系统设置。
-- 文件名、路径、拼音或已索引正文支持空格分词。普通词全部要匹配，顺序不限；用双引号找连续短语。输入 `成都 卫健委 pptx` 或 `.pptx` 按实际扩展名匹配，无需额外语法。
-- 方向键选择，回车打开，⌘↩ 在 Finder 中显示文件；⌘Y 快速查看本机文件（最大 128 MB，不下载仅在线文件），⇧⌘C 复制名称，⌥⌘C 复制路径，Esc 关闭。名称搜索不依赖模型。
-- 正文和语义使用单独选中的目录，名称索引的范围不变。支持本地 TXT、Markdown、DOCX 主文档的段落与表格、PDF 原生文本层。已核对到页码的 PDF 命中可以直接定位该页；没有 OCR 或 DOCX 页码。超限、加密或不支持的文档保留名称，不假报已读取。
-- 名称与范围会随 macOS 文件变化更新。文件新增、改名、移除、正文变更与重启后的补偿已用合成目录测试。索引文件保存在用户本机；引擎不监听网络端口。
-- 已识别的 OneDrive、iCloud 和 File Provider 仅录入系统可见的名称和路径；不会打开网盘文件做正文抽取，也不调用同步 API。系统未列出的条目不在可查范围。不能在未经过测试的提供商或未确认路径上保证同样覆盖。
-- 可选语义索引按段落分批生成。满足输入条件且已有匹配语义索引时，后台补充最多三条相关原文，不替换已有的直接匹配。默认使用已校验的本机 EmbeddingGemma 2 文本模型，不自动下载或上传文本。已有 BGE 向量保留；无语义索引时名称和正文照常可用。模型不判断片段是否已经回答问题。详见[模型安装与生命周期](docs/offline-gemma.md)和[历史 BGE 评估](docs/offline-semantics.md)。
+问答和翻译共享「设置 → 翻译」选中的提供商和模型。支持本机 oMLX 或其他 OpenAI 兼容端点。只有主动提交的文字才送达界面显示的服务。[提供商配置](docs/TRANSLATION.md)
 
-## 设置与诊断
+**启用图像内容搜索。** 在「设置 → 索引与隐私 → 图像内容」选一个已纳入名称索引的本机目录和匹配的本机投影器，然后点「建立或刷新图像索引」。目前支持 PNG 和 JPEG，使用本机 EmbeddingGemma 2 模型及单独准备的视觉投影器。[模型、投影器和大小限制](docs/offline-image-search.md)
 
-用菜单栏的「设置」或在搜索窗按 `⌘,` 打开四页设置。目录与正文修改先保留为草稿，点「应用」后才生效，排除优先。「后台」分别显示文件变化监听和模型索引。「关于与诊断 → 选择文件」只核对选中文件及其已有索引，分别说明名称、正文、语义是否可用，不读取原文、不唤醒云文件。
+## 功能与边界
 
-## Raycast 兼容
+- **名称、正文与图像范围各自设置。** 名称索引默认覆盖启动盘可访问范围，跳过系统、隐私、缓存和隐藏位置。可选定目录或添加排除，排除优先。目录与正文变更在「应用」后生效。外置卷的名称索引从菜单栏按需添加，断开后不显示其结果。
+- **正文和语义按需启用。** 在指定目录读取本地 TXT、Markdown、DOCX 主文档的段落及表格、PDF 原生文本层。无 OCR 或 DOCX 页码。加密、超限或不支持的文档仍可按名称搜索。选配本机模型后，语义搜索可补充相关原文片段。名称搜索不需要模型。[离线语义](docs/offline-gemma.md)
+- **网盘只记录可见元数据。** 已识别的 iCloud、OneDrive 和 File Provider 范围记录系统可见的名称与路径。索引和预览不会主动下载云端占位文件。搜索索引和离线推理留在本机，应用不捆绑或自动下载权重。
+- **进度和缺失原因可以检查。** 「高级与诊断」分别显示文件监听和语义索引状态。使用「文件诊断 → 选取文件」检查名称、正文和语义覆盖，诊断不会读取原文或唤醒云端项目。
+- **常用项目可以固定。** 空搜索可显示手动固定的项目，也可为应用、项目目录和网页创建快捷链接或别名。
+- **扩展支持有限的 Raycast 接口。** 在「扩展」手动添加本地目录，可执行[明确支持的无界面命令](extensions/README.md)，包括文本提示及经确认的复制操作。Raycast Store、任意 JavaScript 和 TypeScript/React 界面不在兼容范围内。
 
-在菜单栏打开「扩展」，手动选择本地源代码目录。Lumen 能运行 [明确支持的 Raycast no-view 子集](extensions/README.md)，包含 `showHUD` 文本和受确认保护的 `Clipboard.copy` 文本。打开面板不会自动扫描或执行扩展。它不包含 Raycast Store、Node、任意 JavaScript、Script Commands、TypeScript/React 界面或全部 `@raycast/api`。
+## 开发与验证
 
-## 独立验证
+Rust 负责扫描、索引和检索，AppKit 与 SwiftUI 提供原生界面。
+
+[版本变更](CHANGELOG.md) · [架构](docs/ARCHITECTURE.md) · [兼容范围](docs/COMPATIBILITY.md) · [基准协议](docs/BENCHMARK.md) · [第三方依赖](THIRD_PARTY.md)
+
+<details>
+<summary>构建与回归命令</summary>
 
 ```sh
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked                         # FSEvents 用例需要系统允许通知流
+cargo test --locked
 cargo test --locked --manifest-path extensions/Cargo.toml
 scripts/build-app.sh
 python3 scripts/smoke-app.py
 python3 scripts/smoke-launcher.py
+python3 scripts/smoke-translation.py
 extensions/tests/smoke-panel.sh
 ```
 
-验证使用合成文件。macOS 命令环境若阻止 AppKit 或 FSEvents，不能把相应测试失败、跳过或模拟结果算成真实系统验收。历史开发基线见 [0.1 合成实测](docs/BASELINE-0.1.md)，本版核验见 [0.2.5 验证](docs/VERIFICATION-0.2.5.md)，四页设置见 [0.2.4 验证](docs/VERIFICATION-0.2.4.md)，模型及签名迁移见 [0.2.3 验证](docs/VERIFICATION-0.2.3.md)，统一搜索见 [0.2.2 验证](docs/VERIFICATION-0.2.2.md)，启动器历史验收见 [0.2.1 验证](docs/VERIFICATION-0.2.1.md)，上一版对照见 [0.2 验证](docs/VERIFICATION-0.2.md)，测量规则见 [基准协议](docs/BENCHMARK.md)。命令行或引擎级基准不能代替原生启动器的正确首帧，更不能概括竞品所有功能。
+使用合成资料验证。AppKit 和 FSEvents 测试依赖 macOS 原生服务，模拟与跳过的用例不能代替实体外接盘或真实第三方服务的验收。
 
-设计：[产品](docs/PRODUCT.md) · [架构](docs/ARCHITECTURE.md) · [兼容范围](docs/COMPATIBILITY.md) · [第三方依赖](THIRD_PARTY.md)。
+</details>
 
-Lumen 原创源码采用 [MIT](LICENSE)。第三方依赖各按自己的许可分发；不捆绑模型权重。
+原创源码采用 [MIT](LICENSE)。独立实现参考了 Tinycast、Oil Find、DigUp 和 Luminator Index 的产品思路。

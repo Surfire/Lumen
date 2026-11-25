@@ -39,6 +39,7 @@ def scenario(fallback):
                 '#!/bin/sh\n'
                 'fixture=${0%/*}\n'
                 'if [ -f "$fixture/hold-reopen" ]; then\n'
+                ': > "$fixture/reopen-helper-started"\n'
                 '    for step in $(/usr/bin/seq 1 100); do\n'
                 '        [ ! -f "$fixture/finish-reopen" ] || break\n'
                 '        /bin/sleep 0.05\n'

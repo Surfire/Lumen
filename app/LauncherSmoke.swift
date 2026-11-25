@@ -147,6 +147,7 @@ final class LauncherSmoke {
             let milliseconds = Double(elapsed.seconds) * 1_000 + Double(elapsed.attoseconds) / 1e15
             let fallback = exists("reopen-fallback")
             if fallback {
+                try await until("fallback traversal reached its held extractor") { self.exists("reopen-helper-started") }
                 try check(model.watchState == .starting, "saved lookup waited for the fallback traversal")
                 try signal("finish-reopen")
             }

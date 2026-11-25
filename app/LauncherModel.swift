@@ -134,6 +134,8 @@ final class Launcher: ObservableObject {
     private var watchSupported: Bool?
     private var watchReportsProgress = false
     private var watchSupportsCachedStart = false
+    private var awaitingStartupStatus = false
+    private var watchReadyReceived = false
     private var indexReportsProgress = true
     private var scanGeneration: UInt64 = 0
     private var revision: UInt64 = 0
@@ -251,8 +253,10 @@ final class Launcher: ObservableObject {
     func start() {
         inspectLocalResources()
         if engine.hasDatabase {
+            awaitingStartupStatus = true
             _ = engine.run(["status", "--include-scope"]) { [weak self] response in
                 guard let self, !self.closed else { return }
+                self.awaitingStartupStatus = false
                 if let report = self.report(from: response) {
                     self.publish(report)
                     self.acceptCoverage(from: report)
@@ -260,6 +264,7 @@ final class Launcher: ObservableObject {
                     self.indexPhase = .unreadable
                     self.indexNotice = LauncherNotice(.status, response.diagnostic)
                 }
+                self.markWatcherRunningIfReady()
                 self.startWatcherIfReady()
             }
         } else {
@@ -1196,6 +1201,7 @@ final class Launcher: ObservableObject {
         let canPrepareCache = watchSupportsCachedStart && indexPhase == .checking && engine.hasDatabase
         guard watchSupported == true, indexPhase == .ready || canPrepareCache, !scopePending,
               watcher == nil, !closed else { return }
+        watchReadyReceived = false
         watchState = .starting
         watchNotice = nil
         watchGeneration &+= 1
@@ -1229,10 +1235,19 @@ final class Launcher: ObservableObject {
         }
     }
 
+    private func markWatcherRunningIfReady() {
+        // Cached queries can run while the initial status request reads
+        // coverage, but Settings still needs the saved scope before applying changes.
+        if watchState == .starting && watchReadyReceived && !awaitingStartupStatus {
+            watchState = .running
+        }
+    }
+
     private func watchEvent(_ line: Data) {
         guard !stoppingWatcher, !scopePending,
               let notice = try? JSONDecoder().decode(WatchEvent.self, from: line) else { return }
         if notice.event == .cached {
+            guard watchSupportsCachedStart else { return }
             scopeTrustedForLookup = true
             indexPhase = .ready
             scheduleSearch(keepAction: true)
@@ -1241,7 +1256,8 @@ final class Launcher: ObservableObject {
         if notice.event == .ready {
             scopeTrustedForLookup = true
             indexPhase = .ready
-            watchState = .running
+            watchReadyReceived = true
+            markWatcherRunningIfReady()
         }
         watchProgress = nil
         refreshCoverage(after: .milliseconds(400))

@@ -14,8 +14,7 @@ use std::{
 mod soa;
 use soa::{MAX_INDEX_BYTES, NameIndex};
 
-// SQLite remains the query path while building, when the byte budget is
-// exceeded, and for queries whose folding needs SQLite's trigram tokenizer.
+// SQLite remains the query path while building or when the byte budget is exceeded.
 const REBUILD_DELAY: Duration = Duration::from_millis(200);
 const OVER_BUDGET_DELAY: Duration = Duration::from_secs(30);
 const MAX_BUILD_DELAY: Duration = Duration::from_secs(15 * 60);
@@ -85,7 +84,7 @@ fn prefix_end(query: &str) -> Option<String> {
 }
 
 fn ranked_prefix(conn: &Connection, query: &str, limit: usize) -> Result<Option<Vec<Hit>>> {
-    if query.contains(['\0', '/']) || !literal_query(query) {
+    if query.contains(['\0', '/']) || !literal_prefix_safe(query) {
         return Ok(None);
     }
     let Some(upper) = prefix_end(query) else {
@@ -304,7 +303,7 @@ impl NameFast {
             {
                 self.start(generation);
             }
-            if current && !query.contains('\0') && (terms.is_some() || literal_query(query)) {
+            if current && !query.contains('\0') {
                 return Ok(self
                     .index
                     .as_ref()
@@ -349,7 +348,7 @@ impl Drop for NameFast {
     }
 }
 
-fn literal_query(query: &str) -> bool {
+fn literal_prefix_safe(query: &str) -> bool {
     if query.is_ascii() || query.chars().count() < 3 {
         return true;
     }
@@ -442,6 +441,45 @@ mod tests {
         assert!(fast.search(&reader, "example", None, 10)?.is_none());
         writer.execute_batch("DELETE FROM item WHERE id=1;")?;
         assert_eq!(name_generation(&reader)?, Some(generation + 3));
+        Ok(())
+    }
+
+    #[test]
+    fn ready_soa_handles_non_ascii_single_words_without_fts() -> Result<()> {
+        let catalog = Catalog::new("unicode-word")?;
+        let db = catalog.db();
+        let (writer, _) = crate::open_write(&db, false)?;
+        for (path, name) in [
+            ("/scope/Résumé", "Résumé"),
+            ("/scope/Mon résumé.txt", "Mon résumé.txt"),
+            ("/scope/Résumés/notes.txt", "notes.txt"),
+            ("/scope/Resume.txt", "Resume.txt"),
+        ] {
+            writer.execute(
+                "INSERT INTO item VALUES(NULL,?1,?2,'file','local',?3,'','',?4,0)",
+                params![path, name, crate::norm(name), crate::norm(path)],
+            )?;
+        }
+        // No FTS rows: require the RAM route, including normalization of
+        // decomposed accented input and matches in both basenames and paths.
+        let reader = open_read(&db)?;
+        let mut fast = NameFast::new(&db, &reader);
+        let query = "RE\u{301}SUME\u{301}";
+        let normalized = crate::norm(query);
+        assert!(crate::query::Terms::parse(&normalized).is_none());
+        finish_build(&fast);
+        let hits =
+            crate::search_with_names(&reader, query, crate::Mode::Name, 20, None, Some(&mut fast))?;
+        assert_eq!(
+            hits.iter()
+                .map(|hit| (hit.name.as_str(), hit.matched_by.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("Résumé", "name"),
+                ("Mon résumé.txt", "name"),
+                ("notes.txt", "path")
+            ],
+        );
         Ok(())
     }
 

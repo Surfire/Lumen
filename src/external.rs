@@ -1,4 +1,8 @@
-use crate::{Hit, Mode, Result, absolute, open_read, with_suffix};
+use crate::{
+    Hit, Mode, Result, absolute,
+    diagnose::{CatalogValidator, HitInput, MetadataBatch},
+    open_read, with_suffix,
+};
 use anyhow::{Context, bail, ensure};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -330,6 +334,7 @@ pub(super) fn append_hits(
     limit: usize,
     hits: &mut Vec<Hit>,
 ) {
+    let mut paths = MetadataBatch::default();
     append_mounted(
         database,
         query,
@@ -337,14 +342,24 @@ pub(super) fn append_hits(
         limit,
         hits,
         mounted,
-        |catalog, hit| {
-            crate::diagnose::validate_catalog_hit(
-                catalog,
-                Path::new(&hit.path),
-                &hit.kind,
-                &hit.availability,
-                None,
-            )
+        |conn, catalog, found, mut remaining| {
+            #[cfg(target_os = "macos")]
+            let Ok(_io) = crate::platform::NoMaterialization::enter() else {
+                found.clear();
+                return;
+            };
+            check_rows(conn, catalog, found, |validator, hit| {
+                let valid = remaining > 0
+                    && validator.check(
+                        &mut paths,
+                        Path::new(&hit.path),
+                        &hit.kind,
+                        &hit.availability,
+                        None,
+                    );
+                remaining -= usize::from(valid);
+                valid
+            });
         },
     );
 }
@@ -356,7 +371,7 @@ fn append_mounted(
     limit: usize,
     hits: &mut Vec<Hit>,
     mount_state: impl Fn() -> Mounted,
-    validate_hit: impl Fn(&Path, &Hit) -> bool,
+    mut check: impl FnMut(&Connection, &Path, &mut Vec<Hit>, usize),
 ) {
     // Old releases allowed raw /Volumes scopes in the main catalog. Only
     // the separately opted-in catalog can now publish one of those paths.
@@ -364,105 +379,203 @@ fn append_mounted(
     if !matches!(mode, Mode::Name | Mode::All) || hits.len() >= limit {
         return;
     }
-    let registered = registrations(database);
-    if registered.is_empty() {
-        return;
-    }
-    let Ok(deny) = deny_rules(database) else {
-        return;
-    };
-    // Find candidates before reading the mount table. One late snapshot
-    // verifies volume identity after the potentially longer catalog searches.
-    let candidates: Vec<_> = registered
+    let candidates = registrations(database)
         .into_iter()
         .filter_map(|(catalog, conn, volume)| {
             let found = super::search_with_names(&conn, query, Mode::Name, 100, None, None).ok()?;
-            (!found.is_empty()).then_some((catalog, conn, volume, found))
+            (!found.is_empty()).then_some(Candidates {
+                catalog,
+                conn,
+                volume,
+                found,
+            })
         })
         .collect();
-    if candidates.is_empty() {
-        return;
+    let mut remaining = limit - hits.len();
+    hits.extend(filter_mounted(
+        database,
+        candidates,
+        mount_state,
+        |hit| Path::new(&hit.path),
+        |conn, catalog, found| {
+            if remaining == 0 {
+                found.clear();
+            } else {
+                check(conn, catalog, found, remaining);
+                remaining -= found.len();
+            }
+        },
+    ));
+}
+
+struct Candidates<T> {
+    catalog: PathBuf,
+    conn: Connection,
+    volume: Mount,
+    found: Vec<T>,
+}
+
+struct Visibility {
+    deny: Vec<PathBuf>,
+    mounts: Mounted,
+}
+
+impl Visibility {
+    fn read(database: &Path, mount_state: &impl Fn() -> Mounted) -> Option<Self> {
+        Some(Self {
+            deny: deny_rules(database).ok()?,
+            mounts: mount_state(),
+        })
     }
-    let attached = mount_state();
-    for (catalog, conn, volume, found) in candidates {
-        if !attached.matches(&volume) {
-            continue;
-        }
-        let boundary = attached.boundary(&volume);
-        let valid: Vec<_> = found
-            .into_iter()
-            .filter(|hit| {
-                let path = Path::new(&hit.path);
-                boundary.allows(path) && permitted(&deny, path) && validate_hit(&catalog, hit)
-            })
-            .take(limit - hits.len())
-            .collect();
-        if !valid.is_empty() && registration(&conn).as_ref() == Some(&volume) {
-            hits.extend(valid);
-        }
-        if hits.len() == limit {
-            break;
-        }
+
+    fn boundary(&self, volume: &Mount) -> Option<Boundary> {
+        self.mounts
+            .matches(volume)
+            .then(|| self.mounts.boundary(volume))
+    }
+
+    fn allows(&self, boundary: &Boundary, path: &Path) -> bool {
+        boundary.allows(path) && permitted(&self.deny, path)
     }
 }
 
-pub(super) fn validate(
+fn filter_mounted<T>(
     database: &Path,
-    path: &Path,
-    kind: &str,
-    availability: &str,
-    stamp: Option<&str>,
-) -> bool {
-    if stamp.is_some() {
-        return false;
+    mut candidates: Vec<Candidates<T>>,
+    mount_state: impl Fn() -> Mounted,
+    path_of: impl Fn(&T) -> &Path,
+    mut check: impl FnMut(&Connection, &Path, &mut Vec<T>),
+) -> impl Iterator<Item = T> {
+    if !candidates.is_empty()
+        && let Some(initial) = Visibility::read(database, &mount_state)
+    {
+        candidates.retain_mut(|group| {
+            let Some(boundary) = initial.boundary(&group.volume) else {
+                return false;
+            };
+            group
+                .found
+                .retain(|value| initial.allows(&boundary, path_of(value)));
+            if !group.found.is_empty() {
+                check(&group.conn, &group.catalog, &mut group.found);
+            }
+            !group.found.is_empty()
+        });
+    } else {
+        candidates.clear();
     }
-    let registered = registrations(database);
-    if registered.is_empty() {
-        return false;
+    // Do not publish any candidate until all filesystem validation has finished.
+    // One fresh policy/mount snapshot gates the whole batch, with a fresh
+    // registration check per sidecar, including nested mount points.
+    if !candidates.is_empty()
+        && let Some(latest) = Visibility::read(database, &mount_state)
+    {
+        candidates.retain_mut(|group| {
+            let Some(boundary) = latest.boundary(&group.volume) else {
+                return false;
+            };
+            if registration(&group.conn).as_ref() != Some(&group.volume) {
+                return false;
+            }
+            group
+                .found
+                .retain(|value| latest.allows(&boundary, path_of(value)));
+            !group.found.is_empty()
+        });
+    } else {
+        candidates.clear();
     }
-    let Ok(deny) = deny_rules(database) else {
-        return false;
-    };
-    if !permitted(&deny, path) {
-        return false;
+    candidates.into_iter().flat_map(|group| group.found)
+}
+
+fn check_rows<T>(
+    conn: &Connection,
+    catalog: &Path,
+    values: &mut Vec<T>,
+    mut check: impl FnMut(&CatalogValidator<'_>, &T) -> bool,
+) {
+    if let Ok(snapshot) = conn.unchecked_transaction()
+        && let Some(validator) = CatalogValidator::new(&snapshot, catalog)
+    {
+        values.retain(|value| check(&validator, value));
+    } else {
+        values.clear();
     }
-    let attached = mounted();
-    registered.iter().any(|(catalog, conn, volume)| {
-        if !attached.matches(volume)
-            || !attached.boundary(volume).allows(path)
-            || !crate::diagnose::validate_catalog_hit(catalog, path, kind, availability, None)
-        {
-            return false;
-        }
-        let latest = mounted();
-        latest.matches(volume)
-            && latest.boundary(volume).allows(path)
-            && registration(conn).as_ref() == Some(volume)
-            && deny_rules(database).is_ok_and(|deny| permitted(&deny, path))
-    })
+}
+
+pub(super) fn validate_batch(
+    database: &Path,
+    hits: &[HitInput<'_>],
+    visible: &mut [bool],
+    paths: &mut MetadataBatch,
+) {
+    let external: Vec<_> = hits
+        .iter()
+        .enumerate()
+        .filter(|&(_, &(path, _, _, stamp))| stamp.is_none() && is_external(Path::new(path)))
+        .collect();
+    if external.is_empty() {
+        return;
+    }
+    let candidates = registrations(database)
+        .into_iter()
+        .filter_map(|(catalog, conn, volume)| {
+            let found = external
+                .iter()
+                .copied()
+                .filter(|&(_, &(path, ..))| Path::new(path).starts_with(&volume.path))
+                .collect::<Vec<_>>();
+            (!found.is_empty()).then_some(Candidates {
+                catalog,
+                conn,
+                volume,
+                found,
+            })
+        })
+        .collect();
+    for (index, _) in filter_mounted(
+        database,
+        candidates,
+        mounted,
+        |&(_, &(path, ..))| Path::new(path),
+        |conn, catalog, selected| {
+            check_rows(
+                conn,
+                catalog,
+                selected,
+                |validator, &(_, &(path, kind, availability, _))| {
+                    validator.check(paths, Path::new(path), kind, availability, None)
+                },
+            )
+        },
+    ) {
+        visible[index] = true;
+    }
 }
 
 pub(super) fn diagnose(database: &Path, path: &Path) -> Option<crate::Diagnosis> {
-    let registered = registrations(database);
-    if registered.is_empty() || !permitted(&deny_rules(database).ok()?, path) {
-        return None;
-    }
-    let attached = mounted();
-    for (catalog, conn, volume) in registered {
-        if !attached.matches(&volume) || !attached.boundary(&volume).allows(path) {
-            continue;
-        }
-        let status = crate::diagnose::diagnose_catalog(&catalog, path);
-        let latest = mounted();
-        if latest.matches(&volume)
-            && latest.boundary(&volume).allows(path)
-            && registration(&conn).as_ref() == Some(&volume)
-            && deny_rules(database).is_ok_and(|deny| permitted(&deny, path))
-        {
-            return Some(status);
-        }
-    }
-    None
+    let candidates = registrations(database)
+        .into_iter()
+        .filter_map(|(catalog, conn, volume)| {
+            path.starts_with(&volume.path).then_some(Candidates {
+                catalog,
+                conn,
+                volume,
+                found: vec![(path, None)],
+            })
+        })
+        .collect();
+    filter_mounted(
+        database,
+        candidates,
+        mounted,
+        |&(path, _)| path,
+        |_, catalog, selected| {
+            selected[0].1 = Some(crate::diagnose::diagnose_catalog(catalog, path));
+        },
+    )
+    .next()?
+    .1
 }
 
 pub(super) fn check_primary_scope(scope: &crate::Scope) -> Result<()> {
@@ -545,7 +658,7 @@ mod tests {
         let volume = mount(root.clone(), [42, 1]);
         let nested = root.join("Nested");
         let (conn, lease) = crate::open_write(&sidecar, true).unwrap();
-        for relative in ["report.txt", "Nested/report-secret.txt"] {
+        for relative in ["report.txt", "report-other.txt", "Nested/report-secret.txt"] {
             let path = root.join(relative);
             let name = path.file_name().unwrap().to_str().unwrap();
             conn.execute(
@@ -571,7 +684,7 @@ mod tests {
             eligible,
             points: vec![root.clone(), nested.clone()],
         };
-        let query = |resolver: &dyn Fn() -> Mounted| {
+        let query_during_validation = |resolver: &dyn Fn() -> Mounted, validate: &dyn Fn(&Hit)| {
             let mut hits = Vec::new();
             append_mounted(
                 &primary,
@@ -580,10 +693,14 @@ mod tests {
                 20,
                 &mut hits,
                 resolver,
-                |_, _| true,
+                |_, _, candidates, limit| {
+                    candidates.truncate(limit);
+                    candidates.iter().for_each(validate);
+                },
             );
             hits.into_iter().map(|hit| hit.name).collect::<Vec<_>>()
         };
+        let query = |resolver: &dyn Fn() -> Mounted| query_during_validation(resolver, &|_| {});
         let active = || state(vec![volume.clone()]);
         assert!(query(&active).is_empty());
         let (conn, _lease) = crate::open_write(&primary, true).unwrap();
@@ -596,7 +713,7 @@ mod tests {
             [serde_json::to_string(&scope).unwrap()],
         )
         .unwrap();
-        assert_eq!(query(&active), ["report.txt"]);
+        assert_eq!(query(&active), ["report.txt", "report-other.txt"]);
         assert!(query(&Mounted::default).is_empty());
         let mut replacement = volume.clone();
         replacement.uuid = "01234567-89ab-cdef-0123-456789abcdee".into();
@@ -609,22 +726,79 @@ mod tests {
         assert!(query(&|| state(vec![reused_mount.clone()])).is_empty());
         assert!(query(&|| state(vec![volume.clone(), volume.clone()])).is_empty());
         let calls = Cell::new(0);
-        // Each query observes one mount snapshot, not a redundant second scan.
+        // Two hits share one mount snapshot before validation and one after it.
+        let checked = Cell::new(0);
         assert_eq!(
-            query(&|| {
-                calls.set(calls.get() + 1);
-                active()
-            }),
-            ["report.txt"]
+            query_during_validation(
+                &|| {
+                    calls.set(calls.get() + 1);
+                    active()
+                },
+                &|_| {
+                    assert_eq!(calls.get(), 1);
+                    checked.set(checked.get() + 1);
+                }
+            ),
+            ["report.txt", "report-other.txt"]
         );
-        assert_eq!(calls.get(), 1);
+        assert_eq!(checked.get(), 2);
+        assert_eq!(calls.get(), 2);
+
+        for latest in [None, Some(reconnected)] {
+            let changed = Cell::new(false);
+            let result = query_during_validation(
+                &|| {
+                    if changed.get() {
+                        state(latest.iter().cloned().collect())
+                    } else {
+                        active()
+                    }
+                },
+                &|_| changed.set(true),
+            );
+            assert!(changed.get(), "volume changed during candidate validation");
+            assert!(result.is_empty());
+        }
+
+        let changed = Cell::new(false);
+        assert!(
+            query_during_validation(
+                &|| {
+                    let mut mounts = active();
+                    if !changed.get() {
+                        mounts.points.retain(|path| path != &nested);
+                    }
+                    mounts
+                },
+                &|hit| {
+                    if hit.name == "report-secret.txt" {
+                        changed.set(true);
+                    }
+                }
+            )
+            .iter()
+            .all(|name| name != "report-secret.txt")
+        );
+        assert!(changed.get(), "new nested mount appeared during validation");
+
+        let save_scope = |scope: &crate::Scope| {
+            conn.execute(
+                "UPDATE info SET value=?1 WHERE key='scope'",
+                [serde_json::to_string(scope).unwrap()],
+            )
+            .unwrap();
+        };
+        let denied_file = crate::Scope {
+            deny: vec![root.join("report.txt")],
+            ..scope.clone()
+        };
+        assert_eq!(
+            query_during_validation(&active, &|_| save_scope(&denied_file)),
+            ["report-other.txt"]
+        );
 
         scope.deny = vec![root.clone()];
-        conn.execute(
-            "UPDATE info SET value=?1 WHERE key='scope'",
-            [serde_json::to_string(&scope).unwrap()],
-        )
-        .unwrap();
+        save_scope(&scope);
         assert!(query(&active).is_empty());
         assert!(forget_volume(&primary, UUID).unwrap());
         assert!(!forget_volume(&primary, UUID).unwrap());

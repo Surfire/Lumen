@@ -8,6 +8,22 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(target_os = "macos")]
+use std::{
+    collections::HashMap,
+    ffi::CString,
+    fs::{File, OpenOptions},
+    io,
+    mem::MaybeUninit,
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, OpenOptionsExt},
+        },
+    },
+};
+
 /// Guard the startup snapshot against out-of-band access changes, including
 /// privacy-policy revocation which may not produce any filesystem event.
 pub fn verify_cached_access(hits: &mut Vec<crate::Hit>) {
@@ -156,41 +172,47 @@ pub fn validate_hit(
     availability: &str,
     stamp: Option<&str>,
 ) -> bool {
+    #[cfg(target_os = "macos")]
+    let Ok(_io) = crate::platform::NoMaterialization::enter() else {
+        return false;
+    };
     if crate::external::is_external(path) {
-        return crate::external::validate(database, path, kind, availability, stamp);
+        let Some(path) = path.to_str() else {
+            return false;
+        };
+        let mut visible = [false];
+        crate::external::validate_batch(
+            database,
+            &[(path, kind, availability, stamp)],
+            &mut visible,
+            &mut MetadataBatch::default(),
+        );
+        return visible[0];
     }
     validate_catalog_hit(database, path, kind, availability, stamp)
 }
 
-pub(super) fn validate_catalog_hit(
+fn validate_catalog_hit(
     database: &Path,
     path: &Path,
     kind: &str,
     availability: &str,
     stamp: Option<&str>,
 ) -> bool {
-    #[cfg(target_os = "macos")]
-    let Ok(_io) = crate::platform::NoMaterialization::enter() else {
-        return false;
-    };
-    if !path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
-        return false;
-    }
     let result = (|| -> crate::Result<bool> {
         let database = absolute(database)?;
         let conn = open_read(&database)?;
-        let sidecars = INDEX_SIDECARS.map(|suffix| with_suffix(&database, suffix));
         Ok(read_snapshot(&conn, |snapshot| {
-            let Some(scope) = saved_index_scope(snapshot)? else {
-                return Ok(false);
-            };
-            validate_in_snapshot(
-                snapshot,
-                (&scope, &database, &sidecars),
-                path,
-                kind,
-                availability,
-                stamp,
+            Ok(
+                CatalogValidator::new(snapshot, &database).is_some_and(|validator| {
+                    validator.check(
+                        &mut MetadataBatch::default(),
+                        path,
+                        kind,
+                        availability,
+                        stamp,
+                    )
+                }),
             )
         })?
         .unwrap_or(false))
@@ -198,44 +220,33 @@ pub(super) fn validate_catalog_hit(
     result.unwrap_or(false)
 }
 
+pub(super) type HitInput<'a> = (&'a str, &'a str, &'a str, Option<&'a str>);
+
 /// Validate an ordered batch using the session's existing catalog connection.
 /// The metadata checks never read the selected files' contents.
 pub(super) fn validate_session_hits(
     conn: &Connection,
     database: &Path,
-    hits: &[(&str, &str, &str, Option<&str>)],
+    hits: &[HitInput<'_>],
 ) -> Vec<bool> {
+    let mut visible = vec![false; hits.len()];
     #[cfg(target_os = "macos")]
     let Ok(_io) = crate::platform::NoMaterialization::enter() else {
-        return vec![false; hits.len()];
+        return visible;
     };
-    let Ok(snapshot) = conn.unchecked_transaction() else {
-        return vec![false; hits.len()];
-    };
-    let scope = saved_index_scope(&snapshot).ok().flatten();
-    let sidecars = INDEX_SIDECARS.map(|suffix| with_suffix(database, suffix));
-    hits.iter()
-        .map(|&(path, kind, availability, stamp)| {
+    let mut paths = MetadataBatch::default();
+    if let Ok(snapshot) = conn.unchecked_transaction()
+        && let Some(validator) = CatalogValidator::new(&snapshot, database)
+    {
+        for (&(path, kind, availability, stamp), visible) in hits.iter().zip(&mut visible) {
             let path = Path::new(path);
-            if !path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
-                return false;
+            if !crate::external::is_external(path) {
+                *visible = validator.check(&mut paths, path, kind, availability, stamp);
             }
-            if crate::external::is_external(path) {
-                return crate::external::validate(database, path, kind, availability, stamp);
-            }
-            scope.as_ref().is_some_and(|scope| {
-                validate_in_snapshot(
-                    &snapshot,
-                    (scope, database, &sidecars),
-                    path,
-                    kind,
-                    availability,
-                    stamp,
-                )
-                .unwrap_or(false)
-            })
-        })
-        .collect()
+        }
+    }
+    crate::external::validate_batch(database, hits, &mut visible, &mut paths);
+    visible
 }
 
 /// Retry a read raced by a catalog commit without repeating work outside SQLite.
@@ -256,72 +267,110 @@ pub(super) fn read_snapshot<T>(
     Ok(None)
 }
 
-fn validate_in_snapshot(
-    conn: &Connection,
-    (scope, database, sidecars): (&Scope, &Path, &[PathBuf]),
-    path: &Path,
-    kind: &str,
-    availability: &str,
-    stamp: Option<&str>,
-) -> crate::Result<bool> {
-    if !matches!(kind, "file" | "directory")
-        || !matches!(
-            availability,
-            "local" | "provider_metadata_only" | "placeholder"
-        )
-    {
-        return Ok(false);
+pub(super) struct CatalogValidator<'a> {
+    conn: &'a Connection,
+    scope: Scope,
+    database: &'a Path,
+    sidecars: [PathBuf; INDEX_SIDECARS.len()],
+}
+
+impl<'a> CatalogValidator<'a> {
+    pub(super) fn new(conn: &'a Connection, database: &'a Path) -> Option<Self> {
+        Some(Self {
+            conn,
+            scope: saved_index_scope(conn).ok()??,
+            database,
+            sidecars: INDEX_SIDECARS.map(|suffix| with_suffix(database, suffix)),
+        })
     }
-    let path = absolute(path)?;
-    if !scope.roots.iter().any(|root| path.starts_with(root))
-        || !scope.allows(&path)
-        || is_index_path(&path, database, sidecars)
-    {
-        return Ok(false);
+
+    pub(super) fn check(
+        &self,
+        paths: &mut MetadataBatch,
+        path: &Path,
+        kind: &str,
+        availability: &str,
+        stamp: Option<&str>,
+    ) -> bool {
+        self.check_row(paths, path, kind, availability, stamp)
+            .unwrap_or(false)
     }
-    let Some(text) = path.to_str() else {
-        return Ok(false);
-    };
-    let id: Option<i64> = conn
-        .prepare_cached(
-            "SELECT id FROM item WHERE path=?1 AND kind=?2 AND availability=?3
+
+    fn check_row(
+        &self,
+        paths: &mut MetadataBatch,
+        path: &Path,
+        kind: &str,
+        availability: &str,
+        stamp: Option<&str>,
+    ) -> crate::Result<bool> {
+        let Self {
+            conn,
+            scope,
+            database,
+            sidecars,
+        } = self;
+        if !path.is_absolute()
+            || path.components().any(|c| c == Component::ParentDir)
+            || !matches!(kind, "file" | "directory")
+            || !matches!(
+                availability,
+                "local" | "provider_metadata_only" | "placeholder"
+            )
+        {
+            return Ok(false);
+        }
+        let path = absolute(path)?;
+        if !scope.roots.iter().any(|root| path.starts_with(root))
+            || !scope.allows(&path)
+            || is_index_path(&path, database, sidecars)
+        {
+            return Ok(false);
+        }
+        let Some(text) = path.to_str() else {
+            return Ok(false);
+        };
+        let id: Option<i64> = conn
+            .prepare_cached(
+                "SELECT id FROM item WHERE path=?1 AND kind=?2 AND availability=?3
              AND availability<>'unverified'",
-        )?
-        .query_row([text, kind, availability], |row| row.get(0))
-        .optional()?;
-    let Some(id) = id else {
-        return Ok(false);
-    };
-    let Ok(file) = selected_metadata(&path, kind == "directory") else {
-        return Ok(false);
-    };
-    // Require the same path spelling, so a replacement or alias cannot
-    // direct the action at a different entry allowed by the filesystem.
-    if file.path != path || file.availability != availability {
-        return Ok(false);
+            )?
+            .query_row([text, kind, availability], |row| row.get(0))
+            .optional()?;
+        let Some(id) = id else {
+            return Ok(false);
+        };
+        let Ok(file) = paths.selected_metadata(&path, kind == "directory") else {
+            return Ok(false);
+        };
+        // Require the same path spelling, so a replacement or alias cannot
+        // direct the action at a different entry allowed by the filesystem.
+        if file.path != path || file.availability != availability {
+            return Ok(false);
+        }
+        let Some(stamp) = stamp else {
+            return Ok(true);
+        };
+        if file.stamp.as_deref() != Some(stamp) {
+            return Ok(false);
+        }
+        if kind == "file" && crate::image_search::stored_match(conn, id, &path, stamp)? {
+            return Ok(true);
+        }
+        if !scope.documents {
+            return Ok(false);
+        }
+        let (column, join) = document_stamp_sql(conn)?;
+        let stored = conn
+            .query_row(
+                &format!("SELECT {column} AS document_stamp FROM document d {join} WHERE d.id=?1"),
+                [id],
+                read_document_stamp,
+            )
+            .optional()?
+            .flatten();
+        Ok(stored.as_deref() == Some(stamp))
     }
-    let Some(stamp) = stamp else {
-        return Ok(true);
-    };
-    if file.stamp.as_deref() != Some(stamp) {
-        return Ok(false);
-    }
-    if kind == "file" && crate::image_search::stored_match(conn, id, &path, stamp)? {
-        return Ok(true);
-    }
-    if !scope.documents {
-        return Ok(false);
-    }
-    let (column, join) = document_stamp_sql(conn)?;
-    let stored = conn
-        .query_row(
-            &format!("SELECT {column} AS document_stamp FROM document d {join} WHERE d.id=?1"),
-            [id],
-            read_document_stamp,
-        )
-        .optional()?
-        .flatten();
-    Ok(stored.as_deref() == Some(stamp))
 }
 
 fn inspect(conn: &Connection, database: &Path, path: &Path) -> Diagnosis {
@@ -467,9 +516,23 @@ pub(crate) fn local_stamp(path: &Path, directory: bool) -> Option<String> {
     file.stamp
 }
 
+fn selected_metadata(path: &Path, directory_hit: bool) -> Result<Selected, Reason> {
+    MetadataBatch::default().selected_metadata(path, directory_hit)
+}
+
+/// Keep verified parent descriptors and failures for this request only.
+/// Each selected leaf is still checked live.
+#[derive(Default)]
+pub(super) struct MetadataBatch {
+    #[cfg(target_os = "macos")]
+    directories: HashMap<PathBuf, Result<File, Reason>>,
+}
+
 #[cfg(not(target_os = "macos"))]
-fn selected_metadata(_: &Path, _: bool) -> Result<Selected, Reason> {
-    Err(Reason::Unknown)
+impl MetadataBatch {
+    fn selected_metadata(&mut self, _: &Path, _: bool) -> Result<Selected, Reason> {
+        Err(Reason::Unknown)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -482,122 +545,132 @@ fn metadata_availability(path: &Path, flags: u32, leaf: bool) -> Result<&'static
 }
 
 #[cfg(target_os = "macos")]
-fn selected_metadata(path: &Path, directory_hit: bool) -> Result<Selected, Reason> {
-    use crate::platform::descriptor_path;
-    use std::{
-        ffi::CString,
-        fs::{File, OpenOptions},
-        io,
-        mem::MaybeUninit,
-        os::{
-            fd::{AsRawFd, FromRawFd},
-            unix::{
-                ffi::OsStrExt,
-                fs::{MetadataExt, OpenOptionsExt},
-            },
-        },
-    };
+const METADATA_ONLY: i32 =
+    libc::O_EVTONLY | libc::O_NOFOLLOW_ANY | libc::O_NONBLOCK | libc::O_CLOEXEC;
 
-    fn io_reason(error: io::Error) -> Reason {
-        match error.raw_os_error() {
-            Some(libc::ENOENT | libc::ENOTDIR) => Reason::Missing,
-            Some(libc::EACCES | libc::EPERM) => Reason::Unreadable,
-            Some(libc::ELOOP) => Reason::Symlink,
-            _ => Reason::Unknown,
+#[cfg(target_os = "macos")]
+fn io_reason(error: io::Error) -> Reason {
+    match error.raw_os_error() {
+        Some(libc::ENOENT | libc::ENOTDIR) => Reason::Missing,
+        Some(libc::EACCES | libc::EPERM) => Reason::Unreadable,
+        Some(libc::ELOOP) => Reason::Symlink,
+        _ => Reason::Unknown,
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl MetadataBatch {
+    fn directory(&mut self, path: &Path) -> Result<&File, Reason> {
+        if !self.directories.contains_key(path) {
+            let opened = self.open_directory(path);
+            self.directories.insert(path.into(), opened);
         }
+        self.directories[path].as_ref().map_err(|&reason| reason)
     }
 
-    const METADATA_ONLY: i32 = libc::O_EVTONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK;
-    let mut directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(METADATA_ONLY | libc::O_DIRECTORY)
-        .open("/")
-        .map_err(io_reason)?;
-    let mut parts = path.components().skip(1).peekable();
-    while let Some(part) = parts.next() {
-        let leaf = parts.peek().is_none();
-        let name = CString::new(part.as_os_str().as_bytes()).map_err(|_| Reason::Unknown)?;
-        let mut raw = MaybeUninit::<libc::stat>::uninit();
-        // The parent is an already validated descriptor. lstat the one named
-        // component so even special files are rejected before opening an fd.
-        if unsafe {
-            libc::fstatat(
-                directory.as_raw_fd(),
-                name.as_ptr(),
-                raw.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } != 0
-        {
-            return Err(io_reason(io::Error::last_os_error()));
+    fn open_directory(&mut self, path: &Path) -> Result<File, Reason> {
+        if path == Path::new("/") {
+            return OpenOptions::new()
+                .read(true)
+                .custom_flags(METADATA_ONLY | libc::O_DIRECTORY)
+                .open(path)
+                .map_err(io_reason);
         }
-        let raw = unsafe { raw.assume_init() };
-        let file_type = raw.st_mode & libc::S_IFMT;
-        if file_type == libc::S_IFLNK {
-            return Err(Reason::Symlink);
+        let parent = self.directory(path.parent().ok_or(Reason::Unknown)?)?;
+        let (name, raw) = stat_component(parent, path)?;
+        if raw.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(Reason::Missing);
         }
-        let expected_leaf = if directory_hit {
+        metadata_availability(path, raw.st_flags, false)?;
+        let (file, metadata) = open_component(parent, &name, &raw, true)?;
+        if crate::platform::availability(path, &metadata) == "placeholder" {
+            return Err(Reason::CloudAncestor);
+        }
+        Ok(file)
+    }
+
+    fn selected_metadata(&mut self, path: &Path, directory: bool) -> Result<Selected, Reason> {
+        use crate::platform::descriptor_path;
+        let parent = self.directory(path.parent().ok_or(Reason::NotFile)?)?;
+        let (name, raw) = stat_component(parent, path)?;
+        let expected = if directory {
             libc::S_IFDIR
         } else {
             libc::S_IFREG
         };
-        if leaf && file_type != expected_leaf {
+        if raw.st_mode & libc::S_IFMT != expected {
             return Err(Reason::NotFile);
         }
-        if !leaf && file_type != libc::S_IFDIR {
-            return Err(Reason::Missing);
-        }
-        let availability = metadata_availability(path, raw.st_flags, leaf)?;
-        if leaf && availability != "local" {
-            // Stat already proves the entry is cloud metadata only. Do not
-            // open it even for events merely to resolve its stored spelling.
-            let path = descriptor_path(&directory)
+        let availability = metadata_availability(path, raw.st_flags, true)?;
+        if availability != "local" {
+            // Do not open cloud-only leaves, even for events merely to get their spelling.
+            let path = descriptor_path(parent)
                 .ok_or(Reason::Unknown)?
-                .join(part);
+                .join(path.file_name().ok_or(Reason::NotFile)?);
             return Ok(Selected {
                 path,
                 availability,
                 stamp: None,
             });
         }
-        let flags = if !leaf || directory_hit {
-            METADATA_ONLY | libc::O_DIRECTORY
-        } else {
-            METADATA_ONLY
-        };
-        let fd = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                name.as_ptr(),
-                flags | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(io_reason(io::Error::last_os_error()));
-        }
-        let file = unsafe { File::from_raw_fd(fd) };
-        let metadata = file.metadata().map_err(io_reason)?;
-        if metadata.file_type().is_symlink() {
-            return Err(Reason::Symlink);
-        }
-        if metadata.dev() != raw.st_dev as u64 || metadata.ino() != raw.st_ino {
-            return Err(Reason::Unknown);
-        }
-        if leaf {
-            let path = descriptor_path(&file).ok_or(Reason::Unknown)?;
-            let availability = crate::platform::availability(&path, &metadata);
-            return Ok(Selected {
-                path,
-                availability,
-                stamp: Some(crate::index::stamp(&metadata)),
-            });
-        }
-        if crate::platform::availability(path, &metadata) == "placeholder" {
-            return Err(Reason::CloudAncestor);
-        }
-        directory = file;
+        let (file, metadata) = open_component(parent, &name, &raw, directory)?;
+        let path = descriptor_path(&file).ok_or(Reason::Unknown)?;
+        let availability = crate::platform::availability(&path, &metadata);
+        Ok(Selected {
+            path,
+            availability,
+            stamp: Some(crate::index::stamp(&metadata)),
+        })
     }
-    Err(Reason::NotFile)
+}
+
+#[cfg(target_os = "macos")]
+fn stat_component(directory: &File, path: &Path) -> Result<(CString, libc::stat), Reason> {
+    let name = path.file_name().ok_or(Reason::NotFile)?;
+    let name = CString::new(name.as_bytes()).map_err(|_| Reason::Unknown)?;
+    let mut raw = MaybeUninit::<libc::stat>::uninit();
+    // The parent is an already validated descriptor. lstat the one named
+    // component so even special files are rejected before opening an fd.
+    if unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            raw.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(io_reason(io::Error::last_os_error()));
+    }
+    let raw = unsafe { raw.assume_init() };
+    let file_type = raw.st_mode & libc::S_IFMT;
+    if file_type == libc::S_IFLNK {
+        return Err(Reason::Symlink);
+    }
+    Ok((name, raw))
+}
+
+#[cfg(target_os = "macos")]
+fn open_component(
+    directory: &File,
+    name: &CString,
+    raw: &libc::stat,
+    is_directory: bool,
+) -> Result<(File, std::fs::Metadata), Reason> {
+    let flags = METADATA_ONLY | if is_directory { libc::O_DIRECTORY } else { 0 };
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io_reason(io::Error::last_os_error()));
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata().map_err(io_reason)?;
+    if metadata.file_type().is_symlink() {
+        return Err(Reason::Symlink);
+    }
+    if metadata.dev() != raw.st_dev as u64 || metadata.ino() != raw.st_ino {
+        return Err(Reason::Unknown);
+    }
+    Ok((file, metadata))
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -624,13 +697,19 @@ mod tests {
         .unwrap();
         let reader = open_read(&database).unwrap();
         let writer = Connection::open(&database).unwrap();
-        let scope = saved_index_scope(&reader).unwrap().unwrap();
-        let sidecars = INDEX_SIDECARS.map(|suffix| with_suffix(&database, suffix));
-        let context = (&scope, database.as_path(), sidecars.as_slice());
+        let validate = |snapshot: &Connection| {
+            CatalogValidator::new(snapshot, &database).unwrap().check(
+                &mut MetadataBatch::default(),
+                &path,
+                "file",
+                "local",
+                None,
+            )
+        };
         let mut attempts = 0;
         let result = read_snapshot(&reader, |snapshot| {
             attempts += 1;
-            let visible = validate_in_snapshot(snapshot, context, &path, "file", "local", None)?;
+            let visible = validate(snapshot);
             if attempts < 3 {
                 writer.execute("UPDATE item SET display=display || 'x'", [])?;
             }
@@ -646,7 +725,7 @@ mod tests {
         attempts = 0;
         let result = read_snapshot(&reader, |snapshot| {
             attempts += 1;
-            let visible = validate_in_snapshot(snapshot, context, &path, "file", "local", None)?;
+            let visible = validate(snapshot);
             writer.execute("UPDATE item SET display=display || 'x'", [])?;
             Ok(visible)
         })
@@ -656,6 +735,60 @@ mod tests {
         drop(reader);
         drop(writer);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_reuses_verified_parents_but_checks_each_leaf_and_drops_the_cache() {
+        use std::{fs, os::unix::fs::symlink};
+
+        let _io = crate::platform::NoMaterialization::enter().unwrap();
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-parent-cache-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let parent = root.join("docs");
+        let first = parent.join("first.txt");
+        let second = parent.join("second.txt");
+        let nested = parent.join("subdir/third.txt");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        for path in [&first, &second, &nested] {
+            fs::write(path, "fixture").unwrap();
+        }
+
+        let mut batch = MetadataBatch::default();
+        assert_eq!(batch.selected_metadata(&first, false).unwrap().path, first);
+        let cached_fd = batch.directories[&parent].as_ref().unwrap().as_raw_fd();
+        let prefixes = batch.directories.len();
+        assert_eq!(
+            batch.selected_metadata(&second, false).unwrap().path,
+            second
+        );
+        assert_eq!(batch.directories.len(), prefixes);
+        assert_eq!(
+            batch.selected_metadata(&nested, false).unwrap().path,
+            nested
+        );
+        assert_eq!(batch.directories.len(), prefixes + 1);
+        assert_eq!(
+            batch.directories[&parent].as_ref().unwrap().as_raw_fd(),
+            cached_fd
+        );
+
+        fs::remove_file(&second).unwrap();
+        symlink(&first, &second).unwrap();
+        assert!(matches!(
+            batch.selected_metadata(&second, false),
+            Err(Reason::Symlink)
+        ));
+        drop(batch);
+        let replacement = root.join("moved");
+        fs::rename(&parent, &replacement).unwrap();
+        symlink(&replacement, &parent).unwrap();
+        assert!(matches!(
+            selected_metadata(&first, false),
+            Err(Reason::Symlink)
+        ));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -56,6 +56,17 @@ impl Diagnosis {
 }
 
 pub fn diagnose(database: &Path, path: &Path) -> Diagnosis {
+    if !path.components().any(|c| c == Component::ParentDir)
+        && let Ok(path) = absolute(path)
+        && crate::external::is_external(&path)
+    {
+        return crate::external::diagnose(database, &path)
+            .unwrap_or_else(|| Diagnosis::blocked(Reason::IndexUnavailable));
+    }
+    diagnose_catalog(database, path)
+}
+
+pub(super) fn diagnose_catalog(database: &Path, path: &Path) -> Diagnosis {
     #[cfg(target_os = "macos")]
     let Ok(_io) = crate::platform::NoMaterialization::enter() else {
         return Diagnosis::blocked(Reason::Unknown);
@@ -83,6 +94,19 @@ pub fn diagnose(database: &Path, path: &Path) -> Diagnosis {
 /// Check one previously presented hit against the committed catalog and the
 /// current filesystem. The lookup uses the exact saved path and reads no bytes.
 pub fn validate_hit(
+    database: &Path,
+    path: &Path,
+    kind: &str,
+    availability: &str,
+    stamp: Option<&str>,
+) -> bool {
+    if crate::external::is_external(path) {
+        return crate::external::validate(database, path, kind, availability, stamp);
+    }
+    validate_catalog_hit(database, path, kind, availability, stamp)
+}
+
+pub(super) fn validate_catalog_hit(
     database: &Path,
     path: &Path,
     kind: &str,

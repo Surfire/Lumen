@@ -1,6 +1,6 @@
 use crate::{
-    Hit, Mode, Result, document_stamp_sql, fts_phrase, name_fast, norm, read_document_stamp,
-    row_hit, short_snippet,
+    Hit, Mode, Result, document_stamp_sql, fts_phrase, name_fast, norm, pinyin,
+    read_document_stamp, row_hit, short_snippet,
 };
 use rusqlite::{Connection, params};
 
@@ -15,7 +15,10 @@ pub(super) struct Terms {
 impl Terms {
     /// The single unquoted token path retains its existing ranking and fast indexes.
     pub(super) fn parse(query: &str) -> Option<Self> {
-        if !query.chars().any(|c| c.is_whitespace() || quote(c)) && extension(query).is_none() {
+        if !query.chars().any(|c| c.is_whitespace() || quote(c))
+            && extension(query).is_none()
+            && pinyin::legacy(query).is_none()
+        {
             return None;
         }
         let mut terms = Self::default();
@@ -196,7 +199,48 @@ pub(super) fn search(
 }
 
 fn find_names(conn: &Connection, terms: &Terms, words: &str, limit: usize) -> Result<Vec<Hit>> {
-    let anchor = anchors(terms.words.iter().chain(terms.suffix.iter()));
+    #[derive(serde::Serialize)]
+    struct Word<'a> {
+        word: &'a str,
+        legacy: Option<pinyin::LegacyReading>,
+    }
+    let aliases: Vec<_> = terms
+        .words
+        .iter()
+        .map(|word| Word {
+            word,
+            legacy: pinyin::legacy(word),
+        })
+        .collect();
+    let has_alias = aliases.iter().any(|term| term.legacy.is_some());
+    let alias_words;
+    let words = if has_alias {
+        alias_words = serde_json::to_string(&aliases)?;
+        &alias_words
+    } else {
+        words
+    };
+    let anchor = if has_alias {
+        let mut phrases: Vec<_> = aliases
+            .iter()
+            .filter(|term| term.word.chars().count() >= 3 && !term.word.contains('\0'))
+            .map(|term| {
+                let phrase = fts_phrase(term.word);
+                if let Some(legacy) = &term.legacy {
+                    format!("({phrase} OR {})", fts_phrase(&legacy.key))
+                } else {
+                    phrase
+                }
+            })
+            .collect();
+        if let Some(suffix) = &terms.suffix {
+            phrases.push(fts_phrase(suffix));
+        }
+        phrases.sort_unstable();
+        phrases.join(" AND ")
+    } else {
+        anchors(terms.words.iter().chain(terms.suffix.iter()))
+    };
     let (from, input) = if !anchor.is_empty() {
         (
             "name_fts CROSS JOIN item i ON i.id=name_fts.rowid AND name_fts MATCH ?3",
@@ -210,13 +254,29 @@ fn find_names(conn: &Connection, terms: &Terms, words: &str, limit: usize) -> Re
     } else {
         ("item i", anchor)
     };
-    let field_rank = "CASE
-        WHEN i.name=t.value THEN 0
-        WHEN instr(i.name,t.value)=1 THEN 1
-        WHEN instr(i.name,t.value)>0 THEN 2
-        WHEN instr(i.full,t.value)>0 OR instr(i.initials,t.value)>0 THEN 3
-        WHEN instr(i.searchable_path,t.value)>0 THEN 4
-        ELSE 5 END";
+    let term = if has_alias {
+        "(t.value ->> '$.word')"
+    } else {
+        "t.value"
+    };
+    let legacy = if has_alias {
+        " OR ((CASE WHEN (t.value ->> '$.legacy.initials') THEN
+                  instr(i.initials, t.value ->> '$.legacy.key') ELSE
+                  instr(i.full, t.value ->> '$.legacy.key') END) > 0
+               AND NOT EXISTS (SELECT 1 FROM json_each(t.value,'$.legacy.phrases') c
+                               WHERE instr(i.name,c.value)=0))"
+    } else {
+        ""
+    };
+    let field_rank = format!(
+        "CASE
+        WHEN i.name={term} THEN 0
+        WHEN instr(i.name,{term})=1 THEN 1
+        WHEN instr(i.name,{term})>0 THEN 2
+        WHEN instr(i.full,{term})>0 OR instr(i.initials,{term})>0{legacy} THEN 3
+        WHEN instr(i.searchable_path,{term})>0 THEN 4
+        ELSE 5 END"
+    );
     let sql = format!(
         "SELECT i.path,i.display,i.kind,i.availability,
                 coalesce((SELECT max({field_rank}) FROM json_each(?1) t),0) AS worst,

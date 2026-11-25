@@ -100,11 +100,12 @@ impl PdfExtractor {
     }
 }
 
-pub(super) const INDEX_SIDECARS: [&str; 4] = ["-wal", "-shm", "-journal", "-watch-lock"];
+pub(super) const INDEX_SIDECARS: [&str; 5] =
+    ["-wal", "-shm", "-journal", "-watch-lock", "-external"];
 
 pub(super) fn is_index_path(path: &Path, database: &Path, sidecars: &[PathBuf]) -> bool {
     path == database
-        || sidecars.iter().any(|sidecar| path == sidecar)
+        || sidecars.iter().any(|sidecar| path.starts_with(sidecar))
         || database
             .parent()
             .is_some_and(|p| p.ends_with("Lumen") && path.starts_with(p))
@@ -113,8 +114,9 @@ pub(super) fn is_index_path(path: &Path, database: &Path, sidecars: &[PathBuf]) 
 pub(super) struct Coverage {
     pub scope: Scope,
     database: PathBuf,
-    sidecars: [PathBuf; 4],
+    sidecars: [PathBuf; INDEX_SIDECARS.len()],
     pub(super) pdf: Option<PdfExtractor>,
+    external: Option<crate::external::Boundary>,
 }
 
 impl Coverage {
@@ -174,6 +176,7 @@ impl Coverage {
             database,
             sidecars,
             pdf,
+            external: None,
         })
     }
 
@@ -204,7 +207,11 @@ impl Coverage {
     }
 
     pub fn allows(&self, path: &Path) -> bool {
-        self.scope.allows(path) && !is_index_path(path, &self.database, &self.sidecars)
+        self.external.as_ref().map_or_else(
+            || !crate::external::is_external(path),
+            |boundary| boundary.allows(path),
+        ) && self.scope.allows(path)
+            && !is_index_path(path, &self.database, &self.sidecars)
     }
 }
 
@@ -219,12 +226,56 @@ pub fn scan_with_progress(
 ) -> Result<ScanStats> {
     #[cfg(target_os = "macos")]
     let _io = platform::NoMaterialization::enter()?;
+    crate::external::check_primary_scope(scope)?;
     let file = absolute(database)?;
     let coverage = Coverage::new(file.clone(), scope)?;
+    crate::external::check_primary_scope(&coverage.scope)?;
     let (mut conn, _lease) =
         open_write(&file, true).with_context(|| format!("open index {}", file.display()))?;
     restrict_scope(&mut conn, &coverage)?;
     reconcile(&mut conn, &coverage, true, progress)
+}
+
+pub(super) fn scan_external(
+    catalog: &Path,
+    conn: &mut Connection,
+    boundary: crate::external::Boundary,
+    mut deny: Vec<PathBuf>,
+    progress: Option<&ScanProgressReporter>,
+) -> Result<ScanStats> {
+    #[cfg(target_os = "macos")]
+    let _io = platform::NoMaterialization::enter()?;
+    let root = boundary.root().to_owned();
+    deny.extend(
+        [
+            "System",
+            "Applications",
+            "Library",
+            "private",
+            "dev",
+            "bin",
+            "sbin",
+            "usr",
+            "etc",
+            "var",
+            "Network",
+            "Volumes",
+            "cores",
+            "Users/Shared",
+            "Backups.backupdb",
+        ]
+        .into_iter()
+        .map(|name| root.join(name)),
+    );
+    let scope = Scope {
+        roots: vec![root.clone()],
+        deny,
+        ..Scope::default()
+    };
+    let mut coverage = Coverage::new(catalog.to_owned(), &scope)?;
+    coverage.external = Some(boundary);
+    restrict_scope(conn, &coverage)?;
+    reconcile(conn, &coverage, true, progress)
 }
 
 /// Load only the complete scope. Legacy "scan" reports recorded roots but omitted
@@ -641,6 +692,14 @@ impl<'a> Walk<'a> {
                     }
                 },
             };
+            if let Some(boundary) = &self.coverage.external
+                && metadata
+                    .as_ref()
+                    .is_none_or(|metadata| metadata.dev() != boundary.device())
+            {
+                self.stats.skipped += 1;
+                continue;
+            }
             let (directory, availability) = match &metadata {
                 Some(meta) => (meta.is_dir(), platform::availability(&path, meta)),
                 None => (false, platform::classify(&path, cached.unwrap().dataless)),
@@ -700,7 +759,9 @@ impl<'a> Walk<'a> {
             if !self.seen_directories.insert((meta.dev(), meta.ino())) && !is_root {
                 continue;
             }
-            if let Some(children) = platform::bulk_children(&path) {
+            if self.coverage.external.is_none()
+                && let Some(children) = platform::bulk_children(&path)
+            {
                 self.stats.bulk_directories += 1;
                 self.readable_roots += usize::from(is_root);
                 stack.extend(
@@ -710,7 +771,13 @@ impl<'a> Walk<'a> {
                 );
             } else {
                 self.stats.fallback_directories += 1;
-                match platform::children(&path) {
+                match platform::children_on_device(
+                    &path,
+                    self.coverage
+                        .external
+                        .as_ref()
+                        .map(|boundary| boundary.device()),
+                ) {
                     Ok(children) => {
                         self.readable_roots += usize::from(is_root);
                         stack.extend(

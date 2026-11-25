@@ -200,6 +200,17 @@ enum Action {
         #[arg(long, default_value_t = 8)]
         max: usize,
     },
+    /// List eligible attached external volumes and saved availability.
+    Volumes,
+    /// Explicitly index names from one mounted local external volume.
+    IndexVolume {
+        /// Emit progress reports as JSON lines on stderr.
+        #[arg(long)]
+        progress: bool,
+        path: PathBuf,
+    },
+    /// Remove an external volume catalog and its authorization.
+    ForgetVolume { uuid: String },
     /// Explain one explicitly selected path using only metadata and the saved index.
     Diagnose { path: PathBuf },
     /// Embed the next batch of document chunks locally (defaults to Gemma).
@@ -412,6 +423,16 @@ fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string(&lumen::index_content(&db, max)?)?
             );
+        }
+        Action::Volumes => println!("{}", serde_json::to_string(&lumen::volumes(&db))?),
+        Action::IndexVolume { path, progress } => {
+            let progress = scan_progress(progress)?;
+            let stats = lumen::index_volume(&db, &path, progress.as_ref())?;
+            drop(progress);
+            println!("{}", serde_json::to_string(&stats)?);
+        }
+        Action::ForgetVolume { uuid } => {
+            println!("{}", json!({"removed":lumen::forget_volume(&db, &uuid)?}));
         }
         Action::Diagnose { path } => {
             println!("{}", serde_json::to_string(&lumen::diagnose(&db, &path))?);

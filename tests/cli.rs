@@ -549,6 +549,147 @@ mod live {
     }
 
     #[test]
+    fn contextual_pinyin_searches_new_and_existing_catalog_rows() {
+        let f = Fixture::new();
+        let root = f.0.join("scope");
+        fs::create_dir(&root).unwrap();
+        let chengdu = "成都卫生Health.PDF";
+        let changsha = "长沙银行纪要.md";
+        for file in [chengdu, changsha, "chengdou-sample.txt", "鹿鸣"] {
+            fs::write(root.join(file), "").unwrap();
+        }
+        f.run(&["index", "--root", root.to_str().unwrap()]);
+        let mut db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+        let mut serve = Serve::new(&f);
+        let verify = |serve: &mut Serve| {
+            for (query, expected) in [
+                ("chengdu", chengdu),
+                ("CD", chengdu),
+                ("chengdu health pdf", chengdu),
+                ("changshayinhang", changsha),
+                ("CS", changsha),
+                ("鹿鸣", "鹿鸣"),
+            ] {
+                assert_eq!(serve.names(query, "name"), [expected], "{query}");
+            }
+        };
+        verify(&mut serve);
+
+        let tx = db.transaction().unwrap();
+        for (display, new_full, new_initials, old_full, old_initials) in [
+            (
+                chengdu,
+                "chengdu",
+                "cd",
+                "chengdouweishenghealthpdf",
+                "cdwshpdf",
+            ),
+            (
+                changsha,
+                "changshayinhang",
+                "csyh",
+                "zhangshayinxingjiyaomd",
+                "zsyxjym",
+            ),
+        ] {
+            let (id, name, full, initials, path): (i64, String, String, String, String) = tx
+                .query_row(
+                    "SELECT id,name,full,initials,searchable_path FROM item WHERE display=?1",
+                    [display],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert!(full.starts_with(new_full), "{full}");
+            assert!(initials.starts_with(new_initials), "{initials}");
+            tx.execute("DELETE FROM name_fts WHERE rowid=?1", [id])
+                .unwrap();
+            tx.execute(
+                "UPDATE item SET full=?2,initials=?3 WHERE id=?1",
+                rusqlite::params![id, old_full, old_initials],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO name_fts(rowid,name,full,initials,searchable_path) VALUES(?1,?2,?3,?4,?5)",
+                rusqlite::params![id, name, old_full, old_initials, path],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        verify(&mut serve);
+        let stored: String = db
+            .query_row("SELECT full FROM item WHERE display=?1", [chengdu], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, "chengdouweishenghealthpdf");
+    }
+
+    #[test]
+    fn launcher_hides_unregistered_external_rows_and_rejects_implicit_scans() {
+        let f = Fixture::new();
+        let root = f.0.join("scope");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("external-fixture-local.txt"), "").unwrap();
+        f.run(&["index", "--root", root.to_str().unwrap()]);
+        let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+        let legacy = "/Volumes/Lumen-Synthetic-External/external-fixture.txt";
+        db.execute(
+            "INSERT INTO item(path,display,kind,availability,name,full,initials,searchable_path)
+             VALUES(?1,'external-fixture.txt','file','local','external-fixture.txt','','',?1)",
+            [legacy],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO name_fts(rowid,name,full,initials,searchable_path)
+             SELECT id,name,full,initials,searchable_path FROM item WHERE path=?1",
+            [legacy],
+        )
+        .unwrap();
+        let mut serve = Serve::new(&f);
+        assert_eq!(
+            serve.names("external-fixture", "name"),
+            ["external-fixture-local.txt"],
+        );
+        assert_eq!(
+            f.run(&[
+                "validate-hit",
+                "--kind",
+                "file",
+                "--availability",
+                "local",
+                "--",
+                legacy
+            ]),
+            serde_json::json!({"valid": false}),
+        );
+        for command in ["index", "watch"] {
+            let rejected = f
+                .cli()
+                .args([command, "--root", "/Volumes/Lumen-Synthetic-External"])
+                .output()
+                .unwrap();
+            assert!(!rejected.status.success());
+            assert!(String::from_utf8_lossy(&rejected.stderr).contains("index-volume"));
+        }
+        let rejected = f
+            .cli()
+            .args(["index-volume", "--"])
+            .arg(root)
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("mount point"));
+    }
+
+    #[test]
     fn validates_only_the_current_scoped_hit_for_an_action() {
         let f = Fixture::new();
         let root = f.0.join("scope");

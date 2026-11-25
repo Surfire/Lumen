@@ -150,6 +150,7 @@ pub fn pinyin(name: &str) -> (String, String) {
     {
         return Default::default();
     }
+    let name = crate::pinyin::contextual_input(name);
     let null = std::ptr::null();
     let raw = unsafe {
         CFStringCreateWithBytes(null, name.as_ptr(), name.len() as isize, 0x0800_0100, 0)
@@ -317,7 +318,10 @@ pub fn bulk_children(_: &Path) -> Option<Children> {
 /// The fallback also opens by descriptor to retain the bulk path's nofollow
 /// policy if a directory is swapped for a symlink between metadata and listing.
 #[cfg(target_os = "macos")]
-pub fn children(path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+pub fn children_on_device(
+    path: &Path,
+    device: Option<u64>,
+) -> std::io::Result<Vec<std::ffi::OsString>> {
     use std::{
         ffi::OsString,
         io,
@@ -326,11 +330,17 @@ pub fn children(path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
             unix::{ffi::OsStringExt, fs::OpenOptionsExt},
         },
     };
-    let fd = fs::OpenOptions::new()
+    let directory = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW_ANY)
-        .open(path)?
-        .into_raw_fd();
+        .open(path)?;
+    if let Some(device) = device {
+        use std::os::unix::fs::MetadataExt;
+        if directory.metadata()?.dev() != device {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+    }
+    let fd = directory.into_raw_fd();
     let directory = unsafe { libc::fdopendir(fd) };
     if directory.is_null() {
         let error = io::Error::last_os_error();
@@ -365,7 +375,7 @@ pub fn children(path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn children(path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+pub fn children_on_device(path: &Path, _: Option<u64>) -> std::io::Result<Vec<std::ffi::OsString>> {
     fs::read_dir(path)?
         .map(|entry| entry.map(|entry| entry.file_name()))
         .collect()

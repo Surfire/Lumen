@@ -70,6 +70,7 @@ mod macos {
         progress: Option<&ScanProgressReporter>,
         emit: impl FnMut(WatchEvent) -> Result<()>,
     ) -> Result<()> {
+        crate::external::check_primary_scope(scope)?;
         let _io = platform::NoMaterialization::enter()?;
         let file = absolute(database)?;
         if scope.unspecified() && !file.try_exists()? {
@@ -79,8 +80,14 @@ mod macos {
         }
         let (mut conn, _lease) = open_write(&file, true)
             .with_context(|| format!("open watch index {}", file.display()))?;
-        let scope = startup_scope(&conn, scope)?;
+        let uses_saved_scope = scope.unspecified();
+        let mut scope = startup_scope(&conn, scope)?;
+        if uses_saved_scope {
+            crate::external::retain_local_watch_scope(&mut scope)?;
+        }
+        crate::external::check_primary_scope(&scope)?;
         let coverage = Arc::new(Coverage::new(file, &scope)?);
+        crate::external::check_primary_scope(&coverage.scope)?;
         restrict_scope(&mut conn, &coverage)
             .context("apply watch scope before filesystem traversal")?;
         // Periodic checks cover silently lost notifications, non-journaling

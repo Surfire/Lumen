@@ -2,10 +2,12 @@
 mod content;
 mod diagnose;
 mod docx;
+mod external;
 mod gemma;
 mod index;
 mod model;
 mod name_fast;
+mod pinyin;
 mod platform;
 mod progress;
 mod query;
@@ -14,6 +16,7 @@ mod watch;
 
 pub use content::{ContentBatch, apply_content_scope, index_content};
 pub use diagnose::{Diagnosis, Reason as DiagnoseReason, diagnose, validate_hit};
+pub use external::{VolumeStatus, forget_volume, index_volume, volumes};
 pub use gemma::{GemmaModel, ID as GEMMA_MODEL_ID};
 pub use index::{scan, scan_with_progress};
 pub use model::{BgeModel, Model, ModelBackend};
@@ -425,7 +428,17 @@ pub fn search_with_backend(
     limit: usize,
     model: Option<ModelBackend<'_>>,
 ) -> Result<Vec<Hit>> {
-    search_with_names(conn, query, mode, limit, model, None)
+    let mut hits = search_with_names(conn, query, mode, limit, model, None)?;
+    if let Some(database) = conn.path().filter(|path| !path.is_empty()) {
+        external::append_hits(
+            Path::new(database),
+            query,
+            mode,
+            limit.clamp(1, 100),
+            &mut hits,
+        );
+    }
+    Ok(hits)
 }
 
 /// A persistent reader for the native launcher's request stream.
@@ -443,7 +456,18 @@ impl SearchSession {
     }
 
     pub fn search(&mut self, query: &str, mode: Mode, limit: usize) -> Result<Vec<Hit>> {
-        search_with_names(&self.conn, query, mode, limit, None, Some(&mut self.names))
+        let mut hits =
+            search_with_names(&self.conn, query, mode, limit, None, Some(&mut self.names))?;
+        if let Some(database) = self.conn.path().filter(|path| !path.is_empty()) {
+            external::append_hits(
+                Path::new(database),
+                query,
+                mode,
+                limit.clamp(1, 100),
+                &mut hits,
+            );
+        }
+        Ok(hits)
     }
 }
 
@@ -551,7 +575,7 @@ fn search_with_names(
         // A concurrent indexer may commit while computing names or combining
         // them with text. Discard that result and read SQLite's current view.
         if version != name_fast::data_version(conn)? {
-            return search_with_backend(conn, query, mode, limit, model);
+            return search_with_names(conn, query, mode, limit, model, None);
         }
     }
     Ok(hits)

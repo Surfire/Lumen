@@ -352,7 +352,9 @@ impl GemmaSearchSession {
         if query.is_empty() || query.len() > 512 || !crate::query_allows_semantic(query) {
             return Ok(Vec::new());
         }
-        search_gemma(&self.conn, query, limit.clamp(1, 100), &mut self.worker)
+        let mut hits = search_gemma(&self.conn, query, limit.clamp(1, 100), &mut self.worker)?;
+        hits.retain(|hit| !crate::external::is_external(Path::new(&hit.path)));
+        Ok(hits)
     }
 }
 

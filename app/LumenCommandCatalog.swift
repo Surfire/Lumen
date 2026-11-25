@@ -68,16 +68,29 @@ public struct LumenCommandCatalog: Sendable {
 
     public static let maximumURLArgumentBytes = 2_048
     public static let maximumQuestionBytes = 16_384
+    private static let reservedVerbs: Set<String> = ["qa", "tr", "translate", "img"]
+    private static let defaultLinks = builtInLinks([
+        ("google", "g", "Search Google", "https://www.google.com/search", "q")
+    ])
+    private static let optionalLinks = builtInLinks([
+        ("github", "gh", "Search GitHub", "https://github.com/search", "q"),
+        ("wikipedia", "wiki", "Search Wikipedia", "https://zh.wikipedia.org/w/index.php", "search"),
+        ("maps", "map", "Search Maps", "https://www.google.com/maps/search/", "query")
+    ])
     private let links: [String: LumenHTTPSQueryLink]
 
-    /// Google is the only default external shortcut. Enable the others explicitly
-    /// through a settings decision; first definition wins, so existing verbs cannot be replaced.
+    static func isBuiltInAlias(_ alias: String, includeOptionalLinks: Bool) -> Bool {
+        reservedVerbs.contains(alias) || defaultLinks.contains { $0.keyword == alias }
+            || (includeOptionalLinks && optionalLinks.contains { $0.keyword == alias })
+    }
+
+    /// Built-in verbs and Google stay reserved. Saved links take precedence over
+    /// opt-in built-ins so enabling those searches cannot redirect an existing alias.
     public init(includeOptionalLinks: Bool = false, additionalLinks: [LumenHTTPSQueryLink] = []) {
         var table: [String: LumenHTTPSQueryLink] = [:]
         var usedIDs = Set(["qa", "translate", "discover", "img"])
-        let reserved = Set(["qa", "tr", "translate", "img"])
-        for link in Self.builtInLinks(includeOptionalLinks: includeOptionalLinks) + additionalLinks {
-            guard !reserved.contains(link.keyword), table[link.keyword] == nil,
+        for link in Self.defaultLinks + additionalLinks + (includeOptionalLinks ? Self.optionalLinks : []) {
+            guard !Self.reservedVerbs.contains(link.keyword), table[link.keyword] == nil,
                   usedIDs.insert(link.commandID).inserted else { continue }
             table[link.keyword] = link
         }
@@ -126,15 +139,8 @@ public struct LumenCommandCatalog: Sendable {
         return .web(commandID: link.commandID, title: link.title, url: url)
     }
 
-    private static func builtInLinks(includeOptionalLinks: Bool) -> [LumenHTTPSQueryLink] {
-        let google = ("google", "g", "Search Google", "https://www.google.com/search", "q")
-        let others = [
-            ("github", "gh", "Search GitHub", "https://github.com/search", "q"),
-            ("wikipedia", "wiki", "Search Wikipedia", "https://zh.wikipedia.org/w/index.php", "search"),
-            ("maps", "map", "Search Maps", "https://www.google.com/maps/search/", "query")
-        ]
-        return ([google] + (includeOptionalLinks ? others : [])).compactMap { tuple in
-            let (id, verb, title, base, key) = tuple
+    private static func builtInLinks(_ definitions: [(String, String, String, String, String)]) -> [LumenHTTPSQueryLink] {
+        definitions.compactMap { id, verb, title, base, key in
             guard let url = URL(string: base) else { return nil }
             let fixed = id == "maps" ? [URLQueryItem(name: "api", value: "1")] : []
             return .init(commandID: id, keyword: verb, title: title, baseURL: url, queryKey: key, fixedQueryItems: fixed)

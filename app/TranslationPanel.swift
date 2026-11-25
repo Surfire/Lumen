@@ -18,6 +18,7 @@ struct TranslationResultCard: View {
                 Spacer()
                 if model.activity == .translating {
                     ProgressView().controlSize(.small)
+                        .accessibilityLabel(t("正在翻译", "Translating"))
                     Button(t("取消", "Cancel"), action: model.cancel)
                 } else if !model.output.isEmpty {
                     Button(t("复制", "Copy"), action: activate)

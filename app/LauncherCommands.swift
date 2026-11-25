@@ -7,13 +7,18 @@ final class LauncherCommands: ObservableObject {
     @Published private(set) var entries: [LumenCommandCatalog.Entry] = []
     @Published private(set) var selection = 0
     @Published private(set) var answer: LumenQuickAnswer.State = .idle
+    @Published private var partialAnswer = ""
     @Published private(set) var copied = false
     @Published private(set) var webFailed = false
     @Published private(set) var answerPage = 0
     private(set) var raw = ""
     private lazy var request: LumenQuickAnswer = {
         let request = LumenQuickAnswer()
-        request.onChange = { [weak self] in self?.answer = $0 }
+        request.onChange = { [weak self] state in
+            guard let self else { return }
+            self.answer = state
+            if !self.partialAnswer.isEmpty { self.partialAnswer = "" }
+        }
         return request
     }()
 
@@ -36,9 +41,22 @@ final class LauncherCommands: ObservableObject {
 
     func move(_ delta: Int) { selection = min(max(0, selection + delta), max(0, entries.count - 1)) }
     func choose(_ index: Int) { if entries.indices.contains(index) { selection = index } }
-    func submit(_ question: String, using ask: @escaping LumenQuickAnswer.Answer) { request.submit(question: question, askConfiguredProvider: ask) }
+    func submit(_ question: String, using ask: @escaping TranslationPanelModel.StreamingAnswer) {
+        request.submit(question: question) { [weak self] input in
+            try await ask(input) { [weak self] delta in
+                guard !Task.isCancelled else { return }
+                self?.partialAnswer += delta
+            }
+        }
+    }
+
+    var answerText: String {
+        if case .answer(let output) = answer { return output }
+        return partialAnswer
+    }
+
     func pageAnswer(_ delta: Int) -> Bool {
-        guard case .answer = answer else { return false }
+        guard !answerText.isEmpty else { return false }
         answerPage += delta
         return true
     }
@@ -74,8 +92,8 @@ struct LauncherCommandCard: View {
                         Button(actionTitle, action: activate).accessibilityIdentifier("launcher-command-action")
                     }
                 }
-                if case .answer(let output) = commands.answer {
-                    QAAnswerView(text: output, page: commands.answerPage,
+                if !commands.answerText.isEmpty {
+                    QAAnswerView(text: commands.answerText, page: commands.answerPage,
                                  label: t("模型回答", "Model Answer"))
                 } else {
                     Text(message).font(.callout).foregroundStyle(.secondary)
@@ -125,21 +143,28 @@ struct LauncherCommandCard: View {
         }
     }
 
-    private func entryTitle(_ item: LumenCommandCatalog.Entry) -> String {
-        switch item.commandID {
+    func entryTitle(_ item: LumenCommandCatalog.Entry) -> String {
+        localizedTitle(item.commandID, fallback: item.title)
+    }
+
+    private func localizedTitle(_ id: String, fallback: String) -> String {
+        switch id {
         case "discover": return t("命令列表", "Browse Commands")
         case "qa": return t("问模型", "Ask Model")
         case "translate": return t("翻译", "Translate")
-        case "google": return t("搜索 Google", "Search Google")
+        case "google": return t("搜索 Google", fallback)
+        case "github": return t("搜索 GitHub", fallback)
+        case "wikipedia": return t("搜索维基百科", fallback)
+        case "maps": return t("搜索 Google 地图", fallback)
         case "img": return t("按画面搜索图片", "Search Images by Description")
-        default: return item.title
+        default: return fallback
         }
     }
 
-    private var title: String {
+    var title: String {
         switch commands.resolution {
         case .question: return t("问模型", "Ask Model")
-        case .web(let id, let title, _): return id == "google" ? t("搜索 Google", "Search Google") : title
+        case .web(let id, let title, _): return localizedTitle(id, fallback: title)
         default: return t("启动器命令", "Launcher Command")
         }
     }
@@ -231,10 +256,7 @@ private struct QAAnswerView: NSViewRepresentable {
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         guard let display = scroll.documentView as? NSTextView else { return }
         display.setAccessibilityLabel(label)
-        if display.string != text {
-            display.string = text
-            scroll.contentView.scroll(to: .zero)
-        }
+        if display.string != text { display.string = text }
         let delta = page - context.coordinator.page
         context.coordinator.page = page
         guard delta != 0 else { return }

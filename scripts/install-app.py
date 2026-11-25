@@ -21,7 +21,6 @@ HELPERS = {
     "lumen": f"{BUNDLE_ID}.engine",
     "LumenLocalEmbedding": f"{BUNDLE_ID}.embedding",
     "LumenPdfExtractor": f"{BUNDLE_ID}.pdf",
-    "lumen-extensions": f"{BUNDLE_ID}.extensions",
 }
 DEFAULT_SOURCE = Path(__file__).resolve().parents[1] / "target/Lumen.app"
 RENAME_SWAP = 0x00000002

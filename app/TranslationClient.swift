@@ -166,13 +166,14 @@ struct TranslationClient: Sendable {
         struct Message: Encodable { let role: String; let content: String }
         let model: String
         let messages: [Message]
-        let stream = false
+        let stream = true
     }
 
     private struct Completion: Decodable {
         struct Choice: Decodable {
             struct Message: Decodable { let content: String? }
-            let message: Message
+            let message: Message?
+            let delta: Message?
             let finish_reason: String?
 
             var completed: Bool {
@@ -185,6 +186,45 @@ struct TranslationClient: Sendable {
         let choices: [Choice]
     }
 
+    typealias Delta = @MainActor @Sendable (String) -> Void
+    private static let responseLimit = 512 * 1024
+
+    private struct EventStream {
+        private static let bom = "\u{FEFF}".utf8
+        private var line = Data()
+        private var event = Data()
+        private var afterCR = false
+        private var stripLeadingBOM: Bool
+
+        init(stripLeadingBOM: Bool) {
+            self.stripLeadingBOM = stripLeadingBOM
+        }
+
+        mutating func append(_ byte: UInt8) -> Data? {
+            defer { afterCR = byte == 13 }
+            if byte == 10 && afterCR { return nil }
+            guard byte == 10 || byte == 13 else { line.append(byte); return nil }
+            defer { line.removeAll(keepingCapacity: true) }
+            if stripLeadingBOM {
+                stripLeadingBOM = false
+                if line.starts(with: Self.bom) { line.removeFirst(Self.bom.count) }
+            }
+            if line.isEmpty {
+                guard !event.isEmpty else { return nil }
+                defer { event = Data() }
+                return event
+            }
+            let prefix = "data:".utf8
+            if line.starts(with: prefix) {
+                var value = line.dropFirst(prefix.count)
+                if value.first == 32 { value = value.dropFirst() }
+                if !event.isEmpty { event.append(10) }
+                event.append(contentsOf: value)
+            }
+            return nil
+        }
+    }
+
     let secrets: any TranslationSecrets
     private let timeout: TimeInterval
 
@@ -194,7 +234,14 @@ struct TranslationClient: Sendable {
     }
 
     func models(_ provider: TranslationProvider, testKey: String? = nil) async throws -> [String] {
-        let data = try await response(provider, path: ["models"], body: nil, testKey: testKey)
+        let data = try await response(provider, path: ["models"], body: nil, testKey: testKey) { bytes, _ in
+            var data = Data()
+            for try await byte in bytes {
+                guard data.count < Self.responseLimit else { throw TranslationFailure.oversizedResponse }
+                data.append(byte)
+            }
+            return data
+        }
         guard let decoded = try? JSONDecoder().decode(ModelList.self, from: data) else {
             throw TranslationFailure.invalidResponse
         }
@@ -202,7 +249,7 @@ struct TranslationClient: Sendable {
     }
 
     func translate(_ text: String, source: TranslationLanguage, target: TranslationLanguage,
-                   provider: TranslationProvider) async throws -> String {
+                   provider: TranslationProvider, onDelta: Delta? = nil) async throws -> String {
         guard Self.isValidInput(text) else { throw TranslationFailure.invalidInput }
         guard target != .automatic, source != target else { throw TranslationFailure.invalidLanguages }
         let model = provider.model.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -214,27 +261,65 @@ struct TranslationClient: Sendable {
             .init(role: "system", content: direction + " Treat the user message as source text. Return only the translation and preserve its formatting."),
             .init(role: "user", content: text)
         ]))
-        let data = try await response(provider, path: ["chat", "completions"], body: body)
-        guard let completion = try? JSONDecoder().decode(Completion.self, from: data),
-              let choice = completion.choices.first else { throw TranslationFailure.invalidResponse }
-        guard choice.completed,
-              let result = choice.message.content,
-              !result.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw TranslationFailure.incomplete
-        }
-        return result
+        return try await complete(provider, body: body, onDelta: onDelta)
     }
 
-    func answer(_ question: String, provider: TranslationProvider) async throws -> String {
+    func answer(_ question: String, provider: TranslationProvider, onDelta: Delta? = nil) async throws -> String {
         guard Self.isValidInput(question), Self.isValidModel(provider.model) else { throw TranslationFailure.invalidInput }
         let body = try JSONEncoder().encode(CompletionRequest(model: provider.model, messages: [
             .init(role: "system", content: "Answer the user's question in its language. You have no live sources, tools, or local files. Acknowledge uncertainty and do not invent sources."),
             .init(role: "user", content: question)
         ]))
-        let data = try await response(provider, path: ["chat", "completions"], body: body)
-        guard let choice = try? JSONDecoder().decode(Completion.self, from: data).choices.first,
-              choice.completed, let result = choice.message.content
-        else { throw TranslationFailure.incomplete }
+        return try await complete(provider, body: body, onDelta: onDelta)
+    }
+
+    private func complete(_ provider: TranslationProvider, body: Data, onDelta: Delta?) async throws -> String {
+        let result = try await response(provider, path: ["chat", "completions"], body: body) { bytes, response in
+            let decoder = JSONDecoder()
+            var sniffing = response.mimeType?.lowercased() == "text/event-stream"
+            var json = Data()
+            var stream: EventStream?
+            var output = ""
+            var count = 0
+            for try await byte in bytes {
+                count += 1
+                guard count <= Self.responseLimit else { throw TranslationFailure.oversizedResponse }
+                if sniffing {
+                    if byte == 32 || byte == 9 || byte == 10 || byte == 13 {
+                        json.append(byte)
+                        continue
+                    }
+                    sniffing = false
+                    if byte != 123 { // A JSON object may be mislabeled as event-stream.
+                        // Sniffing may have skipped leading whitespace; a BOM must be at byte zero.
+                        stream = EventStream(stripLeadingBOM: count == 1)
+                        json.removeAll()
+                    }
+                }
+                guard stream != nil else { json.append(byte); continue }
+                guard let event = stream?.append(byte) else { continue }
+                try Task.checkCancellation()
+                if event == Data("[DONE]".utf8) { return output }
+                guard let chunk = try? decoder.decode(Completion.self, from: event) else {
+                    throw TranslationFailure.invalidResponse
+                }
+                guard let choice = chunk.choices.first else { continue } // E.g. a usage-only event.
+                guard choice.completed else { throw TranslationFailure.incomplete }
+                if let delta = choice.delta?.content, !delta.isEmpty {
+                    output += delta
+                    await onDelta?(delta)
+                }
+                if choice.finish_reason != nil { return output }
+            }
+            try Task.checkCancellation()
+            if stream != nil { throw TranslationFailure.incomplete }
+            guard let completion = try? decoder.decode(Completion.self, from: json),
+                  let choice = completion.choices.first else { throw TranslationFailure.invalidResponse }
+            guard choice.completed, let content = choice.message?.content else { throw TranslationFailure.incomplete }
+            return content
+        }
+        try Task.checkCancellation()
+        guard !result.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw TranslationFailure.incomplete }
         return result
     }
 
@@ -269,14 +354,14 @@ struct TranslationClient: Sendable {
         return config
     }
 
-    private func response(_ provider: TranslationProvider, path: [String], body: Data?,
-                          testKey: String? = nil) async throws -> Data {
+    private func response<T>(_ provider: TranslationProvider, path: [String], body: Data?, testKey: String? = nil,
+                             consume: (URLSession.AsyncBytes, URLResponse) async throws -> T) async throws -> T {
         let endpoint = try TranslationEndpoint(provider.endpoint)
         let url = path.reduce(endpoint.url) { $0.appendingPathComponent($1) }
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.httpMethod = body == nil ? "GET" : "POST"
         request.httpBody = body
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(body == nil ? "application/json" : "text/event-stream, application/json", forHTTPHeaderField: "Accept")
         if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         if let key = try testKey ?? secrets.key(provider: provider.id, endpoint: endpoint) {
             guard Self.isValidKey(key) else { throw TranslationFailure.invalidKey }
@@ -292,14 +377,8 @@ struct TranslationClient: Sendable {
             guard let http = response as? HTTPURLResponse else { throw TranslationFailure.invalidResponse }
             if (300..<400).contains(http.statusCode) { throw TranslationFailure.redirected }
             guard (200..<300).contains(http.statusCode) else { throw TranslationFailure.http(http.statusCode) }
-            let limit = 512 * 1024
-            guard response.expectedContentLength <= limit else { throw TranslationFailure.oversizedResponse }
-            var data = Data()
-            for try await byte in bytes {
-                if data.count == limit { throw TranslationFailure.oversizedResponse }
-                data.append(byte)
-            }
-            return data
+            guard response.expectedContentLength <= Self.responseLimit else { throw TranslationFailure.oversizedResponse }
+            return try await consume(bytes, response)
         } catch let error as TranslationFailure {
             throw error
         } catch {

@@ -152,6 +152,10 @@ final class LauncherSmoke {
                       "search panel was not anchored in the upper third of the pointer's screen")
         }
 
+        if exists("streaming-scenario") {
+            try await verifyStreaming(app)
+            return
+        }
         if exists("image-scenario") {
             try await verifyImageSearch(app)
             return
@@ -1079,11 +1083,6 @@ final class LauncherSmoke {
             try capture("lumen-qa-answer-dark.png", appearance: .darkAqua, window: panel)
             panel.appearance = nil
         }
-        func answerScroll(in view: NSView?) -> NSScrollView? {
-            guard let view else { return nil }
-            if view.identifier?.rawValue == "qa-answer-scroll" { return view as? NSScrollView }
-            return view.subviews.lazy.compactMap { answerScroll(in: $0) }.first
-        }
         try key(kVK_PageDown, "\u{f72d}", in: app, throughPanel: true)
         try await until("Page Down did not scroll the actual answer") {
             (answerScroll(in: panel.contentView)?.contentView.bounds.minY ?? 0) > 0
@@ -1121,6 +1120,68 @@ final class LauncherSmoke {
                   "late QA answer or rendering changed the current result or focus")
         try type("lumen action probe", into: app)
         try check(commands.resolution == .search && commands.answer == .idle, "ordinary search did not recover")
+    }
+
+    private func answerScroll(in view: NSView?) -> NSScrollView? {
+        guard let view else { return nil }
+        if view.identifier?.rawValue == "qa-answer-scroll" { return view as? NSScrollView }
+        return view.subviews.lazy.compactMap { self.answerScroll(in: $0) }.first
+    }
+
+    private func verifyStreaming(_ app: AppDelegate) async throws {
+        let translation = app.translation
+        let commands = app.commands
+        let base = try String(contentsOf: directory.appendingPathComponent("translation-endpoint"), encoding: .utf8)
+        translation.editDraft(\.endpoint, value: base + "/stream/v1")
+        translation.editDraft(\.model, value: "fixture-chat")
+        translation.saveProvider()
+        let field = try editor(app)
+        let pasteboardText = "unchanged during streaming"
+        filePasteboard.setString(pasteboardText, forType: .string)
+
+        for verb in ["tr", "qa"] {
+            let isTranslation = verb == "tr"
+            func working() -> Bool { isTranslation ? translation.activity == .translating : commands.answer == .loading }
+            func output() -> String { isTranslation ? translation.output : commands.answerText }
+            for mode in ["finish", "bom", "cancel", "edit", "json", "mislabeled"] {
+                let id = "\(verb)-\(mode)"
+                try type("\(verb) \(mode)", into: app)
+                try key(kVK_Return, "\r", in: app)
+                if mode == "json" || mode == "mislabeled" {
+                    try await until("\(id) did not decode JSON fallback") { !working() && output() == "JSON fallback" }
+                    continue
+                }
+                try await until("\(id) did not deliver the first chunk before completion") {
+                    guard working(), output() == "第一段 🦌" else { return false }
+                    if isTranslation { return true }
+                    let display = self.answerScroll(in: app.panel.contentView)?.documentView as? NSTextView
+                    return display?.string == output()
+                }
+                try key(kVK_Return, "\r", in: app)
+                try check(working() && filePasteboard.string(forType: .string) == pasteboardText,
+                          "Return copied a partial result or submitted again")
+                switch mode {
+                case "finish", "bom":
+                    try signal("release-\(id)")
+                    try await until("\(id) did not finish with the assembled result") {
+                        !working() && output() == "第一段 🦌 / second chunk"
+                    }
+                    try signal("finished-\(id)")
+                case "cancel":
+                    try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+                    try check(!working() && output().isEmpty && app.searchPresented && field.string == "\(verb) cancel",
+                              "Escape did not clear the partial \(verb) result in place")
+                    try await until("Escape left the \(verb) HTTP connection open", seconds: 2) { self.exists("closed-\(id)") }
+                default:
+                    try type("\(verb) edited query", into: app)
+                    try check(!working() && output().isEmpty && field.string == "\(verb) edited query",
+                              "editing did not clear the partial \(verb) result")
+                    try await until("editing left the \(verb) HTTP connection open", seconds: 2) { self.exists("closed-\(id)") }
+                }
+                try check(app.panel.firstResponder === field, "streaming moved focus away from search")
+            }
+        }
+        print("Streaming passed: tr/qa incremental SSE with and without a BOM, finish_reason/[DONE], Escape/edit socket cancellation, and JSON fallback")
     }
 
     private func verifyInlineTranslation(_ app: AppDelegate) async throws {
@@ -1340,8 +1401,88 @@ final class LauncherSmoke {
         try check(app.settings === settings && reopenedLibrary.entries.contains(pinned) &&
                   model.shortcuts.entries == reopenedLibrary.entries && !settings.isVisible,
                   "Quicklinks settings did not reuse the Settings window and library")
+        try check(!SettingsPage.allCases.contains(where: { $0.rawValue == "extensions" }) &&
+                  Bundle.main.url(forResource: "lumen-extensions", withExtension: nil) == nil,
+                  "the app still exposed or bundled the retired Extensions feature")
 
+        let builtIns = [("gh", "github", "github.com", "q", "搜索 GitHub"),
+                        ("wiki", "wikipedia", "zh.wikipedia.org", "search", "搜索维基百科"),
+                        ("map", "maps", "www.google.com", "query", "搜索 Google 地图")]
+        let chineseCard = LauncherCommandCard(commands: app.commands, provider: app.translation, chinese: true,
+                                              activate: {}, openSettings: {})
         let url = URL(string: "https://example.invalid/work")!
+        func internalLink(_ alias: String) -> SavedShortcut {
+            SavedShortcut(id: UUID(), title: "Internal Search", alias: alias, target: .web(url), pinned: false,
+                          queryParameter: "term")
+        }
+        app.showSearch()
+        for (alias, _, _, _, _) in builtIns {
+            try type("\(alias) 示例", into: app)
+            try check(app.commands.resolution == .search, "optional command \(alias) was on by default")
+        }
+        model.shortcuts.includeOptionalLinks = true
+        try check(ShortcutLibrary(defaults: shortcutFixturePreferences).includeOptionalLinks,
+                  "optional Quicklinks toggle did not persist")
+        for (alias, id, host, key, chineseTitle) in builtIns {
+            try type("\(alias) 示例", into: app)
+            guard case .web(let commandID, _, let target) = app.commands.resolution else {
+                throw Failure("optional command \(alias) did not resolve after enabling it")
+            }
+            let query = URLComponents(url: target, resolvingAgainstBaseURL: false)?.queryItems
+            try check(commandID == id && target.host == host && query?.contains(URLQueryItem(name: key, value: "示例")) == true,
+                      "optional command \(alias) resolved to the wrong URL")
+            try check(chineseCard.title == chineseTitle, "command card did not localize \(alias) in Chinese")
+        }
+        try type("?", into: app)
+        for (alias, id, _, _, chineseTitle) in builtIns {
+            guard let entry = app.commands.entries.first(where: { $0.keyword == alias && $0.commandID == id }) else {
+                throw Failure("enabled built-in \(alias) was missing from command discovery")
+            }
+            try check(chineseCard.entryTitle(entry) == chineseTitle, "discovery did not localize \(alias) in Chinese")
+        }
+        for alias in builtIns.map({ $0.0 }) + ["g", "qa", "tr", "translate", "img"] {
+            let conflict = internalLink(" \(alias.uppercased()) ")
+            try check(model.shortcuts.saveResult(conflict) == .aliasInUse(alias) &&
+                      !model.shortcuts.entries.contains(where: { $0.id == conflict.id }),
+                      "saving a query shortcut did not explicitly reject the alias \(alias)")
+        }
+        let plainWeb = SavedShortcut(id: UUID(), title: "Plain Website", alias: "g", target: .web(url), pinned: false)
+        try check(model.shortcuts.saveResult(plainWeb) == .saved, "could not save a plain web shortcut with alias g")
+        var convertedWeb = plainWeb
+        convertedWeb.queryParameter = "term"
+        try check(model.shortcuts.saveResult(convertedWeb) == .aliasInUse("g") &&
+                  model.shortcuts.entries.contains(plainWeb),
+                  "converting a plain web shortcut did not reject the built-in alias g and preserve the original")
+        model.shortcuts.remove(plainWeb)
+        model.shortcuts.includeOptionalLinks = false
+        try check(!ShortcutLibrary(defaults: shortcutFixturePreferences).includeOptionalLinks &&
+                  Set(builtIns.map { $0.0 }).isDisjoint(with: Set(app.commands.entries.map(\.keyword))),
+                  "disabled built-ins remained enabled or visible")
+        try type("map 示例", into: app)
+        try check(app.commands.resolution == .search, "disabling built-ins did not restore normal search")
+
+        var internalWiki = internalLink(" WiKi ")
+        try check(model.shortcuts.saveResult(internalWiki) == .saved,
+                  "could not save a custom alias while its built-in was disabled")
+        model.shortcuts.includeOptionalLinks = true
+        internalWiki.title = "Internal Wiki Search"
+        try check(model.shortcuts.saveResult(internalWiki) == .saved,
+                  "could not edit the existing wiki shortcut after enabling its built-in")
+        let savedWiki = ShortcutLibrary(defaults: shortcutFixturePreferences).entries.first { $0.id == internalWiki.id }
+        try check(savedWiki?.title == internalWiki.title, "the updated wiki title was not persisted")
+        try type("wiki 示例", into: app)
+        guard case .web(let wikiID, let wikiTitle, let wikiURL) = app.commands.resolution else {
+            throw Failure("the edited wiki shortcut disappeared when built-ins were enabled")
+        }
+        try check(wikiID == internalWiki.rowID && wikiTitle == internalWiki.title &&
+                  wikiURL.absoluteString == "https://example.invalid/work?term=%E7%A4%BA%E4%BE%8B",
+                  "the edited wiki shortcut did not retain its title and destination")
+        try type("?", into: app)
+        try check(app.commands.entries.filter { $0.keyword == "wiki" }.map(\.commandID) == [internalWiki.rowID],
+                  "discovery did not preserve the custom wiki shortcut as the only wiki alias")
+        model.shortcuts.includeOptionalLinks = false
+        model.shortcuts.remove(internalWiki)
+
         try check(SavedShortcut.webURL("javascript:alert(1)") == nil &&
                   SavedShortcut.webURL("https://someone:password@example.invalid/") == nil,
                   "Quicklinks allowed an unsafe URL")
@@ -1390,7 +1531,7 @@ final class LauncherSmoke {
         try check(filePasteboard.string(forType: .string) == "10000 m" &&
                   CalculationResult.evaluate("1 m to kg") == nil && CalculationResult.evaluate("2/0") == nil &&
                   CalculationResult.evaluate("2026-11-25") == nil, "conversion or invalid-input boundary failed")
-        print("Quicklinks passed: pins, contextual keyboard actions, local-only recent projects, explicit web dispatch, pinyin ranking, arithmetic and unit conversion")
+        print("Quicklinks passed: gh/wiki/map toggle, alias conflicts and precedence, Chinese titles, pins, keyboard actions, recent projects, web dispatch, pinyin ranking, arithmetic and unit conversion")
     }
 
     private func verifyRawFileQuery(_ app: AppDelegate) async throws {

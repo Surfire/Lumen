@@ -64,7 +64,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var configuredKey: HotKey?
     private var actionInFlight = false
     private var previewPreparing = false
-    private var makingPreviewKey = false
     private(set) var localPreview: LocalPreviewPanel?
     private(set) var searchPresented = false
 
@@ -318,8 +317,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     func windowDidResignKey(_ notification: Notification) {
-        guard notification.object is SearchPanel, searchPresented, !makingPreviewKey else { return }
-        // AppKit may report the search panel resigning before an existing preview becomes key.
+        guard let window = notification.object as? NSWindow,
+              window is SearchPanel || window === localPreview else { return }
+        dismissSearchIfFocusLeft()
+    }
+
+    private func dismissSearchIfFocusLeft() {
+        guard searchPresented else { return }
+        // AppKit can report resignation or closure before the next key window is set.
         DispatchQueue.main.async { [weak self] in
             guard let self, self.searchPresented, !self.panel.isKeyWindow,
                   self.localPreview?.isKeyWindow != true else { return }
@@ -709,8 +714,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     func makeLocalPreviewKey() {
         guard let localPreview else { return }
-        makingPreviewKey = true
-        defer { makingPreviewKey = false }
         if smoke == nil { NSApp.activate() }
         localPreview.makeKeyAndOrderFront(nil)
     }
@@ -854,7 +857,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     func windowWillClose(_ notification: Notification) {
-        if let localPreview, (notification.object as? NSWindow) === localPreview { self.localPreview = nil }
+        if let localPreview, (notification.object as? NSWindow) === localPreview {
+            self.localPreview = nil
+            dismissSearchIfFocusLeft()
+        }
         if let settings, (notification.object as? NSWindow) === settings {
             settings.makeFirstResponder(nil)
             translation.endSettingsSession()

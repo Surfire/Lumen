@@ -1260,16 +1260,45 @@ final class LauncherSmoke {
         app.contextActions.run(windowPreview)
         try await until("explicit Preview in Window opened the PDFKit view on page 2") { app.localPreview?.displayedPDFPage == 2 }
         guard let preview = app.localPreview else { throw Failure("preview panel missing") }
-        // Run the AppKit key transfer with both windows offscreen and the test app prohibited from activating.
-        app.panel.setFrameOrigin(NSPoint(x: -12_000, y: -12_000))
-        app.panel.makeKeyAndOrderFront(nil)
-        try check(app.panel.isKeyWindow, "search was not key before the preview handoff")
-        app.makeLocalPreviewKey()
-        await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
-        try check(!app.panel.isKeyWindow && app.searchPresented && model.query == "zircon calibration" && model.selection == pdfPath,
-                  "handing key focus to the preview cleared the search session")
-        app.panel.orderOut(nil)
-        preview.close()
+        // The titled preview needs an active app to remain key. Keep both windows offscreen.
+        do {
+            try check(NSApp.setActivationPolicy(.accessory), "could not enable activation for the preview focus test")
+            defer {
+                app.panel.orderOut(nil)
+                preview.close()
+                NSApp.setActivationPolicy(.prohibited)
+            }
+            func focusPreview() async throws {
+                app.panel.setFrameOrigin(NSPoint(x: -12_000, y: -12_000))
+                app.panel.makeKeyAndOrderFront(nil)
+                try check(app.panel.isKeyWindow && !preview.isKeyWindow, "search was not key before the preview handoff")
+                app.makeLocalPreviewKey()
+                await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
+                try check(preview.isKeyWindow && !app.panel.isKeyWindow && app.searchPresented &&
+                          model.query == "zircon calibration" && model.selection == pdfPath,
+                          "settled focus did not move to the preview while preserving the search session")
+            }
+            func verifyFocusLeft(_ message: String) async throws {
+                try await until(message) {
+                    !app.panel.isKeyWindow && !preview.isKeyWindow && !app.searchPresented &&
+                    model.query.isEmpty && model.selection == nil
+                }
+            }
+            NSApp.activate(ignoringOtherApps: true)
+            try await until("app did not activate for the preview focus test") { NSApp.isActive }
+            try await focusPreview()
+            NSApp.deactivate()
+            try await verifyFocusLeft("focus leaving the preview did not dismiss and reset search")
+
+            app.showSearch()
+            _ = try await findPDF()
+            try await focusPreview()
+            app.panel.orderOut(nil) // Prevent AppKit from restoring key focus to search when the preview closes.
+            preview.close()
+            try await verifyFocusLeft("closing the preview without returning focus to search did not dismiss it")
+        }
+        app.showSearch()
+        _ = try await findPDF()
         try key(kVK_Return, "\r", in: app)
         try await until("Return dispatched the original PDF to the default-open route") {
             self.opened?.path == pdfPath && app.localPreview == nil && !app.searchPresented

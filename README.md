@@ -27,6 +27,8 @@ open target/Lumen.app
 
 用菜单栏打开 Lumen，或按默认快捷键 **⌃⇧Space**。可在「设置 → 通用与快捷键」录制或停用热键。应用和系统设置可立即搜索，找文件时先从菜单栏选择「在后台建立索引」。也可先在「索引与隐私」指定范围。建立索引后，菜单栏可查看阶段、扫描数量和耗时。
 
+重新打开 Lumen 时，符合条件的已保存索引可先用于查找。监听器在后台补查关闭期间的变动。
+
 ### 在同一个搜索框里操作
 
 | 输入或按键 | 动作 |
@@ -47,7 +49,7 @@ open target/Lumen.app
 
 ## 功能与边界
 
-- **名称、正文与图像范围各自设置。** 名称索引默认覆盖启动盘可访问范围，跳过系统、隐私、缓存和隐藏位置。可选定目录或添加排除，排除优先。目录与正文变更在「应用」后生效。外置卷的名称索引从菜单栏按需添加，断开后不显示其结果。
+- **名称、正文与图像范围各自设置。** 名称索引默认覆盖启动盘可访问范围，跳过系统、隐私、缓存和隐藏位置。可选定目录或添加排除，排除优先。目录与正文变更在「应用」后生效。外置卷的名称索引在「索引与隐私」按需添加，断开后不显示其结果。
 - **正文和语义按需启用。** 在指定目录读取本地 TXT、Markdown、DOCX 主文档的段落及表格、PDF 原生文本层。无 OCR 或 DOCX 页码。加密、超限或不支持的文档仍可按名称搜索。选配本机模型后，语义搜索可补充相关原文片段。名称搜索不需要模型。[离线语义](docs/offline-gemma.md)
 - **网盘只记录可见元数据。** 已识别的 iCloud、OneDrive 和 File Provider 范围记录系统可见的名称与路径。索引和预览不会主动下载云端占位文件。搜索索引和离线推理留在本机，应用不捆绑或自动下载权重。
 - **进度和缺失原因可以检查。** 「高级与诊断」分别显示文件监听和语义索引状态。使用「文件诊断 → 选取文件」检查名称、正文和语义覆盖，诊断不会读取原文或唤醒云端项目。
@@ -71,6 +73,7 @@ cargo test --locked --manifest-path extensions/Cargo.toml
 scripts/build-app.sh
 python3 scripts/smoke-app.py
 python3 scripts/smoke-launcher.py
+python3 scripts/smoke-relaunch.py target/Lumen.app
 python3 scripts/smoke-translation.py
 extensions/tests/smoke-panel.sh
 ```

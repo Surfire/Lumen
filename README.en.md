@@ -27,6 +27,8 @@ This creates an ad hoc signed development build. For daily use, build with an ex
 
 Open Lumen from the menu bar or press **Control–Shift–Space**. Record or disable the shortcut in **Settings → General & Shortcuts**. Apps and System Settings are searchable immediately. For files, select **Build Index in Background** from the menu bar, or first choose a scope in **Index & Privacy**. The menu bar shows the current phase, scanned item count, and elapsed time.
 
+When you reopen Lumen, eligible results from the saved index can appear while the watcher catches up with changes made since you closed it.
+
 ### Use the same launcher field
 
 | Type or press | Action |
@@ -47,7 +49,7 @@ Q&A and translation share the provider and model selected under **Settings → T
 
 ## Features and limits
 
-- **Separate scopes for names, documents, and images.** Name indexing defaults to accessible locations on the startup disk, skipping system, private, cache, and hidden locations. Choose folders or add exclusions, which take priority. Scope and document changes take effect on **Apply**. Add an external volume's name index from the menu bar. Its results are hidden when disconnected.
+- **Separate scopes for names, documents, and images.** Name indexing defaults to accessible locations on the startup disk, skipping system, private, cache, and hidden locations. Choose folders or add exclusions, which take priority. Scope and document changes take effect on **Apply**. Add an external volume's name index under **Index & Privacy**. Its results are hidden when disconnected.
 - **Opt-in document and semantic search.** In selected folders, Lumen reads local TXT and Markdown, paragraphs and tables in the main DOCX document, and the native PDF text layer. OCR and DOCX page numbers are outside the current scope. Encrypted, oversized, or unsupported documents remain searchable by name. An optional local model can surface related excerpts. Name search requires no model. [Offline semantic search](docs/offline-gemma.md)
 - **Cloud files are indexed by visible metadata.** For recognized iCloud, OneDrive, and other File Provider locations, Lumen records names and paths the system exposes. Indexing and previewing do not download cloud placeholders. Search indexes and offline inference stay on the Mac. Model weights are provisioned separately.
 - **Check progress and diagnose missing files.** **Advanced & Diagnostics** shows file watching and semantic indexing separately. Use **File Diagnostics → Choose File** to check name, document, and semantic coverage for a file. This check neither reads document content nor downloads a placeholder.
@@ -71,6 +73,7 @@ cargo test --locked --manifest-path extensions/Cargo.toml
 scripts/build-app.sh
 python3 scripts/smoke-app.py
 python3 scripts/smoke-launcher.py
+python3 scripts/smoke-relaunch.py target/Lumen.app
 python3 scripts/smoke-translation.py
 extensions/tests/smoke-panel.sh
 ```

@@ -19,6 +19,10 @@ final class LauncherSmoke {
     private let startsWithIndex: Bool
     private let controlledTiming: Bool
     var opened: URL?
+    private var workspaceOpenPaths = Set<String>()
+
+    func simulatesFileOpen(_ url: URL) -> Bool { !workspaceOpenPaths.contains(IndexScope.folderPath(url)) }
+
     var revealed: URL? {
         didSet { revealDispatch = revealed == nil ? nil : .now }
     }
@@ -117,6 +121,10 @@ final class LauncherSmoke {
     }
 
     private func verify(_ app: AppDelegate) async throws {
+        if exists("cooperative-pipe-scenario") {
+            try await verifyCooperativePipeProgress()
+            return
+        }
         let model = app.model
         var observedScan: [IndexProgress] = []
         var observedWatch: [IndexProgress] = []
@@ -363,6 +371,8 @@ final class LauncherSmoke {
 
     private func verifyActions(_ app: AppDelegate) async throws {
         let model = app.model
+        try await verifyCatalogRegressions()
+        try await verifyEngineRegressions()
         try check(model.indexPhase == .needsIndex && !model.canSearch, "action smoke unexpectedly had a file index")
         func chosen() -> LaunchAction? {
             if case .action(let action)? = model.selectedResult { return action }
@@ -393,16 +403,27 @@ final class LauncherSmoke {
                   "icon loading changed search order, selection, or the window frame")
         if exists("capture-icons") { try capture("lumen-app-icon.png", appearance: .aqua, window: app.panel) }
         try check(!exists("app-started"), "app launched during lookup")
+        if case .application(let url, let stamp) = probe.destination {
+            try FileManager.default.setAttributes([.modificationDate: Date.now], ofItemAtPath: url.path)
+            try check(SearchHit.pathStamp(at: url.path, kind: "directory") != stamp, "failed to update the app stamp")
+        }
         try key(kVK_Return, "\r", in: app)
         try await until("a real application launched through NSWorkspace without activation") {
             self.exists("app-started") && !app.searchPresented
         }
         try check(dispatchedActions.first == probe.destination && !NSApp.isActive && !wasActivated,
                   "the app action dispatched elsewhere or activated Lumen")
+        if let defaults = shortcutFixturePreferences {
+            let reloaded = LauncherFrecency(defaults: defaults)
+            try check(reloaded.boost(probe.id) > 0 &&
+                      reloaded.boost(probe.id, now: .now.addingTimeInterval(100 * 86_400)) == 0,
+                      "the real application launch did not persist app frecency or decay")
+        }
 
         try verifyUnconfiguredQA(app)
         try await verifyInlineTranslation(app)
         try await verifyLauncherCommands(app)
+        try verifyProviderDeletion(app.translation)
 
         for (term, expected) in [
             ("无线局域网", "com.apple.wifi-settings-extension"),
@@ -440,7 +461,13 @@ final class LauncherSmoke {
         for twin in twins {
             guard let key = ApplicationIcons.Key(twin) else { throw Failure("missing application icon key") }
             let icon = await icons.image(for: key)
-            try check(icon == nil, "a missing or symlinked resource was loaded instead of using the fallback")
+            var rect = NSRect(x: 0, y: 0, width: 64, height: 64)
+            let workspaceIcon = NSWorkspace.shared.icon(forFile: key.url.path).cgImage(forProposedRect: &rect, context: nil, hints: nil)
+            func png(_ image: CGImage?) -> Data? {
+                image.flatMap { NSBitmapImageRep(cgImage: $0).representation(using: .png, properties: [:]) }
+            }
+            try check(icon != nil && png(icon) == png(workspaceIcon),
+                      "a local resource link or missing artwork did not use the NSWorkspace icon")
         }
         guard case .action(let second)? = model.visibleResults.dropFirst().first,
               model.selection != second.id else { throw Failure("missing unselected application row") }
@@ -465,6 +492,7 @@ final class LauncherSmoke {
         try key(kVK_Return, "\r", in: app)
         try check(dispatchedActions.count == count, "Return dispatched an action from a previous query")
 
+        let frecencyFixtures = exists("quicklinks-scenario") ? try makeFileFrecencyFixtures() : nil
         app.startBackgroundIndex()
         try await until("the isolated file index became available alongside actions") { model.canSearch && model.watchState == .running }
         try check(model.launcherActivityTitle == nil && model.activityTitle == model.t("正在监听文件变化", "Watching file changes"),
@@ -505,8 +533,298 @@ final class LauncherSmoke {
         try check(!FileManager.default.fileExists(atPath: snapshot.path), "closing the preview kept the snapshot")
 
         if exists("syntax-scenario") { try await verifyRawFileQuery(app) }
-        if exists("quicklinks-scenario") { try await verifyQuicklinks(app) }
+        if let fixtures = frecencyFixtures {
+            try await verifyFileFrecency(app, project: fixtures.project, success: fixtures.success, failure: fixtures.failure)
+            app.showSearch()
+            try await verifyQuicklinks(app)
+        }
         print("Unified actions passed: real background app launch, routed Settings URLs, isolated file copies, and native local Quick Look input")
+    }
+
+    private func verifyCatalogRegressions() async throws {
+        let manager = FileManager.default
+        let roots = directory.appendingPathComponent("Linked Apps", isDirectory: true)
+        let target = directory.appendingPathComponent("Visual Studio Code.app", isDirectory: true)
+        let contents = target.appendingPathComponent("Contents", isDirectory: true)
+        try manager.createDirectory(at: roots, withIntermediateDirectories: true)
+        let executables = contents.appendingPathComponent("MacOS", isDirectory: true)
+        try manager.createDirectory(at: executables, withIntermediateDirectories: true)
+        let probeExecutable = appRoots[0].appendingPathComponent("Lumen Action Probe.app/Contents/MacOS/probe")
+        try manager.copyItem(at: probeExecutable, to: executables.appendingPathComponent("resident-probe"))
+        try manager.createSymbolicLink(atPath: executables.appendingPathComponent("probe").path,
+                                       withDestinationPath: "resident-probe")
+        let info: [String: Any] = ["CFBundleIdentifier": "io.github.surfire.lumen.fixture.vsc.\(directory.lastPathComponent)",
+                                   "CFBundlePackageType": "APPL", "CFBundleDisplayName": "Visual Studio Code",
+                                   "CFBundleExecutable": "probe", "LSBackgroundOnly": true]
+        try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+            .write(to: contents.appendingPathComponent("Info.plist"))
+        let link = roots.appendingPathComponent("Editor.app")
+        try manager.createSymbolicLink(at: link, withDestinationURL: target)
+        let secondLink = roots.appendingPathComponent("Two Hops.app")
+        try manager.createSymbolicLink(at: secondLink, withDestinationURL: link)
+        let apps = LaunchCatalog.discoverApplications(roots: [roots], extraApps: [])
+        try check(apps.count == 1 && ApplicationIcons.Key(apps[0])?.url.path == IndexScope.folderPath(target),
+                  "catalog did not resolve the one-level application link: \(apps.map(\.id))")
+        try check(LaunchCatalog.discoverApplications(roots: [], extraApps: [secondLink]).isEmpty,
+                  "catalog followed a second application link")
+        let safari = LaunchAction(id: "app:safari-fixture", english: "Safari", chinese: "Safari", symbol: "app",
+                                  destination: apps[0].destination, aliases: [])
+        try check(LaunchCatalog.matches("s", actions: [safari]).first?.action == safari &&
+                  LaunchCatalog.matches("vsc", actions: apps).first?.action == apps[0],
+                  "single-letter prefix or nonconsecutive application match was missing")
+        guard let key = ApplicationIcons.Key(apps[0]) else { throw Failure("missing linked bundle icon key") }
+        let icon = await ApplicationIcons().image(for: key)
+        try check(icon != nil, "an app without a standalone declared image did not get its NSWorkspace icon")
+        var launched: Bool?
+        LaunchDispatcher.perform(apps[0], activates: false) { launched = $0 }
+        try await until("the linked application's resident symlink executable did not launch") {
+            launched == false || (launched == true && self.exists("app-started"))
+        }
+        try check(launched == true, "NSWorkspace did not launch the app through its symlinked executable")
+        try manager.removeItem(at: directory.appendingPathComponent("app-started"))
+    }
+
+    private func makeFileFrecencyFixtures() throws -> (project: URL, success: URL, failure: URL) {
+        let manager = FileManager.default
+        let project = corpus.appendingPathComponent("Frecency Pin Project", isDirectory: true)
+        let success = corpus.appendingPathComponent("Frecency Open Probe.app", isDirectory: true)
+        // A random extension has no registered handler. Non-text bytes avoid a text-editor fallback.
+        let failure = corpus.appendingPathComponent("Frecency Unhandled Document.lumensmoke-\(UUID().uuidString)")
+        try manager.createDirectory(at: project, withIntermediateDirectories: true)
+        try manager.copyItem(at: appRoots[0].appendingPathComponent("Lumen Action Probe.app"), to: success)
+        try Data([7, 0, 1]).write(to: failure)
+        return (project, success, failure)
+    }
+
+    private func verifyFileFrecency(_ app: AppDelegate, project: URL, success: URL, failure: URL) async throws {
+        guard let defaults = shortcutFixturePreferences else { throw Failure("missing isolated frecency preferences") }
+        let model = app.model
+        func select(_ term: String, _ url: URL) async throws -> SearchHit {
+            app.showSearch()
+            try type(term, into: app)
+            let path = IndexScope.folderPath(url)
+            try await until("frecency fixture was not indexed: \(url.lastPathComponent)") {
+                model.hits.contains { $0.path == path }
+            }
+            if model.selectedHit?.path != path { model.selection = path }
+            guard let hit = model.selectedHit, hit.path == path else { throw Failure("missing selected frecency fixture") }
+            return hit
+        }
+        func boost(_ hit: SearchHit) -> Int {
+            LauncherFrecency(defaults: defaults).boost(LauncherFrecency.fileID(hit.path))
+        }
+
+        let pinned = try await select("frecency pin project", project)
+        try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+        guard let pin = app.contextActions.items.firstIndex(where: { $0.id == "pin-folder" }) else {
+            throw Failure("the folder result did not offer Pin Project Folder")
+        }
+        app.contextActions.run(pin)
+        try await until("the real Pin Folder action did not save a shortcut") {
+            model.shortcuts.entries.contains { $0.target == .folder(pinned.path) && $0.pinned }
+        }
+        try check(boost(pinned) == 0, "pinning a validated project counted as a file open")
+        if let shortcut = model.shortcuts.entries.first(where: { $0.target == .folder(pinned.path) }) {
+            model.shortcuts.remove(shortcut)
+        }
+
+        workspaceOpenPaths = [IndexScope.folderPath(success), IndexScope.folderPath(failure)]
+        defer { workspaceOpenPaths.removeAll() }
+        let failed = try await select("frecency unhandled document", failure)
+        try key(kVK_Return, "\r", in: app)
+        try await until("NSWorkspace did not report the unhandled document's failed file open") {
+            model.searchNotice?.problem == .opening
+        }
+        try check(app.searchPresented && boost(failed) == 0, "a validated but failed workspace open counted as a file open")
+
+        let openedHit = try await select("frecency open probe.app", success)
+        try check(boost(openedHit) == 0, "searching for a file counted as opening it")
+        try FileManager.default.removeItem(at: directory.appendingPathComponent("app-started"))
+        try key(kVK_Return, "\r", in: app)
+        try await until("Return did not launch the file result through NSWorkspace") {
+            !app.searchPresented && self.exists("app-started")
+        }
+        let reloaded = LauncherFrecency(defaults: defaults)
+        try check(boost(openedHit) > 0 && reloaded.rankFiles([failed, openedHit]).first == openedHit,
+                  "a successful workspace open did not persist and affect file ranking")
+    }
+
+    private func verifyEngineRegressions() async throws {
+        let root = directory.appendingPathComponent("engine-regressions", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let executable = root.appendingPathComponent("engine")
+        let source = #"""
+        #!/usr/bin/python3
+        import json, os, signal, sys, time
+        from pathlib import Path
+        root = Path(__file__).parent
+        db, command, *args = sys.argv[2:]
+        def mark(name):
+            (root / name).touch()
+        def hold(name):
+            def stopped(*_):
+                mark(name + '-terminated')
+                sys.exit(0)
+            signal.signal(signal.SIGTERM, stopped)
+            mark(name + '-started')
+            signal.pause()
+        if command == 'status':
+            if Path(db).name == 'unreadable':
+                mark('status-started')
+                limit = time.monotonic() + 10
+                while not (root / 'release-status').exists() and time.monotonic() < limit:
+                    time.sleep(.01)
+                sys.exit('fixture index could not be opened')
+            print('{"items":1}')
+        elif command == 'watch':
+            if '--help' in args:
+                print('--cached-start --progress')
+            else:
+                mark(Path(db).name + '-watch-started')
+                print('{"event":"ready"}', flush=True)
+                signal.pause()
+        elif command == 'serve':
+            for line in sys.stdin:
+                request = json.loads(line)
+                query = request['query']
+                if query == 'stall':
+                    mark(f'stalled-pid-{os.getpid()}')
+                    hold('stalled-request')
+                if query == 'superseded':
+                    mark('unexpected-superseded-request')
+                if query == 'recover' and not (root / f'stalled-pid-{os.getpid()}').exists():
+                    mark('fresh-worker-recovered')
+                reply = {'id': request['id']}
+                if query in ('x', 'no text matches'):
+                    reply['error'] = 'fixture name search failed'
+                else:
+                    reply['hits'] = []
+                print(json.dumps(reply), flush=True)
+        elif command == 'image-serve':
+            for line in sys.stdin:
+                request = json.loads(line)
+                names = ['keep.jpg', 'drop.jpg'] if request['query'] == 'accept' else [request['query'] + '.jpg']
+                hits = [dict(path=str(root / name), name=name, kind='file', availability='local',
+                             matched_by='image_embedding', document_stamp='fixture') for name in names]
+                print(json.dumps(dict(id=request['id'], hits=hits)), flush=True)
+        elif command == 'validate-hit':
+            name = Path(args[-1]).stem
+            if name.startswith('hold-'):
+                hold(name)
+            else:
+                print(json.dumps(dict(valid=name == 'keep')))
+        elif command == 'query':
+            print('[]')
+        elif command == 'pipes':
+            os.write(2, b'e' * 131072 + b'error tail')
+            os.write(1, b'o' * 131072 + b'output tail')
+        elif command == 'hold-pipes':
+            print('ready', flush=True)
+            print('{"event":"progress","phase":"held","entries":1,"elapsed_ms":0}', file=sys.stderr, flush=True)
+            hold('held-pipe')
+        """#
+        try source.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        func testEngine(_ name: String) throws -> LauncherEngine {
+            let db = root.appendingPathComponent(name)
+            try Data().write(to: db)
+            return LauncherEngine(executable: executable, database: db, requestTimeout: .milliseconds(500))
+        }
+        func marked(_ name: String) -> Bool {
+            FileManager.default.fileExists(atPath: root.appendingPathComponent(name).path)
+        }
+
+        let bad = Launcher(engine: try testEngine("unreadable"), defaults: nil)
+        defer { bad.close() }
+        bad.start()
+        try await until("the failed status and watch capability probes did not start") {
+            marked("status-started") && bad.watchState != .checking
+        }
+        try check(bad.watchState == .needsSetup && !marked("unreadable-watch-started"),
+                  "a watcher started before the saved index status was known")
+        try Data().write(to: root.appendingPathComponent("release-status"))
+        try await until("status failure did not leave the index unreadable") { bad.indexPhase == .unreadable }
+        try check(bad.indexNotice?.problem == .status && !marked("unreadable-watch-started"),
+                  "a failed startup status still let watch trust the index")
+
+        let engine = try testEngine("readable")
+        let model = Launcher(engine: engine, defaults: nil)
+        defer { model.close() }
+        model.start()
+        try await until("valid startup did not reach a searchable watcher") { model.canSearch && model.watchState == .running }
+        for query in ["x", "no text matches"] {
+            model.setQuery(query)
+            try await until("name failure did not finish") { !model.searching }
+            try check(model.hits.isEmpty && model.searchNotice?.detail == "fixture name search failed",
+                      "a name-search error was hidden by an empty text branch")
+        }
+
+        var stalled: [Result<[SearchHit], SearchFailure>] = []
+        engine.search("stall", mode: "name") { stalled.append($0) }
+        try await until("the active search did not stall inside serve") { marked("stalled-request-started") }
+        try check(stalled.isEmpty && engine.nameSearchBusy, "search was not active when its successor was queued")
+        var superseded = false
+        engine.search("superseded", mode: "name") { _ in superseded = true }
+        var successor: [Result<[SearchHit], SearchFailure>] = []
+        engine.search("recover", mode: "name") { successor.append($0) }
+        try await until("the stall did not settle both the active search and its queued successor") {
+            !stalled.isEmpty && !successor.isEmpty
+        }
+        guard stalled.count == 1, case .failure(let failure) = stalled[0], failure.detail.contains("timed out") else {
+            throw Failure("the actual stalled search did not get its timeout")
+        }
+        try await until("serve did not terminate the stalled worker") { marked("stalled-request-terminated") }
+        try check(successor.count == 1 && (try? successor[0].get()) == [] && marked("fresh-worker-recovered") &&
+                  !superseded && !marked("unexpected-superseded-request"),
+                  "timeout did not dispatch only the latest queued search on a fresh worker")
+        var pipes: EngineResponse?
+        _ = engine.run(["pipes"]) { pipes = $0 }
+        try await until("large stdout and stderr pipes did not both drain") { pipes != nil }
+        try check(pipes?.output.count == 131083 && pipes?.errors.count == 65_536 &&
+                  pipes?.diagnostic.hasSuffix("error tail") == true, "pipe draining lost output or stderr tail")
+
+        let projector = root.appendingPathComponent("projector")
+        model.setImageQuery("hold-query", projector: projector)
+        try await until("image hit validation did not start") { marked("hold-query-started") }
+        model.setImageQuery("accept", projector: projector)
+        try await until("superseded image validation did not terminate or replacement hits were wrong") {
+            marked("hold-query-terminated") && !model.searching && model.hits.map(\.name) == ["keep.jpg"]
+        }
+        model.setImageQuery("hold-close", projector: projector)
+        try await until("image hit validation did not restart") { marked("hold-close-started") }
+        model.close()
+        try await until("closing the launcher leaked image hit validation") { marked("hold-close-terminated") }
+
+        // libdispatch reads this setting at process startup. One cooperative worker is
+        // enough to expose starvation without racing to saturate a machine-sized pool.
+        let probe = root.appendingPathComponent("cooperative", isDirectory: true)
+        try FileManager.default.createDirectory(at: probe.appendingPathComponent("corpus"), withIntermediateDirectories: true)
+        try Data().write(to: probe.appendingPathComponent("cooperative-pipe-scenario"))
+        let child = Process()
+        child.executableURL = Bundle.main.executableURL
+        child.arguments = ["--gui-smoke", probe.path, "en"]
+        child.environment = ProcessInfo.processInfo.environment.merging(["LIBDISPATCH_COOPERATIVE_POOL_STRICT": "1"]) { _, strict in strict }
+        try child.run()
+        defer { if child.isRunning { child.terminate() } }
+        try await until("the strict cooperative-pool smoke process did not finish", seconds: 15) { !child.isRunning }
+        try check(child.terminationStatus == 0, "long-lived pipes starved the strict cooperative pool")
+    }
+
+    private func verifyCooperativePipeProgress() async throws {
+        let engine = LauncherEngine(executable: directory.deletingLastPathComponent().appendingPathComponent("engine"), database: database)
+        var stdoutReady = false, stderrReady = false, completed = false
+        guard let child = engine.run(["hold-pipes"], onLine: { stdoutReady = String(decoding: $0, as: UTF8.self) == "ready" },
+                                     onProgress: { stderrReady = $0.phase == "held" },
+                                     complete: { _ in completed = true }) else { throw Failure("could not start pipe fixture") }
+        defer { if child.isRunning { child.terminate() } }
+        try await until("both long-lived pipe readers did not start") { stdoutReady && stderrReady }
+        var progressed = false
+        let task = Task.detached(priority: .utility) { await MainActor.run { progressed = true } }
+        defer { task.cancel() }
+        try await until("a detached task could not progress while both engine pipes were open") { progressed }
+        try check(child.isRunning && !completed, "the cooperative task only progressed after a pipe closed")
+        child.terminate()
+        try await until("the held pipe fixture did not finish after termination") { completed }
     }
 
     private func verifyUnconfiguredQA(_ app: AppDelegate) throws {
@@ -628,6 +946,8 @@ final class LauncherSmoke {
         let mdl = app.translation
         let originalPanel = app.panel
         let backdrop = originalPanel.contentView
+        try check(TranslationClient.sessionConfiguration(timeout: 3).connectionProxyDictionary == nil,
+                  "translation session replaced the system proxy configuration")
         guard let local = mdl.provider, local.name == "oMLX", local.endpoint == "http://127.0.0.1:8000/v1",
               mdl.activity == nil else { throw Failure("missing saved oMLX preset") }
 
@@ -670,6 +990,8 @@ final class LauncherSmoke {
 
         let aliasCases: [(String, TranslationLanguage, String)] = [
             ("译 今天下午三点开会", .english, "今天下午三点开会"),
+            ("翻译 今天下午三点开会", .english, "今天下午三点开会"),
+            ("translate it is fine", .simplifiedChinese, "it is fine"),
             ("tr see you tomorrow", .simplifiedChinese, "see you tomorrow"),
             ("tr it is fine", .simplifiedChinese, "it is fine"),
             ("tr made up language", .simplifiedChinese, "made up language"),
@@ -778,6 +1100,22 @@ final class LauncherSmoke {
         print("Search-field translation passed: aliases, IME, Return to submit and copy, edit/Escape cancellation, Settings, and late replies")
     }
 
+    private func verifyProviderDeletion(_ model: TranslationPanelModel) throws {
+        guard let saved = model.provider, let local = model.providers.first(where: { $0 != saved }) else {
+            throw Failure("no saved translation provider to delete")
+        }
+        let endpoint = try TranslationEndpoint(saved.endpoint)
+        try check(model.canRemoveProvider, "saved provider was not removable")
+        model.removeProvider()
+        let afterDeletion = makeTranslationModel()
+        try check(model.status == .removedProvider && model.provider == local && afterDeletion.providers == [local] &&
+                  afterDeletion.provider == local && translationSecrets.key(provider: saved.id, endpoint: endpoint) == nil,
+                  "provider deletion did not remove its credential, persist, or select a remaining provider")
+        model.removeProvider()
+        try check(model.provider == nil && makeTranslationModel().providers.isEmpty,
+                  "deleting the last provider silently restored a preset")
+    }
+
     private func verifyQuicklinks(_ app: AppDelegate) async throws {
         let model = app.model
         func actionName() -> String? {
@@ -843,6 +1181,9 @@ final class LauncherSmoke {
         try check(dispatchedQuicklinks.isEmpty, "typing a Quicklink alias opened a URL")
         try key(kVK_Return, "\r", in: app)
         try check(dispatchedQuicklinks == [url] && !app.searchPresented, "Return did not dispatch the requested website")
+        let savedWeb = ShortcutLibrary(defaults: shortcutFixturePreferences).entries.first { $0.id == web.id }
+        try check(savedWeb == web && model.shortcuts.matches("sw").first?.score == 105,
+                  "opening a web shortcut recorded history or changed its lexical score")
 
         app.showSearch()
         try type("pj", into: app)

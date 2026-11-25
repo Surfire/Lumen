@@ -67,7 +67,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/slow/v1/chat/completions":
             sleep(1)
-        self.reply(200, {"choices": [{"message": {"content": result}, "finish_reason": "stop"}]})
+        finish_reason = {"/changed/v1/chat/completions": "length",
+                         "/other/v1/chat/completions": "end_turn"}.get(self.path, "stop")
+        self.reply(200, {"choices": [{"message": {"content": result}, "finish_reason": finish_reason}]})
 
 
 def main():

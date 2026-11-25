@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import UniformTypeIdentifiers
 
 struct TranslationCommand: Equatable {
     let raw: String
@@ -32,7 +33,10 @@ struct TranslationCommand: Equatable {
         var unsupported: String?
         switch prefix {
         case "翻译", "translate":
-            guard tail.isEmpty else { return nil }
+            // Keep explicit document filenames (e.g. "translate notes.pdf") searchable.
+            if !tail.contains(where: \.isWhitespace),
+               let type = UTType(filenameExtension: (tail as NSString).pathExtension),
+               type.isDeclared, type.conforms(to: .content) { return nil }
         case "译", "tr":
             let (word, rest) = split(tail)
             // English "it" is common at the start of source text. Italian remains
@@ -80,7 +84,7 @@ struct TranslationCommand: Equatable {
 @MainActor
 final class TranslationPanelModel: ObservableObject {
     enum Activity: Equatable { case translating, testing, listing }
-    enum Status: Equatable { case saved, removedKey, connected, models(Int), canceled, failure(TranslationFailure) }
+    enum Status: Equatable { case saved, removedProvider, removedKey, connected, models(Int), canceled, failure(TranslationFailure) }
 
     private struct Preferences: Codable {
         var providers: [TranslationProvider]
@@ -116,8 +120,8 @@ final class TranslationPanelModel: ObservableObject {
         let local = TranslationProvider.localOMLX
         let saved = defaults?.data(forKey: Self.preferenceKey)
             .flatMap { try? JSONDecoder().decode(Preferences.self, from: $0) }
-        let available = saved.flatMap { $0.providers.isEmpty ? nil : $0.providers } ?? [local]
-        let current = available.first(where: { $0.id == saved?.selected }) ?? available[0]
+        let available = saved?.providers ?? [local]
+        let current = available.first(where: { $0.id == saved?.selected }) ?? available.first ?? TranslationProvider()
         providers = available
         selected = current.id
         draft = current
@@ -195,6 +199,26 @@ final class TranslationPanelModel: ObservableObject {
             output = ""
             store()
             status = .saved
+        } catch { showFailure(error) }
+    }
+
+    var canRemoveProvider: Bool {
+        activity == nil && providers.contains { $0.id == draft.id }
+    }
+
+    func removeProvider() {
+        guard canRemoveProvider else { return }
+        do {
+            try client.secrets.remove(provider: draft.id)
+            providers.removeAll { $0.id == draft.id }
+            let next = provider ?? providers.first ?? TranslationProvider()
+            selected = next.id
+            draft = next
+            resetDraftState()
+            output = ""
+            copied = false
+            store()
+            status = .removedProvider
         } catch { showFailure(error) }
     }
 

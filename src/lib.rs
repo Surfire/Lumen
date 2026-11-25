@@ -33,7 +33,7 @@ pub use semantic::{
 pub use watch::{WatchEvent, watch, watch_with_launch_progress, watch_with_progress};
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -44,7 +44,8 @@ use std::{
 use unicode_normalization::UnicodeNormalization;
 
 pub const MAX_DOCUMENT: u64 = 2 * 1024 * 1024;
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 3;
+const LEGACY_SCHEMA_VERSIONS: std::ops::RangeInclusive<i64> = 1..=2;
 const DATABASE_APPLICATION_ID: i64 = 0x4c554d4e; // LUMN
 
 pub fn standard_database() -> PathBuf {
@@ -107,11 +108,11 @@ impl Scope {
     fn excludes(&self, path: &Path) -> bool {
         self.deny.iter().any(|p| platform::denied_by(path, p))
             || sensitive_path(path)
+            || development_noise(path, &self.roots)
             || (system_path(path)
-                && !self
-                    .roots
-                    .iter()
-                    .any(|root| is_temp_path(root) && path.starts_with(root)))
+                && !self.roots.iter().any(|root| {
+                    path.starts_with(root) && (system_path(root) || scope_ancestor(root))
+                }))
             || (path.starts_with("/Volumes")
                 && !self
                     .roots
@@ -120,28 +121,79 @@ impl Scope {
     }
 }
 
-fn is_temp_path(path: &Path) -> bool {
-    [
-        "/tmp",
-        "/private/tmp",
-        "/var/folders",
-        "/private/var/folders",
-    ]
-    .iter()
-    .any(|p| path.starts_with(p))
+fn home_library_tail(path: &Path) -> Option<&Path> {
+    static HOME_LIBRARY: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    let library = HOME_LIBRARY.get_or_init(|| {
+        let home = absolute(Path::new(&std::env::var_os("HOME")?)).ok()?;
+        Some(home.join("Library"))
+    });
+    if let Some(library) = library
+        && let Ok(tail) = path.strip_prefix(library)
+    {
+        return Some(tail);
+    }
+    let mut parts = path.strip_prefix("/Users").ok()?.components();
+    parts.next()?;
+    (parts.next()?.as_os_str() == "Library").then_some(parts.as_path())
 }
+
+// These directories must be traversable to reach the allowed subtrees, but
+// the traversal ancestors themselves are not searchable scope entries.
+fn scope_ancestor(path: &Path) -> bool {
+    path == Path::new("/System")
+        || home_library_tail(path).is_some_and(|p| p.as_os_str().is_empty())
+}
+
 fn system_path(path: &Path) -> bool {
-    [
-        "/System",
-        "/dev",
-        "/private/var",
-        "/private/etc",
-        "/private/tmp",
-        "/cores",
-        "/Network",
-    ]
-    .iter()
-    .any(|p| path.starts_with(p))
+    (path.starts_with("/System")
+        && path != Path::new("/System")
+        && !path.starts_with("/System/Applications"))
+        || home_library_tail(path).is_some_and(|tail| {
+            !tail.as_os_str().is_empty()
+                && !tail.starts_with("Mobile Documents")
+                && !tail.starts_with("CloudStorage")
+        })
+        || [
+            "/Library",
+            "/usr",
+            "/bin",
+            "/sbin",
+            "/opt",
+            "/dev",
+            "/private/var",
+            "/private/etc",
+            "/private/tmp",
+            "/cores",
+            "/Network",
+        ]
+        .iter()
+        .any(|p| path.starts_with(p))
+}
+
+fn development_noise(path: &Path, roots: &[PathBuf]) -> bool {
+    let relative = roots
+        .iter()
+        .filter_map(|root| path.strip_prefix(root).ok().map(|tail| (root, tail)))
+        .max_by_key(|(root, _)| root.as_os_str().len())
+        .map_or(path, |(_, tail)| tail);
+    relative.components().any(|part| {
+        part.as_os_str().to_str().is_some_and(|part| {
+            // Hidden directories (including .venv, .gradle, .cargo, etc.)
+            // are already excluded by sensitive_path.
+            [
+                "node_modules",
+                "target",
+                "DerivedData",
+                "venv",
+                "__pycache__",
+                "Pods",
+                "bower_components",
+                "CMakeFiles",
+            ]
+            .iter()
+            .any(|name| part.eq_ignore_ascii_case(name))
+        })
+    })
 }
 fn sensitive_path(path: &Path) -> bool {
     path.components().any(|part| {
@@ -232,23 +284,45 @@ fn open_write(path: &Path, exclusive_indexer: bool) -> Result<(Connection, Optio
         None
     };
     let metadata = open_private_file(path)?.metadata()?;
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     conn.busy_timeout(Duration::from_secs(5))?;
-    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    let id: i64 = conn.pragma_query_value(None, "application_id", |row| row.get(0))?;
-    if !(id == DATABASE_APPLICATION_ID && version == SCHEMA_VERSION
-        || id == 0 && version == 0 && metadata.len() == 0)
-    {
-        bail!("not a supported Lumen index; no changes made");
+    // Unlike journal_mode, synchronous is a per-connection setting.
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    match catalog_schema(&conn)? {
+        (DATABASE_APPLICATION_ID, SCHEMA_VERSION) => {}
+        (DATABASE_APPLICATION_ID, version) if LEGACY_SCHEMA_VERSIONS.contains(&version) => {
+            migrate_catalog(&mut conn)?;
+        }
+        (0, 0) if metadata.len() == 0 => {
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            migrate_catalog(&mut conn)?;
+        }
+        _ => bail!("not a supported Lumen index; no changes made"),
     }
-    conn.execute_batch(
-        "
-        PRAGMA journal_mode=WAL;
-        PRAGMA synchronous=NORMAL;
-        BEGIN;
-        PRAGMA application_id=0x4c554d4e;
-        PRAGMA user_version=1;
-        CREATE TABLE IF NOT EXISTS item(
+    Ok((conn, lease))
+}
+
+fn catalog_schema(conn: &Connection) -> rusqlite::Result<(i64, i64)> {
+    conn.query_row(
+        "SELECT application_id,user_version FROM pragma_application_id,pragma_user_version",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+}
+
+fn migrate_catalog(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Another writer may have migrated while we were acquiring the lock.
+    let uninitialized = match catalog_schema(&tx)? {
+        (DATABASE_APPLICATION_ID, SCHEMA_VERSION) => return Ok(()),
+        (DATABASE_APPLICATION_ID, version) if LEGACY_SCHEMA_VERSIONS.contains(&version) => false,
+        (0, 0) => true,
+        _ => bail!("not a supported Lumen index; no changes made"),
+    };
+    if uninitialized {
+        tx.pragma_update(None, "application_id", DATABASE_APPLICATION_ID)?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS item(
           id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, display TEXT NOT NULL,
           kind TEXT NOT NULL, availability TEXT NOT NULL, name TEXT NOT NULL,
           full TEXT NOT NULL, initials TEXT NOT NULL, searchable_path TEXT NOT NULL
@@ -260,17 +334,31 @@ fn open_write(path: &Path, exclusive_indexer: bool) -> Result<(Connection, Optio
         CREATE VIRTUAL TABLE IF NOT EXISTS content_fts USING fts5(body, tokenize='trigram');
         CREATE TABLE IF NOT EXISTS embedding(id INTEGER PRIMARY KEY, vector BLOB NOT NULL);
         CREATE TABLE IF NOT EXISTS info(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS document_state(id INTEGER PRIMARY KEY, stamp TEXT NOT NULL);
     ",
-    )?;
-    if !semantic::installed(&conn)? {
-        conn.execute_batch(semantic::SCHEMA)?;
+        )?;
     }
-    conn.execute_batch(semantic::SKIP_SCHEMA)?;
-    conn.execute_batch(semantic::VERSIONED_SCHEMA)?;
-    conn.execute_batch(content::SCHEMA)?;
-    conn.execute_batch("COMMIT;")?;
-    Ok((conn, lease))
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS document_state(id INTEGER PRIMARY KEY, stamp TEXT NOT NULL);",
+    )?;
+    if !semantic::installed(&tx)? {
+        tx.execute_batch(semantic::SCHEMA)?;
+    }
+    tx.execute_batch(semantic::SKIP_SCHEMA)?;
+    tx.execute_batch(semantic::VERSIONED_SCHEMA)?;
+    tx.execute_batch(content::SCHEMA)?;
+    name_fast::install_generation(&tx)?;
+    if !uninitialized {
+        // Retain the user's scope settings, but require a policy pass and a
+        // fresh journal seed even if the serialized scope is unchanged.
+        tx.execute(
+            "DELETE FROM info WHERE key IN ('scope_policy_v3','watch_checkpoint_v1',
+             'watch_replay_overlap_v1','watch_reconciled_at','walk_sample')",
+            [],
+        )?;
+    }
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
+    Ok(())
 }
 
 pub fn open_read(path: &Path) -> Result<Connection> {
@@ -280,9 +368,10 @@ pub fn open_read(path: &Path) -> Result<Connection> {
     }
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     connection.busy_timeout(Duration::from_secs(3))?;
-    let version: i64 = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    let id: i64 = connection.pragma_query_value(None, "application_id", |r| r.get(0))?;
-    if version != SCHEMA_VERSION || id != DATABASE_APPLICATION_ID {
+    let (application, version) = catalog_schema(&connection)?;
+    if application != DATABASE_APPLICATION_ID
+        || (version != SCHEMA_VERSION && !LEGACY_SCHEMA_VERSIONS.contains(&version))
+    {
         bail!("no supported index was found");
     }
     Ok(connection)
@@ -491,12 +580,15 @@ fn search_with_names(
     }
     let limit = limit.clamp(1, 100);
     if let Some(terms) = query::Terms::parse(&q) {
-        if mode != Mode::Semantic {
-            return query::search(conn, &terms, mode, limit);
+        let mut hits = if mode != Mode::Semantic {
+            query::search(conn, &terms, mode, limit)?
+        } else {
+            Vec::new()
+        };
+        if terms.permits_semantic() {
+            append_semantic_hits(conn, query, mode, limit, model, &mut hits)?;
         }
-        if !terms.permits_semantic() {
-            return Ok(Vec::new());
-        }
+        return Ok(hits);
     }
     let cached = if matches!(mode, Mode::Name | Mode::All) {
         match names {
@@ -563,28 +655,43 @@ fn search_with_names(
             }
         }
     }
-    if matches!(mode, Mode::Semantic | Mode::All) && hits.len() < limit {
-        if let Some(model) = model {
-            for hit in semantic::search(conn, query, limit, model)? {
-                if seen.insert(hit.path.clone()) {
-                    hits.push(hit);
-                }
-                if hits.len() == limit {
-                    break;
-                }
-            }
-        } else if mode == Mode::Semantic {
-            bail!("semantic mode requires a local model helper");
-        }
-    }
+    append_semantic_hits(conn, query, mode, limit, model, &mut hits)?;
     if let Some(version) = version {
-        // A concurrent indexer may commit while computing names or combining
-        // them with text. Discard that result and read SQLite's current view.
-        if version != name_fast::data_version(conn)? {
+        // A concurrent item change may obsolete in-memory name hits while
+        // computing names or combining them with text. Read the current view.
+        if Some(version) != name_fast::name_generation(conn)? {
             return search_with_names(conn, query, mode, limit, model, None);
         }
     }
     Ok(hits)
+}
+
+fn append_semantic_hits(
+    conn: &Connection,
+    query: &str,
+    mode: Mode,
+    limit: usize,
+    model: Option<ModelBackend<'_>>,
+    hits: &mut Vec<Hit>,
+) -> Result<()> {
+    if !matches!(mode, Mode::Semantic | Mode::All) || hits.len() >= limit {
+        return Ok(());
+    }
+    if let Some(model) = model {
+        let mut seen: std::collections::HashSet<_> =
+            hits.iter().map(|hit| hit.path.clone()).collect();
+        for hit in semantic::search(conn, query, limit, model)? {
+            if seen.insert(hit.path.clone()) {
+                hits.push(hit);
+            }
+            if hits.len() == limit {
+                break;
+            }
+        }
+    } else if mode == Mode::Semantic {
+        bail!("semantic mode requires a local model helper");
+    }
+    Ok(())
 }
 
 /// Return complete saved scope rules only. Older or malformed indexes have no
@@ -638,4 +745,41 @@ pub fn status(conn: &Connection) -> Result<serde_json::Value> {
     semantic::add_status(conn, &mut data)?;
     data["unverified"] = unverified.into();
     Ok(data)
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    #[test]
+    fn system_and_user_library_noise_leave_app_and_cloud_paths_traversable() {
+        let scope = Scope::default();
+        for path in [
+            "/Library/Installer.db",
+            "/usr/share/files",
+            "/bin/etc",
+            "/sbin/etc",
+            "/opt/bin",
+            "/System/Library/PrefPane",
+            "/Users/example/Library/Application Support/program/file",
+        ] {
+            assert!(
+                !scope.allows(Path::new(path)),
+                "unexpected scoped path {path}"
+            );
+        }
+        for path in [
+            "/System",
+            "/System/Applications/Preview.app",
+            "/Applications/Lumen.app",
+            "/Users/example/Library",
+            "/Users/example/Library/CloudStorage/OneDrive/a.txt",
+            "/Users/example/Library/Mobile Documents/com~apple~CloudDocs/a.txt",
+        ] {
+            assert!(scope.allows(Path::new(path)), "excluded {path}");
+        }
+        for path in ["/System", "/Users/example/Library"] {
+            assert!(scope_ancestor(Path::new(path)));
+        }
+    }
 }

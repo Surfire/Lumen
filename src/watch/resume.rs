@@ -317,18 +317,8 @@ pub(crate) fn can_read_document(path: &Path, stamp: Option<&str>) -> bool {
     fs::symlink_metadata(path).is_ok_and(|metadata| {
         metadata.is_file()
             && platform::availability(path, &metadata) == "local"
-            && OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW_ANY | libc::O_NONBLOCK)
-                .open(path)
-                .is_ok_and(|file| {
-                    file.metadata().is_ok_and(|opened| {
-                        opened.is_file()
-                            && (opened.dev(), opened.ino()) == (metadata.dev(), metadata.ino())
-                            && platform::availability(path, &opened) == "local"
-                            && stamp.is_none_or(|expected| crate::index::stamp(&opened) == expected)
-                    })
-                })
+            && stamp.is_none_or(|expected| crate::index::stamp(&metadata) == expected)
+            && crate::index::can_open_document(path, &metadata)
     })
 }
 
@@ -378,20 +368,15 @@ pub(super) fn verify_access(conn: &mut Connection, roots: Option<&[PathBuf]>) ->
         if covered.is_some_and(|parent| Path::new(path).starts_with(parent)) {
             continue;
         }
-        // The same exclusive end of the slash-delimited subtree used by the
-        // indexer. Removing the document stamp forces the next scan to retry
-        // authorization instead of reusing an unchanged extracted document.
+        // Use the same slash-delimited subtree bounds as the indexer. Keep
+        // hidden bodies and their stamps so a later scan can reuse unchanged
+        // text, but only after it verifies live read access.
         let path_without_slash = path.trim_end_matches('/');
         let start = format!("{path_without_slash}/");
         let end = format!("{path_without_slash}0");
         tx.execute(
             "UPDATE item SET availability='unverified'
              WHERE availability <> 'unverified' AND (path=?1 OR (path>=?2 AND path<?3))",
-            params![path, start, end],
-        )?;
-        tx.execute(
-            "DELETE FROM document_state WHERE id IN
-             (SELECT id FROM item WHERE path=?1 OR (path>=?2 AND path<?3))",
             params![path, start, end],
         )?;
         covered = Some(path);

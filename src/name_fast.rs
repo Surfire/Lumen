@@ -1,5 +1,5 @@
 use crate::{Hit, Result, fts_phrase, open_read, row_hit};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::{
     collections::HashMap,
     mem::size_of,
@@ -17,7 +17,31 @@ use std::{
 const MAX_ROWS: usize = 500_000;
 const MAX_INDEX_BYTES: usize = 120 * 1024 * 1024;
 const REBUILD_DELAY: Duration = Duration::from_millis(200);
-const OVER_BUDGET_DELAY: Duration = Duration::from_secs(10);
+const OVER_BUDGET_DELAY: Duration = Duration::from_secs(30);
+const MAX_BUILD_DELAY: Duration = Duration::from_secs(15 * 60);
+
+pub(super) fn install_generation(conn: &Connection) -> Result<()> {
+    // Triggers also cover visibility changes and item writes outside the walker.
+    let advance = "INSERT INTO info(key,value) VALUES('name_generation',1)
+                   ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1;";
+    conn.execute_batch(&format!(
+        "INSERT OR IGNORE INTO info(key,value) VALUES('name_generation',0);
+         CREATE TRIGGER IF NOT EXISTS item_name_generation_insert AFTER INSERT ON item BEGIN {advance} END;
+         CREATE TRIGGER IF NOT EXISTS item_name_generation_delete AFTER DELETE ON item BEGIN {advance} END;
+         CREATE TRIGGER IF NOT EXISTS item_name_generation_update AFTER UPDATE ON item
+         WHEN (old.id,old.path,old.display,old.kind,old.availability,old.name,old.full,old.initials,old.searchable_path)
+           IS NOT (new.id,new.path,new.display,new.kind,new.availability,new.name,new.full,new.initials,new.searchable_path)
+         BEGIN {advance} END;"
+    ))?;
+    Ok(())
+}
+
+pub(super) fn name_generation(conn: &Connection) -> Result<Option<i64>> {
+    Ok(conn
+        .prepare_cached("SELECT CAST(value AS INTEGER) FROM info WHERE key='name_generation'")?
+        .query_row([], |row| row.get(0))
+        .optional()?)
+}
 
 pub(super) const CREATE_NAME_ORDER: &str =
     "CREATE INDEX IF NOT EXISTS item_name_order ON item(name, length(display), path)
@@ -209,6 +233,7 @@ pub(super) struct NameFast {
     index: Option<NameIndex>,
     build: Option<Build>,
     next_build: Instant,
+    build_delay: Duration,
 }
 
 pub(super) fn data_version(conn: &Connection) -> Result<i64> {
@@ -223,9 +248,10 @@ impl NameFast {
             index: None,
             build: None,
             next_build: Instant::now(),
+            build_delay: OVER_BUDGET_DELAY,
         };
-        if let Ok(version) = data_version(conn) {
-            fast.start(version);
+        if let Ok(Some(generation)) = name_generation(conn) {
+            fast.start(generation);
         }
         fast
     }
@@ -236,44 +262,53 @@ impl NameFast {
         query: &str,
         limit: usize,
     ) -> Result<Option<(i64, Vec<Hit>)>> {
-        let version = data_version(conn)?;
-        let current = self.generation == Some(version);
+        let generation = name_generation(conn)?;
+        let current = generation.is_some() && self.generation == generation;
         if let Some(build) = &self.build {
-            if !current {
-                build.cancel.store(true, Ordering::Relaxed);
-            }
             if build.worker.is_finished() {
                 let build = self.build.take().unwrap();
-                let result = build.worker.join();
-                if current {
-                    self.index = result.ok().and_then(Result::ok).flatten();
-                    if self.index.is_none() {
-                        self.next_build = Instant::now() + OVER_BUDGET_DELAY;
+                match build.worker.join() {
+                    Ok(Ok(Some(index))) => {
+                        self.build_delay = OVER_BUDGET_DELAY;
+                        if current {
+                            self.index = Some(index);
+                        }
                     }
+                    _ if !build.cancel.load(Ordering::Relaxed) => self.back_off(),
+                    _ => {}
                 }
+            } else if !current {
+                build.cancel.store(true, Ordering::Relaxed);
             }
         }
-        if !current && self.build.is_none() && Instant::now() >= self.next_build {
-            self.start(version);
+        if let Some(generation) = generation {
+            if self.build.is_none()
+                && (!current || self.index.is_none())
+                && Instant::now() >= self.next_build
+            {
+                self.start(generation);
+            }
+            if current && !query.contains('\0') && literal_query(query) {
+                return Ok(self
+                    .index
+                    .as_ref()
+                    .map(|index| (generation, index.search(query, limit))));
+            }
         }
-        if !current {
-            return Ok(None);
-        }
-        if query.contains('\0') || !literal_query(query) {
-            return Ok(None);
-        }
-        Ok(self
-            .index
-            .as_ref()
-            .map(|index| (version, index.search(query, limit))))
+        Ok(None)
     }
 
-    fn start(&mut self, version: i64) {
+    fn back_off(&mut self) {
+        self.next_build = Instant::now() + self.build_delay;
+        self.build_delay = (2 * self.build_delay).min(MAX_BUILD_DELAY);
+    }
+
+    fn start(&mut self, generation: i64) {
         let db = self.db.clone();
         let stale = self.index.take();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancellation = Arc::clone(&cancel);
-        self.generation = Some(version);
+        self.generation = Some(generation);
         self.next_build = Instant::now() + REBUILD_DELAY;
         self.build = thread::Builder::new()
             .name("lumen-names".to_owned())
@@ -283,6 +318,9 @@ impl NameFast {
             })
             .ok()
             .map(|worker| Build { cancel, worker });
+        if self.build.is_none() {
+            self.back_off();
+        }
     }
 }
 
@@ -630,6 +668,109 @@ impl NameIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    struct Catalog(PathBuf);
+
+    impl Catalog {
+        fn new(case: &str) -> Result<Self> {
+            let path =
+                std::env::temp_dir().join(format!("lumen-names-{}-{case}", std::process::id()));
+            fs::create_dir(&path)?;
+            Ok(Self(path))
+        }
+
+        fn db(&self) -> PathBuf {
+            fs::canonicalize(&self.0).unwrap().join("index.sqlite")
+        }
+    }
+
+    impl Drop for Catalog {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn finish_build(fast: &NameFast) {
+        let worker = &fast.build.as_ref().unwrap().worker;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker.is_finished() {
+            assert!(Instant::now() < deadline, "name build did not complete");
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn writer_open_does_not_require_a_write_lock_after_migration() -> Result<()> {
+        let catalog = Catalog::new("writer-lock")?;
+        let db = catalog.db();
+        let (conn, _) = crate::open_write(&db, false)?;
+        conn.execute_batch(
+            "BEGIN IMMEDIATE; INSERT INTO info VALUES('test','active transaction');",
+        )?;
+        let (other, _) = crate::open_write(&db, false)?;
+        assert_eq!(name_generation(&other)?, Some(0));
+        conn.execute_batch("ROLLBACK;")?;
+        Ok(())
+    }
+
+    #[test]
+    fn background_writes_keep_name_index_but_item_changes_invalidate_it() -> Result<()> {
+        let catalog = Catalog::new("generation")?;
+        let db = catalog.db();
+        let (writer, _) = crate::open_write(&db, false)?;
+        writer.execute_batch(
+            "INSERT INTO item VALUES(1,'/scope/example','example','file','local','example','','','/scope/example');",
+        )?;
+        let reader = open_read(&db)?;
+        let mut fast = NameFast::new(&db, &reader);
+        finish_build(&fast);
+        let (generation, hits) = fast.search(&reader, "example", 10)?.unwrap();
+        assert_eq!(hits[0].name, "example");
+        let version = data_version(&reader)?;
+        writer.execute_batch(
+            "INSERT INTO document VALUES(1,'a document','a document');
+             INSERT INTO embedding VALUES(1,zeroblob(32));
+             UPDATE item SET availability=availability WHERE id=1;",
+        )?;
+        assert_ne!(version, data_version(&reader)?);
+        assert_eq!(fast.search(&reader, "example", 10)?.unwrap().0, generation);
+        writer.execute_batch("UPDATE item SET availability='unverified' WHERE id=1;")?;
+        assert_eq!(name_generation(&reader)?, Some(generation + 1));
+        assert!(fast.search(&reader, "example", 10)?.is_none());
+        writer.execute_batch("DELETE FROM item WHERE id=1;")?;
+        assert_eq!(name_generation(&reader)?, Some(generation + 2));
+        Ok(())
+    }
+
+    #[test]
+    fn over_budget_catalog_backs_off_across_generations() -> Result<()> {
+        let catalog = Catalog::new("over-budget")?;
+        let db = catalog.db();
+        let (writer, _) = crate::open_write(&db, false)?;
+        writer.execute(
+            "WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<=?1)
+             INSERT INTO item SELECT n,n,'fixture','file','local','fixture','','','' FROM numbers",
+            [MAX_ROWS as i64],
+        )?;
+        let reader = open_read(&db)?;
+        let mut fast = NameFast::new(&db, &reader);
+        finish_build(&fast);
+        let t = Instant::now();
+        assert!(fast.search(&reader, "fixture", 10)?.is_none());
+        assert!(fast.next_build >= t + OVER_BUDGET_DELAY);
+        writer.execute_batch("UPDATE item SET kind='directory' WHERE id=1;")?;
+        assert!(fast.search(&reader, "fixture", 10)?.is_none());
+        assert!(fast.build.is_none());
+        // Advance the retry deadline without sleeping; the same catalog is still oversized.
+        fast.next_build = Instant::now();
+        assert!(fast.search(&reader, "fixture", 10)?.is_none());
+        finish_build(&fast);
+        let t = Instant::now();
+        assert!(fast.search(&reader, "fixture", 10)?.is_none());
+        assert!(fast.next_build >= t + 2 * OVER_BUDGET_DELAY);
+        Ok(())
+    }
 
     #[test]
     fn short_han_candidate_limit_falls_back_without_truncating() -> Result<()> {

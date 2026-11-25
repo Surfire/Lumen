@@ -309,7 +309,7 @@ mod macos {
                 had_access_errors = stats.entries_unreadable != 0;
                 visited = stats.entries_visited;
             }
-            if (guarded_cache || resume::verify_access(conn, Some(&sub.sink.roots))?)
+            if resume::verify_access(conn, Some(&sub.sink.roots))?
                 && !had_access_errors
                 && sub
                     .journal
@@ -349,7 +349,7 @@ mod macos {
                     (sub, _) = Subscription::start(conn, &coverage, persistent, false, &start)?;
                 }
             }
-            if persistent && coverage.scope.documents && !guarded_cache {
+            if persistent && coverage.scope.documents {
                 resume::verify_access(conn, None)?;
             }
             reconcile_startup(conn, &coverage, &mut sub, progress)?;
@@ -432,6 +432,7 @@ mod macos {
                     let (stats, changed) = apply_changes(conn, &coverage, targets)
                         .context("commit filesystem changes to watch index")?;
                     report_unreadable(&stats);
+                    pending_recovery |= stats.entries_unreadable != 0;
                     pending_update |= changed;
                 }
                 if cursor > sub.cursor
@@ -694,6 +695,176 @@ mod macos {
             ffi::{CStr, OsStr},
             os::unix::ffi::OsStrExt,
         };
+
+        struct TestDirectory(PathBuf);
+
+        impl TestDirectory {
+            fn new() -> Self {
+                let mut template = *b"/tmp/lumen-access-XXXXXX\0";
+                let path = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+                assert!(!path.is_null());
+                Self(
+                    fs::canonicalize(PathBuf::from(OsStr::from_bytes(
+                        unsafe { CStr::from_ptr(path) }.to_bytes(),
+                    )))
+                    .unwrap(),
+                )
+            }
+        }
+
+        impl Drop for TestDirectory {
+            fn drop(&mut self) {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(
+                    self.0.join("root/private"),
+                    fs::Permissions::from_mode(0o700),
+                );
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        #[test]
+        fn cached_resume_rechecks_access_without_filesystem_events() {
+            use std::os::unix::fs::PermissionsExt;
+            if unsafe { libc::geteuid() } == 0 {
+                return;
+            }
+            let dir = TestDirectory::new();
+            let root = dir.0.join("root");
+            let private = root.join("private");
+            fs::create_dir_all(&private).unwrap();
+            fs::write(private.join("secret.txt"), "private cached document").unwrap();
+            let db = absolute(&dir.0.join("index.sqlite")).unwrap();
+            let (mut conn, _lease) = open_write(&db, true).unwrap();
+            let coverage = Arc::new(
+                Coverage::new(
+                    db,
+                    &Scope {
+                        roots: vec![root],
+                        ..Scope::default()
+                    },
+                )
+                .unwrap(),
+            );
+            resume::install_invalidation(&conn).unwrap();
+            let policy = || MaintenancePolicy {
+                periodic: Duration::from_secs(60),
+                recovery_cooldown: Duration::from_millis(80),
+                persistent: true,
+                guarded_cache: true,
+            };
+            let start = |sink: &Arc<Sink>, replay: Option<(&resume::Journal, u64)>| {
+                if let Some((_, cursor)) = replay {
+                    sink.send(Event::Checkpoint {
+                        id: cursor,
+                        history_done: true,
+                    });
+                }
+                Ok(())
+            };
+            let ready = |event| {
+                assert!(matches!(event, WatchEvent::Ready));
+                anyhow::bail!("ready")
+            };
+            maintain(&mut conn, coverage.clone(), policy(), None, start, ready).unwrap_err();
+            assert_eq!(
+                crate::search(&conn, "secret", crate::Mode::Name, 20, None)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(
+                resume::Journal::open(&coverage, &configured_watches(&coverage))
+                    .unwrap()
+                    .load(&conn, &coverage.scope)
+                    .unwrap()
+                    .is_some()
+            );
+            fs::set_permissions(&private, fs::Permissions::from_mode(0o0)).unwrap();
+            maintain(&mut conn, coverage, policy(), None, start, ready).unwrap_err();
+            assert!(
+                crate::search(&conn, "secret", crate::Mode::Name, 20, None)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn unreadable_live_entries_schedule_recovery() {
+            use std::os::unix::fs::PermissionsExt;
+            if unsafe { libc::geteuid() } == 0 {
+                return;
+            }
+            let dir = TestDirectory::new();
+            let root = dir.0.join("root");
+            let private = root.join("private");
+            fs::create_dir_all(&private).unwrap();
+            fs::write(private.join("secret.txt"), "retained entry").unwrap();
+            let db = absolute(&dir.0.join("index.sqlite")).unwrap();
+            let (mut conn, _lease) = open_write(&db, true).unwrap();
+            let coverage = Arc::new(
+                Coverage::new(
+                    db.clone(),
+                    &Scope {
+                        roots: vec![root],
+                        ..Scope::default()
+                    },
+                )
+                .unwrap(),
+            );
+            let sink = RefCell::<Option<Arc<Sink>>>::new(None);
+            let periodic = Duration::from_secs(5);
+            let started = Instant::now();
+            let mut updates = 0;
+            let result = maintain(
+                &mut conn,
+                coverage,
+                MaintenancePolicy {
+                    periodic,
+                    // Leave time for Updated to restore access before recovery.
+                    recovery_cooldown: MIN_UPDATE_INTERVAL * 2,
+                    persistent: false,
+                    guarded_cache: false,
+                },
+                None,
+                |s, _| {
+                    *sink.borrow_mut() = Some(s.clone());
+                    Ok(())
+                },
+                |event| {
+                    match event {
+                        WatchEvent::Ready => {
+                            fs::set_permissions(&private, fs::Permissions::from_mode(0o0))?;
+                            sink.borrow()
+                                .as_ref()
+                                .unwrap()
+                                .change(&private, 0, true, false, false);
+                        }
+                        WatchEvent::Updated => {
+                            updates += 1;
+                            let reader = crate::open_read(&db)?;
+                            let hits =
+                                crate::search(&reader, "secret", crate::Mode::Name, 20, None)?;
+                            if updates == 1 {
+                                assert!(hits.is_empty());
+                                fs::set_permissions(&private, fs::Permissions::from_mode(0o700))?;
+                            } else {
+                                assert_eq!(hits.len(), 1);
+                                assert!(
+                                    started.elapsed() < periodic,
+                                    "unreadable entries did not accelerate recovery"
+                                );
+                                anyhow::bail!("recovered");
+                            }
+                        }
+                        WatchEvent::Cached => unreachable!(),
+                    }
+                    Ok(())
+                },
+            );
+            assert_eq!(result.unwrap_err().root_cause().to_string(), "recovered");
+            assert_eq!(updates, 2);
+        }
 
         #[test]
         fn incremental_targets_and_missed_event_recovery() {

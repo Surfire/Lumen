@@ -1,4 +1,5 @@
 //! Independent local index. The CLI and native launcher share this implementation.
+mod content;
 mod diagnose;
 mod docx;
 mod gemma;
@@ -11,6 +12,7 @@ mod query;
 mod semantic;
 mod watch;
 
+pub use content::{ContentBatch, apply_content_scope, index_content};
 pub use diagnose::{Diagnosis, Reason as DiagnoseReason, diagnose, validate_hit};
 pub use gemma::{GemmaModel, ID as GEMMA_MODEL_ID};
 pub use index::{scan, scan_with_progress};
@@ -51,6 +53,8 @@ pub struct Scope {
     pub allow: Vec<PathBuf>,
     pub deny: Vec<PathBuf>,
     pub documents: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_roots: Option<Vec<PathBuf>>,
     pub pdf_helper: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdf_helper_policy: Option<PdfHelperPolicy>,
@@ -69,6 +73,7 @@ impl Scope {
         self.roots.is_empty()
             && self.allow.is_empty()
             && self.deny.is_empty()
+            && self.content_roots.is_none()
             && !self.documents
             && self.pdf_helper.is_none()
     }
@@ -256,6 +261,7 @@ fn open_write(path: &Path, exclusive_indexer: bool) -> Result<(Connection, Optio
     }
     conn.execute_batch(semantic::SKIP_SCHEMA)?;
     conn.execute_batch(semantic::VERSIONED_SCHEMA)?;
+    conn.execute_batch(content::SCHEMA)?;
     conn.execute_batch("COMMIT;")?;
     Ok((conn, lease))
 }
@@ -337,6 +343,8 @@ pub struct Hit {
     pub snippet: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub document_stamp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pdf_page: Option<u32>,
     pub score: Option<f64>,
 }
 
@@ -349,6 +357,7 @@ fn row_hit(row: &rusqlite::Row<'_>, reason: &str) -> rusqlite::Result<Hit> {
         matched_by: reason.to_string(),
         snippet: None,
         document_stamp: None,
+        pdf_page: None,
         score: None,
     })
 }
@@ -484,13 +493,13 @@ fn search_with_names(
     {
         let (stamp, state_join) = document_stamp_sql(conn)?;
         let sql = if q.chars().count() >= 3 {
-            format!("SELECT i.path,i.display,i.kind,i.availability,d.body,{stamp} AS document_stamp
+            format!("SELECT i.path,i.display,i.kind,i.availability,d.body,{stamp} AS document_stamp,d.id
                      FROM content_fts JOIN item i ON i.id=content_fts.rowid JOIN document d ON d.id=i.id
                      {state_join} WHERE content_fts MATCH ?1 AND ?2 IS NOT NULL
                      AND i.availability<>'unverified' ORDER BY rank,i.path LIMIT ?3")
         } else {
             format!(
-                "SELECT i.path,i.display,i.kind,i.availability,d.body,{stamp} AS document_stamp
+                "SELECT i.path,i.display,i.kind,i.availability,d.body,{stamp} AS document_stamp,d.id
                      FROM document d JOIN item i ON i.id=d.id
                      {state_join} WHERE ?1 IS NOT NULL AND instr(d.normalized,?2)>0
                      AND i.availability<>'unverified' ORDER BY i.path LIMIT ?3"
@@ -500,8 +509,18 @@ fn search_with_names(
         let rows = stmt.query_map(params![fts_phrase(&q), q, limit as i64], |r| {
             let mut h = row_hit(r, "text")?;
             let text: String = r.get(4)?;
-            h.snippet = Some(short_snippet(&text, &q));
             h.document_stamp = read_document_stamp(r)?;
+            // Attach the page only for a stamped PDF and a same-page match.
+            let page = if h.document_stamp.is_some()
+                && index::DocumentKind::for_path(Path::new(&h.path))
+                    == Some(index::DocumentKind::Pdf)
+            {
+                content::matching_page(conn, r.get(6)?, &text, &[&q])?
+            } else {
+                None
+            };
+            h.pdf_page = page.map(|(number, _)| number);
+            h.snippet = Some(short_snippet(page.map_or(&text, |(_, page)| page), &q));
             Ok(h)
         })?;
         for hit in rows {
@@ -585,6 +604,7 @@ pub fn status(conn: &Connection) -> Result<serde_json::Value> {
     )?;
     data["items"] = items.into();
     data["documents"] = documents.into();
+    data["content"] = serde_json::to_value(content::coverage(conn)?)?;
     semantic::add_status(conn, &mut data)?;
     data["unverified"] = unverified.into();
     Ok(data)

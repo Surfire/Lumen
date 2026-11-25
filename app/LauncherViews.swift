@@ -256,7 +256,12 @@ struct SearchWindow: View {
                     .lineLimit(1).truncationMode(.middle)
                     .help(hit.path)
                 if hit.hasPreview, let snippet = hit.snippet {
-                    Text(snippet).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                    HStack(spacing: 6) {
+                        if let page = hit.pdf_page {
+                            Text(model.t("第 \(page) 页", "Page \(page)")).font(.system(size: 11, weight: .medium))
+                        }
+                        Text(snippet).font(.system(size: 11)).lineLimit(1)
+                    }.foregroundStyle(.secondary)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -410,12 +415,13 @@ enum SettingsPage: String, CaseIterable, Identifiable {
 }
 
 enum ScopeFolders {
-    case include, exclude
+    case include, exclude, content
 
     var paths: WritableKeyPath<IndexScope, [String]> {
         switch self {
         case .include: return \.allow
         case .exclude: return \.deny
+        case .content: return \.contentFolders
         }
     }
 
@@ -423,6 +429,7 @@ enum ScopeFolders {
         switch self {
         case .include: return model.t("仅包括", "Include Only")
         case .exclude: return model.t("排除", "Exclude")
+        case .content: return model.t("正文与语义目录", "Text and Semantic Folders")
         }
     }
 }
@@ -623,12 +630,19 @@ struct LauncherSettings: View {
 
     @ViewBuilder private var indexAndPrivacy: some View {
         group(model.t("正文索引", "Document Text")) {
-            Toggle(model.t("索引本机文档正文", "Index Local Document Text"), isOn: Binding(
-                get: { session.scope.documents }, set: { session.setDocuments($0) }
-            ))
-            .accessibilityIdentifier("settings.index.documents")
-            note(model.t("支持 TXT、Markdown、DOCX 和 PDF 的文本层。云端占位项目仅索引名称和路径。",
-                         "Includes TXT, Markdown, DOCX, and PDF text layers. Online-only items are indexed by name and path."))
+            folderRows(.content, empty: model.t("请选择要建立正文和语义索引的目录。", "Choose folders to index for text and semantic search."))
+            note(model.t("所选目录内的 TXT、Markdown、DOCX 和 PDF 文本层可检索。云端文件仍只索引名称。",
+                         "Search TXT, Markdown, DOCX, and PDF text in selected folders. Cloud files remain name-only."))
+            if let coverage = model.contentCoverage, coverage.total > 0 {
+                ProgressView(value: Double(coverage.checked), total: Double(coverage.total)) {
+                    Text(model.t("已处理 \(coverage.checked) / \(coverage.total) 份文档", "\(coverage.checked) of \(coverage.total) documents checked"))
+                }
+                if model.contentPaused || model.contentFailed {
+                    Button(model.t("继续正文索引", "Resume Document Indexing")) { model.setContentPaused(false) }
+                } else if coverage.pending > 0 {
+                    Button(model.t("暂停正文索引", "Pause Document Indexing")) { model.setContentPaused(true) }
+                }
+            }
         }
         group(model.t("索引范围", "Index Scope")) {
             note(model.t("只扫描 macOS 允许访问的位置。排除规则优先，包括已添加的子目录。",
@@ -667,6 +681,7 @@ struct LauncherSettings: View {
                 }
                 .controlSize(.small)
                 .accessibilityLabel(model.t("添加目录到「\(title)」", "Add Folder to \(title)"))
+                .accessibilityIdentifier(group == .content ? "settings.content.add" : "settings.scope.add")
             }
             if paths.isEmpty {
                 note(!session.scope.roots.isEmpty ? constrainedEmpty ?? empty : empty)
@@ -834,6 +849,7 @@ struct LauncherSettings: View {
         case "not_file": return model.t("非常规文件", "Not a regular file")
         case "cloud_ancestor": return model.t("所在云端目录尚未下载", "The containing cloud folder is online-only")
         case "cloud_name_only": return model.t("云端项目，仅索引名称和路径", "Online-only, indexed by name and path")
+        case "outside_content_scope": return model.t("不在所选正文目录内", "Outside the selected document folders")
         case "text_disabled": return model.t("正文索引已关闭", "Document indexing is off")
         case "unsupported": return model.t("文件类型不受支持", "Unsupported file type")
         case "pdf_helper_unconfigured": return model.t("PDF 文本提取不可用", "PDF text extraction is unavailable")

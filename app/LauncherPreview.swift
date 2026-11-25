@@ -1,5 +1,6 @@
 import AppKit
 import Darwin
+import PDFKit
 import Quartz
 
 enum FileAction: Equatable {
@@ -107,14 +108,35 @@ enum LocalFile {
 
 @MainActor
 final class LocalPreviewPanel: NSPanel {
-    private let preview: QLPreviewView
+    private let preview: QLPreviewView?
+    private let pdf: PDFView?
     private let snapshot: PreviewSnapshot
     private var closed = false
 
-    init?(snapshot: PreviewSnapshot, title: String) {
+    init?(snapshot: PreviewSnapshot, title: String, page: Int? = nil) {
         let frame = NSRect(x: 0, y: 0, width: 680, height: 520)
-        guard let preview = QLPreviewView(frame: frame, style: .normal) else { return nil }
-        self.preview = preview
+        let view: NSView
+        var destination: PDFPage?
+        if let page {
+            let display = PDFView(frame: frame)
+            guard page > 0, let document = PDFDocument(url: snapshot.url), !document.isLocked,
+                  page <= document.pageCount, let target = document.page(at: page - 1) else { return nil }
+            display.displayMode = .singlePage
+            display.autoScales = true
+            display.document = document
+            preview = nil
+            pdf = display
+            destination = target
+            view = display
+        } else {
+            guard let display = QLPreviewView(frame: frame, style: .normal) else { return nil }
+            display.shouldCloseWithWindow = false
+            display.autostarts = true
+            display.previewItem = snapshot.url as NSURL
+            preview = display
+            pdf = nil
+            view = display
+        }
         self.snapshot = snapshot
         super.init(contentRect: frame, styleMask: [.titled, .closable, .resizable],
                    backing: .buffered, defer: false)
@@ -122,10 +144,8 @@ final class LocalPreviewPanel: NSPanel {
         isReleasedWhenClosed = false
         hidesOnDeactivate = true
         minSize = NSSize(width: 400, height: 300)
-        contentView = preview
-        preview.shouldCloseWithWindow = false
-        preview.autostarts = true
-        preview.previewItem = snapshot.url as NSURL
+        contentView = view
+        if let destination { pdf?.go(to: destination) }
     }
 
     override var canBecomeKey: Bool { true }
@@ -134,11 +154,17 @@ final class LocalPreviewPanel: NSPanel {
     override func close() {
         guard !closed else { return }
         closed = true
-        preview.previewItem = nil
-        preview.close()
+        preview?.previewItem = nil
+        preview?.close()
+        pdf?.document = nil
         super.close()
         snapshot.remove()
     }
 
-    var previewURL: URL? { (preview.previewItem as? NSURL).map { $0 as URL } }
+    var previewURL: URL? { closed ? nil : snapshot.url }
+    var displayedPDFPage: Int? {
+        guard let view = pdf, let page = view.currentPage, let document = view.document else { return nil }
+        let index = document.index(for: page)
+        return index >= 0 && index < document.pageCount ? index + 1 : nil
+    }
 }

@@ -573,7 +573,6 @@ fn prepare_next_document(conn: &mut Connection, require_stamp: bool) -> Result<b
     let Some((id, body)) = document else {
         return Ok(false);
     };
-    let ranges = chunk_ranges(&body);
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let new = tx
         .prepare_cached(
@@ -584,6 +583,21 @@ fn prepare_next_document(conn: &mut Connection, require_stamp: bool) -> Result<b
         )?
         .execute(params![id, body, require_stamp])?;
     if new != 0 {
+        let pages = crate::content::pages(&tx, id)?;
+        let ranges = if pages.is_empty() {
+            chunk_ranges(&body)
+        } else {
+            let ranges = pages
+                .iter()
+                .filter_map(|p| body.get(p.start..p.end).map(|text| (p.start, text)))
+                .flat_map(|(start, text)| {
+                    chunk_ranges(text)
+                        .into_iter()
+                        .map(move |r| (r.start + start)..(r.end + start))
+                })
+                .collect();
+            sample_ranges(ranges)
+        };
         let mut insert = tx.prepare_cached(
             "INSERT INTO semantic_chunk(document_id,start_byte,end_byte) VALUES(?,?,?)",
         )?;
@@ -780,10 +794,15 @@ fn rank(
     let mut hits = Vec::new();
     {
         let (stamp, state_join) = document_stamp_sql(snapshot)?;
+        let page = if crate::content::has_table(snapshot, "pdf_page")? {
+            "(SELECT page FROM pdf_page p WHERE p.document_id=c.document_id AND p.start_byte<=c.start_byte AND c.end_byte<=p.end_byte LIMIT 1)"
+        } else {
+            "NULL"
+        };
         let sql = format!(
             "SELECT i.path,i.display,i.kind,i.availability,
                CAST(substr(CAST(d.body AS BLOB), c.start_byte+1, c.end_byte-c.start_byte) AS TEXT),
-               {stamp} AS document_stamp
+               {stamp} AS document_stamp,{page}
              FROM semantic_chunk c JOIN document d ON d.id=c.document_id JOIN item i ON i.id=d.id
              {state_join} WHERE c.id=?"
         );
@@ -793,6 +812,9 @@ fn rank(
                 let mut record = row_hit(r, reason)?;
                 record.snippet = r.get(4)?;
                 record.document_stamp = read_document_stamp(r)?;
+                if record.document_stamp.is_some() {
+                    record.pdf_page = r.get(6)?;
+                }
                 record.score = Some(score.into());
                 Ok(record)
             })?);
@@ -813,6 +835,10 @@ fn chunk_ranges(body: &str) -> Vec<Range<usize>> {
         offset += line.len();
     }
     split_paragraph(&body[paragraph_start..], paragraph_start, &mut ranges);
+    sample_ranges(ranges)
+}
+
+fn sample_ranges(ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
     if ranges.len() <= MAX_DOCUMENT_CHUNKS {
         return ranges;
     }

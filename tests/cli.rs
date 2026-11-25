@@ -783,7 +783,7 @@ mod live {
         for helper in installs {
             executable(
                 helper,
-                "#!/bin/sh\ncat >/dev/null\n echo called >> \"$0.calls\"\nprintf 'cedar archive review'\n",
+                "#!/bin/sh\ncat >/dev/null\n echo called >> \"$0.calls\"\nif [ \"$1\" = --pages-v1 ]; then printf '[{\"page\":1,\"text\":\"cedar archive review\"}]'; else printf 'cedar archive review\\n'; fi\n",
             );
         }
         let calls = |helper: &Path| {
@@ -889,7 +889,7 @@ mod live {
         assert_eq!(calls(&first_helper), 1);
         assert_eq!(calls(&second_helper), 1);
         let managed_stamp = stamp();
-        assert!(managed_stamp.ends_with(":lumen-pdf:pdfkit-text-v1"));
+        assert!(managed_stamp.ends_with(":lumen-pdf:pdfkit-text-v2"));
         assert_eq!(saved()["pdf_helper_policy"], "bundled");
         assert!(saved()["pdf_helper"].is_null());
         assert_eq!(counts(), (1, 1));
@@ -929,13 +929,13 @@ mod live {
 
         // Simulate a persisted incompatible format and a new helper output.
         raw.execute(
-            "UPDATE document_state SET stamp=replace(stamp,'pdfkit-text-v1','pdfkit-text-v0')",
+            "UPDATE document_state SET stamp=replace(stamp,'pdfkit-text-v2','pdfkit-text-v1')",
             [],
         )
         .unwrap();
         executable(
             &second_helper,
-            "#!/bin/sh\ncat >/dev/null\necho called >> \"$0.calls\"\nprintf 'spruce revised passage'\n",
+            "#!/bin/sh\ncat >/dev/null\necho called >> \"$0.calls\"\nprintf '[{\"page\":1,\"text\":\"spruce revised passage\"}]'\n",
         );
         refresh(&second_engine);
         assert_eq!(calls(&second_helper), 2);
@@ -2510,5 +2510,207 @@ done
         assert_eq!(stale["name"], "indexed");
         assert_eq!(stale["text"], "stale");
         assert_eq!(stale["semantic"], "stale");
+    }
+    #[test]
+    fn separate_content_resumes_batches_and_narrows_without_retiring_names() {
+        let f = Fixture::new();
+        let scope = f.0.join("scope");
+        let selected = scope.join("Selected");
+        let ignored = selected.join("Denied");
+        let cloud = selected.join("Library/CloudStorage/OneDrive-Test");
+        let second = scope.join("Second");
+        for directory in [&ignored, &cloud, &second] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        for (path, text) in [
+            (selected.join("a.md"), "firstneedle scoped content"),
+            (selected.join("b.md"), "secondneedle scoped content"),
+            (ignored.join("hidden.md"), "hiddenneedle scoped content"),
+            (cloud.join("stub.md"), "cloudneedle never indexed"),
+            (second.join("c.md"), "thirdneedle second scope"),
+        ] {
+            fs::write(path, text).unwrap();
+        }
+        let root = scope.to_str().unwrap();
+        let denied = ignored.to_str().unwrap();
+        let selected = selected.to_str().unwrap();
+        let second = second.to_str().unwrap();
+        f.run(&[
+            "index",
+            "--root",
+            root,
+            "--deny",
+            denied,
+            "--separate-content",
+        ]);
+        let configured = f.run(&["content-scope", "--content-root", selected]);
+        assert_eq!(configured["content"]["pending"], 2);
+        assert_eq!(
+            configured["scope"]["roots"],
+            serde_json::json!([fs::canonicalize(root).unwrap()])
+        );
+        let mut search = Serve::new(&f);
+        assert_eq!(search.names("c.md", "name"), ["c.md"]);
+        assert!(search.names("firstneedle", "text").is_empty());
+        assert_eq!(f.run(&["content", "--max", "1"])["pending"], 1);
+        let partial = f.run(&["status"]);
+        assert_eq!(partial["content"]["checked"], 1);
+        assert_eq!(partial["documents"], 1);
+        assert_eq!(search.names("c.md", "name"), ["c.md"]);
+        assert_eq!(f.run(&["content", "--max", "1"])["pending"], 0);
+        assert_eq!(search.names("firstneedle", "text"), ["a.md"]);
+        assert!(search.names("hiddenneedle", "text").is_empty());
+        assert!(search.names("cloudneedle", "text").is_empty());
+        assert_eq!(search.names("stub.md", "name"), ["stub.md"]);
+        assert!(search.names("thirdneedle", "text").is_empty());
+
+        let helper = f.0.join("vector-helper");
+        executable(
+            &helper,
+            "#!/bin/sh\ncat >/dev/null\nprintf '[1,0,0,0,0,0,0,0]'\n",
+        );
+        assert_eq!(
+            f.run(&["embed", "--helper", helper.to_str().unwrap()])["new_embeddings"],
+            2
+        );
+        let changed = f.run(&["content-scope", "--content-root", second]);
+        assert_eq!(changed["embedded_chunks"], 0);
+        assert_eq!(changed["content"]["pending"], 1);
+        assert_eq!(changed["items"], configured["items"]);
+        assert!(search.names("firstneedle", "text").is_empty());
+        assert_eq!(search.names("a.md", "name"), ["a.md"]);
+        f.run(&["content"]);
+        assert_eq!(search.names("thirdneedle", "text"), ["c.md"]);
+        let watcher = watch(&f, &[]);
+        fs::write(
+            Path::new(second).join("c.md"),
+            "updatedneedle from a new version",
+        )
+        .unwrap();
+        assert_eq!(watcher.json()["event"], "updated");
+        assert!(search.names("thirdneedle", "text").is_empty());
+        assert!(search.names("updatedneedle", "text").is_empty());
+        assert_eq!(search.names("c.md", "name"), ["c.md"]);
+        assert_eq!(f.run(&["content"])["indexed"], 1);
+        assert_eq!(search.names("updatedneedle", "text"), ["c.md"]);
+    }
+
+    #[test]
+    fn content_worker_releases_sqlite_writes_while_extractor_runs() {
+        let f = Fixture::new();
+        let scope = f.0.join("scope");
+        fs::create_dir(&scope).unwrap();
+        fs::write(scope.join("pending.pdf"), "%PDF-synthetic fixture").unwrap();
+        let helper = f.0.join("slow-helper");
+        executable(
+            &helper,
+            "#!/bin/sh\ncat >/dev/null\ntouch \"$0.started\"\nfor iteration in $(seq 1 150); do [ -e \"$0.release\" ] && break; sleep 0.02; done\n[ -e \"$0.release\" ] || exit 1\nprintf 'backgroundtoken extracted'\n",
+        );
+        let root = scope.to_str().unwrap();
+        f.run(&[
+            "index",
+            "--root",
+            root,
+            "--documents",
+            "--content-root",
+            root,
+            "--pdf-helper",
+            helper.to_str().unwrap(),
+        ]);
+        let watcher = watch(&f, &[]);
+        let worker = Process::launch(f.cli().arg("content"));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !helper.with_extension("started").exists() {
+            assert!(Instant::now() < deadline, "extractor did not start");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut serve = Serve::new(&f);
+        fs::write(scope.join("live.txt"), "newly listed name").unwrap();
+        assert_eq!(watcher.json()["event"], "updated");
+        assert_eq!(serve.names("live.txt", "name"), ["live.txt"]);
+        assert_eq!(serve.names("pending.pdf", "name"), ["pending.pdf"]);
+        assert!(serve.names("backgroundtoken", "text").is_empty());
+        fs::write(helper.with_extension("release"), "").unwrap();
+        assert_eq!(worker.json()["indexed"], 1);
+        assert_eq!(serve.names("backgroundtoken", "text"), ["pending.pdf"]);
+    }
+
+    #[test]
+    fn page_metadata_follows_a_same_page_lexical_match_or_semantic_chunk() {
+        let f = Fixture::new();
+        let scope = f.0.join("scope");
+        let bundle = f.0.join("Local.app/Contents/Resources");
+        fs::create_dir(&scope).unwrap();
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(scope.join("report.pdf"), "%PDF-synthetic protocol fixture").unwrap();
+        let engine = bundle.join("lumen");
+        fs::copy(env!("CARGO_BIN_EXE_lumen"), &engine).unwrap();
+        executable(
+            &bundle.join("LumenPdfExtractor"),
+            r#"#!/bin/sh
+[ "$1" = '--pages-v1' ] || exit 2
+cat >/dev/null
+printf '%s' '[{"page":1,"text":"northern inventory"},{"page":3,"text":"zircon calibrator"}]'
+"#,
+        );
+        let call = |args: &[&str]| {
+            let out = Command::new(&engine)
+                .arg("--db")
+                .arg(f.0.join("test.sqlite"))
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            serde_json::from_slice::<Value>(&out.stdout).unwrap()
+        };
+        let root = scope.to_str().unwrap();
+        call(&[
+            "index",
+            "--root",
+            root,
+            "--content-root",
+            root,
+            "--bundled-pdf-helper",
+        ]);
+        assert_eq!(call(&["content"])["indexed"], 1);
+        assert_eq!(
+            call(&["query", "zircon", "--mode", "text"])[0]["pdf_page"],
+            3
+        );
+        assert_eq!(
+            call(&["query", "zircon calibrator", "--mode", "text"])[0]["pdf_page"],
+            3
+        );
+        assert!(
+            call(&["query", "northern zircon", "--mode", "text"])[0]
+                .get("pdf_page")
+                .is_none()
+        );
+        assert!(
+            call(&["query", "report", "--mode", "name"])[0]
+                .get("pdf_page")
+                .is_none()
+        );
+        let helper = f.0.join("embed-helper");
+        executable(
+            &helper,
+            "#!/bin/sh\ncase $(cat) in *zircon*) printf '[0,1,0,0,0,0,0,0]' ;; *) printf '[1,0,0,0,0,0,0,0]' ;; esac\n",
+        );
+        let helper = helper.to_str().unwrap();
+        assert_eq!(call(&["embed", "--helper", helper])["new_embeddings"], 2);
+        let related = call(&[
+            "query",
+            "zircon excerpt",
+            "--mode",
+            "semantic",
+            "--helper",
+            helper,
+        ]);
+        assert_eq!(related[0]["pdf_page"], 3);
+        assert_eq!(related[0]["snippet"], "zircon calibrator");
     }
 }

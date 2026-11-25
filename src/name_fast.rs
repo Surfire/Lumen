@@ -340,6 +340,7 @@ impl Entry {
             matched_by: matched_by.to_owned(),
             snippet: None,
             document_stamp: None,
+            pdf_page: None,
             score: None,
         }
     }

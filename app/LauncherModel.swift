@@ -101,6 +101,10 @@ final class Launcher: ObservableObject {
     @Published private(set) var scanProgress: IndexProgress?
     @Published private(set) var watchProgress: IndexProgress?
     @Published private(set) var scopePending: Bool
+    @Published private(set) var contentCoverage: ContentCoverage?
+    @Published private(set) var contentPaused = false
+    @Published private(set) var contentRunning = false
+    @Published private(set) var contentFailed = false
     @Published private(set) var embeddingState = EmbeddingState.idle
     @Published private(set) var embeddingBatch: EmbeddingBatch?
     @Published private(set) var embeddingNotice: LauncherNotice?
@@ -118,9 +122,11 @@ final class Launcher: ObservableObject {
             defaults?.set(scope.allow, forKey: "allowPaths")
             defaults?.set(scope.deny, forKey: "denyPaths")
             defaults?.set(scope.documents, forKey: "documents")
+            defaults?.set(scope.content_roots, forKey: "contentRootPaths")
         }
     }
 
+    private var contentWriter: Process?
     private let engine: LauncherEngine
     private let defaults: UserDefaults?
     private var watchSupported: Bool?
@@ -169,7 +175,7 @@ final class Launcher: ObservableObject {
     }
 
     var settingsScope: IndexScope { (!scopePending ? savedScope : nil) ?? scope }
-    var canApplyScope: Bool { !closed && indexWork == nil && indexPhase != .checking }
+    var canApplyScope: Bool { !closed && !contentRunning && indexWork == nil && indexPhase != .checking }
     var needsScopeSetup: Bool {
         scopePending || indexPhase == .needsIndex || indexPhase == .unreadable || watchState == .needsSetup
     }
@@ -210,10 +216,10 @@ final class Launcher: ObservableObject {
     var canSearch: Bool { indexPhase == .ready && (firstNamesReady || (!scopePending && scopeTrustedForLookup)) }
     var isIndexing: Bool { indexWork == .names || indexWork == .documents }
     var activeProgress: IndexProgress? { isIndexing ? scanProgress : watchProgress }
-    var activityBusy: Bool { indexWork != nil || watchState == .starting || watchProgress != nil }
+    var activityBusy: Bool { contentRunning || indexWork != nil || watchState == .starting || watchProgress != nil }
     var relatedExcerptsLabel: String { t("相关原文", "Related Excerpts") }
     var canBuildEmbeddings: Bool {
-        canSearch && !scopePending && indexWork == nil && localModelState != .checking && embeddingState != .verifying &&
+        canSearch && !scopePending && !contentRunning && indexWork == nil && localModelState != .checking && embeddingState != .verifying &&
             gemmaCoverage?.documents_enabled == true && gemmaCoverage?.pending == true && gemmaCoverage?.limited == false
     }
 
@@ -224,10 +230,12 @@ final class Launcher: ObservableObject {
         builtInActions = LaunchCatalog.systemActions()
         scopePending = engine.hasPendingScope
         language = locale ?? defaults?.string(forKey: "language") ?? "system"
+        let content = defaults?.stringArray(forKey: "contentRootPaths") ?? []
+        contentPaused = defaults?.bool(forKey: "contentIndexingPaused") ?? false
         scope = IndexScope(roots: IndexScope.storedPaths("roots", in: defaults),
                            allow: IndexScope.storedPaths("allow", in: defaults),
                            deny: IndexScope.storedPaths("deny", in: defaults),
-                           documents: defaults?.bool(forKey: "documents") ?? false)
+                           documents: !content.isEmpty, content_roots: content)
         shortcutChanges = shortcuts.objectWillChange.sink { [weak self] in
             DispatchQueue.main.async { [weak self] in
                 self?.objectWillChange.send()
@@ -272,7 +280,7 @@ final class Launcher: ObservableObject {
         clearFileDiagnosis()
         if modelInspection?.isRunning == true { modelInspection?.terminate() }
         engine.close()
-        for process in [watcher, writer, textProcess, actionProcess].compactMap({ $0 }) where process.isRunning {
+        for process in [watcher, writer, contentWriter, textProcess, actionProcess].compactMap({ $0 }) where process.isRunning {
             process.terminate()
         }
     }
@@ -829,6 +837,11 @@ final class Launcher: ObservableObject {
 
     func applyScope(_ requested: IndexScope) {
         guard canApplyScope else { return }
+        var requested = requested
+        if requested.content_roots == nil, let savedScope, !requested.sharesNameScope(with: savedScope) {
+            // Editing the old name scope cannot authorize body indexing in newly visible folders.
+            requested.contentFolders = savedScope.previouslyAuthorizedDocumentFolders
+        }
         scope = requested
         buildIndex()
     }
@@ -842,6 +855,10 @@ final class Launcher: ObservableObject {
         pauseEmbeddings()
         guard canApplyScope else { return }
         let requested = scope
+        let contentOnly = indexPhase == .ready && requested.content_roots != nil
+            && savedScope.map { requested.sharesNameScope(with: $0) && requested.content_roots != $0.content_roots } == true
+        if !requested.contentFolders.isEmpty { defaults?.set(true, forKey: "gemmaIndexingEnabled") }
+        contentFailed = false
         scopeTrustedForLookup = false
         firstNamesReady = false
         scopePending = true
@@ -868,19 +885,20 @@ final class Launcher: ObservableObject {
         embeddingNotice = nil
         let shouldStageDocuments = indexPhase != .ready && requested.documents
         var first = requested
-        if shouldStageDocuments { first.documents = false }
+        if shouldStageDocuments { first.documents = false; if first.content_roots != nil { first.content_roots = [] } }
         indexWork = first.documents ? .documents : .names
         withWatcherStopped { [weak self] in
-            self?.scan(first, then: shouldStageDocuments ? requested : nil)
+            self?.scan(first, then: shouldStageDocuments ? requested : nil, contentOnly: contentOnly)
         }
     }
 
-    private func scan(_ scope: IndexScope, then next: IndexScope?) {
+    private func scan(_ scope: IndexScope, then next: IndexScope?, contentOnly: Bool = false) {
         scanGeneration &+= 1
         let generation = scanGeneration
         scanProgress = nil
-        let progressOption = indexReportsProgress ? ["--progress"] : []
-        writer = engine.run(engine.indexArguments(scope: scope) + progressOption, onProgress: { [weak self] progress in
+        let progressOption = !contentOnly && indexReportsProgress ? ["--progress"] : []
+        let arguments = contentOnly ? scope.contentArguments : engine.indexArguments(scope: scope)
+        writer = engine.run(arguments + progressOption, onProgress: { [weak self] progress in
             guard let self, !self.closed, self.scanGeneration == generation else { return }
             if self.scanProgress != progress { self.scanProgress = progress }
         }) { [weak self] response in
@@ -889,7 +907,7 @@ final class Launcher: ObservableObject {
             self.writer = nil
             let didReport = self.scanProgress != nil
             self.scanProgress = nil
-            if !response.succeeded, !didReport, self.indexReportsProgress,
+            if !contentOnly, !response.succeeded, !didReport, self.indexReportsProgress,
                response.diagnostic.contains("unexpected argument '--progress'") {
                 self.indexReportsProgress = false
                 self.scan(scope, then: next)
@@ -907,7 +925,7 @@ final class Launcher: ObservableObject {
                 self.firstNamesReady = true
                 self.publish(report)
                 self.indexWork = .documents
-                self.scan(next, then: nil)
+                self.scan(next, then: nil, contentOnly: next.content_roots != nil)
                 return
             }
             do {
@@ -923,6 +941,37 @@ final class Launcher: ObservableObject {
             self.publish(report)
             self.startWatcherIfReady()
             self.refreshCoverage()
+        }
+    }
+
+    func setContentPaused(_ paused: Bool) {
+        defaults?.set(paused, forKey: "contentIndexingPaused")
+        contentPaused = paused
+        if !paused {
+            contentFailed = false
+            startContentIfReady()
+        }
+    }
+
+    private func startContentIfReady() {
+        guard canSearch, !scopePending, !closed, indexWork == nil, contentWriter == nil,
+              !contentPaused, !contentFailed, contentCoverage?.pending ?? 0 > 0 else { return }
+        contentRunning = true
+        contentWriter = engine.run(["content", "--max", "8"], priority: .background) { [weak self] response in
+            guard let self, !self.closed else { return }
+            self.contentWriter = nil
+            self.contentRunning = false
+            guard response.succeeded, let batch = try? JSONDecoder().decode(ContentBatch.self, from: response.output) else {
+                self.contentFailed = true
+                return
+            }
+            if batch.indexed > 0 {
+                self.automaticBuildAttempted = false
+                if self.embeddingState == .finished { self.embeddingState = .idle }
+                self.scheduleSearch(keepAction: true)
+            }
+            if batch.processed == 0 && batch.pending > 0 { self.contentFailed = true }
+            self.refreshCoverage(after: .milliseconds(100))
         }
     }
 
@@ -1005,6 +1054,8 @@ final class Launcher: ObservableObject {
         guard !scopePending else { return }
         if savedScope != report.scope { savedScope = report.scope }
         if indexReport != report { indexReport = report }
+        if contentCoverage != report.content { contentCoverage = report.content }
+        startContentIfReady()
         let previous = gemmaCoverage
         if previous != report.gemma {
             gemmaCoverage = report.gemma
@@ -1019,6 +1070,7 @@ final class Launcher: ObservableObject {
         // Existing BGE vectors are evidence an older user explicitly started semantic indexing.
         // The saved scope in the database decides whether documents are eligible.
         if !automaticBuildAttempted, embeddingState == .idle, canBuildEmbeddings,
+           contentCoverage?.pending ?? 0 == 0 || contentPaused || contentFailed,
            defaults?.bool(forKey: "gemmaIndexingPaused") != true,
            (report.embedded_chunks ?? 0) > 0 || defaults?.bool(forKey: "gemmaIndexingEnabled") == true {
             automaticBuildAttempted = true

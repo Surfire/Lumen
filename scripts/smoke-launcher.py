@@ -386,11 +386,51 @@ def make_action_probe(root):
 
 
 
+def make_page_pdf(path):
+    pages = [b"First page: coastal inventory record", b"Second page: zircon calibration certificate"]
+    objects = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [4 0 R 6 0 R] /Count 2 >>",
+               b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    for i, line in enumerate(pages):
+        content = b"BT /F1 16 Tf 50 730 Td (" + line + b") Tj ET\n"
+        objects.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents {5 + 2*i} 0 R >>".encode())
+        objects.append(f"<< /Length {len(content)} >>\nstream\n".encode() + content + b"endstream")
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for i, obj in enumerate(objects, start=1):
+        offsets.append(len(pdf))
+        pdf += f"{i} 0 obj\n".encode() + obj + b"\nendobj\n"
+    xref = len(pdf)
+    pdf += f"xref\n0 {len(offsets)}\n0000000000 65535 f \n".encode()
+    for offset in offsets[1:]:
+        pdf += f"{offset:010d} 00000 n \n".encode()
+    pdf += f"trailer\n<< /Size {len(offsets)} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    path.write_bytes(pdf)
+
+
+def verify_content_pipeline():
+    with tempfile.TemporaryDirectory(prefix="lumen-content-gui-") as tmp:
+        root = Path(tmp).resolve()
+        corpus = root / "corpus"
+        chosen = corpus / "Chosen"
+        denied = chosen / "Denied"
+        denied.mkdir(parents=True)
+        (root / "content-scenario").touch()
+        make_page_pdf(chosen / "report.pdf")
+        (chosen / "notes.md").write_text("Synthetic included note.", encoding="utf-8")
+        (denied / "secret.md").write_text("Synthetic excluded note.", encoding="utf-8")
+        (corpus / "outside-report.md").write_text("outsideexclusivebody", encoding="utf-8")
+        subprocess.run([str(BUNDLE / "Resources/lumen"), "--db", str(root / "index.sqlite"),
+                        "index", "--root", str(corpus), "--deny", str(denied), "--separate-content"],
+                       check=True, timeout=15, stdout=subprocess.DEVNULL)
+        run(root, "en")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--watch-engine", type=Path, help="Also test an integrated lumen binary with persisted watch scopes")
     parser.add_argument("--real-gemma", type=Path,
                         help="Also verify the signed GUI with pinned offline Gemma resources in this directory")
+    parser.add_argument("--content-only", action="store_true", help="Only verify selected content folders and native PDF page opening")
     parser.add_argument("--query-syntax", action="store_true", help="Also verify multiword and bare-extension queries in the unified field")
     parser.add_argument("--snapshots", type=Path, help="Save offscreen PNGs to this directory")
     args = parser.parse_args()
@@ -400,6 +440,9 @@ def main():
         parser.error("--real-gemma must point to a pinned Gemma resource directory")
     if not APP.is_file():
         raise SystemExit("Build the app first with scripts/build-app.sh")
+    verify_content_pipeline()
+    if args.content_only:
+        return
     with tempfile.TemporaryDirectory(prefix="lumen-gui-actions-") as tmp:
         root = Path(tmp).resolve()
         make_corpus(root)

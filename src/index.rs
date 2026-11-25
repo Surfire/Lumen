@@ -17,7 +17,7 @@ use std::{
 const APP_PDF_HELPER: &str = "LumenPdfExtractor";
 // Bump this only when PDF extraction changes the indexed text format. Binary
 // rebuilds, code signatures and app installs are compatible with this ID.
-const APP_PDF_FORMAT: &str = "lumen-pdf:pdfkit-text-v1";
+const APP_PDF_FORMAT: &str = "lumen-pdf:pdfkit-text-v2";
 
 fn is_app_pdf_helper(path: &Path) -> bool {
     let Some(resources) = path.parent() else {
@@ -41,7 +41,7 @@ fn is_app_pdf_helper(path: &Path) -> bool {
 }
 
 #[derive(PartialEq, Eq)]
-struct PdfExtractor {
+pub(super) struct PdfExtractor {
     executable: PathBuf,
     format: String,
     bundled_binary: Option<String>,
@@ -114,7 +114,7 @@ pub(super) struct Coverage {
     pub scope: Scope,
     database: PathBuf,
     sidecars: [PathBuf; 4],
-    pdf: Option<PdfExtractor>,
+    pub(super) pdf: Option<PdfExtractor>,
 }
 
 impl Coverage {
@@ -124,6 +124,24 @@ impl Coverage {
                 .map(|p| absolute(p).map(|p| platform::filesystem_spelling(&p)))
                 .collect()
         };
+        let roots = paths(&scope.roots())?;
+        let allow = paths(&scope.allow)?;
+        let contains_volume = roots.iter().any(|p| p == Path::new("/"))
+            && (allow.is_empty() || allow.iter().any(|p| p == Path::new("/")));
+        let mut content_roots = scope.content_roots.as_deref().map(paths).transpose()?;
+        if let Some(roots) = &mut content_roots {
+            ensure!(
+                !roots.iter().any(|root| root == Path::new("/")),
+                "choose a document folder below the volume root"
+            );
+            roots.sort();
+            roots.dedup();
+        } else {
+            ensure!(
+                !scope.documents || !contains_volume,
+                "document indexing requires an explicit folder; pass --content-root"
+            );
+        }
         let managed = scope.pdf_helper_policy == Some(PdfHelperPolicy::Bundled);
         ensure!(
             !managed || scope.documents,
@@ -134,10 +152,11 @@ impl Coverage {
             "bundled and manual PDF helpers are mutually exclusive"
         );
         let scope = Scope {
-            roots: paths(&scope.roots())?,
-            allow: paths(&scope.allow)?,
+            roots,
+            allow,
             deny: paths(&scope.deny)?,
             documents: scope.documents,
+            content_roots,
             pdf_helper: scope.pdf_helper.as_deref().map(absolute).transpose()?,
             pdf_helper_policy: scope
                 .pdf_helper_policy
@@ -170,8 +189,18 @@ impl Coverage {
         Ok(refreshed)
     }
 
-    fn contains(&self, path: &Path) -> bool {
+    pub(super) fn contains(&self, path: &Path) -> bool {
         self.scope.roots.iter().any(|root| path.starts_with(root)) && self.allows(path)
+    }
+
+    pub(super) fn permits_content(&self, path: &Path) -> bool {
+        self.scope.documents
+            && self.contains(path)
+            && self.scope.content_roots.as_ref().is_none_or(|roots| {
+                roots
+                    .iter()
+                    .any(|root| path != root && path.starts_with(root))
+            })
     }
 
     pub fn allows(&self, path: &Path) -> bool {
@@ -209,6 +238,16 @@ pub(super) fn startup_scope(conn: &Connection, requested: &Scope) -> Result<Scop
         if let Some(stored) = stored {
             let mut saved: Scope =
                 serde_json::from_str(&stored).context("read saved watch scope")?;
+            if saved.content_roots.is_none()
+                && saved.documents
+                && (saved.allow.is_empty() || saved.allow.iter().any(|p| p == Path::new("/")))
+                && saved.roots.iter().any(|p| p == Path::new("/"))
+            {
+                saved.documents = false;
+                saved.content_roots = Some(Vec::new());
+                saved.pdf_helper = None;
+                saved.pdf_helper_policy = None;
+            }
             if requested.pdf_helper_policy == Some(PdfHelperPolicy::Bundled)
                 && saved.documents
                 && saved.pdf_helper_policy != Some(PdfHelperPolicy::Manual)
@@ -253,7 +292,15 @@ pub(super) fn restrict_scope(conn: &mut Connection, coverage: &Coverage) -> Resu
     if prior.as_deref() == Some(&requested) {
         return Ok(());
     }
-    {
+    let same_names = prior
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Scope>(raw).ok())
+        .is_some_and(|scope| {
+            scope.roots == coverage.scope.roots
+                && scope.allow == coverage.scope.allow
+                && scope.deny == coverage.scope.deny
+        });
+    if !same_names {
         let mut items = tx.prepare("SELECT id,path FROM item")?;
         let mut rows = items.query([])?;
         let mut exclude = tx.prepare("INSERT INTO stale VALUES(?)")?;
@@ -266,9 +313,13 @@ pub(super) fn restrict_scope(conn: &mut Connection, coverage: &Coverage) -> Resu
     }
     purge(&tx)?;
     if !coverage.scope.documents {
-        tx.execute_batch("DELETE FROM content_fts; DELETE FROM document; DELETE FROM document_state; DELETE FROM embedding;")?;
+        tx.execute_batch("DELETE FROM content_fts; DELETE FROM document; DELETE FROM document_state; DELETE FROM embedding; DELETE FROM content_job;")?;
+    } else if coverage.scope.content_roots.is_some() {
+        crate::content::restrict_and_seed(&tx, coverage)?;
     }
-    tx.execute("DELETE FROM info WHERE key='walk_sample'", [])?;
+    if !same_names {
+        tx.execute("DELETE FROM info WHERE key='walk_sample'", [])?;
+    }
     write_info(&tx, "scope", &coverage.scope)?;
     tx.commit()?;
     Ok(())
@@ -771,9 +822,21 @@ impl<'a> Walk<'a> {
             return Ok(());
         };
         let available = kind != DocumentKind::Pdf || self.coverage.pdf.is_some();
-        if !self.coverage.scope.documents || directory || !available {
+        if !self.coverage.permits_content(path) || directory || !available {
             // A prior scope may have allowed extraction of this path.
             return self.clear_document(id);
+        }
+        if self.coverage.scope.content_roots.is_some() {
+            self.changed |= crate::content::observe(
+                self.tx,
+                self.coverage,
+                id,
+                path,
+                availability,
+                metadata,
+                kind,
+            )?;
+            return Ok(());
         }
         self.read_document(id, path, availability, metadata, kind)
     }
@@ -786,18 +849,7 @@ impl<'a> Walk<'a> {
         metadata: Option<&fs::Metadata>,
         kind: DocumentKind,
     ) -> Result<()> {
-        let version = |meta: &fs::Metadata| {
-            let extractor = match kind {
-                DocumentKind::Text => "",
-                DocumentKind::Docx => "docx-v1",
-                DocumentKind::Pdf => self
-                    .coverage
-                    .pdf
-                    .as_ref()
-                    .map_or("", |pdf| pdf.format.as_str()),
-            };
-            format!("{}:{extractor}", stamp(meta))
-        };
+        let version = |meta: &fs::Metadata| document_version(self.coverage, kind, meta);
         if availability == "local" {
             let fetched;
             let metadata = match metadata {
@@ -820,17 +872,13 @@ impl<'a> Walk<'a> {
                     self.stats.documents += 1;
                     return Ok(());
                 }
-                let pdf = if kind == DocumentKind::Pdf {
-                    self.coverage.pdf.as_ref()
-                } else {
-                    None
-                };
-                let extractor = pdf.map(PdfExtractor::executable).transpose()?;
-                let body = kind.extract(path, extractor);
-                if let Some(pdf) = pdf {
+                let extracted = extract_document(self.coverage, path, kind);
+                if kind == DocumentKind::Pdf
+                    && let Some(pdf) = &self.coverage.pdf
+                {
                     pdf.executable()?;
                 }
-                let body = match body {
+                let body = match extracted {
                     Err(error)
                         if error.downcast_ref::<std::io::Error>().is_some_and(|io| {
                             io.kind() == std::io::ErrorKind::PermissionDenied
@@ -843,7 +891,7 @@ impl<'a> Walk<'a> {
                     other => other,
                 };
                 if let Ok(body) = body
-                    && !body.is_empty()
+                    && !body.body.is_empty()
                     && fs::symlink_metadata(path).is_ok_and(|m| {
                         m.is_file()
                             && platform::availability(path, &m) == "local"
@@ -867,21 +915,12 @@ impl<'a> Walk<'a> {
                             .prepare_cached(
                                 "SELECT EXISTS(SELECT 1 FROM document WHERE id=? AND body=?)",
                             )?
-                            .query_row(params![id, body], |r| r.get::<_, bool>(0))?;
+                            .query_row(params![id, body.body], |r| r.get::<_, bool>(0))?;
                     if !unchanged_legacy {
-                        self.clear_document(id)?;
-                        let normalized = norm(&body);
-                        self.tx
-                            .prepare_cached("INSERT INTO document VALUES(?,?,?)")?
-                            .execute(params![id, body, normalized])?;
-                        self.tx
-                            .prepare_cached("INSERT INTO content_fts(rowid,body) VALUES(?,?)")?
-                            .execute(params![id, normalized])?;
-                        self.changed = true;
+                        self.changed |= save_document(self.tx, id, &current, &body)?;
+                    } else {
+                        store_document_state(self.tx, id, &current, &body.pages)?;
                     }
-                    self.tx
-                        .prepare_cached("INSERT INTO document_state VALUES(?,?) ON CONFLICT(id) DO UPDATE SET stamp=excluded.stamp")?
-                        .execute(params![id, current])?;
                     self.stats.documents += 1;
                     return Ok(());
                 }
@@ -893,25 +932,86 @@ impl<'a> Walk<'a> {
     }
 
     fn clear_document(&mut self, id: i64) -> Result<()> {
-        if self
-            .tx
-            .prepare_cached("DELETE FROM document WHERE id=?")?
-            .execute([id])?
-            != 0
-        {
-            self.changed = true;
-            self.tx
-                .prepare_cached("DELETE FROM content_fts WHERE rowid=?")?
-                .execute([id])?;
-            self.tx
-                .prepare_cached("DELETE FROM document_state WHERE id=?")?
-                .execute([id])?;
-            self.tx
-                .prepare_cached("DELETE FROM embedding WHERE id=?")?
-                .execute([id])?;
-        }
+        self.changed |= remove_document(self.tx, id)?;
         Ok(())
     }
+}
+
+pub(super) fn document_version(
+    coverage: &Coverage,
+    kind: DocumentKind,
+    meta: &fs::Metadata,
+) -> String {
+    let extractor = match kind {
+        DocumentKind::Text => "",
+        DocumentKind::Docx => "docx-v1",
+        DocumentKind::Pdf => coverage.pdf.as_ref().map_or("", |pdf| pdf.format.as_str()),
+    };
+    format!("{}:{extractor}", stamp(meta))
+}
+
+pub(super) fn extract_document(
+    coverage: &Coverage,
+    path: &Path,
+    kind: DocumentKind,
+) -> Result<crate::content::Extracted> {
+    let pdf = (kind == DocumentKind::Pdf)
+        .then_some(coverage.pdf.as_ref())
+        .flatten();
+    let result = kind.extract(path, pdf);
+    if let Some(pdf) = pdf {
+        pdf.executable()?;
+    }
+    result
+}
+
+pub(super) fn remove_document(conn: &Connection, id: i64) -> Result<bool> {
+    let changed = conn
+        .prepare_cached("DELETE FROM document WHERE id=?")?
+        .execute([id])?
+        != 0;
+    if changed {
+        conn.prepare_cached("DELETE FROM content_fts WHERE rowid=?")?
+            .execute([id])?;
+        conn.prepare_cached("DELETE FROM document_state WHERE id=?")?
+            .execute([id])?;
+        conn.prepare_cached("DELETE FROM embedding WHERE id=?")?
+            .execute([id])?;
+    }
+    Ok(changed)
+}
+
+pub(super) fn save_document(
+    conn: &Connection,
+    id: i64,
+    version: &str,
+    extracted: &crate::content::Extracted,
+) -> Result<bool> {
+    remove_document(conn, id)?;
+    let normalized = norm(&extracted.body);
+    conn.prepare_cached("INSERT INTO document VALUES(?,?,?)")?
+        .execute(params![id, extracted.body, normalized])?;
+    conn.prepare_cached("INSERT INTO content_fts(rowid,body) VALUES(?,?)")?
+        .execute(params![id, normalized])?;
+    store_document_state(conn, id, version, &extracted.pages)?;
+    Ok(true)
+}
+
+fn store_document_state(
+    conn: &Connection,
+    id: i64,
+    version: &str,
+    pages: &[crate::content::PageSpan],
+) -> Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO document_state VALUES(?,?) ON CONFLICT(id) DO UPDATE SET stamp=excluded.stamp",
+    )?
+    .execute(params![id, version])?;
+    for page in pages {
+        conn.prepare_cached("INSERT OR REPLACE INTO pdf_page VALUES(?,?,?,?)")?
+            .execute(params![id, page.number, page.start as i64, page.end as i64])?;
+    }
+    Ok(())
 }
 
 fn confirmed_absent(error: &std::io::Error) -> bool {
@@ -951,21 +1051,27 @@ impl DocumentKind {
         }
     }
 
-    fn extract(self, path: &Path, pdf_helper: Option<&Path>) -> Result<String> {
-        match self {
-            Self::Text => Ok(String::from_utf8(platform::read_local(
-                path,
-                MAX_DOCUMENT,
-            )?)?),
-            Self::Docx => docx::text(&platform::read_local(path, docx::MAX_ARCHIVE)?),
-            Self::Pdf => extract_pdf(path, pdf_helper.context("missing PDF helper")?),
-        }
+    fn extract(self, path: &Path, pdf: Option<&PdfExtractor>) -> Result<crate::content::Extracted> {
+        let body = match self {
+            Self::Text => String::from_utf8(platform::read_local(path, MAX_DOCUMENT)?)?,
+            Self::Docx => docx::text(&platform::read_local(path, docx::MAX_ARCHIVE)?)?,
+            Self::Pdf => return extract_pdf(path, pdf.context("missing PDF helper")?),
+        };
+        Ok(crate::content::Extracted {
+            body,
+            pages: Vec::new(),
+        })
     }
 }
 
-fn extract_pdf(path: &Path, helper: &Path) -> Result<String> {
+fn extract_pdf(path: &Path, helper: &PdfExtractor) -> Result<crate::content::Extracted> {
     let bytes = platform::read_local(path, 24 * 1024 * 1024)?;
-    let mut child = Command::new(helper)
+    let mut command = Command::new(helper.executable()?);
+    let pages = helper.bundled_binary.is_some();
+    if pages {
+        command.arg("--pages-v1");
+    }
+    let mut child = command
         .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -973,11 +1079,16 @@ fn extract_pdf(path: &Path, helper: &Path) -> Result<String> {
         .spawn()?;
     // Input and output must be serviced concurrently to avoid pipe deadlock.
     let mut input = child.stdin.take().context("extractor input")?;
+    let limit = if pages {
+        3 * MAX_DOCUMENT
+    } else {
+        MAX_DOCUMENT
+    };
     let mut output = child
         .stdout
         .take()
         .context("extractor output")?
-        .take(MAX_DOCUMENT + 1);
+        .take(limit + 1);
     let writer = std::thread::spawn(move || input.write_all(&bytes));
     let reader = std::thread::spawn(move || {
         let mut text = Vec::new();
@@ -1003,8 +1114,15 @@ fn extract_pdf(path: &Path, helper: &Path) -> Result<String> {
     writer
         .join()
         .map_err(|_| anyhow::anyhow!("extractor input failed"))??;
-    if !status.success() || text.len() as u64 > MAX_DOCUMENT {
+    if !status.success() || text.len() as u64 > limit {
         bail!("PDF extraction failed or exceeded text limit");
     }
-    Ok(String::from_utf8(text)?)
+    if pages {
+        crate::content::parse_pages(&text)
+    } else {
+        Ok(crate::content::Extracted {
+            body: String::from_utf8(text)?,
+            pages: Vec::new(),
+        })
+    }
 }

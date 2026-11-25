@@ -26,6 +26,7 @@ pub enum Reason {
     CloudAncestor,
     CloudNameOnly,
     TextDisabled,
+    OutsideContentScope,
     Unsupported,
     PdfHelperUnconfigured,
     PendingGemma,
@@ -260,6 +261,13 @@ fn text_state(
     }
     if !scope.documents {
         return Reason::TextDisabled;
+    }
+    if scope
+        .content_roots
+        .as_ref()
+        .is_some_and(|roots| !roots.iter().any(|root| file.path.starts_with(root)))
+    {
+        return Reason::OutsideContentScope;
     }
     let Some(kind) = DocumentKind::for_path(&file.path) else {
         return Reason::Unsupported;

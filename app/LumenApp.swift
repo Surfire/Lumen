@@ -447,6 +447,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func openFile(_ hit: SearchHit) {
+        if hit.pdf_page != nil {
+            previewFile(hit, action: .open)
+            return
+        }
         model.resolve(hit, action: .open) { [weak self] url in
             guard let self else { return }
             if let smoke = self.smoke {
@@ -488,9 +492,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
     }
 
-    private func previewFile(_ hit: SearchHit) {
+    private func previewFile(_ hit: SearchHit, action: FileAction = .preview) {
         guard !previewPreparing else { return }
-        model.resolve(hit, action: .preview) { [weak self] _ in
+        model.resolve(hit, action: action) { [weak self] _ in
             guard let self, self.searchPresented else { return }
             self.previewPreparing = true
             let query = self.model.query
@@ -503,7 +507,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                         snapshot?.remove()
                         return
                     }
-                    guard let snapshot, let panel = LocalPreviewPanel(snapshot: snapshot, title: hit.name) else {
+                    guard let snapshot, let panel = LocalPreviewPanel(snapshot: snapshot, title: hit.name, page: hit.pdf_page) else {
                         snapshot?.remove()
                         self.model.previewFailed()
                         return

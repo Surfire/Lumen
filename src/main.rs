@@ -46,6 +46,12 @@ struct ScopeArgs {
     deny: Vec<PathBuf>,
     #[arg(long)]
     documents: bool,
+    /// Authorize document indexing only below this directory (repeatable).
+    #[arg(long)]
+    content_root: Vec<PathBuf>,
+    /// Keep an explicit content selection, including an empty selection.
+    #[arg(long)]
+    separate_content: bool,
     #[arg(long, requires = "documents")]
     pdf_helper: Option<PathBuf>,
     /// Use this app bundle's PDF extractor and its stable extraction format.
@@ -60,11 +66,17 @@ impl From<ScopeArgs> for Scope {
         } else {
             args.pdf_helper.as_ref().map(|_| PdfHelperPolicy::Manual)
         };
+        let content_roots =
+            (args.separate_content || !args.content_root.is_empty()).then_some(args.content_root);
+        let documents = content_roots
+            .as_ref()
+            .map_or(args.documents, |roots| !roots.is_empty());
         Self {
             roots: args.root,
             allow: args.allow,
             deny: args.deny,
-            documents: args.documents,
+            documents,
+            content_roots,
             pdf_helper: args.pdf_helper,
             pdf_helper_policy,
         }
@@ -175,6 +187,18 @@ enum Action {
         #[arg(long)]
         document_stamp: Option<String>,
         path: PathBuf,
+    },
+    /// Apply an explicit document scope without rebuilding the filename catalog.
+    ContentScope {
+        #[arg(long)]
+        content_root: Vec<PathBuf>,
+        #[arg(long)]
+        bundled_pdf_helper: bool,
+    },
+    /// Extract a resumable batch from the saved document scope.
+    Content {
+        #[arg(long, default_value_t = 8)]
+        max: usize,
     },
     /// Explain one explicitly selected path using only metadata and the saved index.
     Diagnose { path: PathBuf },
@@ -372,6 +396,23 @@ fn main() -> Result<()> {
                 lumen::validate_hit(&db, &path, &kind, &availability, document_stamp.as_deref());
             println!("{}", json!({"valid":valid}));
         }
+        Action::ContentScope {
+            content_root,
+            bundled_pdf_helper,
+        } => {
+            println!(
+                "{}",
+                lumen::apply_content_scope(&db, content_root, bundled_pdf_helper)?
+            );
+        }
+        Action::Content { max } => {
+            // Only this short-lived worker and its extractor children run at low priority.
+            unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 10) };
+            println!(
+                "{}",
+                serde_json::to_string(&lumen::index_content(&db, max)?)?
+            );
+        }
         Action::Diagnose { path } => {
             println!("{}", serde_json::to_string(&lumen::diagnose(&db, &path))?);
         }
@@ -448,6 +489,7 @@ fn main() -> Result<()> {
                     "allow": scope.allow,
                     "deny": scope.deny,
                     "documents": scope.documents,
+                    "content_roots": scope.content_roots,
                 });
             }
             println!("{}", serde_json::to_string_pretty(&report)?);

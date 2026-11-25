@@ -119,6 +119,10 @@ final class LauncherSmoke {
                   "search field did not use requested language")
         _ = try editor(app)
 
+        if exists("content-scenario") {
+            try await verifyContentPipeline(app)
+            return
+        }
         if exists("action-scenario") {
             try await verifyActions(app)
             return
@@ -151,6 +155,7 @@ final class LauncherSmoke {
             try check(model.indexPhase == .needsIndex, "first run did not enter the index guide")
             try type("archive", into: app)
             try check(model.query == "archive" && model.hits.isEmpty, "search input did not reach first-run state")
+            if controlledTiming { model.scope.content_roots = nil }
             model.scope.documents = controlledTiming
             app.startBackgroundIndex()
             try check(model.isIndexing && !app.searchPresented, "first-run index did not dismiss the launcher")
@@ -750,6 +755,56 @@ final class LauncherSmoke {
 
     private func milliseconds(_ duration: Duration) -> Double {
         Double(duration.components.seconds) * 1_000 + Double(duration.components.attoseconds) / 1e15
+    }
+
+    private func verifyContentPipeline(_ app: AppDelegate) async throws {
+        let model = app.model
+        let selected = corpus.appendingPathComponent("Chosen", isDirectory: true)
+        let path = IndexScope.folderPath(selected)
+        try await until("existing names verified") { model.canSearch && model.watchState == .running }
+        app.showSettings()
+        app.settingsSession.page = .index
+        model.setContentPaused(true)
+        chosenSettingsDirectories = [selected]
+        app.chooseSettingsDirectories(.content)
+        try check(app.settingsSession.scope.contentFolders == [path], "content folder picker changed the name scope")
+        app.settingsSession.apply()
+        try await until("saved explicit content roots with work paused") {
+            !model.scopePending && model.savedScope?.contentFolders == [path] && (model.contentCoverage?.pending ?? 0) >= 2
+        }
+        app.showSearch()
+        try type("outside-report", into: app)
+        try await until("names searchable with document indexing paused") { model.selectedHit?.name == "outside-report.md" }
+        try check(!model.contentRunning && model.contentCoverage?.checked == 0, "document indexing moved while paused")
+        model.setContentPaused(false)
+        try await until("resumed content run committed and kept live name search") {
+            model.contentCoverage?.pending == 0 && (model.contentCoverage?.checked ?? 0) >= 2 &&
+            model.selectedHit?.name == "outside-report.md"
+        }
+        try type("zircon calibration", into: app)
+        try await until("actual second-page text hit") {
+            model.selectedHit?.name == "report.pdf" && model.selectedHit?.pdf_page == 2 &&
+                model.selectedHit?.snippet?.contains("zircon calibration") == true
+        }
+        try key(kVK_Return, "\r", in: app, throughPanel: true)
+        try await until("Return opened the PDFKit view on page 2") { app.localPreview?.displayedPDFPage == 2 }
+        app.localPreview?.close()
+        try type("outsideexclusivebody", into: app)
+        try await until("body remained outside the chosen scope") { !model.searching }
+        try check(model.hits.isEmpty, "unselected text appeared as a hit")
+        app.showSettings()
+        app.settingsSession.page = .index
+        app.settingsSession.remove(path, from: .content)
+        app.settingsSession.apply()
+        try await until("narrowed document scope committed") {
+            !model.scopePending && model.savedScope?.content_roots == [] && model.watchState == .running
+        }
+        app.showSearch()
+        try type("zircon calibration", into: app)
+        try await until("removed body stopped matching") { !model.searching }
+        try check(model.hits.isEmpty, "narrowed scope retained the page result")
+        try type("report.pdf", into: app)
+        try await until("removed document still searchable by name") { model.hits.contains { $0.name == "report.pdf" && $0.pdf_page == nil } }
     }
 
     private func verifySettings(_ app: AppDelegate) async throws {

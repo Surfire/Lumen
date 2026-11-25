@@ -9,6 +9,7 @@ struct SearchHit: Decodable, Equatable, Identifiable {
     let matched_by: String
     let snippet: String?
     let document_stamp: String?
+    let pdf_page: Int?
     var id: String { path }
     var isLocal: Bool { availability == "local" }
     var isCloudReference: Bool { availability == "placeholder" || availability == "provider_metadata_only" }
@@ -66,7 +67,20 @@ struct IndexReport: Decodable, Equatable {
     let embedded_chunks: Int?
     let gemma: GemmaCoverage?
     let scope: IndexScope?
+    let content: ContentCoverage?
     let unverified: Int?
+}
+
+struct ContentCoverage: Decodable, Equatable {
+    let pending: Int
+    let checked: Int
+    let total: Int
+}
+
+struct ContentBatch: Decodable {
+    let processed: Int
+    let indexed: Int
+    let pending: Int
 }
 
 struct GemmaCoverage: Decodable, Equatable {
@@ -105,6 +119,32 @@ struct IndexScope: Decodable, Equatable {
     var allow: [String] = []
     var deny: [String] = []
     var documents = false
+    var content_roots: [String]? = nil
+
+    var contentFolders: [String] {
+        get { content_roots ?? [] }
+        set { content_roots = newValue; documents = !newValue.isEmpty }
+    }
+
+    private var effectiveRoots: [String] { roots.isEmpty ? (allow.isEmpty ? ["/"] : allow) : roots }
+
+    func sharesNameScope(with other: IndexScope) -> Bool {
+        Set(effectiveRoots) == Set(other.effectiveRoots) && Set(allow) == Set(other.allow) && Set(deny) == Set(other.deny)
+    }
+
+    var previouslyAuthorizedDocumentFolders: [String] {
+        guard documents else { return [] }
+        func contains(_ root: String, _ path: String) -> Bool {
+            root == "/" || path == root || path.hasPrefix(root + "/")
+        }
+        let folders = allow.isEmpty ? effectiveRoots : effectiveRoots.flatMap { root in
+            allow.compactMap { allowed in
+                if contains(root, allowed) { return allowed }
+                return contains(allowed, root) ? root : nil
+            }
+        }
+        return Array(Set(folders.filter { $0.hasPrefix("/") && $0 != "/" })).sorted()
+    }
 
     static func storedPaths(_ key: String, in defaults: UserDefaults?) -> [String] {
         if let paths = defaults?.stringArray(forKey: key + "Paths") { return paths }
@@ -122,12 +162,22 @@ struct IndexScope: Decodable, Equatable {
         return path
     }
 
-    var hasAbsolutePaths: Bool { (roots + allow + deny).allSatisfy { $0.hasPrefix("/") } }
+    var hasAbsolutePaths: Bool { (roots + allow + deny + contentFolders).allSatisfy { $0.hasPrefix("/") } }
 
     var arguments: [String] {
-        allow.flatMap { ["--allow", $0] } + deny.flatMap { ["--deny", $0] }
-            + (documents ? ["--documents", "--bundled-pdf-helper"] : [])
+        let name = allow.flatMap { ["--allow", $0] } + deny.flatMap { ["--deny", $0] }
+        if let content_roots {
+            return name + ["--separate-content"] + content_roots.flatMap { ["--content-root", $0] }
+                + (content_roots.isEmpty ? [] : ["--bundled-pdf-helper"])
+        }
+        return name + (documents ? ["--documents", "--bundled-pdf-helper"] : [])
     }
+
+    var contentArguments: [String] {
+        ["content-scope"] + contentFolders.flatMap { ["--content-root", $0] }
+            + (contentFolders.isEmpty ? [] : ["--bundled-pdf-helper"])
+    }
+
 }
 
 struct EngineResponse {

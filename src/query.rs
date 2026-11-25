@@ -252,7 +252,7 @@ fn find_text(conn: &Connection, terms: &Terms, words: &str, limit: usize) -> Res
         )
     };
     let sql = format!(
-        "SELECT i.path,i.display,i.kind,i.availability,d.body,{stamp} AS document_stamp
+        "SELECT i.path,i.display,i.kind,i.availability,d.body,{stamp} AS document_stamp,d.id
          FROM {from} {state_join}
          WHERE ?3 IS NOT NULL AND i.availability<>'unverified' AND {SUFFIX_FILTER}
            AND NOT EXISTS (SELECT 1 FROM json_each(?1) t WHERE instr(d.normalized,t.value)=0)
@@ -262,8 +262,20 @@ fn find_text(conn: &Connection, terms: &Terms, words: &str, limit: usize) -> Res
     let rows = stmt.query_map(params![words, terms.suffix, anchor, limit as i64], |row| {
         let mut hit = row_hit(row, "text")?;
         let text: String = row.get(4)?;
-        hit.snippet = Some(short_snippet(&text, &terms.words[0]));
         hit.document_stamp = read_document_stamp(row)?;
+        let page = if hit.document_stamp.is_some()
+            && crate::index::DocumentKind::for_path(std::path::Path::new(&hit.path))
+                == Some(crate::index::DocumentKind::Pdf)
+        {
+            crate::content::matching_page(conn, row.get(6)?, &text, &terms.words)?
+        } else {
+            None
+        };
+        hit.pdf_page = page.map(|(number, _)| number);
+        hit.snippet = Some(short_snippet(
+            page.map_or(&text, |(_, page)| page),
+            &terms.words[0],
+        ));
         Ok(hit)
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)

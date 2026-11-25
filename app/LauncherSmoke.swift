@@ -1446,6 +1446,14 @@ final class LauncherSmoke {
                       !model.shortcuts.entries.contains(where: { $0.id == conflict.id }),
                       "saving a query shortcut did not explicitly reject the alias \(alias)")
         }
+        let plainWeb = SavedShortcut(id: UUID(), title: "Plain Website", alias: "g", target: .web(url), pinned: false)
+        try check(model.shortcuts.saveResult(plainWeb) == .saved, "could not save a plain web shortcut with alias g")
+        var convertedWeb = plainWeb
+        convertedWeb.queryParameter = "term"
+        try check(model.shortcuts.saveResult(convertedWeb) == .aliasInUse("g") &&
+                  model.shortcuts.entries.contains(plainWeb),
+                  "converting a plain web shortcut did not reject the built-in alias g and preserve the original")
+        model.shortcuts.remove(plainWeb)
         model.shortcuts.includeOptionalLinks = false
         try check(!ShortcutLibrary(defaults: shortcutFixturePreferences).includeOptionalLinks &&
                   Set(builtIns.map { $0.0 }).isDisjoint(with: Set(app.commands.entries.map(\.keyword))),

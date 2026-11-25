@@ -7,6 +7,7 @@ mod model;
 mod name_fast;
 mod platform;
 mod progress;
+mod query;
 mod semantic;
 mod watch;
 
@@ -15,6 +16,7 @@ pub use gemma::{GemmaModel, ID as GEMMA_MODEL_ID};
 pub use index::{scan, scan_with_progress};
 pub use model::{BgeModel, Model, ModelBackend};
 pub use progress::{ScanPhase, ScanProgress, ScanProgressReporter};
+pub use query::allows_semantic as query_allows_semantic;
 pub use semantic::{
     EmbedBatch, GemmaCoverage, GemmaSearchSession, embed, embed_batch, embed_with_backend,
     gemma_coverage,
@@ -449,6 +451,14 @@ fn search_with_names(
         return Ok(vec![]);
     }
     let limit = limit.clamp(1, 100);
+    if let Some(terms) = query::Terms::parse(&q) {
+        if mode != Mode::Semantic {
+            return query::search(conn, &terms, mode, limit);
+        }
+        if !terms.permits_semantic() {
+            return Ok(Vec::new());
+        }
+    }
     let cached = if matches!(mode, Mode::Name | Mode::All) {
         match names {
             Some(names) => names.search(conn, &q, limit)?,

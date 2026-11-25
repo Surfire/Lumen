@@ -333,8 +333,16 @@ fn main() -> Result<()> {
             limit,
             semantic,
         } => {
+            let permits_semantic = lumen::query_allows_semantic(&text);
+            if matches!(mode, SearchMode::Semantic) && !permits_semantic {
+                println!("[]");
+                return Ok(());
+            }
             let gemma_home = semantic.gemma_home.clone();
-            let model = semantic.configure()?;
+            let model = permits_semantic
+                .then(|| semantic.configure())
+                .transpose()?
+                .flatten();
             let hits = if model.is_none() && matches!(mode, SearchMode::Semantic) {
                 lumen::GemmaSearchSession::open(
                     &db,

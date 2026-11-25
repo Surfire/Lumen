@@ -349,7 +349,7 @@ impl GemmaSearchSession {
 
     pub fn search(&mut self, query: &str, limit: usize) -> Result<Vec<Hit>> {
         let query = query.trim();
-        if query.is_empty() || query.len() > 512 {
+        if query.is_empty() || query.len() > 512 || !crate::query_allows_semantic(query) {
             return Ok(Vec::new());
         }
         search_gemma(&self.conn, query, limit.clamp(1, 100), &mut self.worker)

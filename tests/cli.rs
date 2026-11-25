@@ -605,6 +605,108 @@ mod live {
     }
 
     #[test]
+    fn launcher_queries_require_all_words_and_filter_real_extensions() {
+        let f = Fixture::new();
+        let root = f.0.join("scope");
+        let chengdu = root.join("成都");
+        let excluded = root.join("excluded");
+        fs::create_dir_all(&chengdu).unwrap();
+        fs::create_dir_all(&excluded).unwrap();
+        fs::create_dir(root.join("成都卫健委.pptx")).unwrap();
+        for file in [
+            "成都 卫健委.PPTX",
+            "卫健委成都方案.pptx",
+            "成都情况.pptx",
+            "成都卫健委旧版.pptx",
+            "成都卫健委.pptx.bak",
+            "成都卫健委pptx.txt",
+            "松林卫生Report.pptx",
+            "鹿鸣",
+        ] {
+            fs::write(root.join(file), "").unwrap();
+        }
+        fs::write(chengdu.join("卫健委通知.pptx"), "").unwrap();
+        fs::write(chengdu.join("鹿鸣资料.md"), "鹿鸣专刊").unwrap();
+        fs::write(excluded.join("成都卫健委隐藏.pptx"), "").unwrap();
+        fs::write(root.join("words.txt"), "卫健委关于新的 成都 公告").unwrap();
+        fs::write(root.join("missing.txt"), "成都消息含有 pptx 这个词").unwrap();
+        fs::write(root.join("letters.md"), "成都 卫健委，正文也写有 pptx").unwrap();
+        let r = root.to_str().unwrap();
+        f.run(&[
+            "index",
+            "--root",
+            r,
+            "--deny",
+            excluded.to_str().unwrap(),
+            "--documents",
+        ]);
+        let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+        // Excluded-by-availability FTS candidates must not reappear via either lane.
+        db.execute(
+            "UPDATE item SET availability='unverified' WHERE display='成都卫健委旧版.pptx'",
+            [],
+        )
+        .unwrap();
+        let mut serve = Serve::new(&f);
+
+        let names = serve.names("成都　 卫健委   pptx", "name");
+        assert_eq!(
+            names,
+            ["成都 卫健委.PPTX", "卫健委成都方案.pptx", "卫健委通知.pptx"]
+        );
+        assert_eq!(serve.names("卫健委 .PpTx 成都", "name"), names);
+        let rank = serve.hits("成都 卫健委 .pptx", "name");
+        assert_eq!(rank[0]["matched_by"], "name");
+        assert_eq!(rank[2]["matched_by"], "path");
+        assert_eq!(
+            serve.names("\"成都 卫健委\" pptx", "name"),
+            ["成都 卫健委.PPTX"]
+        );
+        assert_eq!(
+            serve.names("成都 \"pptx\"", "name"),
+            [
+                "成都情况.pptx",
+                "成都卫健委.pptx",
+                "成都 卫健委.PPTX",
+                "成都卫健委pptx.txt",
+                "成都卫健委.pptx.bak",
+                "卫健委成都方案.pptx",
+                "卫健委通知.pptx"
+            ]
+        );
+        assert_eq!(
+            serve.names("ＳＯＮＧＬＩＮ report .pptx", "name"),
+            ["松林卫生Report.pptx"]
+        );
+        assert_eq!(serve.names("鹿鸣", "name"), ["鹿鸣", "鹿鸣资料.md"]);
+        assert_eq!(serve.names("鹿鸣 成都", "name"), ["鹿鸣资料.md"]);
+        assert_eq!(serve.names("成都 鹿鸣", "name"), ["鹿鸣资料.md"]);
+        assert!(serve.names("成都 pptx pdf", "all").is_empty());
+        assert_eq!(serve.names("ＰＰＴＸ", "name").len(), 5);
+
+        assert_eq!(serve.names("成都 卫健委 txt", "text"), ["words.txt"]);
+        assert_eq!(serve.names("卫健委 .TXT 成都", "text"), ["words.txt"]);
+        assert!(serve.names("\"成都 卫健委\" txt", "text").is_empty());
+        assert_eq!(serve.names("“成都 卫健委” md", "text"), ["letters.md"]);
+        assert_eq!(serve.names("成都 卫健委 \"pptx\"", "text"), ["letters.md"]);
+        assert!(serve.names("成都 卫健委 pptx", "text").is_empty());
+        assert_eq!(
+            f.run(&["query", "--mode", "semantic", "成都 卫健委 pptx"]),
+            serde_json::json!([])
+        );
+        assert!(serve.names("成都 卫健委 .pptx", "semantic").is_empty());
+        db.execute(
+            "UPDATE item SET availability='unverified' WHERE display='卫健委成都方案.pptx'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            serve.names("成都 卫健委 pptx", "name"),
+            ["成都 卫健委.PPTX", "卫健委通知.pptx"]
+        );
+    }
+
+    #[test]
     fn running_serve_observes_committed_scope_and_name_updates() {
         let f = Fixture::new();
         let root = f.0.join("scope");

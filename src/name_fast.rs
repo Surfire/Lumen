@@ -167,6 +167,17 @@ fn ranked_short_han(conn: &Connection, query: &str, limit: usize) -> Result<Opti
     Ok(Some(hits))
 }
 
+/// A bounded disk candidate set for a structured query with only short
+/// terms. The accelerator returns every match or falls back, never a page.
+pub(super) fn short_han_seed(conn: &Connection, words: &[String]) -> Result<Option<Vec<String>>> {
+    for word in words {
+        if let Some(hits) = ranked_short_han(conn, word, MAX_HAN_OCCURRENCES as usize)? {
+            return Ok(Some(hits.into_iter().map(|hit| hit.path).collect()));
+        }
+    }
+    Ok(None)
+}
+
 pub(super) fn search_disk(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Hit>> {
     if let Some(hits) = ranked_prefix(conn, query, limit)? {
         return Ok(hits);

@@ -165,24 +165,19 @@ fn has_gemma_store(conn: &Connection) -> Result<bool> {
 }
 
 fn gemma_searchable(conn: &Connection) -> Result<bool> {
-    let tx = conn
-        .is_autocommit()
-        .then(|| conn.unchecked_transaction())
-        .transpose()?;
-    let snapshot = tx.as_deref().unwrap_or(conn);
-    let searchable = documents_enabled(snapshot)?
-        && has_gemma_store(snapshot)?
-        && snapshot
+    read_snapshot(conn, read_gemma_searchable)
+}
+
+fn read_gemma_searchable(conn: &Connection) -> Result<bool> {
+    Ok(documents_enabled(conn)?
+        && has_gemma_store(conn)?
+        && conn
             .prepare_cached(&format!(
                 "SELECT EXISTS(SELECT 1 {GEMMA_LIVE} AND {GEMMA_VECTOR})"
             ))?
             .query_row(params![gemma::ID, GEMMA_VECTOR_BYTES], |row| {
                 row.get::<_, bool>(0)
-            })?;
-    if let Some(tx) = tx {
-        tx.commit()?;
-    }
-    Ok(searchable)
+            })?)
 }
 
 const GEMMA_VECTOR_BYTES: i64 = (gemma::DIMENSIONS * size_of::<f32>()) as i64;
@@ -327,9 +322,25 @@ fn embed_gemma(conn: &mut Connection, model: &crate::GemmaModel, max: usize) -> 
     Ok(report)
 }
 
+pub(super) enum GemmaQuery {
+    Worker(gemma::GemmaWorker),
+    #[cfg(test)]
+    Fixture(Box<dyn FnMut() -> Vec<f32> + Send>),
+}
+
+impl GemmaQuery {
+    pub fn encode(&mut self, text: &str) -> Result<Vec<f32>> {
+        match self {
+            Self::Worker(worker) => worker.encode(Role::Query, text),
+            #[cfg(test)]
+            Self::Fixture(encode) => Ok(encode()),
+        }
+    }
+}
+
 pub struct GemmaSearchSession {
     conn: Connection,
-    worker: gemma::GemmaWorker,
+    worker: GemmaQuery,
     matrix: MatrixCache<Paragraph>,
 }
 
@@ -348,7 +359,7 @@ impl GemmaSearchSession {
         );
         Ok(Self {
             conn,
-            worker,
+            worker: GemmaQuery::Worker(worker),
             matrix: MatrixCache::default(),
         })
     }
@@ -684,14 +695,16 @@ pub(super) fn search(
 ) -> Result<Vec<Hit>> {
     if let ModelBackend::Gemma(model) = model {
         ensure!(
-            gemma_searchable(conn)?,
+            // Preflight before starting the model. Only the ranking snapshot
+            // authorizes hits; coverage may change during inference.
+            read_gemma_searchable(conn)?,
             "no current Gemma paragraph embeddings: run lumen embed --gemma first"
         );
         return search_gemma(
             conn,
             query,
             limit,
-            &mut model.start()?,
+            &mut GemmaQuery::Worker(model.start()?),
             &mut MatrixCache::default(),
         );
     }
@@ -712,13 +725,18 @@ pub(super) fn search(
     let vector = encoder.encode(Role::Query, query)?;
     // Read scores and original snippets from the same snapshot while watch
     // may replace documents in the background.
-    Ok(read_snapshot(conn, |snapshot| {
+    read_snapshot(conn, |snapshot| {
+        let Some(scope) = saved_index_scope(snapshot)?.filter(|scope| scope.documents) else {
+            return Ok(Vec::new());
+        };
         let state = validate(snapshot)?;
         ensure!(
             state.dimensions == Some(vector.len() as i64),
             "stored and query embedding dimensions differ"
         );
-        let matrix = load_paragraphs(snapshot, vector.len(), LEGACY, [], |_| true)?;
+        let matrix = load_paragraphs(snapshot, vector.len(), LEGACY, [], |path| {
+            paragraph_path_allowed(&scope, path)
+        })?;
         rank(
             snapshot,
             &matrix,
@@ -727,26 +745,24 @@ pub(super) fn search(
             encoder.match_reason(),
             |score| encoder.includes(score),
         )
-    })?
-    .unwrap_or_default())
+    })
 }
 
 fn search_gemma(
     conn: &Connection,
     query: &str,
     limit: usize,
-    worker: &mut gemma::GemmaWorker,
+    worker: &mut GemmaQuery,
     matrix: &mut MatrixCache<Paragraph>,
 ) -> Result<Vec<Hit>> {
-    let vector = match worker.encode(Role::Query, query) {
+    let vector = match worker.encode(query) {
         Ok(vector) => vector,
         Err(error) if error.is::<Unencodable>() => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    Ok(read_snapshot(conn, |snapshot| {
+    read_snapshot(conn, |snapshot| {
         rank_gemma(snapshot, &vector, limit, matrix)
-    })?
-    .unwrap_or_default())
+    })
 }
 
 const LEGACY: &str = "SELECT c.document_id, c.id, i.path, c.vector FROM semantic_chunk c
@@ -786,7 +802,7 @@ fn load_paragraphs(
     Ok(matrix)
 }
 
-fn gemma_path_allowed(scope: &Scope, path: &Path) -> bool {
+fn paragraph_path_allowed(scope: &Scope, path: &Path) -> bool {
     !crate::external::is_external(path)
         && scope.roots.iter().any(|root| path.starts_with(root))
         && scope.allows(path)
@@ -823,7 +839,7 @@ fn rank_gemma(
             gemma::DIMENSIONS,
             &format!("SELECT c.document_id,c.id,i.path,v.vector {GEMMA_LIVE} AND {GEMMA_VECTOR} AND i.kind='file'"),
             params![gemma::ID, GEMMA_VECTOR_BYTES],
-            |path| gemma_path_allowed(&scope, path),
+            |path| paragraph_path_allowed(&scope, path),
         )
     })?;
     let scores: Vec<_> = matrix.scores(query).collect();
@@ -998,7 +1014,14 @@ mod tests {
     }
 
     use super::*;
+    use crate::diagnose::snapshot_tests::{start_benign_writes, stop_benign_writes};
     use std::fs;
+
+    fn query_vector() -> Vec<f32> {
+        let mut query = vec![0.0; gemma::DIMENSIONS];
+        query[0] = 1.0;
+        query
+    }
 
     #[test]
     fn gemma_searches_mixed_rows_caches_the_snapshot_and_gates_a_noisy_corpus() {
@@ -1027,8 +1050,6 @@ mod tests {
         .unwrap();
         let mut writer = Connection::open(&database).unwrap();
         while prepare_next_document(&mut writer, true).unwrap() {}
-        let mut query = vec![0.0; gemma::DIMENSIONS];
-        query[0] = 1.0;
         let store = |writer: &Connection, i: usize| {
             let mut vector = vec![0.0_f32; gemma::DIMENSIONS];
             vector[0] = if i == 0 { 0.9375 } else { 0.6875 };
@@ -1049,19 +1070,20 @@ mod tests {
         store(&writer, 0);
         store(&writer, 1);
         assert_eq!(gemma_coverage(&writer).unwrap().embedded_chunks, 2);
-        let reader = crate::open_read(&database).unwrap();
-        let mut cache = MatrixCache::default();
-        let lookup = |snapshot: &Connection, cache: &mut MatrixCache<_>| {
-            rank_gemma(snapshot, &query, 20, cache)
+        let mut session = GemmaSearchSession {
+            conn: crate::open_read(&database).unwrap(),
+            worker: GemmaQuery::Fixture(Box::new(query_vector)),
+            matrix: MatrixCache::default(),
+        };
+        let lookup = |session: &mut GemmaSearchSession| {
+            session
+                .search("document fixture", 20)
                 .unwrap()
                 .into_iter()
                 .map(|hit| (hit.name, hit.snippet.unwrap(), hit.score.unwrap()))
                 .collect::<Vec<_>>()
         };
-        let first = {
-            let snapshot = reader.unchecked_transaction().unwrap();
-            lookup(&snapshot, &mut cache)
-        };
+        let first = lookup(&mut session);
         assert_eq!(
             first,
             [
@@ -1069,12 +1091,14 @@ mod tests {
                 ("doc-1.txt".into(), "Body number 1".into(), 0.6875)
             ]
         );
-        let snapshot = reader.unchecked_transaction().unwrap();
-        cache
-            .get(&snapshot, |_| {
+        session.conn.execute_batch("BEGIN").unwrap();
+        read_snapshot(&session.conn, |snapshot| {
+            session.matrix.get(snapshot, |_| {
                 panic!("unchanged catalog reloaded the matrix")
-            })
-            .unwrap();
+            })?;
+            Ok(())
+        })
+        .unwrap();
         std::thread::scope(|thread| {
             thread
                 .spawn(|| {
@@ -1089,37 +1113,124 @@ mod tests {
                 .unwrap()
         });
         // The held WAL read transaction remains coherent during a writer commit.
-        assert_eq!(lookup(&snapshot, &mut cache), first);
-        snapshot.commit().unwrap();
-        let warm = read_snapshot(&reader, |snapshot| Ok(lookup(snapshot, &mut cache)))
+        assert_eq!(lookup(&mut session), first);
+        session.conn.execute_batch("COMMIT").unwrap();
+        assert_eq!(lookup(&mut session), first[..1]);
+
+        start_benign_writes(&session.conn, &database);
+        for _ in 0..8 {
+            assert_eq!(lookup(&mut session), first[..1]);
+        }
+        assert!(stop_benign_writes(&session.conn) >= 8);
+
+        for (update, expected, revoked) in [
+            (
+                "UPDATE info SET value=json_set(value,'$.deny',json_array((SELECT path FROM item WHERE display='doc-0.txt'))) WHERE key='scope'",
+                7,
+                "doc-0.txt",
+            ),
+            (
+                "UPDATE item SET availability='unverified' WHERE display='doc-1.txt'",
+                6,
+                "doc-1.txt",
+            ),
+            (
+                "UPDATE info SET value=json_set(value,'$.documents',json('false')) WHERE key='scope'",
+                0,
+                "doc-2.txt",
+            ),
+        ] {
+            let database = database.clone();
+            session.worker = GemmaQuery::Fixture(Box::new(move || {
+                // The writer commits after search starts but before ranking
+                // pins its snapshot. This must invalidate the warm matrix.
+                Connection::open(&database)
+                    .unwrap()
+                    .execute_batch(update)
+                    .unwrap();
+                query_vector()
+            }));
+            let hits = lookup(&mut session);
+            assert_eq!(hits.len(), expected);
+            assert!(hits.iter().all(|(name, _, _)| name != revoked));
+        }
+        drop(session);
+        drop(writer);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_search_uses_saved_scope_without_ending_the_callers_transaction() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = fs::canonicalize(std::env::temp_dir())
             .unwrap()
+            .join(format!("lumen-legacy-snapshot-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let docs = root.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        let denied = docs.join("deny.txt");
+        fs::write(&denied, "Denied paragraph").unwrap();
+        fs::write(docs.join("keep.txt"), "Allowed paragraph").unwrap();
+        let database = root.join("index.sqlite");
+        crate::scan(
+            &database,
+            &Scope {
+                roots: vec![docs],
+                documents: true,
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        let executable = root.join("encoder");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' '[1,0,0,0,0,0,0,0]'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let model = Model {
+            executable,
+            language: "en".into(),
+        };
+        let backend = ModelBackend::Helper(&model);
+        assert_eq!(embed_with_backend(&database, backend, 20).unwrap(), 2);
+        let reader = crate::open_read(&database).unwrap();
+        let writer = Connection::open(&database).unwrap();
+        let lookup = |conn: &Connection| {
+            crate::search_with_backend(
+                conn,
+                "document fixture",
+                crate::Mode::Semantic,
+                20,
+                Some(backend),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.name)
+            .collect::<Vec<_>>()
+        };
+        start_benign_writes(&reader, &database);
+        for _ in 0..8 {
+            assert_eq!(lookup(&reader), ["deny.txt", "keep.txt"]);
+        }
+        assert!(stop_benign_writes(&reader) >= 8);
+
+        let tx = reader.unchecked_transaction().unwrap();
+        assert_eq!(lookup(&tx), ["deny.txt", "keep.txt"]);
+        writer
+            .execute(
+                "UPDATE info SET value=json_set(value,'$.deny',json_array(?1)) WHERE key='scope'",
+                [denied.to_str().unwrap()],
+            )
             .unwrap();
-        assert_eq!(warm, first[..1]);
-        let mut attempts = 0;
-        let hits = read_snapshot(&reader, |snapshot| {
-            let hits = lookup(snapshot, &mut cache);
-            attempts += 1;
-            if attempts == 1 {
-                assert_eq!(hits, warm);
-                let tx = writer.transaction()?;
-                // Revoke via scope rules alone, leaving the cached vectors and
-                // item intact; also mark another item's access unverified.
-                tx.execute("UPDATE info SET value=json_set(value,'$.deny',json_array(?1)) WHERE key='scope'", [root.join("docs/doc-0.txt").to_str().unwrap()])?;
-                tx.execute("UPDATE item SET availability='unverified' WHERE display='doc-1.txt'", [])?;
-                tx.commit()?;
-            }
-            Ok(hits)
-        }).unwrap().unwrap();
-        assert_eq!(attempts, 2);
-        assert_eq!(hits.len(), 6);
-        assert!(
-            hits.iter()
-                .all(|(name, _, _)| name != "doc-0.txt" && name != "doc-1.txt")
-        );
-        writer.execute("UPDATE info SET value=json_set(value,'$.documents',json('false')) WHERE key='scope'", []).unwrap();
-        let snapshot = reader.unchecked_transaction().unwrap();
-        assert!(lookup(&snapshot, &mut cache).is_empty());
-        drop(snapshot);
+        let retained: i64 = writer.query_row("SELECT count(*) FROM semantic_chunk c JOIN item i ON i.id=c.document_id WHERE i.path=?1 AND c.vector IS NOT NULL", [denied.to_str().unwrap()], |row| row.get(0)).unwrap();
+        assert_eq!(retained, 1);
+        // An already pinned caller-owned transaction keeps its old view.
+        assert_eq!(lookup(&tx), ["deny.txt", "keep.txt"]);
+        assert!(!reader.is_autocommit());
+        tx.commit().unwrap();
+        assert_eq!(lookup(&reader), ["keep.txt"]);
         drop(reader);
         drop(writer);
         fs::remove_dir_all(root).unwrap();

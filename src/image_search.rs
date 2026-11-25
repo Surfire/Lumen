@@ -2,10 +2,10 @@ use crate::{
     GemmaModel, Hit, Scope, absolute,
     content::has_table,
     diagnose::{local_stamp, read_snapshot},
-    gemma::{DIMENSIONS, GemmaWorker},
+    gemma::DIMENSIONS,
     image_decode::{MAX_FILE_BYTES, supported_path, thumbnail},
-    model::Role,
     open_read, open_write, platform, saved_index_scope,
+    semantic::GemmaQuery,
     vector::{Matrix, MatrixCache, adaptive_floor, pack},
 };
 use anyhow::{Context, Result, ensure};
@@ -336,7 +336,7 @@ pub struct ImageSearchSession<'a> {
     conn: Connection,
     model: &'a GemmaModel,
     projector: PathBuf,
-    worker: Option<GemmaWorker>,
+    worker: Option<GemmaQuery>,
     matrix: MatrixCache<ImageRow>,
 }
 
@@ -362,25 +362,30 @@ impl<'a> ImageSearchSession<'a> {
         {
             return Ok(Vec::new());
         }
-        // Avoid starting a runtime for an empty/disabled scope. Don't hold a
-        // read transaction through model inference; recheck the version after it.
-        {
-            let snapshot = self.conn.unchecked_transaction()?;
-            if self.matrix.get(&snapshot, load_images)?.rows.is_empty() {
-                return Ok(Vec::new());
-            }
-        }
         let worker = match &mut self.worker {
             Some(worker) => worker,
-            None => self
-                .worker
-                .insert(self.model.start_images(&self.projector)?),
+            None => {
+                // This cold-start probe only avoids launching an unused model.
+                // Ranking rechecks scope and availability after inference.
+                let Some(rules) = Rules::read(&self.conn)? else {
+                    return Ok(Vec::new());
+                };
+                if count_images(&self.conn, &rules)? == 0 {
+                    return Ok(Vec::new());
+                }
+                self.worker.insert(GemmaQuery::Worker(
+                    self.model.start_images(&self.projector)?,
+                ))
+            }
         };
-        let query = worker.encode(Role::Query, text)?;
-        Ok(read_snapshot(&self.conn, |snapshot| {
-            search_in_snapshot(snapshot, &query, limit, &mut self.matrix)
-        })?
-        .unwrap_or_default())
+        let query = worker.encode(text)?;
+        read_snapshot(&self.conn, |snapshot| {
+            Ok(rank_images(
+                self.matrix.get(snapshot, load_images)?,
+                &query,
+                limit,
+            ))
+        })
     }
 }
 
@@ -416,13 +421,7 @@ fn load_images(snapshot: &Connection) -> Result<Matrix<ImageRow>> {
     Ok(matrix)
 }
 
-fn search_in_snapshot(
-    snapshot: &Connection,
-    query: &[f32],
-    limit: usize,
-    cache: &mut MatrixCache<ImageRow>,
-) -> Result<Vec<Hit>> {
-    let matrix = cache.get(snapshot, load_images)?;
+fn rank_images(matrix: &Matrix<ImageRow>, query: &[f32], limit: usize) -> Vec<Hit> {
     let scores: Vec<_> = matrix.scores(query).collect();
     let floor = adaptive_floor(&scores, MIN_COSINE, Z_THRESHOLD);
     let mut hits: Vec<_> = scores
@@ -431,8 +430,7 @@ fn search_in_snapshot(
         .filter(|(score, _)| score.is_finite() && f64::from(*score) >= floor)
         .collect();
     hits.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.path.cmp(&b.1.path)));
-    let hits = hits
-        .into_iter()
+    hits.into_iter()
         .filter_map(|(score, row)| {
             if local_stamp(Path::new(row.path.as_ref()), false).as_deref()
                 != Some(row.stamp.as_ref())
@@ -452,14 +450,20 @@ fn search_in_snapshot(
             })
         })
         .take(limit)
-        .collect();
-    Ok(hits)
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnose::snapshot_tests::{start_benign_writes, stop_benign_writes};
     use std::fs;
+
+    fn query_vector() -> Vec<f32> {
+        let mut query = vec![0.0; DIMENSIONS];
+        query[0] = 1.0;
+        query
+    }
 
     #[test]
     fn image_cache_ranks_mixed_formats_and_refreshes_when_scope_changes() {
@@ -528,31 +532,30 @@ mod tests {
             store(i);
         }
         assert_eq!(image_status(&database).unwrap().vectors, 3);
-        let reader = open_read(&database).unwrap();
-        let mut cache = MatrixCache::default();
-        let mut query = vec![0.0; DIMENSIONS];
-        query[0] = 1.0;
-        let lookup = |cache: &mut MatrixCache<_>| {
-            let snapshot = reader.unchecked_transaction().unwrap();
-            search_in_snapshot(&snapshot, &query, 20, cache)
+        let model = GemmaModel::installed(Some(&root)).unwrap();
+        let mut session =
+            ImageSearchSession::open(&database, &model, "unused-projector".into()).unwrap();
+        session.worker = Some(GemmaQuery::Fixture(Box::new(query_vector)));
+        let lookup = |session: &mut ImageSearchSession<'_>| {
+            session
+                .search("image fixture", 20)
                 .unwrap()
                 .into_iter()
                 .map(|hit| hit.name)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(lookup(&mut cache), ["a.HEIC", "b.heif", "c.webp"]);
-        {
-            let snapshot = reader.unchecked_transaction().unwrap();
-            cache
-                .get(&snapshot, |_| {
-                    panic!("unchanged image scope reloaded the matrix")
-                })
-                .unwrap();
-        }
+        assert_eq!(lookup(&mut session), ["a.HEIC", "b.heif", "c.webp"]);
+        read_snapshot(&session.conn, |snapshot| {
+            session.matrix.get(snapshot, |_| {
+                panic!("unchanged image scope reloaded the matrix")
+            })?;
+            Ok(())
+        })
+        .unwrap();
         for i in 3..8 {
             store(i);
         }
-        assert_eq!(lookup(&mut cache), ["a.HEIC"]);
+        assert_eq!(lookup(&mut session), ["a.HEIC"]);
         let batch = image_batch(
             &database,
             &GemmaModel::installed(None).unwrap(),
@@ -563,14 +566,14 @@ mod tests {
         .unwrap();
         assert_eq!((batch.processed, batch.reused, batch.skipped), (9, 8, 1));
         image_scope(&database, None).unwrap();
-        assert!(lookup(&mut cache).is_empty());
-        drop(reader);
+        assert!(lookup(&mut session).is_empty());
+        drop(session);
         drop(writer);
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn image_snapshot_never_publishes_hits_after_concurrent_scope_clear() {
+    fn image_search_survives_benign_writes_and_honors_revocations_during_inference() {
         let root = fs::canonicalize(std::env::temp_dir())
             .unwrap()
             .join(format!("lumen-image-snapshot-{}", std::process::id()));
@@ -590,60 +593,65 @@ mod tests {
         .unwrap();
         image_scope(&database, Some(&images)).unwrap();
         let writer = Connection::open(&database).unwrap();
-        let mut query = vec![0.0_f32; DIMENSIONS];
-        query[0] = 1.0;
-        let vector: Vec<u8> = query.iter().flat_map(|value| value.to_le_bytes()).collect();
-        writer
-            .execute(
-                "INSERT INTO image_embedding SELECT id,?1,?2,?3 FROM item WHERE path=?4",
-                params![
-                    MODEL_ID,
-                    local_stamp(&path, false).unwrap(),
-                    vector,
-                    path.to_str().unwrap()
-                ],
-            )
-            .unwrap();
-        let reader = open_read(&database).unwrap();
-        let mut cache = MatrixCache::default();
-        let rank =
-            |snapshot: &Connection, cache: &mut _| search_in_snapshot(snapshot, &query, 20, cache);
-        let mut edits = 0;
-        let warm = read_snapshot(&reader, |snapshot| {
-            let hits = rank(snapshot, &mut cache)?;
-            if edits < 2 {
-                edits += 1;
-                writer.execute(
-                    "UPDATE item SET display=?1 WHERE path=?2",
-                    params![format!("latest-{edits}"), path.to_str().unwrap()],
-                )?;
-            }
-            Ok(hits)
-        })
-        .unwrap()
-        .unwrap();
-        assert_eq!(edits, 2);
-        assert_eq!(warm.len(), 1);
-        assert_eq!(warm[0].name, "latest-2");
-        assert_eq!(warm[0].path, path.to_str().unwrap());
+        let vector = pack(&query_vector());
+        assert_eq!(
+            writer
+                .execute(
+                    "INSERT INTO image_embedding SELECT id,?1,?2,?3 FROM item WHERE path=?4",
+                    params![
+                        MODEL_ID,
+                        local_stamp(&path, false).unwrap(),
+                        vector,
+                        path.to_str().unwrap()
+                    ],
+                )
+                .unwrap(),
+            1
+        );
+        let model = GemmaModel::installed(Some(&root)).unwrap();
+        let mut session =
+            ImageSearchSession::open(&database, &model, "unused-projector".into()).unwrap();
+        let text = "image fixture";
+        let assert_visible = |session: &mut ImageSearchSession<'_>| {
+            session.worker = Some(GemmaQuery::Fixture(Box::new(query_vector)));
+            let hits = session.search(text, 20).unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].path, path.to_str().unwrap());
+        };
+        assert_visible(&mut session);
+        start_benign_writes(&session.conn, &database);
+        for _ in 0..8 {
+            let hits = session.search_candidates(text, 20).unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].path, path.to_str().unwrap());
+        }
+        assert!(stop_benign_writes(&session.conn) >= 8);
 
-        let mut attempts = 0;
-        let hits = read_snapshot(&reader, |snapshot| {
-            attempts += 1;
-            let hits = rank(snapshot, &mut cache)?;
-            if attempts == 1 {
-                assert_eq!(hits[0].path, path.to_str().unwrap());
-                // Commit on a different connection while the WAL reader still
-                // holds the snapshot used by the warm matrix and its hits.
-                image_scope(&database, None)?;
-            }
-            Ok(hits)
-        })
-        .unwrap()
-        .unwrap();
-        assert_eq!(attempts, 2);
-        assert!(hits.is_empty());
-        drop(reader);
+        for update in [
+            // Leave the item and vector in place when changing only policy.
+            "UPDATE info SET value=json_set(value,'$.deny',json_array((SELECT path FROM item WHERE display='sample.png'))) WHERE key='scope'",
+            // Keep the vector to make sure availability is independently checked.
+            "DROP TRIGGER image_entry_moved; UPDATE item SET availability='unverified' WHERE display='sample.png'",
+            "UPDATE image_scope SET root=NULL,epoch=epoch+1",
+        ] {
+            assert_visible(&mut session);
+            let database = database.clone();
+            session.worker = Some(GemmaQuery::Fixture(Box::new(move || {
+                // Commit from a separate connection while search is encoding,
+                // before its ranking snapshot can be pinned.
+                Connection::open(&database)
+                    .unwrap()
+                    .execute_batch(update)
+                    .unwrap();
+                query_vector()
+            })));
+            assert!(
+                session.search_candidates(text, 20).unwrap().is_empty(),
+                "{update}"
+            );
+            writer.execute_batch("UPDATE info SET value=json_set(value,'$.deny',json('[]')) WHERE key='scope'; UPDATE item SET availability='local' WHERE display='sample.png'").unwrap();
+        }
+        drop(session);
         drop(writer);
         fs::remove_dir_all(root).unwrap();
     }

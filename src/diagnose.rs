@@ -202,7 +202,7 @@ fn validate_catalog_hit(
     let result = (|| -> crate::Result<bool> {
         let database = absolute(database)?;
         let conn = open_read(&database)?;
-        Ok(read_snapshot(&conn, |snapshot| {
+        read_snapshot(&conn, |snapshot| {
             Ok(
                 CatalogValidator::new(snapshot, &database).is_some_and(|validator| {
                     validator.check(
@@ -214,8 +214,7 @@ fn validate_catalog_hit(
                     )
                 }),
             )
-        })?
-        .unwrap_or(false))
+        })
     })();
     result.unwrap_or(false)
 }
@@ -235,36 +234,96 @@ pub(super) fn validate_session_hits(
         return visible;
     };
     let mut paths = MetadataBatch::default();
-    if let Ok(snapshot) = conn.unchecked_transaction()
-        && let Some(validator) = CatalogValidator::new(&snapshot, database)
-    {
-        for (&(path, kind, availability, stamp), visible) in hits.iter().zip(&mut visible) {
-            let path = Path::new(path);
-            if !crate::external::is_external(path) {
-                *visible = validator.check(&mut paths, path, kind, availability, stamp);
+    let _ = read_snapshot(conn, |snapshot| {
+        if let Some(validator) = CatalogValidator::new(snapshot, database) {
+            for (&(path, kind, availability, stamp), visible) in hits.iter().zip(&mut visible) {
+                let path = Path::new(path);
+                if !crate::external::is_external(path) {
+                    *visible = validator.check(&mut paths, path, kind, availability, stamp);
+                }
             }
         }
-    }
+        Ok(())
+    });
     crate::external::validate_batch(database, hits, &mut visible, &mut paths);
     visible
 }
 
-/// Retry a read raced by a catalog commit without repeating work outside SQLite.
-/// A continuously changing catalog still has a bounded, fail-closed fallback.
+/// Use one WAL snapshot for the version check, scope rules, and hit reads.
+/// A caller's transaction (including an already pinned snapshot) stays open.
 pub(super) fn read_snapshot<T>(
     conn: &Connection,
-    mut read: impl FnMut(&Connection) -> crate::Result<T>,
-) -> crate::Result<Option<T>> {
-    for _ in 0..3 {
-        let before = crate::name_fast::data_version(conn)?;
-        let snapshot = conn.unchecked_transaction()?;
-        let value = read(&snapshot)?;
-        drop(snapshot);
-        if before == crate::name_fast::data_version(conn)? {
-            return Ok(Some(value));
+    read: impl FnOnce(&Connection) -> crate::Result<T>,
+) -> crate::Result<T> {
+    let tx = conn
+        .is_autocommit()
+        .then(|| conn.unchecked_transaction())
+        .transpose()?;
+    let snapshot = tx.as_deref().unwrap_or(conn);
+    // BEGIN is deferred: take a real read of main before any cache lookup so
+    // PRAGMA data_version describes the WAL snapshot pinned by this SELECT.
+    snapshot
+        .prepare_cached("SELECT 1 FROM main.sqlite_schema LIMIT 1")?
+        .exists([])?;
+    read(snapshot)
+}
+
+#[cfg(test)]
+pub(super) mod snapshot_tests {
+    use rusqlite::{Connection, ffi};
+    use std::{cell::RefCell, path::Path};
+
+    thread_local! {
+        static WRITER: RefCell<Option<Connection>> = const { RefCell::new(None) };
+    }
+
+    // Commit between statements of the actual search, without sleeps or a
+    // search-side hook. SQLite calls this on the reader's thread, but the
+    // writes use a separate connection to an unrelated table.
+    pub fn start_benign_writes(reader: &Connection, database: &Path) {
+        let writer = Connection::open(database).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE benign_writes(n INTEGER); INSERT INTO benign_writes VALUES (0)",
+            )
+            .unwrap();
+        WRITER.with_borrow_mut(|slot| assert!(slot.replace(writer).is_none()));
+        unsafe {
+            ffi::sqlite3_trace_v2(
+                reader.handle(),
+                ffi::SQLITE_TRACE_PROFILE,
+                Some(after_read),
+                std::ptr::null_mut(),
+            );
         }
     }
-    Ok(None)
+
+    unsafe extern "C" fn after_read(
+        _: std::ffi::c_uint,
+        _: *mut std::ffi::c_void,
+        stmt: *mut std::ffi::c_void,
+        _: *mut std::ffi::c_void,
+    ) -> std::ffi::c_int {
+        // PROFILE provides a live statement on the registered reader. Only
+        // interleave writes while that connection holds a read transaction.
+        let db = unsafe { ffi::sqlite3_db_handle(stmt.cast()) };
+        if unsafe { ffi::sqlite3_txn_state(db, c"main".as_ptr()) } == ffi::SQLITE_TXN_READ {
+            WRITER.with_borrow(|writer| {
+                if let Some(writer) = writer {
+                    let _ = writer.execute("UPDATE benign_writes SET n=n+1", []);
+                }
+            });
+        }
+        0
+    }
+
+    pub fn stop_benign_writes(reader: &Connection) -> i64 {
+        unsafe { ffi::sqlite3_trace_v2(reader.handle(), 0, None, std::ptr::null_mut()) };
+        let writer = WRITER.with_borrow_mut(|slot| slot.take().unwrap());
+        writer
+            .query_row("SELECT n FROM benign_writes", [], |r| r.get(0))
+            .unwrap()
+    }
 }
 
 pub(super) struct CatalogValidator<'a> {
@@ -681,10 +740,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_validation_retries_concurrent_commits_and_is_bounded() {
+    fn catalog_validation_survives_concurrent_benign_commits() {
         let root = std::fs::canonicalize(std::env::temp_dir())
             .unwrap()
-            .join(format!("lumen-snapshot-retry-{}", std::process::id()));
+            .join(format!("lumen-diagnose-snapshot-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("docs")).unwrap();
         let path = root.join("docs/file.txt");
@@ -709,32 +768,22 @@ mod tests {
                 None,
             )
         };
-        let mut attempts = 0;
-        let result = read_snapshot(&reader, |snapshot| {
-            attempts += 1;
-            let visible = validate(snapshot);
-            if attempts < 3 {
+        let transaction = reader.unchecked_transaction().unwrap();
+        let result = read_snapshot(&transaction, |snapshot| {
+            assert!(validate(snapshot));
+            for _ in 0..8 {
                 writer.execute("UPDATE item SET display=display || 'x'", [])?;
+                assert!(validate(snapshot));
             }
-            Ok(visible)
+            Ok(true)
         })
         .unwrap();
-        assert_eq!(result, Some(true));
-        assert_eq!(attempts, 3);
+        assert!(result);
+        assert!(!reader.is_autocommit());
+        transaction.commit().unwrap();
         assert!(validate_catalog_hit(
             &database, &path, "file", "local", None
         ));
-
-        attempts = 0;
-        let result = read_snapshot(&reader, |snapshot| {
-            attempts += 1;
-            let visible = validate(snapshot);
-            writer.execute("UPDATE item SET display=display || 'x'", [])?;
-            Ok(visible)
-        })
-        .unwrap();
-        assert_eq!(result, None);
-        assert_eq!(attempts, 3);
         drop(reader);
         drop(writer);
         std::fs::remove_dir_all(root).unwrap();

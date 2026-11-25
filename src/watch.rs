@@ -69,10 +69,11 @@ mod macos {
         time::{Duration, Instant},
     };
 
-    #[derive(Clone, Copy)]
-    struct Timing {
+    struct MaintenancePolicy {
         periodic: Duration,
         recovery_cooldown: Duration,
+        persistent: bool,
+        guarded_cache: bool,
     }
 
     const MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(300);
@@ -139,21 +140,14 @@ mod macos {
         }
         // Periodic checks cover silently lost notifications, non-journaling
         // volumes, and directories we could not read during a previous pass.
-        let timing = Timing {
+        let policy = MaintenancePolicy {
             periodic: Duration::from_secs(30 * 60),
             recovery_cooldown: Duration::from_secs(30),
+            persistent: true,
+            guarded_cache,
         };
         resume::install_invalidation(&conn)?;
-        maintain(
-            &mut conn,
-            coverage,
-            timing,
-            progress,
-            true,
-            guarded_cache,
-            start_stream,
-            emit,
-        )
+        maintain(&mut conn, coverage, policy, progress, start_stream, emit)
     }
 
     struct Subscription<S> {
@@ -278,13 +272,17 @@ mod macos {
     fn maintain<S>(
         conn: &mut Connection,
         mut coverage: Arc<Coverage>,
-        timing: Timing,
+        policy: MaintenancePolicy,
         progress: Option<&ScanProgressReporter>,
-        persistent: bool,
-        guarded_cache: bool,
         start: impl Fn(&Arc<Sink>, Option<(&resume::Journal, u64)>) -> Result<S>,
         mut emit: impl FnMut(WatchEvent) -> Result<()>,
     ) -> Result<()> {
+        let MaintenancePolicy {
+            periodic,
+            recovery_cooldown,
+            persistent,
+            guarded_cache,
+        } = policy;
         let (mut sub, attempt_resume) =
             Subscription::start(conn, &coverage, persistent, true, &start)?;
         let mut resumed = false;
@@ -371,9 +369,9 @@ mod macos {
         let mut pending_update = false;
         loop {
             let interval = if pending_recovery {
-                timing.recovery_cooldown
+                recovery_cooldown
             } else {
-                timing.periodic
+                periodic
             };
             let mut wait = interval.saturating_sub(last_reconciled.elapsed());
             if pending_update {
@@ -414,8 +412,8 @@ mod macos {
                 pending_recovery = true;
             }
             let full = rearm
-                || last_reconciled.elapsed() >= timing.periodic
-                || pending_recovery && last_reconciled.elapsed() >= timing.recovery_cooldown;
+                || last_reconciled.elapsed() >= periodic
+                || pending_recovery && last_reconciled.elapsed() >= recovery_cooldown;
             if full {
                 if persistent {
                     resume::invalidate(conn)?;
@@ -744,19 +742,19 @@ mod macos {
             let target = absolute(&root.join("delivered.txt")).unwrap();
             let missed = absolute(&root.join("missed.txt")).unwrap();
             let sink = RefCell::<Option<Arc<Sink>>>::new(None);
-            let timing = Timing {
+            let policy = MaintenancePolicy {
                 periodic: Duration::from_millis(if report_loss { 2500 } else { 500 }),
                 recovery_cooldown: Duration::from_millis(80),
+                persistent: false,
+                guarded_cache: false,
             };
             let mut updates = 0;
             let started = Instant::now();
             let result = maintain(
                 &mut conn,
                 coverage,
-                timing,
+                policy,
                 None,
-                false,
-                false,
                 |s, _| {
                     *sink.borrow_mut() = Some(s.clone());
                     Ok(())
@@ -790,7 +788,7 @@ mod macos {
                                 assert_eq!(names("missed")?.len(), 1);
                                 if report_loss {
                                     assert!(
-                                        started.elapsed() < timing.periodic,
+                                        started.elapsed() < periodic,
                                         "lost-event notice did not accelerate reconciliation"
                                     );
                                 }

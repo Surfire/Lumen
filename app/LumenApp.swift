@@ -20,6 +20,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     let model: Launcher
     let smoke: LauncherSmoke?
     let applicationIcons = ResultIconDisplay()
+    let contextActions = ContextActions()
+    private var contextUpdates: AnyCancellable?
+    private(set) var quicklinksWindow: NSPanel?
     private let defaults: UserDefaults?
     private(set) lazy var globalHotKey = GlobalHotKey { [weak self] in self?.showSearch() }
     private var statusItem: NSStatusItem?
@@ -73,10 +76,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
         panel.delegate = self
-        panel.onCancel = { [weak self] in self?.dismissSearch() }
+        panel.onCancel = { [weak self] in self?.cancelCurrentPanelAction() }
+        panel.onContextActions = { [weak self] in self?.toggleContextActions() }
         panel.onSettings = { [weak self] in self?.showSettings() }
         panel.onFileAction = { [weak self] action in
-            guard let self, let hit = self.model.selectedHit else { return }
+            guard let self, !self.contextActions.isOpen, let hit = self.model.selectedHit else { return }
             self.perform(action, on: hit)
         }
         let content = SearchBackdrop()
@@ -107,6 +111,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         let results = NSHostingView(rootView: SearchWindow(
             model: model,
             applicationIcons: applicationIcons,
+            contextActions: contextActions,
+            toggleContextActions: { [weak self] in self?.toggleContextActions() },
             showSettings: { [weak self] in self?.showSettings() },
             beginIndex: { [weak self] in self?.startBackgroundIndex() },
             open: { [weak self] in self?.open($0) },
@@ -172,6 +178,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 self.presentationScheduled = false
                 self.updatePresentation()
             }
+        }
+        contextUpdates = contextActions.$items.dropFirst().sink { [weak self] _ in
+            DispatchQueue.main.async { [weak self] in self?.updatePresentation() }
         }
         updateLanguage()
         model.start()
@@ -265,6 +274,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     @objc func dismissSearch() {
         guard searchPresented else { return }
         searchPresented = false
+        contextActions.close()
         // Release the field editor first so an earlier composition cannot be restored on reopen.
         panel.makeFirstResponder(nil)
         searchField.stringValue = ""
@@ -285,25 +295,94 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if model.isIndexing { dismissSearch() }
     }
 
-    func controlTextDidChange(_ notification: Notification) {
+    func controlTextDidChange(_ notification: Notification) { searchFieldAction() }
+
+    @objc private func searchFieldAction() {
+        if model.query != searchField.stringValue { contextActions.close() }
         model.setQuery(searchField.stringValue)
     }
-
-    @objc private func searchFieldAction() { model.setQuery(searchField.stringValue) }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
         guard control === searchField, !textView.hasMarkedText() else { return false }
         switch commandSelector {
-        case #selector(NSResponder.moveUp(_:)): model.moveSelection(-1)
-        case #selector(NSResponder.moveDown(_:)): model.moveSelection(1)
+        case #selector(NSResponder.moveUp(_:)): moveCurrentSelection(-1)
+        case #selector(NSResponder.moveDown(_:)): moveCurrentSelection(1)
         case #selector(NSResponder.insertNewline(_:)): openSelection()
-        case #selector(NSResponder.cancelOperation(_:)): dismissSearch()
+        case #selector(NSResponder.cancelOperation(_:)): cancelCurrentPanelAction()
         default: return false
         }
         return true
     }
 
+    private func moveCurrentSelection(_ delta: Int) {
+        if contextActions.isOpen { contextActions.move(delta) }
+        else { model.moveSelection(delta) }
+    }
+
+    private func cancelCurrentPanelAction() {
+        if contextActions.isOpen { contextActions.close() }
+        else { dismissSearch() }
+    }
+
+    private func toggleContextActions() {
+        if contextActions.isOpen { contextActions.close(); return }
+        var items: [ContextActions.Item] = []
+        func item(_ id: String, _ zh: String, _ en: String, _ symbol: String, _ callback: @escaping () -> Void) {
+            items.append(.init(id: id, title: model.t(zh, en), symbol: symbol, perform: callback))
+        }
+        if let selected = model.selectedResult {
+            if case .calculation = selected {
+                item("copy", "复制结果", "Copy Result", "doc.on.doc") { [weak self] in self?.open(selected) }
+            } else if case .file(let hit) = selected, !hit.isLocal {
+                item("reveal", "在 Finder 中显示", "Show in Finder", "folder") { [weak self] in self?.revealInFinder(hit) }
+            } else {
+                item("open", "打开", "Open", "return") { [weak self] in self?.open(selected) }
+            }
+
+            switch selected {
+            case .file(let hit):
+                if hit.isLocal { item("reveal", "在 Finder 中显示", "Show in Finder", "folder") { [weak self] in self?.revealInFinder(hit) } }
+                if hit.isLocal && hit.kind == "file" {
+                    item("preview", "快速查看", "Quick Look", "eye") { [weak self] in self?.previewFile(hit) }
+                }
+                item("copy-name", "复制名称", "Copy Name", "doc.on.doc") { [weak self] in self?.perform(.copyName, on: hit) }
+                item("copy-path", "复制路径", "Copy Path", "link") { [weak self] in self?.perform(.copyPath, on: hit) }
+                if hit.isLocal && hit.kind == "directory" {
+                    item("pin-folder", "固定项目文件夹", "Pin Project Folder", "pin") { [weak self] in
+                        guard let self else { return }
+                        self.model.resolve(hit, action: .open) { [weak self] url in
+                            self?.pin(title: hit.name, target: .folder(url.path))
+                        }
+                    }
+                }
+            case .action(let action):
+                if case .application = action.destination {
+                    item("pin-app", "固定应用", "Pin Application", "pin") { [weak self] in
+                        guard let self, self.model.containsCurrentAction(action) else { return }
+                        self.pin(title: action.title(chinese: self.model.zh), target: .application(action.id))
+                    }
+                }
+            case .shortcut(let shortcut):
+                item("toggle-pin", shortcut.pinned ? "取消固定" : "固定", shortcut.pinned ? "Unpin" : "Pin", "pin") { [weak self] in
+                    self?.model.shortcuts.togglePin(shortcut)
+                }
+            case .calculation: break
+            }
+        }
+        item("quicklinks", "管理快捷链接…", "Manage Quicklinks…", "link") { [weak self] in self?.showQuicklinks() }
+        contextActions.show(items)
+    }
+
+    private func pin(title: String, target: SavedShortcut.Target) {
+        if let saved = model.shortcuts.entries.first(where: { $0.target == target }) {
+            if !saved.pinned { model.shortcuts.togglePin(saved) }
+        } else if !model.shortcuts.save(.init(id: UUID(), title: title, alias: "", target: target, pinned: true)) {
+            model.openingFailed()
+        }
+    }
+
     private func openSelection() {
+        if contextActions.isOpen { contextActions.run(); return }
         if let selected = model.selectedResult { open(selected) }
     }
 
@@ -311,11 +390,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         switch result {
         case .file(let hit): openFile(hit)
         case .action(let action): runAction(action)
+        case .shortcut(let shortcut): openShortcut(shortcut)
+        case .calculation(let calculation):
+            guard searchPresented, model.calculation == calculation else { return }
+            let pasteboard = smoke?.filePasteboard ?? NSPasteboard.general
+            pasteboard.clearContents()
+            if pasteboard.setString(calculation.copyValue, forType: .string) { dismissSearch() }
+            else { model.openingFailed() }
         }
     }
 
-    private func runAction(_ action: LaunchAction) {
-        guard searchPresented, model.containsCurrentAction(action), !actionInFlight else { return }
+    private func openShortcut(_ shortcut: SavedShortcut) {
+        guard searchPresented, model.visibleResults.contains(where: {
+            if case .shortcut(let current) = $0 { return current == shortcut }
+            return false
+        }) else { return }
+        let url: URL
+        switch shortcut.target {
+        case .application:
+            guard let app = model.application(for: shortcut) else { model.openingFailed(); return }
+            runAction(app, shortcut: shortcut)
+            return
+        case .folder(let path):
+            guard SearchHit.pathStamp(at: path, kind: "directory") != nil else { model.openingFailed(); return }
+            url = URL(fileURLWithPath: path, isDirectory: true)
+        case .web(let destination):
+            guard let verified = SavedShortcut.webURL(destination.absoluteString) else { model.openingFailed(); return }
+            url = verified
+        }
+        if let smoke { smoke.dispatchedQuicklinks.append(url) }
+        else if !NSWorkspace.shared.open(url) { model.openingFailed(); return }
+        model.shortcuts.noteOpened(shortcut)
+        dismissSearch()
+    }
+
+    private func runAction(_ action: LaunchAction, shortcut: SavedShortcut? = nil) {
+        let current = shortcut.map { saved in
+            model.visibleResults.contains { row in
+                if case .shortcut(let value) = row { return value == saved && model.application(for: value) == action }
+                return false
+            }
+        } ?? model.containsCurrentAction(action)
+        guard searchPresented, current, !actionInFlight else { return }
         actionInFlight = true
         let query = model.query
         let finished: (Bool) -> Void = { [weak self] success in
@@ -403,6 +519,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 }
             }
         }
+    }
+
+    @objc func showQuicklinks() {
+        loadApplicationCatalog()
+        if quicklinksWindow == nil {
+            let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 620, height: 520),
+                                 styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            let view = QuicklinksView(model: model, library: model.shortcuts) { [weak self, weak window] complete in
+                guard let self, let window else { return }
+                if let smoke = self.smoke {
+                    if let folder = smoke.chosenQuicklinkFolder { complete(folder) }
+                    return
+                }
+                let picker = NSOpenPanel()
+                picker.canChooseDirectories = true
+                picker.canChooseFiles = false
+                picker.allowsMultipleSelection = false
+                picker.resolvesAliases = false
+                picker.beginSheetModal(for: window) { response in
+                    if response == .OK, let url = picker.url { complete(url) }
+                }
+            }
+            window.contentView = NSHostingView(rootView: view)
+            if smoke == nil { window.center() }
+            else { window.setFrameOrigin(NSPoint(x: -12_000, y: -12_000)) }
+            quicklinksWindow = window
+        }
+        quicklinksWindow?.title = model.t("快捷链接", "Quicklinks")
+        if smoke == nil {
+            NSApp.activate()
+            quicklinksWindow?.makeKeyAndOrderFront(nil)
+        }
+        if searchPresented { dismissSearch() }
     }
 
     @objc func showSettings() {
@@ -588,6 +738,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         #if LUMEN_EXTENSIONS
         menu.addItem(withTitle: model.t("扩展…", "Extensions…"), action: #selector(showExtensions), keyEquivalent: "").target = self
         #endif
+        menu.addItem(withTitle: model.t("快捷链接…", "Quicklinks…"), action: #selector(showQuicklinks), keyEquivalent: "").target = self
         menu.addItem(withTitle: model.t("设置…", "Settings…"), action: #selector(showSettings), keyEquivalent: "").target = self
         menu.addItem(.separator())
         menu.addItem(withTitle: model.t("退出 Lumen", "Quit Lumen"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "").target = NSApp
@@ -597,7 +748,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func updatePresentation() {
-        applicationIcons.update(for: searchPresented ? model.launchMatches : [])
+        let pinnedApps = model.visibleResults.prefix(SearchWindow.maximumVisibleRows).compactMap { row -> ActionMatch? in
+            guard case .shortcut(let shortcut) = row, let action = model.application(for: shortcut) else { return nil }
+            return ActionMatch(action: action, score: 0)
+        }
+        applicationIcons.update(for: searchPresented ? model.launchMatches + pinnedApps : [])
 
         let activity = model.activityTitle
         let metrics = model.activityMetrics
@@ -624,7 +779,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
         guard searchPresented else { return }
         var frame = panel.frame
-        let height = SearchWindow.height(for: model)
+        let height = SearchWindow.height(for: model, contextCount: contextActions.items.count)
         guard frame.height != height else { return }
         frame.origin.y += frame.height - height
         frame.size.height = height
@@ -709,6 +864,7 @@ final class SearchBackdrop: NSVisualEffectView {
 final class SearchPanel: NSPanel {
     var onCancel: (() -> Void)?
     var onFileAction: ((FileAction) -> Void)?
+    var onContextActions: (() -> Void)?
     var onSettings: (() -> Void)?
     override var canBecomeKey: Bool { true }
 
@@ -719,6 +875,7 @@ final class SearchPanel: NSPanel {
         if modifiers == [.command] {
             if key == "," { onSettings?() }
             else if key == "y" { onFileAction?(.preview) }
+            else if key == "k" { onContextActions?() }
             else if event.keyCode == kVK_Return || event.keyCode == kVK_ANSI_KeypadEnter { onFileAction?(.reveal) }
             else { return false }
         } else if key == "c", modifiers == [.command, .shift] {

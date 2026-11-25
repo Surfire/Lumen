@@ -84,6 +84,9 @@ final class Launcher: ObservableObject {
     @Published private(set) var query = ""
     @Published private(set) var hits: [SearchHit] = []
     @Published private(set) var launchMatches: [ActionMatch] = []
+    @Published private(set) var calculation: CalculationResult?
+    let shortcuts: ShortcutLibrary
+    private var shortcutChanges: AnyCancellable?
     @Published var selection: String?
     @Published private(set) var searching = false
     @Published private(set) var semanticBusy = false
@@ -171,13 +174,36 @@ final class Launcher: ObservableObject {
         scopePending || indexPhase == .needsIndex || indexPhase == .unreadable || watchState == .needsSetup
     }
 
-    var showsResults: Bool { hasQuery && (canSearch || !launchMatches.isEmpty) }
+    var showsResults: Bool { hasQuery ? (canSearch || !visibleResults.isEmpty) : !shortcuts.home.isEmpty }
+
+    var installedActions: [LaunchAction] {
+        appActions.sorted { $0.title(chinese: zh).localizedStandardCompare($1.title(chinese: zh)) == .orderedAscending }
+    }
+
+    func application(for shortcut: SavedShortcut) -> LaunchAction? {
+        guard case .application(let id) = shortcut.target else { return nil }
+        return appActions.first { $0.id == id }
+    }
 
     var visibleResults: [LauncherResult] {
-        let actions = launchMatches.filter(\.primary).map { LauncherResult.action($0.action) }
-        let otherActions = launchMatches.filter { !$0.primary }.map { LauncherResult.action($0.action) }
-        let files = resultsRevision == revision || launchMatches.isEmpty ? hits.map(LauncherResult.file) : []
-        return actions + files + otherActions
+        guard hasQuery else { return shortcuts.home.map(LauncherResult.shortcut) }
+        let nativeScores = Dictionary(uniqueKeysWithValues: launchMatches.map { ($0.action.id, $0.score) })
+        let shortcuts = shortcuts.matches(query).filter { match in
+            guard case .application(let id) = match.record.target else { return true }
+            return match.score >= (nativeScores[id] ?? 0)
+        }
+        let linkedApps = Set(shortcuts.compactMap { match -> String? in
+            if case .application(let id) = match.record.target { return id }
+            return nil
+        })
+        let native = launchMatches.filter { !linkedApps.contains($0.action.id) }.map {
+            (LauncherResult.action($0.action), $0.score)
+        }
+        let saved = shortcuts.map { (LauncherResult.shortcut($0.record), $0.score) }
+        let commands = (native + saved).sorted { $0.1 > $1.1 }
+        let files = resultsRevision == revision || commands.isEmpty ? hits.map(LauncherResult.file) : []
+        let result = calculation.map { [LauncherResult.calculation($0)] } ?? []
+        return result + commands.filter { $0.1 >= 80 }.map(\.0) + files + commands.filter { $0.1 < 80 }.map(\.0)
     }
 
     var hasQuery: Bool { !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -194,6 +220,7 @@ final class Launcher: ObservableObject {
     init(engine: LauncherEngine, defaults: UserDefaults?, locale: String? = nil) {
         self.engine = engine
         self.defaults = defaults
+        shortcuts = ShortcutLibrary(defaults: defaults)
         builtInActions = LaunchCatalog.systemActions()
         scopePending = engine.hasPendingScope
         language = locale ?? defaults?.string(forKey: "language") ?? "system"
@@ -201,6 +228,12 @@ final class Launcher: ObservableObject {
                            allow: IndexScope.storedPaths("allow", in: defaults),
                            deny: IndexScope.storedPaths("deny", in: defaults),
                            documents: defaults?.bool(forKey: "documents") ?? false)
+        shortcutChanges = shortcuts.objectWillChange.sink { [weak self] in
+            DispatchQueue.main.async { [weak self] in
+                self?.objectWillChange.send()
+                self?.reconcileSelection()
+            }
+        }
     }
 
     func start() {
@@ -302,9 +335,17 @@ final class Launcher: ObservableObject {
     func setQuery(_ text: String) {
         guard text != query else { return }
         query = text
+        calculation = CalculationResult.evaluate(text)
         updateLaunchMatches()
         scheduleSearch()
-        if let preferred = launchMatches.first(where: \.primary) { selection = preferred.action.id }
+        if let first = visibleResults.first {
+            switch first {
+            case .file: break
+            case .action(let action):
+                if launchMatches.first(where: { $0.action.id == action.id })?.primary == true { selection = first.id }
+            case .shortcut, .calculation: selection = first.id
+            }
+        }
         reconcileSelection()
     }
 
@@ -325,6 +366,7 @@ final class Launcher: ObservableObject {
 
     func clear() {
         query = ""
+        calculation = nil
         launchMatches = []
         scheduleSearch(clearRows: true)
     }
@@ -528,8 +570,9 @@ final class Launcher: ObservableObject {
     }
 
     var selectedResult: LauncherResult? {
-        if let action = launchMatches.first(where: { $0.action.id == selection }) { return .action(action.action) }
-        return selectedHit.map(LauncherResult.file)
+        guard let row = visibleResults.first(where: { $0.id == selection }) else { return nil }
+        if case .file = row { return selectedHit.map(LauncherResult.file) }
+        return row
     }
 
     var selectedHit: SearchHit? {

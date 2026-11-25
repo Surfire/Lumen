@@ -377,6 +377,13 @@ def make_action_probe(root):
                 borrowed.symlink_to(icon)
                 metadata["CFBundleIconFile"] = borrowed.name
             plistlib.dump(metadata, handle)
+    for name, identifier in (("WeChat Fixture", "com.tencent.xinwechat"),
+                             ("WX", "io.github.surfire.lumen.smoke.wx." + root.name)):
+        extra = root / f"Applications/{name}.app/Contents"
+        extra.mkdir(parents=True)
+        with (extra / "Info.plist").open("wb") as handle:
+            plistlib.dump({"CFBundleIdentifier": identifier, "CFBundlePackageType": "APPL"}, handle)
+
 
 
 def main():
@@ -399,6 +406,7 @@ def main():
         make_action_probe(root)
         (root / "corpus/Lumen Action Probe notes.txt").write_text("Synthetic unified search fixture.", encoding="utf-8")
         (root / "action-scenario").touch()
+        (root / "quicklinks-scenario").touch()
         if args.query_syntax:
             fixtures = root / "corpus"
             for name in ("成都 卫健委.PPTX", "卫健委成都方案.pptx", "Other project.pptx",

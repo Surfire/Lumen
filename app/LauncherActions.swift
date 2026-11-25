@@ -145,12 +145,14 @@ struct ActionMatch: Equatable {
 }
 
 enum LauncherResult: Identifiable {
-    case file(SearchHit), action(LaunchAction)
+    case file(SearchHit), action(LaunchAction), shortcut(SavedShortcut), calculation(CalculationResult)
 
     var id: String {
         switch self {
         case .file(let hit): return hit.path
         case .action(let action): return action.id
+        case .shortcut(let shortcut): return shortcut.rowID
+        case .calculation: return "calculation"
         }
     }
 }
@@ -179,7 +181,8 @@ enum LaunchCatalog {
             // These destinations are fixed. Search text is never interpolated into a URL.
             let url = URL(string: "x-apple.systempreferences:" + identifier)!
             return LaunchAction(id: "settings:" + identifier, english: english, chinese: chinese, symbol: icon,
-                                destination: .settings(url), aliases: aliases + [english + " settings", chinese + "设置"])
+                                destination: .settings(url),
+                                aliases: aliases + [english + " settings", chinese + "设置"] + pinyinAliases(chinese))
         }
         return settings
     }
@@ -239,6 +242,7 @@ enum LaunchCatalog {
             let initials = filename.split { !$0.isLetter && !$0.isNumber }.compactMap(\.first)
             let aliases = [filename, localized, bundle.infoDictionary?["CFBundleName"] as? String ?? filename]
                 + (commonAliases[normalizedID] ?? []) + (initials.count > 1 ? [String(initials)] : [])
+                + pinyinAliases(chinese) + (localized == chinese ? [] : pinyinAliases(localized))
             actions.append(LaunchAction(id: "app:" + identifier, english: english, chinese: chinese,
                                         symbol: "app", destination: .application(target, stamp: stamp), aliases: aliases))
         }
@@ -264,7 +268,8 @@ enum LaunchCatalog {
         let term = normalized(query)
         guard !term.isEmpty, term.utf8.count <= 128, !query.contains("/") && !query.contains("\\") else { return [] }
         return actions.compactMap { action -> ActionMatch? in
-            let score = action.searchable.lazy.map { match(term, in: normalized($0)) }.max() ?? 0
+            let names = [action.english, action.chinese].map(normalized)
+            let score = names.contains(term) ? 110 : action.searchable.lazy.map { match(term, in: normalized($0)) }.max() ?? 0
             guard score > 0 else { return nil }
             return ActionMatch(action: action, score: score)
         }.sorted {
@@ -274,7 +279,17 @@ enum LaunchCatalog {
         }.prefix(4).map { $0 }
     }
 
-    private static func normalized(_ value: String) -> String {
+    static func pinyinAliases(_ value: String) -> [String] {
+        let han = String(value.unicodeScalars.filter { (0x3400...0x9fff).contains($0.value) })
+        guard !han.isEmpty,
+              let latin = han.applyingTransform(.toLatin, reverse: false)?.applyingTransform(.stripCombiningMarks, reverse: false)
+        else { return [] }
+        let syllables = latin.lowercased().split { !$0.isASCII || !$0.isLetter }
+        guard !syllables.isEmpty else { return [] }
+        return [syllables.joined(), String(syllables.compactMap(\.first))]
+    }
+
+    static func normalized(_ value: String) -> String {
         value.precomposedStringWithCompatibilityMapping
             .folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: Locale(identifier: "en_US_POSIX"))
             .filter { $0.isLetter || $0.isNumber }

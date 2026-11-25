@@ -4,6 +4,8 @@ import SwiftUI
 struct SearchWindow: View {
     @ObservedObject var model: Launcher
     @ObservedObject var applicationIcons: ResultIconDisplay
+    @ObservedObject var contextActions: ContextActions
+    let toggleContextActions: () -> Void
     let showSettings: () -> Void
     let beginIndex: () -> Void
     let open: (LauncherResult) -> Void
@@ -13,16 +15,21 @@ struct SearchWindow: View {
     static let footerHeight: CGFloat = 28
     static let maximumVisibleRows = 8
 
-    static func height(for model: Launcher) -> CGFloat {
+    static func height(for model: Launcher, contextCount: Int = 0) -> CGFloat {
         let shell = headerHeight + footerHeight
-        return model.showsResults ? shell + CGFloat(maximumVisibleRows * 44) : shell
+        if contextCount > 0 { return shell + CGFloat(min(contextCount, maximumVisibleRows) * 44) }
+        guard model.showsResults else { return shell }
+        let rows = model.hasQuery ? maximumVisibleRows : min(model.visibleResults.count, maximumVisibleRows)
+        return shell + CGFloat(rows * 44)
     }
 
     private static func rowHeight(_ hit: SearchHit) -> CGFloat { hit.hasPreview ? 60 : 44 }
 
     var body: some View {
         VStack(spacing: 0) {
-            if model.showsResults {
+            if contextActions.isOpen {
+                contextRows
+            } else if model.showsResults {
                 results.overlay {
                     if model.visibleResults.isEmpty {
                         Text(emptyResultsLabel)
@@ -69,6 +76,10 @@ struct SearchWindow: View {
             } else {
                 keyHint("esc", model.t("关闭", "Close"))
             }
+            Button(action: toggleContextActions) {
+                keyHint("⌘K", model.t("操作", "Actions"))
+            }
+            .buttonStyle(.borderless)
             Button(action: showSettings) {
                 Image(systemName: "gearshape").font(.system(size: 12))
             }
@@ -103,6 +114,12 @@ struct SearchWindow: View {
                         switch result {
                         case .file(let hit): resultRow(hit).id(result.id)
                         case .action(let action): actionRow(action).id(result.id)
+                        case .shortcut(let shortcut):
+                            utilityRow(result, title: shortcut.title, detail: shortcut.detail, symbol: shortcut.symbol)
+                                .id(result.id)
+                        case .calculation(let calculation):
+                            utilityRow(result, title: calculation.display, detail: model.t("回车复制", "Return to Copy"),
+                                       symbol: "plus.forwardslash.minus").id(result.id)
                         }
                     }
                 }
@@ -119,6 +136,55 @@ struct SearchWindow: View {
                 return .handled
             }
         }
+    }
+
+    private var contextRows: some View {
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                ForEach(Array(contextActions.items.enumerated()), id: \.element.id) { index, item in
+                    Button {
+                        contextActions.run(index)
+                    } label: {
+                        Label(item.title, systemImage: item.symbol)
+                            .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 10)
+                            .frame(height: 44).background { selectionBackground(contextActions.selected == index) }
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(contextActions.selected == index ? .isSelected : [])
+                }
+            }.padding(.horizontal, 8)
+        }
+    }
+
+    private func utilityRow(_ result: LauncherResult, title: String, detail: String, symbol: String) -> some View {
+        let selected = model.selection == result.id
+        return HStack(spacing: 10) {
+            if case .shortcut(let shortcut) = result, let action = model.application(for: shortcut) {
+                ActionResultIcon(action: action, image: ApplicationIcons.Key(action).flatMap { applicationIcons.images[$0] },
+                                 selected: selected)
+            } else {
+                Image(systemName: symbol).frame(width: 28, height: 28)
+                    .foregroundStyle(selected ? Color.accentColor : .secondary)
+                    .background(.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 6))
+                    .accessibilityHidden(true)
+            }
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                Text(detail).font(.system(size: 11)).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.middle)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 44)
+        .background { selectionBackground(selected) }
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) { open(result) }
+        .onTapGesture { model.selection = result.id }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityAction(named: Text(model.t("执行", "Run"))) { open(result) }
     }
 
     private var emptyResultsLabel: String {

@@ -23,6 +23,8 @@ final class LauncherSmoke {
     }
     private var revealDispatch: ContinuousClock.Instant?
     var wasActivated = false
+    var dispatchedQuicklinks: [URL] = []
+    var chosenQuicklinkFolder: URL?
     var chosenSettingsDirectories: [URL]?
     var chosenDiagnosticFile: URL?
 
@@ -415,7 +417,96 @@ final class LauncherSmoke {
         try check(!FileManager.default.fileExists(atPath: snapshot.path), "closing the preview kept the snapshot")
 
         if exists("syntax-scenario") { try await verifyRawFileQuery(app) }
+        if exists("quicklinks-scenario") { try await verifyQuicklinks(app) }
         print("Unified actions passed: real background app launch, routed Settings URLs, isolated file copies, and native local Quick Look input")
+    }
+
+    private func verifyQuicklinks(_ app: AppDelegate) async throws {
+        let model = app.model
+        func actionName() -> String? {
+            if case .action(let action)? = model.selectedResult { return action.english }
+            return nil
+        }
+        try type("wx", into: app)
+        try await until("exact app title beat the short pinyin initialism") {
+            actionName() == "WX" && model.launchMatches.contains { $0.action.chinese == "微信" }
+        }
+        try type("weixin", into: app)
+        try await until("full pinyin reached WeChat") { actionName() == "WeChat Fixture" }
+        try type("lanya", into: app)
+        try await until("full pinyin reached Bluetooth") { actionName() == "Bluetooth" }
+        try type("ly", into: app)
+        try await until("pinyin initials reached Bluetooth") { actionName() == "Bluetooth" }
+
+        try type("lap", into: app)
+        try await until("the app was ready to pin") { actionName() == "Lumen Action Probe" }
+        try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+        try check(app.contextActions.items.map(\.id) == ["open", "pin-app", "quicklinks"],
+                  "Command–K did not expose the selected app's actions")
+        try key(kVK_DownArrow, "\u{f701}", in: app)
+        try key(kVK_Return, "\r", in: app)
+        try type("", into: app)
+        try await until("manually pinned app appeared in empty search") { model.visibleResults.count == 1 }
+        guard case .shortcut(let pinned)? = model.selectedResult else { throw Failure("pin was not selectable") }
+        try check(pinned.pinned && pinned.title == "Lumen Action Probe", "unexpected empty-search pin")
+
+        try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try check(!app.contextActions.isOpen && app.searchPresented, "Escape dismissed search instead of closing its action list")
+        try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+        try key(kVK_DownArrow, "\u{f701}", in: app)
+        try key(kVK_DownArrow, "\u{f701}", in: app)
+        try key(kVK_Return, "\r", in: app)
+        try check(app.quicklinksWindow != nil && app.quicklinksWindow?.isVisible == false,
+                  "the contextual Quicklinks action failed to open the isolated editor")
+
+        let url = URL(string: "https://example.invalid/work")!
+        try check(SavedShortcut.webURL("javascript:alert(1)") == nil &&
+                  SavedShortcut.webURL("https://someone:password@example.invalid/") == nil,
+                  "Quicklinks allowed an unsafe URL")
+        var appAlias = pinned
+        appAlias.alias = "launchfixture"
+        let web = SavedShortcut(id: UUID(), title: "Fixture Website", alias: "sw", target: .web(url), pinned: false)
+        let directory = corpus.appendingPathComponent("Test Project Folder", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let project = SavedShortcut(id: UUID(), title: "Fixture Project", alias: "pj",
+                                    target: .folder(IndexScope.folderPath(directory)), pinned: false)
+        try check(model.shortcuts.save(appAlias) && model.shortcuts.save(web) && model.shortcuts.save(project),
+                  "could not save isolated app alias, web link, and selected project")
+        app.showSearch()
+        try type("launchfixture", into: app)
+        guard case .shortcut(let alias)? = model.selectedResult else { throw Failure("saved app alias did not match") }
+        try check(alias.id == pinned.id, "app alias selected a different target")
+        try type("sw", into: app)
+        try check(dispatchedQuicklinks.isEmpty, "typing a Quicklink alias opened a URL")
+        try key(kVK_Return, "\r", in: app)
+        try check(dispatchedQuicklinks == [url] && !app.searchPresented, "Return did not dispatch the requested website")
+
+        app.showSearch()
+        try type("pj", into: app)
+        try key(kVK_Return, "\r", in: app)
+        try check(dispatchedQuicklinks.last.map(IndexScope.folderPath) == IndexScope.folderPath(directory),
+                  "project alias did not dispatch the saved local path")
+        app.showSearch()
+        try await until("the explicitly opened project was recent below the manual pin") {
+            model.visibleResults.map(\.id) == [pinned.rowID, project.rowID]
+        }
+        let clipboardBefore = filePasteboard.string(forType: .string)
+        try type("（２＋３）×４", into: app)
+        try check(model.calculation?.display == "20" && filePasteboard.string(forType: .string) == clipboardBefore,
+                  "typing a calculation changed the clipboard")
+        try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+        try check(app.contextActions.items.first?.id == "copy", "calculator context did not offer Copy Result")
+        try key(kVK_Return, "\r", in: app)
+        try check(filePasteboard.string(forType: .string) == "20", "context menu did not copy the calculated value")
+        app.showSearch()
+        try type("10 公里 到 米", into: app)
+        try check(model.calculation?.copyValue == "10000 m", "local Chinese unit conversion failed")
+        try key(kVK_Return, "\r", in: app)
+        try check(filePasteboard.string(forType: .string) == "10000 m" &&
+                  CalculationResult.evaluate("1 m to kg") == nil && CalculationResult.evaluate("2/0") == nil &&
+                  CalculationResult.evaluate("2026-11-25") == nil, "conversion or invalid-input boundary failed")
+        print("Quicklinks passed: pins, contextual keyboard actions, local-only recent projects, explicit web dispatch, pinyin ranking, arithmetic and unit conversion")
     }
 
     private func verifyRawFileQuery(_ app: AppDelegate) async throws {

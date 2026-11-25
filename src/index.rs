@@ -134,6 +134,11 @@ pub(super) fn is_index_path(path: &Path, database: &Path, sidecars: &[PathBuf]) 
     path == database || sidecars.iter().any(|sidecar| path.starts_with(sidecar))
 }
 
+// Traversal may pass through these paths without publishing rows for them.
+fn visible_entry_path(path: &Path) -> bool {
+    path != Path::new("/") && !super::scope_ancestor(path)
+}
+
 pub(super) struct Coverage {
     pub scope: Scope,
     database: PathBuf,
@@ -216,7 +221,9 @@ impl Coverage {
     }
 
     pub(super) fn contains(&self, path: &Path) -> bool {
-        self.scope.roots.iter().any(|root| path.starts_with(root)) && self.allows(path)
+        visible_entry_path(path)
+            && self.scope.roots.iter().any(|root| path.starts_with(root))
+            && self.allows(path)
     }
 
     pub(super) fn permits_content(&self, path: &Path) -> bool {
@@ -385,9 +392,12 @@ pub(super) fn restrict_scope(conn: &mut Connection, coverage: &Coverage) -> Resu
     let prior: Option<String> = tx
         .query_row("SELECT value FROM info WHERE key='scope'", [], |r| r.get(0))
         .optional()?;
+    // Recheck unchanged scopes from catalogs written before traversal-only
+    // paths were excluded here as well as in the walk.
+    const POLICY_KEY: &str = "scope_policy_v4";
     let policy_reconciled = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM info WHERE key='scope_policy_v3')",
-        [],
+        "SELECT EXISTS(SELECT 1 FROM info WHERE key=?)",
+        [POLICY_KEY],
         |r| r.get::<_, bool>(0),
     )?;
     if policy_reconciled && prior.as_deref() == Some(&requested) {
@@ -423,7 +433,7 @@ pub(super) fn restrict_scope(conn: &mut Connection, coverage: &Coverage) -> Resu
         tx.execute("DELETE FROM info WHERE key='walk_sample'", [])?;
     }
     write_info(&tx, "scope", &coverage.scope)?;
-    write_info(&tx, "scope_policy_v3", &true)?;
+    write_info(&tx, POLICY_KEY, &true)?;
     tx.commit()?;
     Ok(())
 }
@@ -847,7 +857,7 @@ impl<'a> Walk<'a> {
                     .as_ref()
                     .is_none_or(|(kind, old)| kind != "directory" || old != availability);
             }
-            if path != Path::new("/") && !super::scope_ancestor(&path) {
+            if visible_entry_path(&path) {
                 let mut legacy = None;
                 let mut content = None;
                 if !directory
@@ -1227,21 +1237,23 @@ impl<'a> Walk<'a> {
 
 /// Verify access to the same local document version without reading bytes.
 pub(super) fn can_open_document(path: &Path, expected: &fs::Metadata) -> bool {
+    check_document_access(path, expected).unwrap_or(false)
+}
+
+pub(super) fn check_document_access(path: &Path, expected: &fs::Metadata) -> std::io::Result<bool> {
     use std::os::unix::fs::OpenOptionsExt;
     #[cfg(target_os = "macos")]
     let flags = libc::O_NOFOLLOW_ANY | libc::O_NONBLOCK;
     #[cfg(not(target_os = "macos"))]
     let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
-    fs::OpenOptions::new()
+    let opened = fs::OpenOptions::new()
         .read(true)
         .custom_flags(flags)
-        .open(path)
-        .and_then(|file| file.metadata())
-        .is_ok_and(|opened| {
-            opened.is_file()
-                && platform::availability(path, &opened) == "local"
-                && stamp(&opened) == stamp(expected)
-        })
+        .open(path)?
+        .metadata()?;
+    Ok(opened.is_file()
+        && platform::availability(path, &opened) == "local"
+        && stamp(&opened) == stamp(expected))
 }
 
 pub(super) fn document_version(

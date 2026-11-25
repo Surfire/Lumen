@@ -1,6 +1,6 @@
 use crate::index::{
-    Coverage, DocumentKind, can_open_document, document_version, extract_document, remove_document,
-    restrict_scope, save_document,
+    Coverage, DocumentKind, can_open_document, check_document_access, document_version,
+    extract_document, remove_document, restrict_scope, save_document,
 };
 use crate::{MAX_DOCUMENT, PdfHelperPolicy, Scope, absolute, open_read, open_write, platform};
 use anyhow::{Result, ensure};
@@ -8,6 +8,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    io::{self, ErrorKind},
     path::{Path, PathBuf},
 };
 
@@ -269,45 +270,13 @@ pub fn index_content(database: &Path, max: usize) -> Result<ContentBatch> {
             .execute([id])?;
             attempted = true;
             after = id;
-            let file = Path::new(&path);
-            let kind =
-                eligible_kind(&configured, file).filter(|_| configured.permits_content(file));
-            let stamp = |kind, meta: &fs::Metadata| document_version(&configured, kind, meta);
-            let metadata = match kind.map(|_| local_metadata(file)).transpose() {
-                Ok(metadata) => metadata.flatten(),
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
-                Err(_) => None,
-            };
-            let before = kind
-                .zip(metadata.as_ref())
-                .map(|(kind, meta)| stamp(kind, meta));
-            let cached = conn
-                .query_row("SELECT stamp FROM document_state WHERE id=?", [id], |r| {
-                    r.get::<_, String>(0)
-                })
-                .optional()?;
-            let unchanged = before.is_some()
-                && before == cached
-                && metadata
-                    .as_ref()
-                    .is_some_and(|meta| can_open_document(file, meta));
-            let extracted = if unchanged {
-                None
-            } else {
-                let result = kind
-                    .filter(|_| before.is_some())
-                    .map(|kind| extract_document(&configured, file, kind));
-                if result
-                    .as_ref()
-                    .is_some_and(|result| result.as_ref().is_err_and(transient_extraction_error))
-                {
-                    // Leave this job pending: unchanged file metadata does not mean
-                    // a temporary access failure or extractor timeout is permanent.
-                    continue;
-                }
-                result
-                    .and_then(Result::ok)
-                    .filter(|item| !item.body.trim().is_empty())
+            // Both metadata passes and extraction must finish before acquiring the
+            // SQLite write lock. Recheck the database scope and job under that lock.
+            let update = match prepare_update(&conn, &configured, id, Path::new(&path)) {
+                Ok(Some(update)) => update,
+                Ok(None) => continue,
+                Err(error) if has_io_error(&error, ErrorKind::PermissionDenied) => Update::Denied,
+                Err(error) => return Err(error),
             };
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             if saved_scope(&tx)?.0 != scope_identity {
@@ -319,30 +288,36 @@ pub fn index_content(database: &Path, max: usize) -> Result<ContentBatch> {
             WHERE i.id=?1 AND i.path=?2 AND i.availability='local' AND j.stamp IS NULL)",
                 )?
                 .query_row(params![id, path], |r| r.get(0))?;
-            let after = match kind
-                .map(|kind| local_metadata(file).map(|meta| meta.map(|meta| stamp(kind, &meta))))
-                .transpose()
-            {
-                Ok(version) => version.flatten(),
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
-                Err(_) => None,
-            };
-            if !pending || before != after {
+            if !pending {
                 continue;
             }
-            if kind.is_none() {
-                retire(&tx, id)?;
-            } else {
-                if let (Some(version), Some(extracted)) = (&before, extracted) {
-                    save_document(&tx, id, version, &extracted)?;
-                    batch.indexed += 1;
-                } else if !unchanged {
+            match update {
+                Update::Denied => {
+                    // A job seeded from the legacy index may still have a body.
+                    // Clear it now, but keep the job pending for a later retry.
                     remove_document(&tx, id)?;
+                    tx.commit()?;
+                    continue;
                 }
-                tx.execute(
-                    "UPDATE content_job SET stamp=?2 WHERE item_id=?1",
-                    params![id, before.as_deref().unwrap_or("unavailable")],
-                )?;
+                Update::Retire => {
+                    retire(&tx, id)?;
+                }
+                Update::Complete {
+                    version,
+                    unchanged,
+                    extracted,
+                } => {
+                    if let (Some(version), Some(extracted)) = (&version, extracted) {
+                        save_document(&tx, id, version, &extracted)?;
+                        batch.indexed += 1;
+                    } else if !unchanged {
+                        remove_document(&tx, id)?;
+                    }
+                    tx.execute(
+                        "UPDATE content_job SET stamp=?2 WHERE item_id=?1",
+                        params![id, version.as_deref().unwrap_or("unavailable")],
+                    )?;
+                }
             }
             tx.commit()?;
             batch.processed += 1;
@@ -352,18 +327,83 @@ pub fn index_content(database: &Path, max: usize) -> Result<ContentBatch> {
     Ok(batch)
 }
 
-fn transient_extraction_error(error: &anyhow::Error) -> bool {
+enum Update {
+    Denied,
+    Retire,
+    Complete {
+        version: Option<String>,
+        unchanged: bool,
+        extracted: Option<Extracted>,
+    },
+}
+
+fn prepare_update(
+    conn: &Connection,
+    coverage: &Coverage,
+    id: i64,
+    path: &Path,
+) -> Result<Option<Update>> {
+    let Some(kind) = eligible_kind(coverage, path).filter(|_| coverage.permits_content(path))
+    else {
+        return Ok(Some(Update::Retire));
+    };
+    let metadata = || match local_metadata(path) {
+        Err(error) if error.kind() != ErrorKind::PermissionDenied => Ok(None),
+        result => result,
+    };
+    let stamp = |meta: &fs::Metadata| document_version(coverage, kind, meta);
+    let before = metadata()?;
+    let version = before.as_ref().map(stamp);
+    let cached = conn
+        .query_row("SELECT stamp FROM document_state WHERE id=?", [id], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()?;
+    let unchanged = if let Some(meta) = before.as_ref().filter(|_| version == cached) {
+        match check_document_access(path, meta) {
+            Ok(unchanged) => unchanged,
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => return Err(error.into()),
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
+    let extracted = if before.is_some() && !unchanged {
+        match extract_document(coverage, path, kind) {
+            Ok(extracted) => Some(extracted).filter(|item| !item.body.trim().is_empty()),
+            Err(error) if has_io_error(&error, ErrorKind::PermissionDenied) => return Err(error),
+            Err(error)
+                if has_io_error(&error, ErrorKind::TimedOut)
+                    || error
+                        .chain()
+                        .any(|cause| cause.to_string() == "PDF extraction timed out") =>
+            {
+                return Ok(None);
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    if version != metadata()?.as_ref().map(stamp) {
+        return Ok(None);
+    }
+    Ok(Some(Update::Complete {
+        version,
+        unchanged,
+        extracted,
+    }))
+}
+
+fn has_io_error(error: &anyhow::Error, kind: ErrorKind) -> bool {
     error.chain().any(|cause| {
-        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
-            matches!(
-                io.kind(),
-                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::TimedOut
-            )
-        }) || cause.to_string() == "PDF extraction timed out"
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|io| io.kind() == kind)
     })
 }
 
-fn local_metadata(path: &Path) -> std::io::Result<Option<fs::Metadata>> {
+fn local_metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {
     // Check ancestors in root order before examining any child. Opening document
     // bytes repeats the engine's no-follow and no-materialization protections.
     let parents: Vec<_> = path.ancestors().skip(1).collect();

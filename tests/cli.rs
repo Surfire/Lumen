@@ -45,6 +45,47 @@ impl Drop for Fixture {
     }
 }
 
+#[test]
+fn custom_root_indexes_project_material_but_not_development_noise() {
+    let f = Fixture::new();
+    let root = f.0.join("project");
+    for dir in [
+        "node_modules",
+        "target",
+        "DerivedData",
+        ".venv",
+        "venv",
+        "__pycache__",
+        "Pods",
+        ".gradle",
+        ".cargo",
+        ".rustup",
+        ".npm",
+        ".pnpm-store",
+        ".yarn",
+        ".next",
+        ".nuxt",
+        ".build",
+        ".swiftpm",
+        "bower_components",
+        "CMakeFiles",
+        "src",
+    ] {
+        let path = root.join(dir);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("scope-probe.txt"), "").unwrap();
+    }
+    f.run(&["index", "--root", root.to_str().unwrap()]);
+    let hits = f.run(&["query", "scope-probe"]);
+    assert_eq!(hits.as_array().unwrap().len(), 1);
+    assert!(
+        hits[0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("/src/scope-probe.txt")
+    );
+}
+
 const WORD_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 
 fn word_body(content: &str) -> String {
@@ -828,7 +869,19 @@ mod live {
         assert_eq!(serve.names("鹿鸣 成都", "name"), ["鹿鸣资料.md"]);
         assert_eq!(serve.names("成都 鹿鸣", "name"), ["鹿鸣资料.md"]);
         assert!(serve.names("成都 pptx pdf", "all").is_empty());
-        assert_eq!(serve.names("ＰＰＴＸ", "name").len(), 5);
+        assert_eq!(serve.names(".ＰＰＴＸ", "name").len(), 5);
+        assert_eq!(
+            serve.names("ext:pptx", "name"),
+            serve.names(".pptx", "name")
+        );
+        assert!(
+            serve
+                .names("ＰＰＴＸ", "name")
+                .contains(&"成都卫健委pptx.txt".to_owned())
+        );
+        let mut text_matches = serve.names("pptx", "text");
+        text_matches.sort_unstable();
+        assert_eq!(text_matches, ["letters.md", "missing.txt"]);
 
         assert_eq!(serve.names("成都 卫健委 txt", "text"), ["words.txt"]);
         assert_eq!(serve.names("卫健委 .TXT 成都", "text"), ["words.txt"]);
@@ -1210,6 +1263,48 @@ mod live {
                 && event["estimated_total"] == 2
                 && event["estimate_basis"] == "previous_scan"
         }));
+    }
+
+    #[test]
+    fn legacy_pdf_extraction_does_not_lock_out_background_writers() {
+        let f = Fixture::new();
+        let root = f.0.join("scope");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("legacy.pdf"), "%PDF-synthetic fixture").unwrap();
+        let helper = f.0.join("legacy-extractor");
+        executable(
+            &helper,
+            r#"#!/bin/sh
+: > "$0.started"
+i=0
+while [ ! -f "$0.release" ] && [ "$i" -lt 250 ]; do i=$((i+1)); sleep 0.02; done
+printf 'legacy indexed body'
+"#,
+        );
+        let mut scanner = Process::launch(f.cli().args([
+            "index",
+            "--root",
+            root.to_str().unwrap(),
+            "--documents",
+            "--pdf-helper",
+            helper.to_str().unwrap(),
+        ]));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !helper.with_extension("started").exists() {
+            assert!(Instant::now() < deadline, "legacy extractor did not start");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+        db.busy_timeout(Duration::ZERO).unwrap();
+        let write = db.execute("INSERT INTO info VALUES('write_probe','background')", []);
+        fs::write(helper.with_extension("release"), "").unwrap();
+        assert_eq!(
+            write.unwrap(),
+            1,
+            "a background write must not wait for PDF extraction"
+        );
+        assert!(scanner.child.wait().unwrap().success());
+        assert_eq!(f.run(&["status"])["documents"], 1);
     }
 
     #[test]
@@ -1598,8 +1693,10 @@ mod live {
         fs::write(root.join("existing.txt"), "legacy document").unwrap();
         f.run(&["index", "--root", r, "--documents"]);
         let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
-        db.execute_batch("DELETE FROM info WHERE key='scope'; DROP TABLE document_state;")
-            .unwrap();
+        db.execute_batch(
+            "PRAGMA user_version=1; DELETE FROM info WHERE key='scope'; DROP TABLE document_state;",
+        )
+        .unwrap();
         drop(db);
 
         let output = f.cli().arg("watch").output().unwrap();
@@ -1925,6 +2022,10 @@ esac
             assert_eq!(result[0]["matched_by"], "semantic");
             assert!(result[0].get("page").is_none());
         }
+        let all_hits = f.run(&["query", "distant orbit", "--mode", "all", "--helper", m]);
+        assert_eq!(all_hits.as_array().unwrap().len(), 1);
+        assert_eq!(all_hits[0]["name"], "reference.docx");
+        assert_eq!(all_hits[0]["matched_by"], "semantic");
         let filler_hits = f.run(&["query", "invoice", "--mode", "semantic", "--helper", m]);
         assert_eq!(filler_hits.as_array().unwrap().len(), 1);
     }
@@ -2029,7 +2130,8 @@ esac
         let path = f.0.join("test.sqlite");
         let db = rusqlite::Connection::open(&path).unwrap();
         db.execute_batch(
-            "DROP TRIGGER semantic_document_inserted; DROP TRIGGER semantic_document_deleted;
+            "PRAGMA user_version=1;
+             DROP TRIGGER semantic_document_inserted; DROP TRIGGER semantic_document_deleted;
              DROP TABLE semantic_chunk; DROP TABLE semantic_document; DROP TABLE semantic_state;
              INSERT INTO embedding SELECT id, zeroblob(32) FROM document;
              INSERT INTO info VALUES('model','legacy-prefix-model');",
@@ -2137,7 +2239,8 @@ esac
         );
 
         let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
-        db.execute_batch("DROP TABLE document_state").unwrap();
+        db.execute_batch("PRAGMA user_version=1; DROP TABLE document_state")
+            .unwrap();
         for hits in [serve.hits("older paragraph", "text"), semantic()] {
             assert_eq!(hits[0]["snippet"], old);
             assert!(hits[0].get("document_stamp").is_none());
@@ -2412,8 +2515,9 @@ done
         );
         let raw = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
         raw.execute_batch(
-            "DROP TRIGGER semantic_versioned_chunk_deleted;
-                           DROP TABLE semantic_vector; DROP TABLE semantic_vector_count;",
+            "PRAGMA user_version=1;
+             DROP TRIGGER semantic_versioned_chunk_deleted;
+             DROP TABLE semantic_vector; DROP TABLE semantic_vector_count;",
         )
         .unwrap();
         let before = f.run(&["gemma-status", "--gemma-home", home]);

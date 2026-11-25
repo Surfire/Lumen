@@ -318,6 +318,28 @@ struct SearchReply {
     hits: Vec<lumen::Hit>,
 }
 
+// Access checks can discard stale cached hits. Fetch candidates before applying
+// the client's limit, while respecting each search engine's existing bound.
+fn search_checked(
+    limit: usize,
+    check_access: bool,
+    maximum: usize,
+    search: impl FnOnce(usize) -> Result<Vec<lumen::Hit>>,
+) -> Result<Vec<lumen::Hit>> {
+    let requested = limit.clamp(1, maximum);
+    let fetch = if check_access {
+        requested.saturating_mul(4).min(100)
+    } else {
+        limit
+    };
+    let mut hits = search(fetch)?;
+    if check_access {
+        lumen::verify_cached_access(&mut hits);
+        hits.truncate(requested);
+    }
+    Ok(hits)
+}
+
 fn scan_progress(enabled: bool) -> io::Result<Option<lumen::ScanProgressReporter>> {
     enabled
         .then(|| {
@@ -434,26 +456,25 @@ fn main() -> Result<()> {
                 .then(|| semantic.configure())
                 .transpose()?
                 .flatten();
-            let mut hits = if model.is_none() && matches!(mode, SearchMode::Semantic) {
-                lumen::GemmaSearchSession::open(
-                    &db,
-                    &GemmaModel::installed(gemma_home.as_deref())?,
-                )?
-                .search(&text, limit)?
-            } else {
-                let conn =
-                    lumen::open_read(&db).context("no usable index; run lumen index first")?;
-                lumen::search_with_backend(
-                    &conn,
-                    &text,
-                    mode.into(),
-                    limit,
-                    model.as_ref().map(ConfiguredModel::backend),
-                )?
-            };
-            if check_access {
-                lumen::verify_cached_access(&mut hits);
-            }
+            let hits = search_checked(limit, check_access, 100, |limit| {
+                Ok(if model.is_none() && matches!(mode, SearchMode::Semantic) {
+                    lumen::GemmaSearchSession::open(
+                        &db,
+                        &GemmaModel::installed(gemma_home.as_deref())?,
+                    )?
+                    .search(&text, limit)?
+                } else {
+                    let conn =
+                        lumen::open_read(&db).context("no usable index; run lumen index first")?;
+                    lumen::search_with_backend(
+                        &conn,
+                        &text,
+                        mode.into(),
+                        limit,
+                        model.as_ref().map(ConfiguredModel::backend),
+                    )?
+                })
+            })?;
             println!("{}", serde_json::to_string_pretty(&hits)?);
         }
         Action::ValidateHit {
@@ -566,11 +587,13 @@ fn main() -> Result<()> {
                 io::stdin().lock(),
                 io::BufWriter::new(io::stdout().lock()),
                 |query, limit| {
-                    let mut hits = session.search(query, limit)?;
-                    if check_access {
-                        lumen::verify_cached_access(&mut hits);
-                    }
-                    Ok(hits)
+                    search_checked(limit, check_access, 20, |limit| {
+                        if check_access {
+                            session.search_candidates(query, limit)
+                        } else {
+                            session.search(query, limit)
+                        }
+                    })
                 },
             )?;
         }
@@ -586,11 +609,9 @@ fn main() -> Result<()> {
                 io::stdin().lock(),
                 io::BufWriter::new(io::stdout().lock()),
                 |query, limit| {
-                    let mut hits = session.search(query, limit)?;
-                    if check_access {
-                        lumen::verify_cached_access(&mut hits);
-                    }
-                    Ok(hits)
+                    search_checked(limit, check_access, 100, |limit| {
+                        session.search(query, limit)
+                    })
                 },
             )?;
         }
@@ -640,18 +661,19 @@ fn main() -> Result<()> {
             for line in io::stdin().lock().lines() {
                 let data = line?;
                 match serde_json::from_str::<Request>(&data) {
-                    Ok(q) => match search.search(&q.query, q.mode, q.limit.unwrap_or(20)) {
-                        Ok(mut hits) => {
-                            if check_access {
-                                lumen::verify_cached_access(&mut hits);
+                    Ok(q) => {
+                        match search_checked(q.limit.unwrap_or(20), check_access, 100, |limit| {
+                            search.search(&q.query, q.mode, limit)
+                        }) {
+                            Ok(hits) => {
+                                serde_json::to_writer(&mut out, &SearchReply { id: q.id, hits })?
                             }
-                            serde_json::to_writer(&mut out, &SearchReply { id: q.id, hits })?
+                            Err(e) => serde_json::to_writer(
+                                &mut out,
+                                &json!({"id":q.id,"error":e.to_string()}),
+                            )?,
                         }
-                        Err(e) => serde_json::to_writer(
-                            &mut out,
-                            &json!({"id":q.id,"error":e.to_string()}),
-                        )?,
-                    },
+                    }
                     Err(e) => serde_json::to_writer(&mut out, &json!({"error":e.to_string()}))?,
                 }
                 writeln!(out)?;
@@ -666,6 +688,61 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn checked_search_fills_limit_after_discarding_stale_candidates() {
+        use std::{
+            ffi::{CStr, OsStr},
+            fs,
+            os::unix::ffi::OsStrExt,
+            path::PathBuf,
+        };
+        let mut template = *b"/tmp/lumen-overfetch-XXXXXX\0";
+        let path = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+        assert!(!path.is_null());
+        let dir = PathBuf::from(OsStr::from_bytes(
+            unsafe { CStr::from_ptr(path) }.to_bytes(),
+        ));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let root = dir.join("root");
+        fs::create_dir(&root).unwrap();
+        for name in ["match-a.txt", "match-b.txt", "match-c.txt", "match-d.txt"] {
+            fs::write(root.join(name), "candidate").unwrap();
+        }
+        let db = dir.join("index.sqlite");
+        lumen::scan(
+            &db,
+            &lumen::Scope {
+                roots: vec![root],
+                ..lumen::Scope::default()
+            },
+        )
+        .unwrap();
+        let mut session = lumen::SearchSession::open(&db).unwrap();
+        let candidates = session.search("match", Mode::Name, 4).unwrap();
+        assert_eq!(candidates.len(), 4);
+        fs::remove_file(&candidates[0].path).unwrap();
+        let hits = search_checked(2, true, 100, |limit| {
+            session.search("match", Mode::Name, limit)
+        })
+        .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].path, candidates[1].path);
+        assert_eq!(hits[1].path, candidates[2].path);
+        let unchecked = search_checked(2, false, 100, |limit| {
+            session.search("match", Mode::Name, limit)
+        })
+        .unwrap();
+        assert_eq!(unchecked.len(), 2);
+        assert_eq!(unchecked[0].path, candidates[0].path);
+    }
 
     #[test]
     fn semantic_json_lines_keep_their_limit_and_request_identity() {

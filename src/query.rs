@@ -16,13 +16,21 @@ impl Terms {
     /// The single unquoted token path retains its existing ranking and fast indexes.
     pub(super) fn parse(query: &str) -> Option<Self> {
         if !query.chars().any(|c| c.is_whitespace() || quote(c))
-            && extension(query).is_none()
+            && explicit_extension(query).is_none()
             && pinyin::legacy(query).is_none()
         {
             return None;
         }
         let mut terms = Self::default();
+        let mut tokens = Vec::new();
         let mut current = String::new();
+        let mut push = |current: &mut String, quoted| {
+            if !current.trim().is_empty() {
+                tokens.push((std::mem::take(current), quoted));
+            } else {
+                current.clear();
+            }
+        };
         let mut in_quote = false;
         let mut chars = query.chars().peekable();
         while let Some(c) = chars.next() {
@@ -33,35 +41,42 @@ impl Terms {
             {
                 current.push(chars.next().unwrap());
             } else if quote(c) {
-                terms.push(&mut current, in_quote);
+                push(&mut current, in_quote);
                 in_quote = !in_quote;
                 terms.quoted = true;
             } else if c.is_whitespace() && !in_quote {
-                terms.push(&mut current, false);
+                push(&mut current, false);
             } else {
                 current.push(c);
             }
         }
         // During typing, an opening quote treats the remaining input as a phrase.
-        terms.push(&mut current, in_quote);
-        Some(terms)
-    }
-
-    fn push(&mut self, current: &mut String, quoted: bool) {
-        let word = std::mem::take(current);
-        if word.trim().is_empty() {
-            return;
-        }
-        if !quoted && let Some(ext) = extension(&word) {
-            let suffix = format!(".{ext}");
-            if let Some(previous) = &self.suffix {
-                self.conflicting_suffixes |= previous != &suffix;
+        push(&mut current, in_quote);
+        // Bare extensions are shorthand only alongside a search term. In
+        // particular `json` must search names/text, not list every JSON file.
+        let has_search_word = tokens.iter().any(|(word, quoted)| {
+            *quoted || (explicit_extension(word).is_none() && !common_extension(word))
+        });
+        for (word, quoted) in tokens {
+            let ext = if quoted {
+                None
             } else {
-                self.suffix = Some(suffix);
+                explicit_extension(&word).or_else(|| {
+                    (has_search_word && common_extension(&word)).then_some(word.as_str())
+                })
+            };
+            if let Some(ext) = ext {
+                let suffix = format!(".{ext}");
+                if let Some(previous) = &terms.suffix {
+                    terms.conflicting_suffixes |= previous != &suffix;
+                } else {
+                    terms.suffix = Some(suffix);
+                }
+            } else if !terms.words.contains(&word) {
+                terms.words.push(word);
             }
-        } else if !self.words.contains(&word) {
-            self.words.push(word);
         }
+        Some(terms)
     }
 
     pub(super) fn permits_semantic(&self) -> bool {
@@ -73,12 +88,16 @@ fn quote(c: char) -> bool {
     matches!(c, '"' | '“' | '”')
 }
 
-fn extension(word: &str) -> Option<&str> {
-    let ext = word.strip_prefix('.').unwrap_or(word);
-    // These common bare tokens are recognizable as filename extensions. The
-    // dotted form also supports types whose bare spelling is an ordinary word.
-    let common = matches!(
-        ext,
+fn explicit_extension(word: &str) -> Option<&str> {
+    let ext = word
+        .strip_prefix('.')
+        .or_else(|| word.strip_prefix("ext:"))?;
+    (!ext.is_empty() && ext.bytes().all(|c| c.is_ascii_alphanumeric())).then_some(ext)
+}
+
+fn common_extension(word: &str) -> bool {
+    matches!(
+        word,
         "pdf"
             | "doc"
             | "docx"
@@ -127,14 +146,7 @@ fn extension(word: &str) -> Option<&str> {
             | "gz"
             | "tar"
             | "dmg"
-    );
-    (common
-        || (word.starts_with('.')
-            && matches!(
-                ext,
-                "key" | "pages" | "numbers" | "go" | "js" | "ts" | "rs" | "py" | "log"
-            )))
-    .then_some(ext)
+    )
 }
 
 pub fn allows_semantic(query: &str) -> bool {

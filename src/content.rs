@@ -226,9 +226,15 @@ pub fn index_content(database: &Path, max: usize) -> Result<ContentBatch> {
             break;
         }
         let kind = eligible_kind(&configured, file).filter(|_| configured.permits_content(file));
-        let version =
-            |kind| local_metadata(file).map(|meta| document_version(&configured, kind, &meta));
-        let before = kind.and_then(version);
+        let version = |kind| {
+            local_metadata(file)
+                .map(|meta| meta.map(|meta| document_version(&configured, kind, &meta)))
+        };
+        let before = match kind.map(version).transpose() {
+            Ok(version) => version.flatten(),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
+            Err(_) => None,
+        };
         let cached = conn
             .query_row("SELECT stamp FROM document_state WHERE id=?", [id], |r| {
                 r.get::<_, String>(0)
@@ -238,8 +244,19 @@ pub fn index_content(database: &Path, max: usize) -> Result<ContentBatch> {
         let extracted = if unchanged {
             None
         } else {
-            kind.filter(|_| before.is_some())
-                .and_then(|kind| extract_document(&configured, file, kind).ok())
+            let result = kind
+                .filter(|_| before.is_some())
+                .map(|kind| extract_document(&configured, file, kind));
+            if result
+                .as_ref()
+                .is_some_and(|result| result.as_ref().is_err_and(transient_extraction_error))
+            {
+                // Leave this job pending: unchanged file metadata does not mean
+                // a temporary access failure or extractor timeout is permanent.
+                continue;
+            }
+            result
+                .and_then(Result::ok)
                 .filter(|item| !item.body.trim().is_empty())
         };
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -252,7 +269,12 @@ pub fn index_content(database: &Path, max: usize) -> Result<ContentBatch> {
             WHERE i.id=?1 AND i.path=?2 AND i.availability='local' AND j.stamp IS NULL)",
             )?
             .query_row(params![id, path], |r| r.get(0))?;
-        if !pending || before != kind.and_then(version) {
+        let after = match kind.map(version).transpose() {
+            Ok(version) => version.flatten(),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
+            Err(_) => None,
+        };
+        if !pending || before != after {
             continue;
         }
         if kind.is_none() {
@@ -277,18 +299,29 @@ pub fn index_content(database: &Path, max: usize) -> Result<ContentBatch> {
     Ok(batch)
 }
 
-fn local_metadata(path: &Path) -> Option<fs::Metadata> {
+fn transient_extraction_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::TimedOut
+            )
+        }) || cause.to_string() == "PDF extraction timed out"
+    })
+}
+
+fn local_metadata(path: &Path) -> std::io::Result<Option<fs::Metadata>> {
     // Check ancestors in root order before examining any child. Opening document
     // bytes repeats the engine's no-follow and no-materialization protections.
     let parents: Vec<_> = path.ancestors().skip(1).collect();
     for parent in parents.into_iter().rev() {
-        let meta = fs::symlink_metadata(parent).ok()?;
+        let meta = fs::symlink_metadata(parent)?;
         if !meta.is_dir() || platform::availability(parent, &meta) == "placeholder" {
-            return None;
+            return Ok(None);
         }
     }
-    let meta = fs::symlink_metadata(path).ok()?;
-    (meta.is_file() && platform::availability(path, &meta) == "local").then_some(meta)
+    let meta = fs::symlink_metadata(path)?;
+    Ok((meta.is_file() && platform::availability(path, &meta) == "local").then_some(meta))
 }
 
 pub(super) struct Extracted {
@@ -379,4 +412,115 @@ pub(super) fn matching_page<'a>(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn retry_extractor(timeout: bool) {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "lumen-content-retry-{}-{}",
+                std::process::id(),
+                if timeout { "timeout" } else { "permission" }
+            ));
+        let _ = fs::remove_dir_all(&root);
+        let docs = root.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        let database = root.join("index.db");
+        let helper = root.join("extractor");
+        fs::write(
+            &helper,
+            "#!/bin/sh\ncat >/dev/null\nprintf 'recovered document'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(docs.join("sample.pdf"), b"%PDF-1.4\n").unwrap();
+        crate::index::scan(
+            &database,
+            &Scope {
+                roots: vec![docs.clone()],
+                documents: true,
+                content_roots: Some(vec![]),
+                pdf_helper: Some(helper.clone()),
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        apply_content_scope(&database, vec![docs], false).unwrap();
+        if timeout {
+            // Exercise the real extractor deadline, not a mocked error.
+            fs::write(&helper, "#!/bin/sh\ncat >/dev/null\nwhile :; do :; done\n").unwrap();
+        } else {
+            fs::set_permissions(&helper, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let failed = index_content(&database, 1).unwrap();
+        assert_eq!(failed.pending, 1);
+        assert_eq!(failed.indexed, 0);
+        let reader = open_read(&database).unwrap();
+        let stamped: i64 = reader
+            .query_row(
+                "SELECT count(*) FROM content_job WHERE stamp IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamped, 0);
+        drop(reader);
+        fs::write(
+            &helper,
+            "#!/bin/sh\ncat >/dev/null\nprintf 'recovered document'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        let recovered = index_content(&database, 1).unwrap();
+        assert_eq!(recovered.indexed, 1);
+        assert_eq!(recovered.pending, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn permission_denied_metadata_remains_pending() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "lumen-content-metadata-retry-{}",
+                std::process::id()
+            ));
+        let _ = fs::remove_dir_all(&root);
+        let docs = root.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(docs.join("sample.txt"), "recovered document").unwrap();
+        let database = root.join("index.db");
+        crate::index::scan(
+            &database,
+            &Scope {
+                roots: vec![docs.clone()],
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        apply_content_scope(&database, vec![docs.clone()], false).unwrap();
+        fs::set_permissions(&docs, fs::Permissions::from_mode(0o000)).unwrap();
+        let failed = index_content(&database, 1);
+        fs::set_permissions(&docs, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(failed.unwrap().pending, 1);
+        let recovered = index_content(&database, 1).unwrap();
+        assert_eq!(recovered.indexed, 1);
+        assert_eq!(recovered.pending, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn permission_denied_extraction_remains_pending() {
+        retry_extractor(false);
+    }
+
+    #[test]
+    fn pdf_timeout_extraction_remains_pending() {
+        retry_extractor(true);
+    }
 }

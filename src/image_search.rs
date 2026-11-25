@@ -5,7 +5,6 @@ use crate::{
     gemma::{DIMENSIONS, GemmaWorker},
     image_decode::thumbnail,
     model::Role,
-    name_fast::data_version,
     open_read, open_write, platform, saved_index_scope,
 };
 use anyhow::{Context, Result, ensure};
@@ -335,12 +334,17 @@ impl<'a> ImageSearchSession<'a> {
     }
 
     pub fn search(&mut self, text: &str, limit: usize) -> Result<Vec<Hit>> {
+        self.search_candidates(text, limit.min(20))
+    }
+
+    #[doc(hidden)]
+    pub fn search_candidates(&mut self, text: &str, limit: usize) -> Result<Vec<Hit>> {
         let text = text.trim();
         if text.is_empty() || text.len() > 8192 || limit == 0 || !crate::query_allows_semantic(text)
         {
             return Ok(Vec::new());
         }
-        let Some(rules) = Rules::read(&self.conn)? else {
+        let Some(_) = Rules::read(&self.conn)? else {
             return Ok(Vec::new());
         };
         let present: bool = self.conn.query_row(
@@ -358,71 +362,136 @@ impl<'a> ImageSearchSession<'a> {
                 .insert(self.model.start_images(&self.projector)?),
         };
         let query = worker.encode(Role::Query, text)?;
-        let before = data_version(&self.conn)?;
-        let snapshot = self.conn.unchecked_transaction()?;
-        if Rules::read(&snapshot)?.as_ref() != Some(&rules) {
-            return Ok(Vec::new());
-        }
-        let (lower, upper) = rules.bounds();
-        let mut hits = Vec::new();
-        {
-            let mut stmt = snapshot.prepare_cached(
+        Ok(crate::diagnose::read_snapshot(&self.conn, |snapshot| {
+            search_in_snapshot(snapshot, &query, limit)
+        })?
+        .unwrap_or_default())
+    }
+}
+
+fn search_in_snapshot(snapshot: &Connection, query: &[f32], limit: usize) -> Result<Vec<Hit>> {
+    let Some(rules) = Rules::read(snapshot)? else {
+        return Ok(Vec::new());
+    };
+    let (lower, upper) = rules.bounds();
+    let mut hits = Vec::new();
+    {
+        let mut stmt = snapshot.prepare_cached(
                 "SELECT i.path,i.display,e.stamp,e.vector FROM image_embedding e JOIN item i USING(id)
                  WHERE e.model=?1 AND i.path>=?2 AND i.path<?3 AND i.kind='file' AND i.availability='local'",
             )?;
-            let mut rows = stmt.query(params![MODEL_ID, lower, upper])?;
-            while let Some(row) = rows.next()? {
-                let path: String = row.get(0)?;
-                if !rules.allows(Path::new(&path)) {
-                    continue;
-                }
-                let vector = row.get_ref(3)?.as_blob()?;
-                if vector.len() != DIMENSIONS * 4 {
-                    continue;
-                }
-                let score = vector
-                    .chunks_exact(4)
-                    .zip(&query)
-                    .map(|(bytes, q)| {
-                        f32::from_le_bytes(bytes.try_into().expect("four vector bytes")) * q
-                    })
-                    .sum::<f32>();
-                if score.is_finite() && score >= CANDIDATE_FLOOR {
-                    hits.push((
-                        score,
-                        path,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ));
-                }
+        let mut rows = stmt.query(params![MODEL_ID, lower, upper])?;
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            if !rules.allows(Path::new(&path)) {
+                continue;
+            }
+            let vector = row.get_ref(3)?.as_blob()?;
+            if vector.len() != DIMENSIONS * 4 {
+                continue;
+            }
+            let score = vector
+                .chunks_exact(4)
+                .zip(query)
+                .map(|(bytes, q)| {
+                    f32::from_le_bytes(bytes.try_into().expect("four vector bytes")) * q
+                })
+                .sum::<f32>();
+            if score.is_finite() && score >= CANDIDATE_FLOOR {
+                hits.push((
+                    score,
+                    path,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ));
             }
         }
-        hits.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        let hits = hits
-            .into_iter()
-            .filter_map(|(score, path, name, stamp)| {
-                if local_stamp(Path::new(&path), false).as_deref() != Some(&stamp) {
-                    return None;
-                }
-                Some(Hit {
-                    path,
-                    name,
-                    kind: "file".into(),
-                    availability: "local".into(),
-                    matched_by: "image_embedding".into(),
-                    snippet: None,
-                    document_stamp: Some(stamp),
-                    pdf_page: None,
-                    score: Some(score.into()),
-                })
+    }
+    hits.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let hits = hits
+        .into_iter()
+        .filter_map(|(score, path, name, stamp)| {
+            if local_stamp(Path::new(&path), false).as_deref() != Some(&stamp) {
+                return None;
+            }
+            Some(Hit {
+                path,
+                name,
+                kind: "file".into(),
+                availability: "local".into(),
+                matched_by: "image_embedding".into(),
+                snippet: None,
+                document_stamp: Some(stamp),
+                pdf_page: None,
+                score: Some(score.into()),
             })
-            .take(limit.min(20))
-            .collect();
-        drop(snapshot);
-        Ok(if data_version(&self.conn)? == before {
-            hits
-        } else {
-            Vec::new()
         })
+        .take(limit)
+        .collect();
+    Ok(hits)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn image_snapshot_retries_and_observes_latest_catalog() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-image-snapshot-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let images = root.join("images");
+        fs::create_dir_all(&images).unwrap();
+        let path = images.join("sample.png");
+        fs::write(&path, "image fixture with a precomputed vector").unwrap();
+        let database = root.join("index.db");
+        crate::index::scan(
+            &database,
+            &Scope {
+                roots: vec![images.clone()],
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        image_scope(&database, Some(&images)).unwrap();
+        let writer = Connection::open(&database).unwrap();
+        let mut query = vec![0.0_f32; DIMENSIONS];
+        query[0] = 1.0;
+        let vector: Vec<u8> = query.iter().flat_map(|value| value.to_le_bytes()).collect();
+        writer
+            .execute(
+                "INSERT INTO image_embedding SELECT id,?1,?2,?3 FROM item WHERE path=?4",
+                params![
+                    MODEL_ID,
+                    local_stamp(&path, false).unwrap(),
+                    vector,
+                    path.to_str().unwrap()
+                ],
+            )
+            .unwrap();
+        let reader = open_read(&database).unwrap();
+        let mut attempts = 0;
+        let hits = crate::diagnose::read_snapshot(&reader, |snapshot| {
+            attempts += 1;
+            let hits = search_in_snapshot(snapshot, &query, 20)?;
+            if attempts < 3 {
+                writer.execute(
+                    "UPDATE item SET display=?1 WHERE path=?2",
+                    params![format!("latest-{attempts}"), path.to_str().unwrap()],
+                )?;
+            }
+            Ok(hits)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(attempts, 3);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "latest-2");
+        assert_eq!(hits[0].path, path.to_str().unwrap());
+        drop(reader);
+        drop(writer);
+        fs::remove_dir_all(root).unwrap();
     }
 }

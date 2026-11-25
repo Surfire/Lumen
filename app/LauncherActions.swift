@@ -71,6 +71,7 @@ enum LaunchCatalog {
     }
 
     private static let chineseNames = [
+        "com.tencent.xinwechat": "微信",
         "com.apple.finder": "访达", "com.apple.calculator": "计算器", "com.apple.safari": "Safari 浏览器",
         "com.apple.notes": "备忘录", "com.apple.ical": "日历", "com.apple.mail": "邮件",
         "com.apple.mobilesms": "信息", "com.apple.reminders": "提醒事项", "com.apple.preview": "预览",

@@ -107,9 +107,9 @@ Status legend: `pending` | `in_progress` | `done`
 
 ---
 
-## Milestone 3: P2 Simplification + Semantic/Multimodal Moat (`pending`)
+## Milestone 3: P2 Simplification + Semantic/Multimodal Moat (`done`)
 
-### `T12` UI Cleanup, Streaming Translation/QA & Built-in Quicklinks (`pending`)
+### `T12` UI Cleanup, Streaming Translation/QA & Built-in Quicklinks (`done`)
 - **Worktree**: `m3-cleanup-polish`
 - **Scope**:
   - Retire misleading "Raycast Extensions" UI entry from the primary macOS app (keep `extensions/` crate and tests intact).
@@ -117,7 +117,7 @@ Status legend: `pending` | `in_progress` | `done`
   - Expose built-in optional web quicklinks (`gh`, `wiki`, `map`) in Settings → Quicklinks.
   - Update `README.md`, `README.en.md`, `CHANGELOG.md`.
 
-### `T13` Semantic Engine Upgrade (`pending`)
+### `T13` Semantic Engine Upgrade (`done`)
 - **Worktree**: `m3-semantic-multimodal`
 - **Scope**:
   - Store new/rebuilt vectors in `f16` (backward-compatible `f32` reader).
@@ -125,7 +125,7 @@ Status legend: `pending` | `in_progress` | `done`
   - Per-query z-score + minimum-cosine adaptive gating to replace fixed `0.0` / `0.65` thresholds.
   - Cache verified `(path, size, mtime, sha256)` metadata so Gemma assets aren't re-hashed via `/usr/bin/openssl` on every batch.
 
-### `T14` Multimodal Expansion: HEIC/WebP + Apple Vision OCR (`pending`)
+### `T14` Multimodal Expansion: HEIC/WebP + Apple Vision OCR (`done`)
 - **Worktree**: `m3-semantic-multimodal`
 - **Scope**:
   - Support `.heic`, `.heif`, and `.webp` in `image_decode.rs` / `image_search.rs` (keeping `NoMaterialization` / `SF_DATALESS` / 12 MiB / 32MP limits).

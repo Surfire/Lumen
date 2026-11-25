@@ -46,22 +46,6 @@ struct HotKey: Codable, Equatable {
 
     func checkSystemShortcut() throws {
         if modifiers == UInt32(cmdKey), code == kVK_ANSI_Comma || key == "," { throw HotKeyIssue.app }
-        // Some fixed system shortcuts are not necessarily listed as configurable shortcuts.
-        switch (Int(code), Int(modifiers)) {
-        case (kVK_Space, cmdKey), (kVK_Space, cmdKey | optionKey), (kVK_Space, cmdKey | shiftKey),
-             (kVK_Space, controlKey), (kVK_Space, controlKey | optionKey),
-             (kVK_ANSI_Q, cmdKey | shiftKey), (kVK_ANSI_Q, cmdKey | shiftKey | optionKey),
-             (kVK_ANSI_Q, cmdKey | controlKey), (kVK_ANSI_D, cmdKey | optionKey):
-            throw HotKeyIssue.system
-        default: break
-        }
-        let capture = [kVK_ANSI_3, kVK_ANSI_4, kVK_ANSI_5, kVK_ANSI_6].contains(Int(code))
-        if capture && (modifiers == UInt32(cmdKey | shiftKey) || modifiers == UInt32(cmdKey | shiftKey | controlKey)) {
-            throw HotKeyIssue.system
-        }
-        // Control–Option is a default VoiceOver modifier, including when combined with other modifiers.
-        let voiceOver = UInt32(controlKey | optionKey)
-        if modifiers & voiceOver == voiceOver { throw HotKeyIssue.system }
         let permittedKeys = CharacterSet.alphanumerics.union(.punctuationCharacters).union(.symbols)
         guard modifiers & ~Self.mask == 0,
               modifiers & UInt32(cmdKey | controlKey | optionKey) != 0,

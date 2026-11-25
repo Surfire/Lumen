@@ -492,17 +492,15 @@ final class LauncherSmoke {
         guard case .action(let second)? = model.visibleResults.dropFirst().first,
               model.selection != second.id else { throw Failure("missing unselected application row") }
         let dispatchCount = dispatchedActions.count
-        app.panel.setFrameOrigin(NSPoint(x: -12_000, y: -12_000))
-        app.panel.makeKeyAndOrderFront(nil)
-        await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
-        app.panel.contentView?.layoutSubtreeIfNeeded()
         let rowCenter = NSPoint(x: 160, y: app.panel.frame.height - SearchWindow.headerHeight - 66)
+        try await until("the second action row was not hit-testable") {
+            app.panel.contentView?.layoutSubtreeIfNeeded()
+            return app.panel.contentView?.hitTest(rowCenter) is ActionRowClickTarget
+        }
         try click(count: 1, at: rowCenter, in: app.panel)
-        await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
         try check(model.selection == second.id && dispatchedActions.count == dispatchCount,
                   "single click did not select the row immediately without opening it (selected: \(model.selection ?? "none"))")
         try click(count: 2, at: rowCenter, in: app.panel)
-        await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
         try check(dispatchedActions.count == dispatchCount + 1 && dispatchedActions.last == second.destination &&
                   !app.searchPresented, "double click did not open the selected row exactly once")
         app.showSearch()
@@ -557,16 +555,28 @@ final class LauncherSmoke {
         try key(kVK_Space, " ", in: app, throughPanel: true)
         try check(app.localPreview == nil && app.searchPresented, "Space closed the search rather than just the preview")
         try check(LocalFile.dragURL(for: expected)?.path == expected.path, "the local file did not export a drag URL")
+        let similarlyNamed = directory.appendingPathComponent("local/Library/CloudStorage/resident.txt")
+        try FileManager.default.createDirectory(at: similarlyNamed.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("local fixture".utf8).write(to: similarlyNamed)
+        let residentPath = IndexScope.folderPath(similarlyNamed)
+        func dragHit(availability: String) -> SearchHit {
+            SearchHit(path: residentPath, name: similarlyNamed.lastPathComponent, kind: "file",
+                      availability: availability, matched_by: "name", snippet: nil, document_stamp: nil, pdf_page: nil)
+        }
+        try check(LocalFile.dragURL(for: dragHit(availability: "local"))?.path == residentPath &&
+                  LocalFile.dragURL(for: dragHit(availability: "provider_metadata_only")) == nil,
+                  "drag eligibility followed the spelling of a local path instead of its residency")
         try type("lumen action", into: app)
         try check(!app.panel.browsing, "editing the search field did not return to typing mode")
         try key(kVK_Space, " ", in: app)
         try check(try editor(app).string.hasSuffix(" ") && app.localPreview == nil, "Space did not insert whitespace while typing")
 
-        let folder = URL(fileURLWithPath: expected.path).deletingLastPathComponent().path
-        try type("kind:file ext:txt path:\"\(folder)/\" lumen action probe", into: app)
-        try await until("kind, extension, and path prefix combine in launcher search") {
-            !model.searching && model.hits.map(\.path) == [expected.path]
-        }
+        let definition = "A synthetic definition\nwith a second line."
+        let definitionAlert = LauncherSystemActions.definitionAlert(word: "fixture", definition: definition, chinese: false)
+        let definitionText = (definitionAlert.accessoryView as? NSScrollView)?.documentView as? NSTextView
+        try check(definitionAlert.messageText == "fixture" && definitionText?.string == definition &&
+                  definitionText?.isEditable == false && definitionText?.isSelectable == true,
+                  "the definition was not presented as selectable plain text")
         let operations: [(String, LauncherSystemActions.Operation)] = [
             ("suoping", .lock), ("睡眠", .sleep), ("empty trash", .emptyTrash), ("切换深色模式", .darkMode),
             ("mute", .mute), ("quxiaojingyin", .unmute), ("eject", .eject), ("define macintosh", .define("macintosh")),
@@ -707,7 +717,7 @@ final class LauncherSmoke {
         let executable = root.appendingPathComponent("engine")
         let source = #"""
         #!/usr/bin/python3
-        import json, os, signal, sys, time
+        import json, os, shlex, signal, sys, time
         from pathlib import Path
         root = Path(__file__).parent
         db, command, *args = sys.argv[2:]
@@ -739,13 +749,25 @@ final class LauncherSmoke {
                 print('{"event":"ready"}', flush=True)
                 signal.pause()
         elif command == 'serve':
-            for line in sys.stdin:
+            long_validation = []
+            frame_count = 0
+            for line in sys.stdin.buffer:
+                assert len(line) <= 12 * 1024, len(line)
                 request = json.loads(line)
                 if request.get('op') == 'validate':
                     assert set(request) == {'id', 'op', 'hits'}
                     hits = request['hits']
                     names = [Path(hit['path']).stem for hit in hits]
                     assert all(hit['document_stamp'] == 'fixture' for hit in hits)
+                    if [hit['path'] for hit in hits] == ['/scope with spaces/keep.txt']:
+                        print(json.dumps(dict(id=request['id'], valid=[True])), flush=True)
+                        continue
+                    if names[0].startswith('long-'):
+                        indices = [int(name.removeprefix('long-')) for name in names]
+                        long_validation.extend(indices)
+                        frame_count += 1
+                        print(json.dumps(dict(id=request['id'], valid=[i % 3 != 1 for i in indices])), flush=True)
+                        continue
                     if names[0].startswith('hold-'):
                         hold(names[0])
                     assert names == ['keep', 'drop'], names
@@ -755,6 +777,37 @@ final class LauncherSmoke {
                 query = request['query']
                 assert request['check_access'] == (query == 'cached probe'), request
                 assert request['check_access'] == ('--check-access' in args), args
+                if query == 'validation tail':
+                    assert frame_count > 1 and long_validation == list(range(26)), (frame_count, long_validation)
+                    mark('validated-all-on-one-connection')
+                if 'limit-probe' in query:
+                    tokens = shlex.split(query)
+                    mode, limit = request['mode'], request['limit']
+                    assert limit == {'name': 60, 'text': 24}[mode]
+                    assert tokens in (['limit-probe'], ['kind:folder', 'limit-probe'],
+                                      ['/scope with spaces/', 'kind:doc', 'ext:txt', 'limit-probe']), tokens
+                    def hit(path, kind='file'):
+                        return dict(path=path, name=Path(path).name, kind=kind, availability='local',
+                                    matched_by=mode, **(dict(snippet='limit-probe', document_stamp='fixture')
+                                                        if mode == 'text' else {}))
+                    if mode == 'name':
+                        hits = [hit(f'/other/limit-probe-{i}.txt') for i in range(61)]
+                        hits += [hit('/other/limit-probe-folder', 'directory')]
+                    else:
+                        hits = [hit(f'/other/global-{i}.txt') for i in range(25)]
+                        hits += [hit('/scope with spaces/keep.md'), hit('/scope with spaces/keep.txt')]
+                    # Mirror the M2 wire contract; apply all constraints before slicing the fixture ranking.
+                    if 'kind:folder' in tokens:
+                        hits = [h for h in hits if h['kind'] == 'directory']
+                    if 'kind:doc' in tokens:
+                        hits = [h for h in hits if h['path'].endswith(('.txt', '.md'))]
+                    if 'ext:txt' in tokens:
+                        hits = [h for h in hits if h['path'].endswith('.txt')]
+                    if '/scope with spaces/' in tokens:
+                        hits = [h for h in hits if h['path'].startswith('/scope with spaces/')]
+                        mark('scoped-' + mode)
+                    print(json.dumps(dict(id=request['id'], hits=hits[:limit])), flush=True)
+                    continue
                 if query == 'cached probe':
                     mark('checked-cached-' + request['mode'])
                 if query == 'stall':
@@ -832,6 +885,44 @@ final class LauncherSmoke {
             try check(model.hits.isEmpty && model.searchNotice?.detail == "fixture name search failed",
                       "a name-search error was hidden by an empty text branch")
         }
+
+        // This branch still bundles the M1 engine. Exercise the Swift launcher against a
+        // fixture serving the M2 query contract, with the matching rows ranked below each cap.
+        for (mode, limit, wanted) in [("name", 60, "/other/limit-probe-folder"), ("text", 24, "/scope with spaces/keep.txt")] {
+            var baseline: Result<[SearchHit], SearchFailure>?
+            engine.search("limit-probe", mode: mode) { baseline = $0 }
+            try await until("the unfiltered \(mode) request did not finish") { baseline != nil }
+            let hits = try baseline?.get()
+            try check(hits?.count == limit && hits?.contains { $0.path == wanted } == false,
+                      "the fixture did not hide the matching \(mode) row behind the unfiltered limit")
+        }
+        model.setQuery("KIND:Directory limit-probe")
+        try await until("the folder behind 60 file names was not returned") {
+            !model.searching && model.hits.map(\.path) == ["/other/limit-probe-folder"]
+        }
+        model.setQuery("kind:doc EXT:.TXT path:\"/scope with spaces/\" limit-probe")
+        try await until("the in-scope text result behind 24 global hits was not returned") {
+            !model.searching && marked("scoped-name") && marked("scoped-text") &&
+                model.hits.map(\.path) == ["/scope with spaces/keep.txt"] && model.hits.first?.hasPreview == true
+        }
+        model.clear()
+
+        let longComponent = String(repeating: "界\\\"z", count: 38)
+        let longPrefix = String(repeating: "/" + longComponent, count: 4)
+        let longHits = (0..<26).map { i in
+            SearchHit(path: longPrefix + "/long-\(i).txt", name: "long-\(i).txt", kind: "file", availability: "local",
+                      matched_by: "text", snippet: "fixture", document_stamp: "fixture", pdf_page: nil)
+        }
+        var validation: Result<[Bool]?, SearchFailure>?
+        engine.validate(longHits) { validation = $0 }
+        try await until("the long-path validation did not finish") { validation != nil }
+        try check(try validation?.get() == (0..<26).map { $0 % 3 != 1 },
+                  "chunked validation lost or reordered flags")
+        var tail: Result<[SearchHit], SearchFailure>?
+        engine.search("validation tail", mode: "name") { tail = $0 }
+        try await until("the same validation connection did not survive for a follow-up query") { tail != nil }
+        try check(try tail?.get() == [] && marked("validated-all-on-one-connection"),
+                  "validation did not split into bounded frames on one persistent server")
 
         var stalled: [Result<[SearchHit], SearchFailure>] = []
         engine.search("stall", mode: "name") { stalled.append($0) }
@@ -2432,17 +2523,20 @@ final class LauncherSmoke {
     }
 
     private func click(count: Int, at point: NSPoint, in window: NSWindow) throws {
-        for (type, mask) in [(NSEvent.EventType.leftMouseDown, NSEvent.EventTypeMask.leftMouseDown), (.leftMouseUp, .leftMouseUp)] {
+        // Hit-test the live row, then deliver AppKit events to that responder. The
+        // app-local event does not depend on desktop focus or the global mouse queue.
+        guard let target = window.contentView?.hitTest(point) as? ActionRowClickTarget else {
+            throw Failure("the fixture row was not hit-testable")
+        }
+        for type: NSEvent.EventType in [.leftMouseDown, .leftMouseUp] {
             guard let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
                                                  timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
-                                                 context: nil, eventNumber: 0, clickCount: count, pressure: 1) else {
+                                                 context: nil, eventNumber: 0, clickCount: count,
+                                                 pressure: type == .leftMouseDown ? 1 : 0) else {
                 throw Failure("cannot make in-process mouse event")
             }
-            NSApp.postEvent(event, atStart: true)
-            guard let posted = NSApp.nextEvent(matching: mask, until: .distantPast, inMode: .default, dequeue: true) else {
-                throw Failure("could not dequeue in-process mouse event")
-            }
-            NSApp.sendEvent(posted)
+            if type == .leftMouseDown { target.mouseDown(with: event) }
+            else { target.mouseUp(with: event) }
         }
     }
 

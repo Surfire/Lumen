@@ -64,22 +64,10 @@ enum LauncherSystemActions {
                 DispatchQueue.main.async { completion(ejected) }
             }
         case .define(let word):
-            let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
-            if let encoded = word.addingPercentEncoding(withAllowedCharacters: allowed),
-               let url = URL(string: "dict://" + encoded),
-               let app = NSWorkspace.shared.urlForApplication(toOpen: url),
-               Bundle(url: app)?.bundleIdentifier == "com.apple.Dictionary",
-               NSWorkspace.shared.open(url) {
-                completion(true)
-                return
-            }
             DispatchQueue.global(qos: .userInitiated).async {
                 let definition = dictionaryDefinition(word)
                 DispatchQueue.main.async {
-                    let alert = NSAlert()
-                    alert.messageText = word
-                    alert.informativeText = definition ?? t("系统词典中没有找到释义。", "No definition was found in the system dictionaries.")
-                    alert.addButton(withTitle: t("完成", "Done"))
+                    let alert = definitionAlert(word: word, definition: definition, chinese: chinese)
                     NSApp.activate()
                     alert.runModal()
                     completion(true)
@@ -91,6 +79,29 @@ enum LauncherSystemActions {
     nonisolated static func dictionaryDefinition(_ word: String) -> String? {
         DCSCopyTextDefinition(nil, word as CFString, CFRange(location: 0, length: word.utf16.count))?
             .takeRetainedValue() as String?
+    }
+
+    static func definitionAlert(word: String, definition: String?, chinese: Bool) -> NSAlert {
+        let alert = NSAlert()
+        alert.messageText = word
+        if let definition {
+            let scroll = NSTextView.scrollableTextView()
+            scroll.frame.size = NSSize(width: 400, height: 160)
+            scroll.hasVerticalScroller = true
+            scroll.borderType = .bezelBorder
+            if let text = scroll.documentView as? NSTextView {
+                text.string = definition
+                text.font = .systemFont(ofSize: NSFont.systemFontSize)
+                text.textContainerInset = NSSize(width: 6, height: 6)
+                text.isEditable = false
+                text.isSelectable = true
+            }
+            alert.accessoryView = scroll
+        } else {
+            alert.informativeText = chinese ? "系统词典中没有找到释义。" : "No definition was found in the system dictionaries."
+        }
+        alert.addButton(withTitle: chinese ? "完成" : "Done")
+        return alert
     }
 
     private static func script(_ source: String, completion: (Bool) -> Void) {

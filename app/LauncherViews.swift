@@ -295,13 +295,12 @@ struct SearchWindow: View {
         .accessibilityAction(named: Text(model.t("执行", "Run"))) { open(result) }
     }
 
-    private func clickRow(_ result: LauncherResult) {
+    private func clickRow(_ result: LauncherResult, count: Int? = nil) {
         browse()
         model.selection = result.id
-        // A single recognizer handles both clicks without waiting for a possible second click.
-        if let event = NSApp.currentEvent, event.type == .leftMouseUp, event.clickCount == 2 {
-            open(result)
-        }
+        // Select on mouseUp without waiting to see if it becomes a double click.
+        let event = NSApp.currentEvent
+        if (count ?? (event?.type == .leftMouseUp ? event?.clickCount : nil)) == 2 { open(result) }
     }
 
     private var emptyResultsLabel: String {
@@ -350,7 +349,7 @@ struct SearchWindow: View {
         .frame(height: 44)
         .background { selectionBackground(selected) }
         .contentShape(Rectangle())
-        .onTapGesture { clickRow(.action(action)) }
+        .overlay { ActionRowClickView { clickRow(.action(action), count: $0) }.accessibilityHidden(true) }
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(selected ? .isSelected : [])
         .accessibilityAction(named: Text(model.t("打开", "Open"))) { open(.action(action)) }
@@ -435,6 +434,26 @@ struct SearchWindow: View {
         }
     }
 
+}
+
+@MainActor
+private struct ActionRowClickView: NSViewRepresentable {
+    let click: (Int) -> Void
+
+    func makeNSView(context: Context) -> ActionRowClickTarget { ActionRowClickTarget() }
+    func updateNSView(_ view: ActionRowClickTarget, context: Context) { view.click = click }
+}
+
+// Launch actions are not draggable. Use the native mouseUp click count rather than
+// inferring a double click from SwiftUI gesture timing or NSApp.currentEvent.
+final class ActionRowClickTarget: NSView {
+    var click: ((Int) -> Void)?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { click?(event.clickCount) }
+    }
 }
 
 // Use type artwork without opening or requesting an icon from the indexed path.

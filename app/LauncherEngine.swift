@@ -366,16 +366,62 @@ final class LauncherEngine {
     func validate(_ hits: [SearchHit], explicit: Bool = false,
                   complete: @escaping (Result<[Bool]?, SearchFailure>) -> Void) {
         guard !legacyValidation else { complete(.success(nil)); return }
+        do {
+            let batches = try validationBatches(hits)
+            let server = try connect(\.connection, command: ["serve"])
+            validate(batches[...], on: server, explicit: explicit, valid: [], complete: complete)
+        } catch let failure as SearchFailure {
+            complete(.failure(failure))
+        } catch {
+            complete(.failure(SearchFailure(error.localizedDescription)))
+        }
+    }
+
+    private func validationBatches(_ hits: [SearchHit]) throws -> [[ValidationHit]] {
+        // Count the encoded JSON, not path characters. Reserve a full-width ID and newline.
+        let budget = 12 * 1024
+        let encoder = JSONEncoder()
+        let overhead = try encoder.encode(SearchRequest(id: .max, op: "validate", hits: [])).count + 1
+        var batches: [[ValidationHit]] = []
+        var batch: [ValidationHit] = []
+        var size = overhead
+        for hit in hits {
+            let entry = ValidationHit(hit)
+            let bytes = try encoder.encode(entry).count
+            guard overhead + bytes <= budget else { throw SearchFailure("Validation hit exceeds lumen serve frame budget") }
+            if size + bytes + (batch.isEmpty ? 0 : 1) > budget {
+                batches.append(batch)
+                batch = []
+                size = overhead
+            }
+            size += bytes + (batch.isEmpty ? 0 : 1)
+            batch.append(entry)
+        }
+        batches.append(batch)
+        return batches
+    }
+
+    private func validate(_ batches: ArraySlice<[ValidationHit]>, on server: SearchConnection, explicit: Bool,
+                          valid: [Bool], complete: @escaping (Result<[Bool]?, SearchFailure>) -> Void) {
+        guard let batch = batches.first else { complete(.success(valid)); return }
+        guard server.isRunning else { complete(.failure(SearchFailure("lumen serve stopped during validation"))); return }
         nextID &+= 1
-        let request = SearchRequest(id: nextID, op: "validate", hits: hits.map(ValidationHit.init))
-        submit(request, to: \.connection, command: ["serve"], idleTimeout: nil, explicit: explicit) { [weak self] result in
+        let request = SearchRequest(id: nextID, op: "validate", hits: batch)
+        // A reply clears the active request before calling us. Send continuations
+        // ahead of unrelated queued work so only the first chunk can migrate on timeout.
+        server.enqueue(request, explicit: explicit, aheadOfQueue: !valid.isEmpty) { [weak self] result in
             switch result {
             case .success(let reply):
-                guard let valid = reply.valid, valid.count == hits.count else {
+                guard let flags = reply.valid, flags.count == batch.count else {
                     complete(.failure(SearchFailure("Invalid validation response from lumen serve")))
                     return
                 }
-                complete(.success(valid))
+                let remaining = batches.dropFirst()
+                guard !remaining.isEmpty else { complete(.success(valid + flags)); return }
+                // A queued request can be migrated before it runs if the previous
+                // request times out. Continue on the connection that just replied.
+                guard let self, let responder = self.connection else { return }
+                self.validate(remaining, on: responder, explicit: explicit, valid: valid + flags, complete: complete)
             case .failure(let error):
                 let detail = error.detail.lowercased()
                 if (detail.contains("missing field") && detail.contains("query")) ||
@@ -563,9 +609,10 @@ private final class SearchConnection {
         }
     }
 
-    func enqueue(_ request: SearchRequest, explicit: Bool, complete: @escaping ServeCompletion) {
+    func enqueue(_ request: SearchRequest, explicit: Bool, aheadOfQueue: Bool = false,
+                 complete: @escaping ServeCompletion) {
         let pending = Pending(request: request, explicit: explicit, complete: complete)
-        if explicit { queued.insert(pending, at: 0) }
+        if explicit || aheadOfQueue { queued.insert(pending, at: 0) }
         else {
             if let mode = request.mode { queued.removeAll { $0.request.mode == mode } }
             queued.append(pending)

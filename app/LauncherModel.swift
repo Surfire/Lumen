@@ -476,7 +476,7 @@ final class Launcher: ObservableObject {
             ? hits.filter(\.isSemanticCandidate) : []
         let fileQuery = LauncherFileQuery(term)
         // Short text falls back to a document scan. A one-character edit is a name lookup.
-        let searchesText = fileQuery.kind != "directory" && fileQuery.words.count >= 2 &&
+        let searchesText = fileQuery.kind != "folder" && fileQuery.words.count >= 2 &&
             gemmaCoverage?.documents_enabled != false
         if !searchesText { text = .success([]) }
 
@@ -517,21 +517,21 @@ final class Launcher: ObservableObject {
                 publish()
             }
         }
-        engine.search(fileQuery.nameTerm, mode: "name") { [weak self] result in
+        engine.search(fileQuery.engineQuery, mode: "name") { [weak self] result in
             guard let self, self.revision == revision, !self.closed else { return }
             // Name replies have no snippets to inspect on disk.
-            names = result.map { $0.filter { !$0.hasPreview && fileQuery.contains($0) } }
+            names = result.map { $0.filter { !$0.hasPreview } }
             publish()
         }
         guard searchesText else { return }
         textDebounce = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(55))
             guard !Task.isCancelled, let self, self.revision == revision else { return }
-            self.engine.search(fileQuery.words, mode: "text") { [weak self] response in
+            self.engine.search(fileQuery.engineQuery, mode: "text") { [weak self] response in
                 guard let self, self.revision == revision, !self.closed else { return }
                 switch response {
                 case .success(let hits):
-                    self.validatePreviews(hits.filter(fileQuery.contains), revision: revision) { available in
+                    self.validatePreviews(hits, revision: revision) { available in
                         text = .success(available)
                         publish()
                     }

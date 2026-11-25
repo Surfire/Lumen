@@ -98,11 +98,13 @@ enum LocalFile {
         let prior = getiopolicy_np(policy, scope)
         guard prior >= 0, setiopolicy_np(policy, scope, IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0 else { return nil }
         defer { _ = setiopolicy_np(policy, scope, prior) }
-        var volume = statfs()
-        let path = hit.path + "/"
-        guard !path.contains("/Library/CloudStorage/"), !path.contains("/Library/Mobile Documents/"),
-              statfs(hit.path, &volume) == 0, volume.f_flags & UInt32(MNT_LOCAL) != 0 else { return nil }
-        return URL(fileURLWithPath: hit.path, isDirectory: hit.kind == "directory")
+        // Availability already excludes provider_metadata_only; the live stat above
+        // also rejects dataless leaves and ancestors. Check Apple provider/volume metadata
+        // under the no-materialization policy before handing the URL to another app.
+        let url = URL(fileURLWithPath: hit.path, isDirectory: hit.kind == "directory")
+        guard let values = try? url.resourceValues(forKeys: [.isUbiquitousItemKey, .volumeIsLocalKey]),
+              values.isUbiquitousItem != true, values.volumeIsLocal == true else { return nil }
+        return url
     }
 
     static func openReadOnly(_ path: String) -> Int32? {

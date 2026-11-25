@@ -90,13 +90,17 @@ impl Drop for NoMaterialization {
 /// Accept regular files only, no symlink of any component on macOS. Provider paths
 /// remain metadata-only even if a race changes flags after preflight.
 pub fn read_local(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    read_local_checked(path, limit, None)
+}
+
+pub(crate) fn read_local_checked(path: &Path, limit: u64, stamp: Option<&str>) -> Result<Vec<u8>> {
+    #[cfg(target_os = "macos")]
+    let _io = NoMaterialization::enter()?;
     let preflight = fs::symlink_metadata(path)?;
     if !preflight.is_file() || preflight.len() > limit || availability(path, &preflight) != "local"
     {
         bail!("not a small local regular file");
     }
-    #[cfg(target_os = "macos")]
-    let _io = NoMaterialization::enter()?;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     #[cfg(target_os = "macos")]
     let flags = libc::O_NOFOLLOW_ANY | libc::O_NONBLOCK;
@@ -115,10 +119,19 @@ pub fn read_local(path: &Path, limit: u64) -> Result<Vec<u8>> {
     {
         bail!("file changed or is not local");
     }
+    if stamp.is_some_and(|expected| crate::index::stamp(&opened) != expected) {
+        bail!("file changed before reading");
+    }
     let mut data = Vec::new();
-    File::take(file, limit + 1).read_to_end(&mut data)?;
+    Read::take(&file, limit + 1).read_to_end(&mut data)?;
     if data.len() as u64 > limit {
         bail!("file exceeded size limit");
+    }
+    if let Some(stamp) = stamp {
+        let after = file.metadata()?;
+        if crate::index::stamp(&after) != stamp || availability(path, &after) != "local" {
+            bail!("file changed while reading");
+        }
     }
     Ok(data)
 }

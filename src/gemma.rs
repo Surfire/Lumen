@@ -1,4 +1,4 @@
-//! Owns a pinned text-only llama.cpp child over a private Unix socket.
+//! Owns a pinned llama.cpp child over a private Unix socket.
 use crate::model::{Role, Unencodable};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
@@ -23,6 +23,8 @@ const MODEL_FILE: &str = "embeddinggemma-2-Q8_0.gguf";
 const MAX_FRAME: usize = 128 * 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 const ENCODE_TIMEOUT: Duration = Duration::from_secs(8);
+pub(crate) const IMAGE_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const IMAGE_TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(Deserialize)]
 struct Asset {
@@ -33,6 +35,7 @@ struct Asset {
 #[derive(Deserialize)]
 struct Manifest {
     model: Asset,
+    image_projector: Asset,
     runtime: BTreeMap<String, Asset>,
 }
 
@@ -85,7 +88,20 @@ impl GemmaModel {
     }
 
     pub(crate) fn start(&self) -> Result<GemmaWorker> {
+        self.start_profile(None)
+    }
+
+    pub(crate) fn start_images(&self, projector: &Path) -> Result<GemmaWorker> {
+        self.start_profile(Some(crate::absolute(projector)?))
+    }
+
+    fn start_profile(&self, projector: Option<PathBuf>) -> Result<GemmaWorker> {
         self.assets(true)?;
+        if let Some(path) = &projector {
+            let manifest: Manifest =
+                serde_json::from_str(include_str!("../scripts/gemma-assets.json"))?;
+            asset(path, &manifest.image_projector, true)?;
+        }
         let mut random = [0_u8; 32];
         File::open("/dev/urandom")?.read_exact(&mut random)?;
         let address: String = random[..16]
@@ -116,14 +132,19 @@ server=$!
 trap 'kill -KILL "$server" 2>/dev/null; wait "$server" 2>/dev/null; /bin/rm -f "$folder/worker.sock"; /bin/rmdir "$folder" 2>/dev/null' EXIT
 IFS= read -r owner || :
 "#;
-        let child = Command::new("/bin/sh")
+        let mut command = Command::new("/bin/sh");
+        command
             .arg("-c")
             .arg(supervise)
             .arg("lumen-gemma-owner")
             .arg(&worker.private)
             .arg(self.home.join("runtime/llama-server"))
             .arg("--model")
-            .arg(self.home.join(MODEL_FILE))
+            .arg(self.home.join(MODEL_FILE));
+        if let Some(projector) = &projector {
+            command.arg("--mmproj").arg(projector);
+        }
+        let child = command
             .arg("--host")
             .arg(&worker.socket)
             .args([
@@ -223,12 +244,25 @@ impl GemmaWorker {
             Role::Query => format!("task: search result | query: {text}"),
             Role::Passage => format!("title: none | text: {text}"),
         };
+        self.encode_input(serde_json::json!(input), ENCODE_TIMEOUT)
+    }
+
+    pub(crate) fn encode_image(&mut self, bytes: &[u8]) -> Result<Vec<f32>> {
+        ensure!(
+            bytes.len() as u64 <= IMAGE_MAX_BYTES,
+            "image exceeds the input size limit"
+        );
+        let url = format!("data:image/png;base64,{}", image_base64(bytes));
+        self.encode_input(
+            serde_json::json!({"content":[{"type":"image_url","image_url":{"url":url}}]}),
+            IMAGE_TIMEOUT,
+        )
+    }
+
+    fn encode_input(&self, input: serde_json::Value, timeout: Duration) -> Result<Vec<f32>> {
         let payload = serde_json::to_vec(&serde_json::json!({"input":[input]}))?;
-        let (status, body) = self.request(
-            "POST /v1/embeddings",
-            &payload,
-            Instant::now() + ENCODE_TIMEOUT,
-        )?;
+        let (status, body) =
+            self.request("POST /v1/embeddings", &payload, Instant::now() + timeout)?;
         if status == 400
             && (body.windows(9).any(|s| s == b"truncated")
                 || body.windows(7).any(|s| s == b"context"))
@@ -341,6 +375,29 @@ impl GemmaWorker {
         ensure!(body.len() == length, "truncated Gemma response body");
         Ok((status, body))
     }
+}
+
+fn image_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let a = chunk[0] as usize;
+        let b = chunk.get(1).copied().unwrap_or(0) as usize;
+        let c = chunk.get(2).copied().unwrap_or(0) as usize;
+        encoded.push(ALPHABET[a >> 2] as char);
+        encoded.push(ALPHABET[((a & 3) << 4) | (b >> 4)] as char);
+        encoded.push(if chunk.len() >= 2 {
+            ALPHABET[((b & 15) << 2) | (c >> 6)] as char
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() == 3 {
+            ALPHABET[c & 63] as char
+        } else {
+            '='
+        });
+    }
+    encoded
 }
 
 fn remaining(deadline: Instant) -> io::Result<Duration> {

@@ -184,7 +184,13 @@ fn validate_in_snapshot(
     let Some(stamp) = stamp else {
         return Ok(true);
     };
-    if !scope.documents || file.stamp.as_deref() != Some(stamp) {
+    if file.stamp.as_deref() != Some(stamp) {
+        return Ok(false);
+    }
+    if kind == "file" && crate::image_search::stored_match(conn, id, &path, stamp)? {
+        return Ok(true);
+    }
+    if !scope.documents {
         return Ok(false);
     }
     let (column, join) = document_stamp_sql(conn)?;
@@ -330,6 +336,16 @@ struct Selected {
     path: PathBuf,
     availability: &'static str,
     stamp: Option<String>,
+}
+
+pub(crate) fn local_stamp(path: &Path, directory: bool) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    let _io = crate::platform::NoMaterialization::enter().ok()?;
+    let file = selected_metadata(path, directory).ok()?;
+    if file.path != path || file.availability != "local" {
+        return None;
+    }
+    file.stamp
 }
 
 #[cfg(not(target_os = "macos"))]

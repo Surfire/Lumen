@@ -200,6 +200,31 @@ enum Action {
         #[arg(long, default_value_t = 8)]
         max: usize,
     },
+    /// Opt one local folder into image content indexing, or clear its image vectors.
+    ImageScope {
+        #[arg(required_unless_present = "clear")]
+        root: Option<PathBuf>,
+        #[arg(long, conflicts_with = "root")]
+        clear: bool,
+    },
+    /// Embed the next bounded batch from the opted-in image folder.
+    ImageIndex {
+        #[arg(long, value_name = "FILE")]
+        projector: PathBuf,
+        #[arg(long, value_name = "DIR")]
+        gemma_home: Option<PathBuf>,
+        #[arg(long, value_name = "CURSOR")]
+        after: Option<String>,
+        #[arg(long, default_value_t = 8)]
+        max: usize,
+    },
+    /// Serve local text-to-image candidate searches over newline-delimited JSON.
+    ImageServe {
+        #[arg(long, value_name = "FILE")]
+        projector: PathBuf,
+        #[arg(long, value_name = "DIR")]
+        gemma_home: Option<PathBuf>,
+    },
     /// List eligible attached external volumes and saved availability.
     Volumes,
     /// Explicitly index names from one mounted local external volume.
@@ -471,6 +496,42 @@ fn main() -> Result<()> {
                 .and_then(|model| model.inspect(verify));
             let coverage = lumen::gemma_coverage(&conn)?;
             println!("{}", gemma_status(inspection, verify, Some(coverage)));
+        }
+        Action::ImageScope { root, clear: _ } => {
+            println!(
+                "{}",
+                serde_json::to_string(&lumen::image_scope(&db, root.as_deref())?)?
+            );
+        }
+        Action::ImageIndex {
+            projector,
+            gemma_home,
+            after,
+            max,
+        } => {
+            let model = GemmaModel::installed(gemma_home.as_deref())?;
+            println!(
+                "{}",
+                serde_json::to_string(&lumen::image_batch(
+                    &db,
+                    &model,
+                    &projector,
+                    after.as_deref(),
+                    max
+                )?)?
+            );
+        }
+        Action::ImageServe {
+            projector,
+            gemma_home,
+        } => {
+            let model = GemmaModel::installed(gemma_home.as_deref())?;
+            let mut session = lumen::ImageSearchSession::open(&db, &model, projector)?;
+            serve_gemma(
+                io::stdin().lock(),
+                io::BufWriter::new(io::stdout().lock()),
+                |query, limit| session.search(query, limit),
+            )?;
         }
         Action::SemanticServe { gemma_home } => {
             let mut session = lumen::GemmaSearchSession::open(

@@ -6,9 +6,11 @@ import SwiftUI
 public struct MacInlinePreviewView: View {
     public enum Language { case simplifiedChinese, english }
     public let state: InlinePreviewState
+    private let image: NSImage?
     public let language: Language
-    public init(state: InlinePreviewState, language: Language) {
+    public init(state: InlinePreviewState, image: NSImage?, language: Language) {
         self.state = state
+        self.image = image
         self.language = language
     }
 
@@ -46,10 +48,10 @@ public struct MacInlinePreviewView: View {
                         }
                         if let visual = content.visual {
                             switch visual {
-                            case .image(let bytes):
-                                bitmap(bytes, caption: label("图片预览", "Image preview"))
-                            case .pdf(let bytes, let displayedPage, let isMatchPage):
-                                bitmap(bytes, caption: isMatchPage
+                            case .image:
+                                bitmap(caption: label("图片预览", "Image preview"))
+                            case .pdf(_, let displayedPage, let isMatchPage):
+                                bitmap(caption: isMatchPage
                                     ? label("命中第 \(displayedPage) 页", "Match on page \(displayedPage)")
                                     : label("预览第 \(displayedPage) 页（未定位命中页）", "Page \(displayedPage) preview (match page unknown)"))
                             }
@@ -63,8 +65,8 @@ public struct MacInlinePreviewView: View {
         .accessibilityIdentifier("lumen-inline-preview")
     }
 
-    @ViewBuilder private func bitmap(_ bytes: Data, caption: String) -> some View {
-        if let image = NSImage(data: bytes) {
+    @ViewBuilder private func bitmap(caption: String) -> some View {
+        if let image {
             Text(caption).font(.caption).foregroundStyle(.secondary)
             Image(nsImage: image)
                 .resizable()

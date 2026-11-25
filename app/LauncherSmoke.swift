@@ -132,6 +132,16 @@ final class LauncherSmoke {
         try check(app.searchField.placeholderString == (language == "zh" ? "搜索文件、应用和系统设置" : "Search files, apps, and system settings"),
                   "search field did not use requested language")
         _ = try editor(app)
+        try check(app.panel.styleMask.contains(.nonactivatingPanel) &&
+                  app.panel.collectionBehavior == [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle],
+                  "search panel was activating or had incorrect Spaces behavior")
+        let mouse = NSEvent.mouseLocation
+        if let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main {
+            let visible = screen.visibleFrame
+            try check(abs(app.panel.frame.midX - visible.midX) <= 1 &&
+                      abs(app.panel.frame.maxY - (visible.maxY - visible.height / 3)) <= 1,
+                      "search panel was not anchored in the upper third of the pointer's screen")
+        }
 
         if exists("image-scenario") {
             try await verifyImageSearch(app)
@@ -360,10 +370,12 @@ final class LauncherSmoke {
         }
 
         // All typed text passes through the real AppKit field editor.
+        let top = app.panel.frame.maxY
         try type("lumen action probe", into: app)
         try await until("a discovered application is selectable before any file index exists") {
             chosen()?.english == "Lumen Action Probe" && app.panel.frame.height == 436
         }
+        try check(app.panel.frame.maxY == top, "growing the results panel moved its top edge")
         try type("lap", into: app)
         try await until("an application initialism is selectable") { chosen()?.english == "Lumen Action Probe" }
         guard let probe = chosen(), case .application = probe.destination else {
@@ -430,6 +442,23 @@ final class LauncherSmoke {
             let icon = await icons.image(for: key)
             try check(icon == nil, "a missing or symlinked resource was loaded instead of using the fallback")
         }
+        guard case .action(let second)? = model.visibleResults.dropFirst().first,
+              model.selection != second.id else { throw Failure("missing unselected application row") }
+        let dispatchCount = dispatchedActions.count
+        app.panel.setFrameOrigin(NSPoint(x: -12_000, y: -12_000))
+        app.panel.makeKeyAndOrderFront(nil)
+        await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
+        app.panel.contentView?.layoutSubtreeIfNeeded()
+        let rowCenter = NSPoint(x: 160, y: app.panel.frame.height - SearchWindow.headerHeight - 66)
+        try click(count: 1, at: rowCenter, in: app.panel)
+        await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
+        try check(model.selection == second.id && dispatchedActions.count == dispatchCount,
+                  "single click did not select the row immediately without opening it (selected: \(model.selection ?? "none"))")
+        try click(count: 2, at: rowCenter, in: app.panel)
+        await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
+        try check(dispatchedActions.count == dispatchCount + 1 && dispatchedActions.last == second.destination &&
+                  !app.searchPresented, "double click did not open the selected row exactly once")
+        app.showSearch()
         try type("Wi-Fi", into: app)
         let count = dispatchedActions.count
         try type("not a registered action", into: app)
@@ -1176,11 +1205,27 @@ final class LauncherSmoke {
             model.contentCoverage?.pending == 0 && (model.contentCoverage?.checked ?? 0) >= 2 &&
             model.selectedHit?.name == "outside-report.md"
         }
-        try type("zircon calibration", into: app)
-        try await until("actual second-page text hit") {
-            model.selectedHit?.name == "report.pdf" && model.selectedHit?.pdf_page == 2 &&
-                model.selectedHit?.snippet?.contains("zircon calibration") == true
+        func findPDF() async throws -> String {
+            try type("zircon calibration", into: app)
+            try await until("actual second-page text hit") {
+                model.selectedHit?.name == "report.pdf" && model.selectedHit?.pdf_page == 2 &&
+                    model.selectedHit?.snippet?.contains("zircon calibration") == true
+            }
+            guard let hit = model.selectedHit else { throw Failure("lost PDF hit") }
+            return hit.path
         }
+        let pdfPath = try await findPDF()
+        let input = try editor(app)
+        let marked = "qa nihao"
+        input.setMarkedText(marked, selectedRange: NSRange(location: marked.utf16.count, length: 0),
+                            replacementRange: NSRange(location: 0, length: input.string.utf16.count))
+        try check(input.hasMarkedText(), "could not start command-like marked text")
+        app.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: app.searchField))
+        if let action = app.searchField.action { _ = NSApp.sendAction(action, to: app, from: app.searchField) }
+        try check(model.query == "zircon calibration" && model.selection == pdfPath &&
+                  app.commands.resolution == .search && !app.commands.showsCard,
+                  "marked text changed live results or switched to a command card")
+        input.insertText("zircon calibration", replacementRange: input.markedRange())
         try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
         try await until("inline PDF did not render the verified match page") {
             if case .ready(_, let document) = app.inlinePreview.state,
@@ -1193,12 +1238,52 @@ final class LauncherSmoke {
             try capture("lumen-inline-pdf.png", appearance: .aqua, window: app.panel)
             app.panel.appearance = nil
         }
+        guard let pdfImage = app.inlinePreview.image else { throw Failure("PDF bitmap was not decoded for the view") }
+        app.panel.contentView?.layoutSubtreeIfNeeded()
+        try check(app.inlinePreview.image === pdfImage, "layout discarded the cached PDF bitmap")
+        // Start from a taller frame and verify the close-button action recomputes the natural height.
+        let frame = app.panel.frame
+        app.panel.setFrame(frame.insetBy(dx: 0, dy: -16).offsetBy(dx: 0, dy: -16), display: false)
+        app.closeInlinePreview()
+        try check(!app.inlinePreview.isOpen && app.inlinePreview.image == nil && app.panel.frame == frame &&
+                  model.query == "zircon calibration" && app.searchPresented,
+                  "closing inline preview did not restore the anchored layout or retain the search")
+        try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
         try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
         try check(!app.inlinePreview.isOpen && model.query == "zircon calibration" && app.searchPresented,
                   "Escape closed the launcher rather than its preview")
-        try key(kVK_Return, "\r", in: app, throughPanel: true)
-        try await until("Return opened the PDFKit view on page 2") { app.localPreview?.displayedPDFPage == 2 }
-        app.localPreview?.close()
+
+        try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+        guard let windowPreview = app.contextActions.items.firstIndex(where: { $0.id == "quick-look" }) else {
+            throw Failure("missing explicit window preview action")
+        }
+        app.contextActions.run(windowPreview)
+        try await until("explicit Preview in Window opened the PDFKit view on page 2") { app.localPreview?.displayedPDFPage == 2 }
+        guard let preview = app.localPreview else { throw Failure("preview panel missing") }
+        // Run the AppKit key transfer with both windows offscreen and the test app prohibited from activating.
+        app.panel.setFrameOrigin(NSPoint(x: -12_000, y: -12_000))
+        app.panel.makeKeyAndOrderFront(nil)
+        try check(app.panel.isKeyWindow, "search was not key before the preview handoff")
+        app.makeLocalPreviewKey()
+        await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
+        try check(!app.panel.isKeyWindow && app.searchPresented && model.query == "zircon calibration" && model.selection == pdfPath,
+                  "handing key focus to the preview cleared the search session")
+        app.panel.orderOut(nil)
+        preview.close()
+        try key(kVK_Return, "\r", in: app)
+        try await until("Return dispatched the original PDF to the default-open route") {
+            self.opened?.path == pdfPath && app.localPreview == nil && !app.searchPresented
+        }
+        opened = nil
+        app.showSearch()
+        _ = try await findPDF()
+        try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+        try check(app.contextActions.items.first?.id == "open", "missing PDF Open action")
+        try key(kVK_Return, "\r", in: app)
+        try await until("Command–K Open dispatched the original PDF to the default-open route") {
+            self.opened?.path == pdfPath && app.localPreview == nil && !app.searchPresented
+        }
+        app.showSearch()
         try type("included note", into: app)
         try await until("verified text excerpt became selectable") { model.selectedHit?.snippet?.contains("included note") == true }
         try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
@@ -1831,11 +1916,27 @@ final class LauncherSmoke {
         let grave = try HotKey(event: event(kVK_ANSI_Grave, "`", in: app, flags: [.command]))
         try grave.checkSystemShortcut()
         try check(grave.cyclesMacWindows && grave.label == "⌘`", "single-modifier Command–grave was rejected")
-        let spotlight = try event(kVK_Space, " ", in: app, flags: [.command])
-        app.recordShortcut(spotlight)
-        guard case .system? = app.model.hotKeyIssue else { throw Failure("Spotlight chord was not diagnosed as reserved") }
-        app.recordShortcut(try event(kVK_ANSI_G, "G", in: app, flags: [.control, .option]))
-        guard case .system? = app.model.hotKeyIssue else { throw Failure("VoiceOver chord was not diagnosed as reserved") }
+        var symbolic: Unmanaged<CFArray>?
+        guard CopySymbolicHotKeys(&symbolic) == noErr,
+              let bindings = symbolic?.takeRetainedValue() as? [[String: Any]] else {
+            throw Failure("could not read the live system shortcut catalog")
+        }
+        let spaceChords = [cmdKey, cmdKey | optionKey, cmdKey | shiftKey, controlKey, controlKey | optionKey]
+            .map { HotKey(code: UInt32(kVK_Space), modifiers: UInt32($0), key: "␣") }
+        let voiceOver = try HotKey(event: event(kVK_ANSI_G, "G", in: app, flags: [.control, .option]))
+        for chord in spaceChords + [voiceOver] {
+            let enabled = bindings.contains { entry in
+                (entry["kHISymbolicHotKeyEnabled"] as? NSNumber)?.boolValue == true &&
+                    (entry["kHISymbolicHotKeyCode"] as? NSNumber)?.uint32Value == chord.code &&
+                    (entry["kHISymbolicHotKeyModifiers"] as? NSNumber).map { $0.uint32Value & HotKey.mask } == chord.modifiers
+            }
+            var reserved = false
+            do { try chord.checkSystemShortcut() }
+            catch HotKeyIssue.system { reserved = true }
+            try check(reserved == enabled, "\(chord.label) conflict did not match the system shortcut catalog")
+        }
+        app.recordShortcut(try event(kVK_ANSI_Comma, ",", in: app, flags: [.command]))
+        guard case .app? = app.model.hotKeyIssue else { throw Failure("Command–comma did not retain the Settings binding") }
 
         // Reserve two test chords only for this synchronous check. No key is sent to the OS.
         let flags: NSEvent.ModifierFlags = [.command, .control, .shift]
@@ -1865,9 +1966,31 @@ final class LauncherSmoke {
                                     MemoryLayout<EventHotKeyID>.size, &identifier) == noErr, "cannot set Carbon hotkey ID")
         try check(SendEventToEventTarget(carbon, GetApplicationEventTarget()) == noErr, "Carbon hotkey handler did not accept the event")
         _ = try editor(app)
-        app.dismissSearch()
+        try type("archive", into: app)
+        // Become key without ordering the test panel or activating the app.
+        app.panel.becomeKey()
+        try check(app.panel.isKeyWindow, "could not simulate a focused search panel")
+        try check(SendEventToEventTarget(carbon, GetApplicationEventTarget()) == noErr &&
+                  !app.searchPresented && app.model.query.isEmpty,
+                  "the repeat hotkey did not dismiss and reset the key search panel")
+        if app.panel.isKeyWindow { app.panel.resignKey() }
         try check(SendEventToEventTarget(carbon, GetApplicationEventTarget()) == noErr && app.searchPresented,
                   "a missing release event suppressed the next shortcut")
+    }
+
+    private func click(count: Int, at point: NSPoint, in window: NSWindow) throws {
+        for (type, mask) in [(NSEvent.EventType.leftMouseDown, NSEvent.EventTypeMask.leftMouseDown), (.leftMouseUp, .leftMouseUp)] {
+            guard let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
+                                                 timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                                                 context: nil, eventNumber: 0, clickCount: count, pressure: 1) else {
+                throw Failure("cannot make in-process mouse event")
+            }
+            NSApp.postEvent(event, atStart: true)
+            guard let posted = NSApp.nextEvent(matching: mask, until: .distantPast, inMode: .default, dequeue: true) else {
+                throw Failure("could not dequeue in-process mouse event")
+            }
+            NSApp.sendEvent(posted)
+        }
     }
 
     private func type(_ text: String, into app: AppDelegate) throws {

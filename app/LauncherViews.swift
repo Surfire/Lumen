@@ -75,7 +75,7 @@ struct SearchWindow: View {
                             .buttonStyle(.borderless)
                             .accessibilityLabel(model.t("关闭预览", "Close Preview"))
                         }
-                        MacInlinePreviewView(state: inlinePreview.state,
+                        MacInlinePreviewView(state: inlinePreview.state, image: inlinePreview.image,
                                              language: model.zh ? .simplifiedChinese : .english)
                         Spacer(minLength: 0)
                     }
@@ -282,11 +282,18 @@ struct SearchWindow: View {
         .frame(height: 44)
         .background { selectionBackground(selected) }
         .contentShape(Rectangle())
-        .onTapGesture(count: 2) { open(result) }
-        .onTapGesture { model.selection = result.id }
+        .onTapGesture { clickRow(result) }
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(selected ? .isSelected : [])
         .accessibilityAction(named: Text(model.t("执行", "Run"))) { open(result) }
+    }
+
+    private func clickRow(_ result: LauncherResult) {
+        model.selection = result.id
+        // A single recognizer handles both clicks without waiting for a possible second click.
+        if let event = NSApp.currentEvent, event.type == .leftMouseUp, event.clickCount == 2 {
+            open(result)
+        }
     }
 
     private var emptyResultsLabel: String {
@@ -332,8 +339,7 @@ struct SearchWindow: View {
         .frame(height: 44)
         .background { selectionBackground(selected) }
         .contentShape(Rectangle())
-        .onTapGesture(count: 2) { open(.action(action)) }
-        .onTapGesture { model.selection = action.id }
+        .onTapGesture { clickRow(.action(action)) }
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(selected ? .isSelected : [])
         .accessibilityAction(named: Text(model.t("打开", "Open"))) { open(.action(action)) }
@@ -386,8 +392,7 @@ struct SearchWindow: View {
         .frame(height: Self.rowHeight(hit))
         .background { selectionBackground(selected) }
         .contentShape(Rectangle())
-        .onTapGesture(count: 2) { open(.file(hit)) }
-        .onTapGesture { model.selection = hit.path }
+        .onTapGesture { clickRow(.file(hit)) }
         .accessibilityElement(children: .contain)
         .accessibilityAddTraits(selected ? .isSelected : [])
         .accessibilityAction(named: Text(model.t("打开", "Open"))) { open(.file(hit)) }

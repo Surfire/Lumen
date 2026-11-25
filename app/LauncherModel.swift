@@ -134,8 +134,6 @@ final class Launcher: ObservableObject {
     private var watchSupported: Bool?
     private var watchReportsProgress = false
     private var watchSupportsCachedStart = false
-    private var awaitingStartupStatus = false
-    private var watchReadyReceived = false
     private var indexReportsProgress = true
     private var scanGeneration: UInt64 = 0
     private var revision: UInt64 = 0
@@ -163,6 +161,7 @@ final class Launcher: ObservableObject {
     private var stoppingWatcher = false
     private var writer: Process?
     private var textProcess: Process?
+    private var imageValidationProcesses: [UUID: Process] = [:]
     private var relatedRevision: UInt64?
     private var modelCheck: Process?
     private var modelCheckGeneration: UInt64 = 0
@@ -171,6 +170,8 @@ final class Launcher: ObservableObject {
     private var supportsTargetedValidation = true
     private var closed = false
     private let builtInActions: [LaunchAction]
+    private let frecency: LauncherFrecency
+    private var applicationOpens: AnyCancellable?
     private var appActions: [LaunchAction] = []
     private var loadingApplications = false
     private var applicationsLoadedAt: ContinuousClock.Instant?
@@ -232,7 +233,9 @@ final class Launcher: ObservableObject {
     init(engine: LauncherEngine, defaults: UserDefaults?, locale: String? = nil) {
         self.engine = engine
         self.defaults = defaults
-        shortcuts = ShortcutLibrary(defaults: defaults)
+        let frecency = LauncherFrecency(defaults: defaults)
+        self.frecency = frecency
+        shortcuts = ShortcutLibrary(defaults: defaults, frecency: frecency)
         builtInActions = LaunchCatalog.systemActions()
         scopePending = engine.hasPendingScope
         language = locale ?? defaults?.string(forKey: "language") ?? "system"
@@ -248,23 +251,24 @@ final class Launcher: ObservableObject {
                 self?.reconcileSelection()
             }
         }
+        applicationOpens = LaunchDispatcher.didOpenApplication.sink { [weak self] action in
+            guard let self, !self.closed, self.appActions.contains(action) else { return }
+            self.frecency.noteOpened(action.id)
+        }
     }
 
     func start() {
         inspectLocalResources()
         if engine.hasDatabase {
-            awaitingStartupStatus = true
             _ = engine.run(["status", "--include-scope"]) { [weak self] response in
                 guard let self, !self.closed else { return }
-                self.awaitingStartupStatus = false
                 if let report = self.report(from: response) {
                     self.publish(report)
                     self.acceptCoverage(from: report)
-                } else if !self.scopeTrustedForLookup {
+                } else {
                     self.indexPhase = .unreadable
                     self.indexNotice = LauncherNotice(.status, response.diagnostic)
                 }
-                self.markWatcherRunningIfReady()
                 self.startWatcherIfReady()
             }
         } else {
@@ -290,6 +294,7 @@ final class Launcher: ObservableObject {
         cancelCoverageRead()
         cancelModelCheck()
         clearFileDiagnosis()
+        cancelImageValidation()
         if modelInspection?.isRunning == true { modelInspection?.terminate() }
         engine.close()
         for process in [watcher, writer, contentWriter, textProcess, actionProcess].compactMap({ $0 }) where process.isRunning {
@@ -386,7 +391,8 @@ final class Launcher: ObservableObject {
 
     private func updateLaunchMatches() {
         guard !isImageSearch else { return }
-        let current = LaunchCatalog.matches(query, actions: builtInActions + appActions)
+        let now = Date.now
+        let current = LaunchCatalog.matches(query, actions: builtInActions + appActions) { frecency.boost($0, now: now) }
         if launchMatches != current { launchMatches = current }
     }
 
@@ -424,6 +430,7 @@ final class Launcher: ObservableObject {
         cancelRelatedExcerpts()
         engine.discardQueuedSearch()
         engine.discardQueuedImages()
+        cancelImageValidation()
         if textProcess?.isRunning == true { textProcess?.terminate() }
         textProcess = nil
         if !keepAction {
@@ -480,7 +487,8 @@ final class Launcher: ObservableObject {
             // Keep provisional path filler below body hits and out of the first result update.
             let weakPaths = complete ? nameHits.filter { $0.matched_by == "path" } : []
             var seen = Set<String>()
-            let lexical = Array((strongNames + bodyHits + weakPaths).filter { seen.insert($0.path).inserted }.prefix(60))
+            let ranked = [strongNames, bodyHits, weakPaths].flatMap { self.frecency.rankFiles($0) }
+            let lexical = Array(ranked.filter { seen.insert($0.path).inserted }.prefix(60))
             guard complete || !lexical.isEmpty else { return }
             self.presentedQuery = term
             self.directHits = lexical
@@ -488,7 +496,7 @@ final class Launcher: ObservableObject {
             self.publishWithRelated(self.shouldFindRelatedExcerpts(directCount: lexical.count) ? related : [])
             if complete {
                 self.searching = false
-                if case .failure(let error) = names, case .failure? = text {
+                if case .failure(let error) = names, bodyHits.isEmpty {
                     self.searchNotice = LauncherNotice(.search, error.detail)
                 }
                 self.queueRelatedExcerpts()
@@ -582,31 +590,47 @@ final class Launcher: ObservableObject {
                     self.searching = false
                     self.searchNotice = LauncherNotice(.search)
                 case .success(let results):
-                    let candidates = results.prefix(5).filter { $0.isImageMatch && $0.isLocal && $0.document_stamp != nil }
-                    let group = DispatchGroup()
-                    var confirmed = Set<String>()
-                    for hit in candidates {
-                        guard let stamp = hit.document_stamp else { continue }
-                        group.enter()
-                        _ = self.engine.run(["validate-hit", "--kind", hit.kind, "--availability", hit.availability,
-                                             "--document-stamp", stamp, "--", hit.path]) { result in
-                            defer { group.leave() }
-                            if result.succeeded, (try? JSONDecoder().decode(HitValidation.self, from: result.output))?.valid == true {
-                                confirmed.insert(hit.path)
-                            }
-                        }
-                    }
-                    group.notify(queue: .main) { [weak self] in
-                        guard let self, self.revision == revision, self.isImageSearch, !self.scopePending else { return }
-                        self.searching = false
-                        self.presentedQuery = query
-                        self.resultsRevision = revision
-                        self.directHits = candidates.filter { confirmed.contains($0.path) }
-                        self.publishHits(self.directHits)
-                    }
+                    self.validateImageHits(results, query: query, revision: revision)
                 }
             }
         }
+    }
+
+    private func validateImageHits(_ results: [SearchHit], query: String, revision: UInt64) {
+        let candidates = results.prefix(5).compactMap { hit -> (SearchHit, String)? in
+            guard hit.isImageMatch, hit.isLocal, let stamp = hit.document_stamp else { return nil }
+            return (hit, stamp)
+        }
+        var remaining = candidates.count
+        var confirmed = Set<String>()
+        let publish = { [weak self] in
+            guard let self, !self.closed, self.revision == revision, !self.scopePending else { return }
+            self.searching = false
+            self.presentedQuery = query
+            self.resultsRevision = revision
+            self.directHits = candidates.map(\.0).filter { confirmed.contains($0.path) }
+            self.publishHits(self.directHits)
+        }
+        if candidates.isEmpty { publish() }
+        for (hit, stamp) in candidates {
+            let id = UUID()
+            let arguments = ["validate-hit", "--kind", hit.kind, "--availability", hit.availability,
+                             "--document-stamp", stamp, "--", hit.path]
+            imageValidationProcesses[id] = engine.run(arguments) { [weak self] response in
+                guard let self, !self.closed, self.revision == revision else { return }
+                self.imageValidationProcesses[id] = nil
+                if response.succeeded, (try? JSONDecoder().decode(HitValidation.self, from: response.output))?.valid == true {
+                    confirmed.insert(hit.path)
+                }
+                remaining -= 1
+                if remaining == 0 { publish() }
+            }
+        }
+    }
+
+    private func cancelImageValidation() {
+        for process in imageValidationProcesses.values where process.isRunning { process.terminate() }
+        imageValidationProcesses.removeAll()
     }
 
     private func validatePreviews(_ hits: [SearchHit], revision: UInt64, complete: @escaping ([SearchHit]) -> Void) {
@@ -688,7 +712,12 @@ final class Launcher: ObservableObject {
             if hit.isCloudReference { searchNotice = LauncherNotice(.online) }
             return
         }
-        revalidate(hit, retry: true, complete: complete)
+        revalidate(hit, retry: true) { [weak self] url in
+            // The UI owns NSWorkspace.open; count only opens that passed validation,
+            // not previews, reveals, copies or stale results.
+            if action == .open { self?.frecency.noteOpened(LauncherFrecency.fileID(hit.path)) }
+            complete(url)
+        }
     }
 
     private func revalidate(_ hit: SearchHit, retry: Bool, complete: @escaping (URL) -> Void) {
@@ -1198,10 +1227,8 @@ final class Launcher: ObservableObject {
     }
 
     private func startWatcherIfReady() {
-        let canPrepareCache = watchSupportsCachedStart && indexPhase == .checking && engine.hasDatabase
-        guard watchSupported == true, indexPhase == .ready || canPrepareCache, !scopePending,
+        guard watchSupported == true, indexPhase == .ready, !scopePending,
               watcher == nil, !closed else { return }
-        watchReadyReceived = false
         watchState = .starting
         watchNotice = nil
         watchGeneration &+= 1
@@ -1235,14 +1262,6 @@ final class Launcher: ObservableObject {
         }
     }
 
-    private func markWatcherRunningIfReady() {
-        // Cached queries can run while the initial status request reads
-        // coverage, but Settings still needs the saved scope before applying changes.
-        if watchState == .starting && watchReadyReceived && !awaitingStartupStatus {
-            watchState = .running
-        }
-    }
-
     private func watchEvent(_ line: Data) {
         guard !stoppingWatcher, !scopePending,
               let notice = try? JSONDecoder().decode(WatchEvent.self, from: line) else { return }
@@ -1256,8 +1275,7 @@ final class Launcher: ObservableObject {
         if notice.event == .ready {
             scopeTrustedForLookup = true
             indexPhase = .ready
-            watchReadyReceived = true
-            markWatcherRunningIfReady()
+            watchState = .running
         }
         watchProgress = nil
         refreshCoverage(after: .milliseconds(400))

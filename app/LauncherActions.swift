@@ -1,7 +1,6 @@
 import AppKit
 import Combine
 import Darwin
-import ImageIO
 
 struct LaunchAction: Equatable, Identifiable {
     enum Destination: Equatable {
@@ -52,61 +51,22 @@ actor ApplicationIcons {
     }
 
     private static func readIcon(_ key: Key) -> CGImage? {
-        let policy = IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES
-        let scope = IOPOL_SCOPE_THREAD
-        let prior = getiopolicy_np(policy, scope)
-        guard prior >= 0, setiopolicy_np(policy, scope, IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0 else { return nil }
-        defer { _ = setiopolicy_np(policy, scope, prior) }
-
-        // Read declared icon bytes in this process. IconServices may read the source
-        // bundle on another thread or in a service without our no-download policy.
-        guard SearchHit.pathStamp(at: key.url.path, kind: "directory") == key.stamp else { return nil }
-        let contents = key.url.appendingPathComponent("Contents", isDirectory: true)
-        guard let plist = readLocal(contents.appendingPathComponent("Info.plist"), limit: 512 * 1024),
-              let info = (try? PropertyListSerialization.propertyList(from: plist, format: nil)) as? [String: Any]
-        else { return nil }
-        let resources = contents.appendingPathComponent("Resources", isDirectory: true)
-        for field in ["CFBundleIconFile", "CFBundleIconName"] {
-            guard let name = info[field] as? String, !name.isEmpty,
-                  name != ".", name != "..", !name.contains("/"), !name.contains("\\") else { continue }
-            let ext = (name as NSString).pathExtension.lowercased()
-            guard ext.isEmpty || ["icns", "png", "tiff"].contains(ext) else { continue }
-            let file = resources.appendingPathComponent(ext.isEmpty ? name + ".icns" : name)
-            if let bytes = readLocal(file, limit: 8 * 1024 * 1024), let image = thumbnail(bytes) { return image }
+        withNoDatalessMaterialization { () -> CGImage? in
+            guard let bundle = residentBundle(at: key.url) else { return nil }
+            let resources = key.url.appendingPathComponent("Contents/Resources", isDirectory: true)
+            // IconServices may run outside our thread's I/O policy. Check for unsafe
+            // references, but leave icon format and representation selection to AppKit.
+            guard resources.isResidentIfPresent(kind: S_IFDIR) else { return nil }
+            var names = ["Assets.car"]
+            if let name = bundle.object(forInfoDictionaryKey: "CFBundleIconFile") as? String, !name.isEmpty {
+                guard !name.contains("/"), name != ".", name != ".." else { return nil }
+                names.append((name as NSString).pathExtension.isEmpty ? name + ".icns" : name)
+            }
+            guard names.allSatisfy({ resources.appendingPathComponent($0).isResidentIfPresent(kind: S_IFREG) }) else { return nil }
+            let icon = NSWorkspace.shared.icon(forFile: key.url.path)
+            var rect = NSRect(x: 0, y: 0, width: 64, height: 64)
+            return icon.cgImage(forProposedRect: &rect, context: nil, hints: nil)
         }
-        return nil
-    }
-
-    private static func readLocal(_ url: URL, limit: Int) -> Data? {
-        guard let fd = LocalFile.openReadOnly(url.path) else { return nil }
-        let input = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-        defer { try? input.close() }
-        var file = stat()
-        var volume = statfs()
-        guard fstat(fd, &file) == 0, file.st_size > 0, file.st_size <= limit,
-              fstatfs(fd, &volume) == 0, volume.f_flags & UInt32(MNT_LOCAL) != 0,
-              let data = try? input.read(upToCount: limit + 1), data.count == file.st_size else { return nil }
-        return data
-    }
-
-    private static func thumbnail(_ data: Data) -> CGImage? {
-        let noCache = [kCGImageSourceShouldCache: false] as CFDictionary
-        guard let source = CGImageSourceCreateWithData(data as CFData, noCache) else { return nil }
-        let count = min(CGImageSourceGetCount(source), 32)
-        guard count > 0 else { return nil }
-        let size = 64
-        let representations = (0..<count).compactMap { index -> (Int, Int)? in
-            guard let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any],
-                  let width = properties[kCGImagePropertyPixelWidth] as? Int,
-                  let height = properties[kCGImagePropertyPixelHeight] as? Int else { return nil }
-            return (index, max(width, height))
-        }
-        let index = representations.filter { $0.1 >= size }.min(by: { $0.1 < $1.1 })?.0
-            ?? representations.max(by: { $0.1 < $1.1 })?.0 ?? 0
-        let options = [kCGImageSourceThumbnailMaxPixelSize: size,
-                       kCGImageSourceCreateThumbnailFromImageAlways: true,
-                       kCGImageSourceShouldCacheImmediately: true] as CFDictionary
-        return CGImageSourceCreateThumbnailAtIndex(source, index, options)
     }
 }
 
@@ -225,17 +185,29 @@ enum LaunchCatalog {
         var actions: [LaunchAction] = []
 
         func add(_ url: URL) {
-            guard url.pathExtension.lowercased() == "app",
-                  let values = url.resourceValuesIfLocal(keys), values.isDirectory == true,
-                  let bundle = Bundle(url: url), let identifier = bundle.bundleIdentifier,
+            guard url.pathExtension.lowercased() == "app", !url.isInCloudStorage else { return }
+            let source = IndexScope.folderPath(url)
+            var attributes = stat()
+            guard lstat(source, &attributes) == 0, attributes.st_flags & UInt32(SF_DATALESS) == 0 else { return }
+            let target: URL
+            if attributes.st_mode & S_IFMT == S_IFLNK {
+                guard let destination = try? manager.destinationOfSymbolicLink(atPath: source) else { return }
+                let parent = url.deletingLastPathComponent()
+                let resolved = destination.hasPrefix("/") ? URL(fileURLWithPath: destination) : parent.appendingPathComponent(destination)
+                target = URL(fileURLWithPath: IndexScope.folderPath(resolved), isDirectory: true)
+            } else {
+                target = URL(fileURLWithPath: source, isDirectory: true)
+            }
+            // pathStamp does not follow symlinks: a second bundle link is not accepted.
+            guard target.pathExtension.lowercased() == "app",
+                  let stamp = SearchHit.pathStamp(at: target.path, kind: "directory"),
+                  let bundle = residentBundle(at: target), let identifier = bundle.bundleIdentifier,
                   identifier != settingsBundleID, identifier != "io.github.surfire.lumen",
-                  bundle.object(forInfoDictionaryKey: "CFBundlePackageType") as? String == "APPL" else { return }
-            let path = IndexScope.folderPath(url)
-            guard let stamp = SearchHit.pathStamp(at: path, kind: "directory"),
+                  bundle.object(forInfoDictionaryKey: "CFBundlePackageType") as? String == "APPL",
                   seen.insert(identifier).inserted else { return }
-            let target = URL(fileURLWithPath: path, isDirectory: true)
+            let values = target.resourceValuesIfLocal(keys)
             let filename = url.deletingPathExtension().lastPathComponent
-            let localized = values.localizedName.map { ($0 as NSString).deletingPathExtensionIfApp } ?? filename
+            let localized = values?.localizedName.map { ($0 as NSString).deletingPathExtensionIfApp } ?? filename
             let english = bundle.infoDictionary?["CFBundleDisplayName"] as? String ?? filename
             let normalizedID = identifier.lowercased()
             let chinese = chineseNames[normalizedID] ?? localized
@@ -264,14 +236,17 @@ enum LaunchCatalog {
         return actions
     }
 
-    static func matches(_ query: String, actions: [LaunchAction]) -> [ActionMatch] {
+    static func matches(_ query: String, actions: [LaunchAction], boost: (String) -> Int = { _ in 0 }) -> [ActionMatch] {
         let term = normalized(query)
         guard !term.isEmpty, term.utf8.count <= 128, !query.contains("/") && !query.contains("\\") else { return [] }
         return actions.compactMap { action -> ActionMatch? in
             let names = [action.english, action.chinese].map(normalized)
-            let score = names.contains(term) ? 110 : action.searchable.lazy.map { match(term, in: normalized($0)) }.max() ?? 0
+            let score: Int
+            if names.contains(term) { score = 110 }
+            else if term.count == 1 && names.contains(where: { $0.hasPrefix(term) }) { score = 62 }
+            else { score = action.searchable.lazy.map { match(term, in: normalized($0)) }.max() ?? 0 }
             guard score > 0 else { return nil }
-            return ActionMatch(action: action, score: score)
+            return ActionMatch(action: action, score: score + boost(action.id))
         }.sorted {
             if $0.score != $1.score { return $0.score > $1.score }
             if $0.action.english.count != $1.action.english.count { return $0.action.english.count < $1.action.english.count }
@@ -295,21 +270,65 @@ enum LaunchCatalog {
             .filter { $0.isLetter || $0.isNumber }
     }
 
-    private static func match(_ term: String, in candidate: String) -> Int {
+    static func match(_ term: String, in candidate: String) -> Int {
         if candidate == term { return 100 }
+        if candidate.hasPrefix(term) { return term.count == 1 ? 45 : 80 }
         guard term.count >= 2 else { return 0 }
-        if candidate.hasPrefix(term) { return 80 }
         if candidate.contains(term) { return 55 }
+        var remaining = term[...]
+        var gaps = 0
+        for letter in candidate {
+            if letter == remaining.first {
+                remaining = remaining.dropFirst()
+                if remaining.isEmpty { return max(26, 42 - gaps) }
+            } else {
+                gaps += 1
+            }
+        }
         return 0
     }
 }
 
+private func withNoDatalessMaterialization<T>(_ body: () -> T?) -> T? {
+    let policy = IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES
+    let scope = IOPOL_SCOPE_THREAD
+    let previous = getiopolicy_np(policy, scope)
+    guard previous >= 0, setiopolicy_np(policy, scope, IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0 else { return nil }
+    defer { _ = setiopolicy_np(policy, scope, previous) }
+    return body()
+}
+
+private func residentBundle(at url: URL) -> Bundle? {
+    guard !url.isInCloudStorage,
+          let values = url.resourceValuesIfLocal([.isDirectoryKey, .isSymbolicLinkKey, .isUbiquitousItemKey, .volumeIsLocalKey]),
+          values.isDirectory == true, values.volumeIsLocal == true else { return nil }
+    let plist = url.appendingPathComponent("Contents/Info.plist").path
+    let fd = Darwin.open(plist, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW_ANY)
+    guard fd >= 0 else { return nil }
+    defer { Darwin.close(fd) }
+    var info = stat()
+    guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_flags & UInt32(SF_DATALESS) == 0 else { return nil }
+    return Bundle(url: url)
+}
+
 private extension URL {
-    func resourceValuesIfLocal(_ keys: Set<URLResourceKey>) -> URLResourceValues? {
-        guard let values = try? resourceValues(forKeys: keys), values.isSymbolicLink != true,
-              values.isUbiquitousItem != true else { return nil }
+    var isInCloudStorage: Bool {
+        // Launch Services and IconServices can access the bundle outside our I/O policy.
+        let path = path + "/"
+        return path.contains("/Library/CloudStorage/") || path.contains("/Library/Mobile Documents/")
+    }
+
+    func isResidentIfPresent(kind: mode_t) -> Bool {
         var attributes = stat()
-        guard lstat(path, &attributes) == 0, attributes.st_flags & UInt32(SF_DATALESS) == 0 else { return nil }
+        if lstat(path, &attributes) != 0 { return errno == ENOENT }
+        return attributes.st_mode & S_IFMT == kind && attributes.st_flags & UInt32(SF_DATALESS) == 0
+    }
+
+    func resourceValuesIfLocal(_ keys: Set<URLResourceKey>) -> URLResourceValues? {
+        var attributes = stat()
+        guard !isInCloudStorage, lstat(path, &attributes) == 0,
+              attributes.st_mode & S_IFMT != S_IFLNK, attributes.st_flags & UInt32(SF_DATALESS) == 0,
+              let values = try? resourceValues(forKeys: keys), values.isUbiquitousItem != true else { return nil }
         return values
     }
 }
@@ -322,21 +341,29 @@ private extension NSString {
 
 @MainActor
 enum LaunchDispatcher {
+    static let didOpenApplication = PassthroughSubject<LaunchAction, Never>()
+
     static func perform(_ action: LaunchAction, activates: Bool = true,
                         completion: @escaping (Bool) -> Void) {
         let workspace = NSWorkspace.shared
         switch action.destination {
-        case .application(let url, let stamp):
-            guard SearchHit.pathStamp(at: url.path, kind: "directory") == stamp else {
-                completion(false)
-                return
+        case .application(let url, _):
+            let started = withNoDatalessMaterialization {
+                guard let bundle = residentBundle(at: url),
+                      bundle.executableURL?.isResidentIfPresent(kind: S_IFREG) != false else { return nil as Bool? }
+                let options = NSWorkspace.OpenConfiguration()
+                options.activates = activates
+                options.addsToRecentItems = activates
+                workspace.openApplication(at: url, configuration: options) { running, error in
+                    DispatchQueue.main.async {
+                        let opened = running != nil && error == nil
+                        if opened { didOpenApplication.send(action) }
+                        completion(opened)
+                    }
+                }
+                return true
             }
-            let options = NSWorkspace.OpenConfiguration()
-            options.activates = activates
-            options.addsToRecentItems = activates
-            workspace.openApplication(at: url, configuration: options) { running, error in
-                DispatchQueue.main.async { completion(running != nil && error == nil) }
-            }
+            if started == nil { completion(false) }
         case .settings(let url):
             // Require Apple's registered handler for these local System Settings URLs.
             guard let destination = workspace.urlForApplication(toOpen: url),

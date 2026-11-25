@@ -174,6 +174,13 @@ struct TranslationClient: Sendable {
             struct Message: Decodable { let content: String? }
             let message: Message
             let finish_reason: String?
+
+            var completed: Bool {
+                switch finish_reason {
+                case nil, "stop", "length", "end_turn": return true
+                default: return false
+                }
+            }
         }
         let choices: [Choice]
     }
@@ -210,7 +217,7 @@ struct TranslationClient: Sendable {
         let data = try await response(provider, path: ["chat", "completions"], body: body)
         guard let completion = try? JSONDecoder().decode(Completion.self, from: data),
               let choice = completion.choices.first else { throw TranslationFailure.invalidResponse }
-        guard choice.finish_reason == nil || choice.finish_reason == "stop",
+        guard choice.completed,
               let result = choice.message.content,
               !result.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw TranslationFailure.incomplete
@@ -226,7 +233,7 @@ struct TranslationClient: Sendable {
         ]))
         let data = try await response(provider, path: ["chat", "completions"], body: body)
         guard let choice = try? JSONDecoder().decode(Completion.self, from: data).choices.first,
-              choice.finish_reason == nil || choice.finish_reason == "stop", let result = choice.message.content
+              choice.completed, let result = choice.message.content
         else { throw TranslationFailure.incomplete }
         return result
     }
@@ -252,6 +259,16 @@ struct TranslationClient: Sendable {
             && key.utf8.allSatisfy { (33...126).contains($0) }
     }
 
+    static func sessionConfiguration(timeout: TimeInterval) -> URLSessionConfiguration {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = timeout
+        config.timeoutIntervalForResource = timeout * 3
+        config.httpCookieStorage = nil
+        config.urlCredentialStorage = nil
+        config.urlCache = nil
+        return config
+    }
+
     private func response(_ provider: TranslationProvider, path: [String], body: Data?,
                           testKey: String? = nil) async throws -> Data {
         let endpoint = try TranslationEndpoint(provider.endpoint)
@@ -266,14 +283,8 @@ struct TranslationClient: Sendable {
             request.setValue("Bearer " + key, forHTTPHeaderField: "Authorization")
         }
 
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = timeout
-        config.timeoutIntervalForResource = timeout * 3
-        config.httpCookieStorage = nil
-        config.urlCredentialStorage = nil
-        config.urlCache = nil
-        config.connectionProxyDictionary = [:]
-        let session = URLSession(configuration: config, delegate: RejectRedirects(), delegateQueue: nil)
+        let session = URLSession(configuration: Self.sessionConfiguration(timeout: timeout),
+                                 delegate: RejectRedirects(), delegateQueue: nil)
         defer { session.invalidateAndCancel() }
 
         do {

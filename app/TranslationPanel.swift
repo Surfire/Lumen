@@ -91,6 +91,7 @@ struct TranslationSettingsView: View {
             Picker(t("已保存的提供商", "Saved Provider"), selection: Binding(
                 get: { model.selected }, set: { model.choose($0) }
             )) {
+                if model.providers.isEmpty { Text(t("暂无提供商", "No Saved Providers")).tag(model.selected) }
                 ForEach(model.providers) { provider in
                     Text(verbatim: provider.name).tag(provider.id)
                 }
@@ -100,7 +101,10 @@ struct TranslationSettingsView: View {
                 HStack {
                     Button(t("新建提供商", "New Provider"), action: model.newProvider)
                     Button(t("恢复已保存设置", "Restore Saved Settings")) { model.choose(model.selected) }
-                        .disabled(model.draft == model.provider && model.keyInput.isEmpty)
+                        .disabled(model.provider == nil || (model.draft == model.provider && model.keyInput.isEmpty))
+                    Button(t("删除提供商", "Delete Provider"), role: .destructive, action: model.removeProvider)
+                        .disabled(!model.canRemoveProvider)
+                        .accessibilityIdentifier("translation-delete-provider")
                 }
                 field(t("名称", "Name"), field: \.name, identifier: "translation-provider-name")
                 field(t("API 基址", "API Base URL"), field: \.endpoint,
@@ -171,6 +175,7 @@ struct TranslationSettingsView: View {
     private func statusMessage(_ status: TranslationPanelModel.Status) -> String {
         switch status {
         case .saved: t("已保存提供商。", "Provider saved.")
+        case .removedProvider: t("已删除提供商。", "Provider deleted.")
         case .removedKey: t("已移除 API 密钥。", "API key removed.")
         case .connected: t("已连通模型接口。", "The model endpoint responded.")
         case .models(let count): t("发现 \(count) 个模型。", "Found \(count) models.")

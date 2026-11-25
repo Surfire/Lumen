@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import SwiftUI
 
 struct SavedShortcut: Codable, Equatable, Identifiable {
@@ -49,13 +50,66 @@ struct SavedShortcut: Codable, Equatable, Identifiable {
 }
 
 @MainActor
-final class ShortcutLibrary: ObservableObject {
-    @Published private(set) var entries: [SavedShortcut]
+final class LauncherFrecency {
+    private struct Entry: Codable {
+        var count: Double
+        var lastOpened: Date
+    }
+
     private let defaults: UserDefaults?
-    private let key = "launcher.savedShortcuts.v1"
+    private let key = "launcher.frecency.v1"
+    private let capacity = 512
+    private var entries: [String: Entry]
 
     init(defaults: UserDefaults?) {
         self.defaults = defaults
+        entries = defaults?.data(forKey: key).flatMap { try? JSONDecoder().decode([String: Entry].self, from: $0) } ?? [:]
+    }
+
+    nonisolated static func fileID(_ path: String) -> String {
+        // Do not keep a plaintext list of opened file paths in preferences.
+        "file:" + Data(SHA256.hash(data: Data(path.utf8))).base64EncodedString()
+    }
+
+    func noteOpened(_ id: String, now: Date = .now) {
+        let prior = entries[id].map { $0.count * decay($0.lastOpened, now: now, days: 14) } ?? 0
+        entries[id] = Entry(count: min(prior + 1, 64), lastOpened: now)
+        if entries.count > capacity {
+            let keep = entries.sorted { $0.value.lastOpened > $1.value.lastOpened }.prefix(capacity)
+            entries = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
+        }
+        if let data = try? JSONEncoder().encode(entries) { defaults?.set(data, forKey: key) }
+    }
+
+    func boost(_ id: String, now: Date = .now) -> Int {
+        guard let entry = entries[id] else { return 0 }
+        let frequency = entry.count * decay(entry.lastOpened, now: now, days: 14)
+        let recency = decay(entry.lastOpened, now: now, days: 3)
+        return min(12, Int(3 * log2(1 + frequency) + 4 * recency))
+    }
+
+    private func decay(_ lastOpened: Date, now: Date, days: Double) -> Double {
+        exp2(-max(0, now.timeIntervalSince(lastOpened)) / (86_400 * days))
+    }
+
+    func rankFiles(_ hits: [SearchHit]) -> [SearchHit] {
+        guard hits.count > 1, !entries.isEmpty else { return hits }
+        let now = Date.now
+        return hits.enumerated().map { (index: $0.offset, hit: $0.element, rank: $0.offset - boost(Self.fileID($0.element.path), now: now)) }
+            .sorted { ($0.rank, $0.index) < ($1.rank, $1.index) }.map(\.hit)
+    }
+}
+
+@MainActor
+final class ShortcutLibrary: ObservableObject {
+    @Published private(set) var entries: [SavedShortcut]
+    private let defaults: UserDefaults?
+    private let frecency: LauncherFrecency
+    private let key = "launcher.savedShortcuts.v1"
+
+    init(defaults: UserDefaults?, frecency: LauncherFrecency? = nil) {
+        self.defaults = defaults
+        self.frecency = frecency ?? LauncherFrecency(defaults: defaults)
         let data = defaults?.data(forKey: key)
         entries = data.flatMap { try? JSONDecoder().decode([SavedShortcut].self, from: $0) } ?? []
     }
@@ -100,8 +154,8 @@ final class ShortcutLibrary: ObservableObject {
     }
 
     func noteOpened(_ shortcut: SavedShortcut) {
-        guard case .folder = shortcut.target,
-              let index = entries.firstIndex(where: { $0.id == shortcut.id }) else { return }
+        guard let index = entries.firstIndex(where: { $0.id == shortcut.id }) else { return }
+        frecency.noteOpened(shortcut.rowID)
         entries[index].lastOpened = .now
         persist()
     }
@@ -111,7 +165,10 @@ final class ShortcutLibrary: ObservableObject {
         let recentProjects = entries.filter {
             if case .folder = $0.target { return !$0.pinned && $0.lastOpened != nil }
             return false
-        }.sorted { ($0.lastOpened ?? .distantPast) > ($1.lastOpened ?? .distantPast) }
+        }.sorted {
+            let first = frecency.boost($0.rowID), second = frecency.boost($1.rowID)
+            return first == second ? ($0.lastOpened ?? .distantPast) > ($1.lastOpened ?? .distantPast) : first > second
+        }
         return pins + recentProjects.prefix(4)
     }
 
@@ -123,11 +180,13 @@ final class ShortcutLibrary: ObservableObject {
             let score = fields.map { field -> Int in
                 let value = LaunchCatalog.normalized(field)
                 if term == value { return 105 }
-                guard term.count > 1 else { return 0 }
-                if value.hasPrefix(term) { return 80 }
-                return value.contains(term) ? 55 : 0
+                return LaunchCatalog.match(term, in: value)
             }.max() ?? 0
-            return score == 0 ? nil : (record, score)
+            guard score > 0 else { return nil }
+            let boost: Int
+            if case .application(let id) = record.target { boost = frecency.boost(id) }
+            else { boost = frecency.boost(record.rowID) }
+            return (record, score + boost)
         }.sorted { $0.score > $1.score }.prefix(6).map { $0 }
     }
 

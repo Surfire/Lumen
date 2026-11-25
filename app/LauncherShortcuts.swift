@@ -102,6 +102,10 @@ final class LauncherFrecency {
 
 @MainActor
 final class ShortcutLibrary: ObservableObject {
+    enum SaveResult: Equatable {
+        case saved, invalid, aliasInUse(String)
+    }
+
     @Published private(set) var entries: [SavedShortcut]
     @Published var includeOptionalLinks: Bool {
         didSet { defaults?.set(includeOptionalLinks, forKey: Self.optionalLinksKey) }
@@ -118,31 +122,36 @@ final class ShortcutLibrary: ObservableObject {
     }
 
     func save(_ shortcut: SavedShortcut) -> Bool {
+        saveResult(shortcut) == .saved
+    }
+
+    func saveResult(_ shortcut: SavedShortcut) -> SaveResult {
         var shortcut = shortcut
         shortcut.title = shortcut.title.trimmingCharacters(in: .whitespacesAndNewlines)
         shortcut.alias = shortcut.alias.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !shortcut.title.isEmpty, shortcut.title.count <= 100, shortcut.alias.count <= 80,
               !shortcut.title.contains(where: \.isNewline), !shortcut.alias.contains(where: \.isNewline)
-        else { return false }
+        else { return .invalid }
         switch shortcut.target {
-        case .application(let identifier): guard identifier.hasPrefix("app:") else { return false }
-        case .folder(let path): guard SearchHit.pathStamp(at: path, kind: "directory") != nil else { return false }
-        case .web(let url): guard SavedShortcut.webURL(url.absoluteString) == url else { return false }
+        case .application(let identifier): guard identifier.hasPrefix("app:") else { return .invalid }
+        case .folder(let path): guard SearchHit.pathStamp(at: path, kind: "directory") != nil else { return .invalid }
+        case .web(let url): guard SavedShortcut.webURL(url.absoluteString) == url else { return .invalid }
         }
         if shortcut.queryParameter != nil {
-            guard let link = shortcut.queryLink,
-                  !["g", "qa", "tr", "translate", "img"].contains(link.keyword),
-                  !entries.contains(where: { $0.id != shortcut.id && $0.queryLink?.keyword == link.keyword })
-            else { return false }
+            guard let link = shortcut.queryLink else { return .invalid }
+            if LumenCommandCatalog.isBuiltInAlias(link.keyword, includeOptionalLinks: includeOptionalLinks)
+                || entries.contains(where: { $0.id != shortcut.id && $0.queryLink?.keyword == link.keyword }) {
+                return .aliasInUse(link.keyword)
+            }
         }
         if let index = entries.firstIndex(where: { $0.id == shortcut.id }) {
             entries[index] = shortcut
         } else {
-            guard entries.count < 128 else { return false }
+            guard entries.count < 128 else { return .invalid }
             entries.append(shortcut)
         }
         persist()
-        return true
+        return .saved
     }
 
     func remove(_ shortcut: SavedShortcut) {
@@ -236,15 +245,15 @@ struct QuicklinksView: View {
     @State private var destination = ""
     @State private var queryParameter = ""
     @State private var pinned = false
-    @State private var invalid = false
+    @State private var saveResult: ShortcutLibrary.SaveResult?
 
     var body: some View {
         Form {
             Section(model.t("内置网页搜索", "Built-in Web Search")) {
                 Toggle(model.t("启用 GitHub、维基百科和 Google 地图搜索",
                                "Enable GitHub, Wikipedia, and Google Maps Search"), isOn: $library.includeOptionalLinks)
-                Text(model.t("输入 gh、wiki 或 map，空一格后输入搜索词，按回车在浏览器中打开。",
-                             "Type gh, wiki, or map followed by a search term, then press Return to open it in your browser."))
+                Text(model.t("输入 gh、wiki 或 map，空一格后输入搜索词，按回车在浏览器中打开。已保存的自定义查询别名优先。",
+                             "Type gh, wiki, or map followed by a search term, then press Return to open it in your browser. Saved custom query aliases take precedence."))
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section(model.t("已保存", "Saved")) {
@@ -304,7 +313,11 @@ struct QuicklinksView: View {
                     Button(model.t("保存", "Save")) { save() }.buttonStyle(.borderedProminent)
                     if editing != nil { Button(model.t("取消编辑", "Cancel Editing")) { reset() } }
                 }
-                if invalid {
+                if case .aliasInUse(let alias) = saveResult {
+                    Text(model.t("查询别名「\(alias)」已被使用。请选择其他别名。",
+                                 "The query alias “\(alias)” is already in use. Choose a different alias."))
+                        .foregroundStyle(.secondary)
+                } else if saveResult == .invalid {
                     Text(model.t("请检查名称、别名或目标地址。", "Check the name, alias, or destination."))
                         .foregroundStyle(.secondary)
                 }
@@ -332,7 +345,7 @@ struct QuicklinksView: View {
         case .application(let value), .folder(let value): destination = value
         case .web(let url): destination = url.absoluteString
         }
-        invalid = false
+        saveResult = nil
     }
 
     private func reset() {
@@ -342,24 +355,25 @@ struct QuicklinksView: View {
         destination = ""
         queryParameter = ""
         pinned = false
-        invalid = false
+        saveResult = nil
     }
 
     private func save() {
         let target: SavedShortcut.Target
         switch kind {
         case .application:
-            guard model.installedActions.contains(where: { $0.id == destination }) else { invalid = true; return }
+            guard model.installedActions.contains(where: { $0.id == destination }) else { saveResult = .invalid; return }
             target = .application(destination)
         case .folder: target = .folder(destination)
         case .web:
-            guard let url = SavedShortcut.webURL(destination) else { invalid = true; return }
+            guard let url = SavedShortcut.webURL(destination) else { saveResult = .invalid; return }
             target = .web(url)
         }
         let parameter = queryParameter.trimmingCharacters(in: .whitespacesAndNewlines)
         let shortcut = SavedShortcut(id: editing?.id ?? UUID(), title: title, alias: alias,
                                      target: target, pinned: pinned, lastOpened: editing?.lastOpened,
                                      queryParameter: kind == .web && !parameter.isEmpty ? parameter : nil)
-        if library.save(shortcut) { reset() } else { invalid = true }
+        let result = library.saveResult(shortcut)
+        if result == .saved { reset() } else { saveResult = result }
     }
 }

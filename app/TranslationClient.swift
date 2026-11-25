@@ -190,15 +190,25 @@ struct TranslationClient: Sendable {
     private static let responseLimit = 512 * 1024
 
     private struct EventStream {
+        private static let bom = "\u{FEFF}".utf8
         private var line = Data()
         private var event = Data()
         private var afterCR = false
+        private var stripLeadingBOM: Bool
+
+        init(stripLeadingBOM: Bool) {
+            self.stripLeadingBOM = stripLeadingBOM
+        }
 
         mutating func append(_ byte: UInt8) -> Data? {
             defer { afterCR = byte == 13 }
             if byte == 10 && afterCR { return nil }
             guard byte == 10 || byte == 13 else { line.append(byte); return nil }
             defer { line.removeAll(keepingCapacity: true) }
+            if stripLeadingBOM {
+                stripLeadingBOM = false
+                if line.starts(with: Self.bom) { line.removeFirst(Self.bom.count) }
+            }
             if line.isEmpty {
                 guard !event.isEmpty else { return nil }
                 defer { event = Data() }
@@ -267,9 +277,8 @@ struct TranslationClient: Sendable {
         let result = try await response(provider, path: ["chat", "completions"], body: body) { bytes, response in
             let decoder = JSONDecoder()
             var sniffing = response.mimeType?.lowercased() == "text/event-stream"
-            var streaming = false
             var json = Data()
-            var stream = EventStream()
+            var stream: EventStream?
             var output = ""
             var count = 0
             for try await byte in bytes {
@@ -281,11 +290,14 @@ struct TranslationClient: Sendable {
                         continue
                     }
                     sniffing = false
-                    streaming = byte != 123 // A JSON object may be mislabeled as event-stream.
-                    if streaming { json.removeAll() }
+                    if byte != 123 { // A JSON object may be mislabeled as event-stream.
+                        // Sniffing may have skipped leading whitespace; a BOM must be at byte zero.
+                        stream = EventStream(stripLeadingBOM: count == 1)
+                        json.removeAll()
+                    }
                 }
-                guard streaming else { json.append(byte); continue }
-                guard let event = stream.append(byte) else { continue }
+                guard stream != nil else { json.append(byte); continue }
+                guard let event = stream?.append(byte) else { continue }
                 try Task.checkCancellation()
                 if event == Data("[DONE]".utf8) { return output }
                 guard let chunk = try? decoder.decode(Completion.self, from: event) else {
@@ -300,7 +312,7 @@ struct TranslationClient: Sendable {
                 if choice.finish_reason != nil { return output }
             }
             try Task.checkCancellation()
-            if streaming { throw TranslationFailure.incomplete }
+            if stream != nil { throw TranslationFailure.incomplete }
             guard let completion = try? decoder.decode(Completion.self, from: json),
                   let choice = completion.choices.first else { throw TranslationFailure.invalidResponse }
             guard choice.completed, let content = choice.message?.content else { throw TranslationFailure.incomplete }

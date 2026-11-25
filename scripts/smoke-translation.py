@@ -99,14 +99,21 @@ class StreamingHandler(Handler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b': fixture heartbeat\r\ndata: {"choices":[]}\r\n\r\n')
-        self.wfile.write(b'data: {"choices":\r\n')
-        first = 'data: [{"delta":{"content":"第一段 🦌"},"finish_reason":null}]}\r\n\r\n'.encode()
+        if mode == "bom":
+            prefix = '\ufeffdata: {"choices":'
+        else:
+            if mode == "finish":
+                # The BOM after a blank line is not a stream prefix; ignore this field.
+                self.wfile.write(b'\r\n\xef\xbb\xbfdata: {"choices":[{"delta":{"content":"unexpected"}}]}\r\n\r\n')
+            self.wfile.write(b': fixture heartbeat\r\ndata: {"choices":[]}\r\n\r\n')
+            self.wfile.write(b'data: {"choices":\r\n')
+            prefix = 'data: '
+        first = (prefix + '[{"delta":{"content":"第一段 🦌"},"finish_reason":null}]}\r\n\r\n').encode()
         split = first.index("🦌".encode()) + 1
         self.wfile.write(first[:split])
         self.wfile.write(first[split:])
         root = self.server.root
-        if mode == "finish":
+        if mode in ("finish", "bom"):
             self.wait_for_marker(root / f"release-{case}")
             finish = "length" if verb == "tr" else None
             chunk = {"choices": [{"delta": {"content": " / second chunk"}, "finish_reason": finish}]}
@@ -150,7 +157,7 @@ def verify_streaming():
                 server.shutdown()
                 worker.join()
             assert server.requests == [f"{verb}-{mode}" for verb in ("tr", "qa")
-                                       for mode in ("finish", "cancel", "edit", "json", "mislabeled")], server.requests
+                                       for mode in ("finish", "bom", "cancel", "edit", "json", "mislabeled")], server.requests
 
 
 def main():

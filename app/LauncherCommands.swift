@@ -143,21 +143,28 @@ struct LauncherCommandCard: View {
         }
     }
 
-    private func entryTitle(_ item: LumenCommandCatalog.Entry) -> String {
-        switch item.commandID {
+    func entryTitle(_ item: LumenCommandCatalog.Entry) -> String {
+        localizedTitle(item.commandID, fallback: item.title)
+    }
+
+    private func localizedTitle(_ id: String, fallback: String) -> String {
+        switch id {
         case "discover": return t("命令列表", "Browse Commands")
         case "qa": return t("问模型", "Ask Model")
         case "translate": return t("翻译", "Translate")
-        case "google": return t("搜索 Google", "Search Google")
+        case "google": return t("搜索 Google", fallback)
+        case "github": return t("搜索 GitHub", fallback)
+        case "wikipedia": return t("搜索维基百科", fallback)
+        case "maps": return t("搜索 Google 地图", fallback)
         case "img": return t("按画面搜索图片", "Search Images by Description")
-        default: return item.title
+        default: return fallback
         }
     }
 
-    private var title: String {
+    var title: String {
         switch commands.resolution {
         case .question: return t("问模型", "Ask Model")
-        case .web(let id, let title, _): return id == "google" ? t("搜索 Google", "Search Google") : title
+        case .web(let id, let title, _): return localizedTitle(id, fallback: title)
         default: return t("启动器命令", "Launcher Command")
         }
     }

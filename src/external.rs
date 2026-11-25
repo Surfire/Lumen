@@ -371,47 +371,37 @@ fn append_mounted(
     let Ok(deny) = deny_rules(database) else {
         return;
     };
-    let first = mount_state();
-    let mut candidates = Vec::new();
-    let mut remaining = limit - hits.len();
-    for (catalog, conn, volume) in registered {
-        if !first.matches(&volume) {
+    // Find candidates before reading the mount table. One late snapshot
+    // verifies volume identity after the potentially longer catalog searches.
+    let candidates: Vec<_> = registered
+        .into_iter()
+        .filter_map(|(catalog, conn, volume)| {
+            let found = super::search_with_names(&conn, query, Mode::Name, 100, None, None).ok()?;
+            (!found.is_empty()).then_some((catalog, conn, volume, found))
+        })
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let attached = mount_state();
+    for (catalog, conn, volume, found) in candidates {
+        if !attached.matches(&volume) {
             continue;
         }
-        let Ok(found) = super::search_with_names(&conn, query, Mode::Name, 100, None, None) else {
-            continue;
-        };
-        let boundary = first.boundary(&volume);
+        let boundary = attached.boundary(&volume);
         let valid: Vec<_> = found
             .into_iter()
             .filter(|hit| {
                 let path = Path::new(&hit.path);
                 boundary.allows(path) && permitted(&deny, path) && validate_hit(&catalog, hit)
             })
-            .take(remaining)
+            .take(limit - hits.len())
             .collect();
-        if !valid.is_empty() {
-            remaining -= valid.len();
-            candidates.push((conn, volume, valid));
+        if !valid.is_empty() && registration(&conn).as_ref() == Some(&volume) {
+            hits.extend(valid);
         }
-        if remaining == 0 {
+        if hits.len() == limit {
             break;
-        }
-    }
-    if candidates.is_empty() {
-        return;
-    }
-    let Ok(deny) = deny_rules(database) else {
-        return;
-    };
-    let latest = mount_state();
-    for (conn, volume, valid) in candidates {
-        if latest.matches(&volume) && registration(&conn).as_ref() == Some(&volume) {
-            let boundary = latest.boundary(&volume);
-            hits.extend(valid.into_iter().filter(|hit| {
-                let path = Path::new(&hit.path);
-                boundary.allows(path) && permitted(&deny, path)
-            }));
         }
     }
 }
@@ -619,17 +609,15 @@ mod tests {
         assert!(query(&|| state(vec![reused_mount.clone()])).is_empty());
         assert!(query(&|| state(vec![volume.clone(), volume.clone()])).is_empty());
         let calls = Cell::new(0);
-        assert!(
+        // Each query observes one mount snapshot, not a redundant second scan.
+        assert_eq!(
             query(&|| {
                 calls.set(calls.get() + 1);
-                if calls.get() == 1 {
-                    active()
-                } else {
-                    Mounted::default()
-                }
-            })
-            .is_empty()
+                active()
+            }),
+            ["report.txt"]
         );
+        assert_eq!(calls.get(), 1);
 
         scope.deny = vec![root.clone()];
         conn.execute(

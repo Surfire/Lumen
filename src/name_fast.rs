@@ -1,8 +1,6 @@
-use crate::{Hit, Result, fts_phrase, open_read, row_hit};
+use crate::{Hit, Result, fts_phrase, row_hit};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{
-    collections::HashMap,
-    mem::size_of,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -12,13 +10,23 @@ use std::{
     time::{Duration, Instant},
 };
 
-// SQLite remains the query path while building, for larger indexes, and for
-// queries whose folding needs SQLite's trigram tokenizer.
-const MAX_ROWS: usize = 500_000;
-const MAX_INDEX_BYTES: usize = 120 * 1024 * 1024;
+#[path = "name_soa.rs"]
+mod soa;
+use soa::{MAX_INDEX_BYTES, NameIndex};
+
+// SQLite remains the query path while building, when the byte budget is
+// exceeded, and for queries whose folding needs SQLite's trigram tokenizer.
 const REBUILD_DELAY: Duration = Duration::from_millis(200);
 const OVER_BUDGET_DELAY: Duration = Duration::from_secs(30);
 const MAX_BUILD_DELAY: Duration = Duration::from_secs(15 * 60);
+
+pub(super) fn has_mtime(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('item') WHERE name='mtime')",
+        [],
+        |row| row.get(0),
+    )?)
+}
 
 pub(super) fn install_generation(conn: &Connection) -> Result<()> {
     // Triggers also cover visibility changes and item writes outside the walker.
@@ -28,9 +36,10 @@ pub(super) fn install_generation(conn: &Connection) -> Result<()> {
         "INSERT OR IGNORE INTO info(key,value) VALUES('name_generation',0);
          CREATE TRIGGER IF NOT EXISTS item_name_generation_insert AFTER INSERT ON item BEGIN {advance} END;
          CREATE TRIGGER IF NOT EXISTS item_name_generation_delete AFTER DELETE ON item BEGIN {advance} END;
-         CREATE TRIGGER IF NOT EXISTS item_name_generation_update AFTER UPDATE ON item
-         WHEN (old.id,old.path,old.display,old.kind,old.availability,old.name,old.full,old.initials,old.searchable_path)
-           IS NOT (new.id,new.path,new.display,new.kind,new.availability,new.name,new.full,new.initials,new.searchable_path)
+         DROP TRIGGER IF EXISTS item_name_generation_update;
+         CREATE TRIGGER item_name_generation_update AFTER UPDATE ON item
+         WHEN (old.id,old.path,old.display,old.kind,old.availability,old.name,old.full,old.initials,old.searchable_path,old.mtime)
+           IS NOT (new.id,new.path,new.display,new.kind,new.availability,new.name,new.full,new.initials,new.searchable_path,new.mtime)
          BEGIN {advance} END;"
     ))?;
     Ok(())
@@ -234,6 +243,7 @@ pub(super) struct NameFast {
     build: Option<Build>,
     next_build: Instant,
     build_delay: Duration,
+    budget: usize,
 }
 
 pub(super) fn data_version(conn: &Connection) -> Result<i64> {
@@ -242,6 +252,10 @@ pub(super) fn data_version(conn: &Connection) -> Result<i64> {
 
 impl NameFast {
     pub(super) fn new(db: &Path, conn: &Connection) -> Self {
+        Self::with_budget(db, conn, MAX_INDEX_BYTES)
+    }
+
+    fn with_budget(db: &Path, conn: &Connection, budget: usize) -> Self {
         let mut fast = Self {
             db: db.to_owned(),
             generation: None,
@@ -249,6 +263,7 @@ impl NameFast {
             build: None,
             next_build: Instant::now(),
             build_delay: OVER_BUDGET_DELAY,
+            budget,
         };
         if let Ok(Some(generation)) = name_generation(conn) {
             fast.start(generation);
@@ -260,6 +275,7 @@ impl NameFast {
         &mut self,
         conn: &Connection,
         query: &str,
+        terms: Option<&crate::query::Terms>,
         limit: usize,
     ) -> Result<Option<(i64, Vec<Hit>)>> {
         let generation = name_generation(conn)?;
@@ -288,11 +304,11 @@ impl NameFast {
             {
                 self.start(generation);
             }
-            if current && !query.contains('\0') && literal_query(query) {
+            if current && !query.contains('\0') && (terms.is_some() || literal_query(query)) {
                 return Ok(self
                     .index
                     .as_ref()
-                    .map(|index| (generation, index.search(query, limit))));
+                    .map(|index| (generation, index.search(query, terms, limit))));
             }
         }
         Ok(None)
@@ -310,11 +326,12 @@ impl NameFast {
         let cancellation = Arc::clone(&cancel);
         self.generation = Some(generation);
         self.next_build = Instant::now() + REBUILD_DELAY;
+        let budget = self.budget;
         self.build = thread::Builder::new()
             .name("lumen-names".to_owned())
             .spawn(move || {
                 drop(stale);
-                NameIndex::load(&db, &cancellation)
+                NameIndex::load(&db, &cancellation, budget)
             })
             .ok()
             .map(|worker| Build { cancel, worker });
@@ -344,330 +361,10 @@ fn literal_query(query: &str) -> bool {
         .all(|c| c.is_ascii() || matches!(c, '\u{3400}'..='\u{9fff}'))
 }
 
-struct Entry {
-    path: Box<str>,
-    searchable_path: Option<Box<str>>,
-    display: Box<str>,
-    display_len: usize,
-    name: Option<Box<str>>,
-    kind: Box<str>,
-    availability: Box<str>,
-    full: Box<str>,
-    initials: Box<str>,
-}
-
-impl Entry {
-    fn name(&self) -> &str {
-        self.name.as_deref().unwrap_or(&self.display)
-    }
-
-    fn searchable_path(&self) -> &str {
-        self.searchable_path.as_deref().unwrap_or(&self.path)
-    }
-
-    fn has_pinyin(&self, query: &str) -> bool {
-        self.full.contains(query) || self.initials.contains(query)
-    }
-
-    fn hit(&self, matched_by: &str) -> Hit {
-        Hit {
-            path: self.path.to_string(),
-            name: self.display.to_string(),
-            kind: self.kind.to_string(),
-            availability: self.availability.to_string(),
-            matched_by: matched_by.to_owned(),
-            snippet: None,
-            document_stamp: None,
-            pdf_page: None,
-            score: None,
-        }
-    }
-}
-
-#[derive(Default)]
-struct Postings(HashMap<u32, PostingList>);
-
-#[derive(Default)]
-struct PostingList {
-    // Sorted entry IDs tend to be close for common grams. Keep their gaps
-    // as base-128 integers so shared path segments cost about a byte per row.
-    gaps: Vec<u8>,
-    count: usize,
-    last: u32,
-}
-
-impl PostingList {
-    fn insert(&mut self, id: u32) -> usize {
-        if self.count != 0 && self.last == id {
-            return 0;
-        }
-        let before = self.gaps.capacity();
-        let mut gap = id - self.last;
-        while gap >= 128 {
-            self.gaps.push((gap as u8) | 128);
-            gap >>= 7;
-        }
-        self.gaps.push(gap as u8);
-        self.last = id;
-        self.count += 1;
-        self.gaps.capacity() - before
-    }
-
-    fn ids(&self) -> impl Iterator<Item = u32> + '_ {
-        let mut bytes = self.gaps.iter();
-        let mut id = 0;
-        std::iter::from_fn(move || {
-            let mut shift = 0;
-            for &byte in bytes.by_ref() {
-                id += u32::from(byte & 127) << shift;
-                if byte < 128 {
-                    return Some(id);
-                }
-                shift += 7;
-            }
-            None
-        })
-    }
-}
-
-impl Postings {
-    fn add(&mut self, text: &str, id: u32, bytes: &mut usize) {
-        let s = text.as_bytes();
-        for (i, &a) in s.iter().enumerate() {
-            if a.is_ascii() {
-                self.insert(u32::from(a), id, bytes);
-            }
-            if let Some(&b) = s.get(i + 1) {
-                if (a.is_ascii() && b.is_ascii())
-                    || ((0xc2..=0xdf).contains(&a) && (0x80..=0xbf).contains(&b))
-                {
-                    self.insert(u32::from_be_bytes([0, 1, a, b]), id, bytes);
-                }
-                if let Some(&c) = s.get(i + 2) {
-                    self.insert(u32::from_be_bytes([1, a, b, c]), id, bytes);
-                }
-            }
-        }
-    }
-
-    fn insert(&mut self, gram: u32, id: u32, bytes: &mut usize) {
-        let postings = self.0.entry(gram).or_default();
-        if postings.count == 0 {
-            // Include hash table slack in the index budget.
-            *bytes += 64;
-        }
-        *bytes += postings.insert(id);
-    }
-
-    fn candidates(&self, query: &str) -> impl Iterator<Item = u32> + '_ {
-        self.rarest(query).into_iter().flat_map(PostingList::ids)
-    }
-
-    fn rarest(&self, query: &str) -> Option<&PostingList> {
-        match query.as_bytes() {
-            &[a] => self.0.get(&u32::from(a)),
-            &[a, b] => self.0.get(&u32::from_be_bytes([0, 1, a, b])),
-            longer => {
-                let mut shortest: Option<&PostingList> = None;
-                for gram in longer.windows(3) {
-                    let n = self
-                        .0
-                        .get(&u32::from_be_bytes([1, gram[0], gram[1], gram[2]]))?;
-                    if shortest.is_none_or(|prior| n.count < prior.count) {
-                        shortest = Some(n);
-                    }
-                }
-                shortest
-            }
-        }
-    }
-}
-
-#[derive(Default)]
-struct NameIndex {
-    // Tie-break order is precomputed once per published index generation.
-    entries: Vec<Entry>,
-    by_name: Vec<u32>,
-    names: Postings,
-    pinyin: Postings,
-    paths: Postings,
-}
-
-impl NameIndex {
-    fn load(db: &Path, cancel: &AtomicBool) -> Result<Option<Self>> {
-        let mut index = Self::default();
-        let mut bytes = 0;
-        {
-            let conn = open_read(db)?;
-            let too_large: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM item LIMIT 1 OFFSET ?1)",
-                [MAX_ROWS as i64],
-                |row| row.get(0),
-            )?;
-            if too_large || cancel.load(Ordering::Relaxed) {
-                return Ok(None);
-            }
-            let mut stmt = conn.prepare(
-                "SELECT path,display,kind,availability,name,full,initials,searchable_path
-                 FROM item WHERE availability<>'unverified' LIMIT ?1",
-            )?;
-            let mut rows = stmt.query([MAX_ROWS as i64 + 1])?;
-            while let Some(row) = rows.next()? {
-                if index.entries.len() == MAX_ROWS || cancel.load(Ordering::Relaxed) {
-                    return Ok(None);
-                }
-                let path: Box<str> = row.get(0)?;
-                let display: Box<str> = row.get(1)?;
-                let kind: Box<str> = row.get(2)?;
-                let availability: Box<str> = row.get(3)?;
-                let name: Box<str> = row.get(4)?;
-                let full: Box<str> = row.get(5)?;
-                let initials: Box<str> = row.get(6)?;
-                let searchable_path: Box<str> = row.get(7)?;
-                if [
-                    path.as_ref(),
-                    display.as_ref(),
-                    name.as_ref(),
-                    full.as_ref(),
-                    initials.as_ref(),
-                    searchable_path.as_ref(),
-                ]
-                .iter()
-                .any(|text| text.contains('\0'))
-                {
-                    // FTS5's behavior with embedded NUL differs from instr.
-                    return Ok(None);
-                }
-                let name = (name != display).then_some(name);
-                let searchable_path = (searchable_path != path).then_some(searchable_path);
-                bytes += path.len()
-                    + display.len()
-                    + kind.len()
-                    + availability.len()
-                    + name.as_ref().map_or(0, |s| s.len())
-                    + searchable_path.as_ref().map_or(0, |s| s.len())
-                    + full.len()
-                    + initials.len();
-                let before = index.entries.capacity();
-                index.entries.push(Entry {
-                    path,
-                    searchable_path,
-                    display_len: display.chars().count(),
-                    display,
-                    name,
-                    kind,
-                    availability,
-                    full,
-                    initials,
-                });
-                bytes += (index.entries.capacity() - before) * size_of::<Entry>();
-                if bytes > MAX_INDEX_BYTES {
-                    return Ok(None);
-                }
-            }
-        }
-        index.entries.sort_unstable_by(|a, b| {
-            a.display_len
-                .cmp(&b.display_len)
-                .then_with(|| a.path.cmp(&b.path))
-        });
-        index.by_name = (0..index.entries.len() as u32).collect();
-        bytes += index.by_name.capacity() * size_of::<u32>();
-        index.by_name.sort_unstable_by(|&a, &b| {
-            index.entries[a as usize]
-                .name()
-                .cmp(index.entries[b as usize].name())
-                .then_with(|| a.cmp(&b))
-        });
-        for (id, entry) in index.entries.iter().enumerate() {
-            if cancel.load(Ordering::Relaxed) {
-                return Ok(None);
-            }
-            let id = id as u32;
-            index.names.add(entry.name(), id, &mut bytes);
-            index.pinyin.add(&entry.full, id, &mut bytes);
-            index.pinyin.add(&entry.initials, id, &mut bytes);
-            index.paths.add(entry.searchable_path(), id, &mut bytes);
-            if bytes > MAX_INDEX_BYTES {
-                return Ok(None);
-            }
-        }
-        Ok(Some(index))
-    }
-
-    fn entry(&self, id: u32) -> &Entry {
-        &self.entries[id as usize]
-    }
-
-    fn search(&self, query: &str, limit: usize) -> Vec<Hit> {
-        let start = self
-            .by_name
-            .partition_point(|&id| self.entry(id).name() < query);
-        let names = &self.by_name[start..];
-        let exact = names.partition_point(|&id| self.entry(id).name() == query);
-        let mut hits = Vec::with_capacity(limit);
-        hits.extend(
-            names[..exact]
-                .iter()
-                .take(limit)
-                .map(|&id| self.entry(id).hit("name")),
-        );
-        if hits.len() == limit {
-            return hits;
-        }
-
-        let prefixes =
-            names[exact..].partition_point(|&id| self.entry(id).name().starts_with(query));
-        let mut remaining_prefixes = prefixes.min(limit - hits.len());
-        let mut substrings = Vec::new();
-        for id in self.names.candidates(query) {
-            if hits.len() == limit
-                || (remaining_prefixes == 0 && substrings.len() >= limit - hits.len())
-            {
-                break;
-            }
-            let entry = self.entry(id);
-            let name = entry.name();
-            if name.starts_with(query) {
-                if name != query {
-                    hits.push(entry.hit("name"));
-                    remaining_prefixes -= 1;
-                }
-            } else if substrings.len() < limit - hits.len() && name.contains(query) {
-                substrings.push(entry);
-            }
-        }
-        for entry in substrings.into_iter().take(limit - hits.len()) {
-            hits.push(entry.hit("name"));
-        }
-        for id in self.pinyin.candidates(query) {
-            if hits.len() == limit {
-                return hits;
-            }
-            let entry = self.entry(id);
-            if entry.has_pinyin(query) && !entry.name().contains(query) {
-                hits.push(entry.hit("pinyin"));
-            }
-        }
-        for id in self.paths.candidates(query) {
-            if hits.len() == limit {
-                break;
-            }
-            let entry = self.entry(id);
-            if entry.searchable_path().contains(query)
-                && !entry.name().contains(query)
-                && !entry.has_pinyin(query)
-            {
-                hits.push(entry.hit("path"));
-            }
-        }
-        hits
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::open_read;
     use std::fs;
 
     struct Catalog(PathBuf);
@@ -693,7 +390,7 @@ mod tests {
 
     fn finish_build(fast: &NameFast) {
         let worker = &fast.build.as_ref().unwrap().worker;
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !worker.is_finished() {
             assert!(Instant::now() < deadline, "name build did not complete");
             thread::yield_now();
@@ -720,12 +417,12 @@ mod tests {
         let db = catalog.db();
         let (writer, _) = crate::open_write(&db, false)?;
         writer.execute_batch(
-            "INSERT INTO item VALUES(1,'/scope/example','example','file','local','example','','','/scope/example');",
+            "INSERT INTO item VALUES(1,'/scope/example','example','file','local','example','','','/scope/example',0);",
         )?;
         let reader = open_read(&db)?;
         let mut fast = NameFast::new(&db, &reader);
         finish_build(&fast);
-        let (generation, hits) = fast.search(&reader, "example", 10)?.unwrap();
+        let (generation, hits) = fast.search(&reader, "example", None, 10)?.unwrap();
         assert_eq!(hits[0].name, "example");
         let version = data_version(&reader)?;
         writer.execute_batch(
@@ -734,12 +431,17 @@ mod tests {
              UPDATE item SET availability=availability WHERE id=1;",
         )?;
         assert_ne!(version, data_version(&reader)?);
-        assert_eq!(fast.search(&reader, "example", 10)?.unwrap().0, generation);
-        writer.execute_batch("UPDATE item SET availability='unverified' WHERE id=1;")?;
+        assert_eq!(
+            fast.search(&reader, "example", None, 10)?.unwrap().0,
+            generation
+        );
+        writer.execute_batch("UPDATE item SET mtime=123 WHERE id=1;")?;
         assert_eq!(name_generation(&reader)?, Some(generation + 1));
-        assert!(fast.search(&reader, "example", 10)?.is_none());
-        writer.execute_batch("DELETE FROM item WHERE id=1;")?;
+        writer.execute_batch("UPDATE item SET availability='unverified' WHERE id=1;")?;
         assert_eq!(name_generation(&reader)?, Some(generation + 2));
+        assert!(fast.search(&reader, "example", None, 10)?.is_none());
+        writer.execute_batch("DELETE FROM item WHERE id=1;")?;
+        assert_eq!(name_generation(&reader)?, Some(generation + 3));
         Ok(())
     }
 
@@ -748,27 +450,150 @@ mod tests {
         let catalog = Catalog::new("over-budget")?;
         let db = catalog.db();
         let (writer, _) = crate::open_write(&db, false)?;
-        writer.execute(
-            "WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<=?1)
-             INSERT INTO item SELECT n,n,'fixture','file','local','fixture','','','' FROM numbers",
-            [MAX_ROWS as i64],
+        writer.execute_batch(
+            "INSERT INTO item VALUES(1,'/scope/fixture','fixture','file','local','fixture','','','/scope/fixture',0);",
+        )?;
+        let reader = open_read(&db)?;
+        let mut fast = NameFast::with_budget(&db, &reader, 64);
+        finish_build(&fast);
+        let t = Instant::now();
+        assert!(fast.search(&reader, "fixture", None, 10)?.is_none());
+        assert!(fast.next_build >= t + OVER_BUDGET_DELAY);
+        writer.execute_batch("UPDATE item SET kind='directory' WHERE id=1;")?;
+        assert!(fast.search(&reader, "fixture", None, 10)?.is_none());
+        assert!(fast.build.is_none());
+        // Advance the retry deadline without sleeping; the same catalog is still oversized.
+        fast.next_build = Instant::now();
+        assert!(fast.search(&reader, "fixture", None, 10)?.is_none());
+        finish_build(&fast);
+        let t = Instant::now();
+        assert!(fast.search(&reader, "fixture", None, 10)?.is_none());
+        assert!(fast.next_build >= t + 2 * OVER_BUDGET_DELAY);
+        Ok(())
+    }
+
+    #[test]
+    fn soa_scales_past_the_old_row_cap() -> Result<()> {
+        let catalog = Catalog::new("large-soa")?;
+        let db = catalog.db();
+        let (writer, _) = crate::open_write(&db, false)?;
+        writer.execute_batch(
+            "WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<510001),
+             names(id,name) AS (SELECT n,printf('report-%06d.pdf',n) FROM numbers)
+             INSERT INTO item SELECT id,'/scope/'||name,name,'file','local',name,'','','/scope/'||name,0 FROM names;",
         )?;
         let reader = open_read(&db)?;
         let mut fast = NameFast::new(&db, &reader);
         finish_build(&fast);
-        let t = Instant::now();
-        assert!(fast.search(&reader, "fixture", 10)?.is_none());
-        assert!(fast.next_build >= t + OVER_BUDGET_DELAY);
-        writer.execute_batch("UPDATE item SET kind='directory' WHERE id=1;")?;
-        assert!(fast.search(&reader, "fixture", 10)?.is_none());
-        assert!(fast.build.is_none());
-        // Advance the retry deadline without sleeping; the same catalog is still oversized.
-        fast.next_build = Instant::now();
-        assert!(fast.search(&reader, "fixture", 10)?.is_none());
+        let q = "report 510001 kind:doc ext:pdf /scope/";
+        let (_, hits) = fast
+            .search(&reader, q, crate::query::Terms::parse(q).as_ref(), 20)?
+            .expect("the 510,001-row catalog must publish a RAM snapshot");
+        assert_eq!(
+            hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+            ["/scope/report-510001.pdf"]
+        );
+        assert!(fast.index.as_ref().unwrap().capacity_bytes() < 70 * 1024 * 1024);
+        Ok(())
+    }
+
+    #[test]
+    fn soa_filters_path_pinyin_and_composite_rank() -> Result<()> {
+        let catalog = Catalog::new("soa-filters")?;
+        let db = catalog.db();
+        let (writer, _) = crate::open_write(&db, false)?;
+        let home = crate::absolute(Path::new(&std::env::var_os("HOME").expect("HOME")))?;
+        let entries = [
+            (home.join("Desktop/draft brief.pdf"), "file", "", 60),
+            (home.join("Desktop/draft brief.png"), "file", "", 60),
+            (home.join("Desktop/draft brief-old.pdf"), "file", "", 50),
+            (
+                home.join("Desktop/node_modules/draft brief.pdf"),
+                "file",
+                "",
+                90,
+            ),
+            (PathBuf::from("/elsewhere/draft brief.pdf"), "file", "", 100),
+            (home.join("Desktop/draft"), "directory", "", 40),
+            (home.join("Desktop/draft.app"), "directory", "", 40),
+            (
+                home.join("Desktop/成都会报 winter.pdf"),
+                "file",
+                "chengdouhuibaowinterpdf",
+                30,
+            ),
+            (
+                home.join("Desktop-adjacent/draft brief.pdf"),
+                "file",
+                "",
+                20,
+            ),
+            (home.join("Desktop/music.wav"), "file", "", 50),
+            (home.join("Desktop/clip.mov"), "file", "", 50),
+            (home.join("Desktop/main.rs"), "file", "", 50),
+            (home.join("Desktop/backup.tar.gz"), "file", "", 50),
+        ];
+        for (path, kind, full, mtime) in &entries {
+            let path = path.to_str().unwrap();
+            let display = Path::new(path).file_name().unwrap().to_str().unwrap();
+            writer.execute(
+                "INSERT INTO item VALUES(NULL,?1,?2,?3,'local',?4,?5,'',?6,?7)",
+                params![
+                    path,
+                    display,
+                    kind,
+                    crate::norm(display),
+                    full,
+                    crate::norm(path),
+                    mtime
+                ],
+            )?;
+        }
+        let reader = open_read(&db)?;
+        let mut fast = NameFast::new(&db, &reader);
         finish_build(&fast);
-        let t = Instant::now();
-        assert!(fast.search(&reader, "fixture", 10)?.is_none());
-        assert!(fast.next_build >= t + 2 * OVER_BUDGET_DELAY);
+        // This fixture has no FTS rows; require a published snapshot for every search.
+        let mut search = |q: &str| {
+            fast.search(&reader, q, crate::query::Terms::parse(q).as_ref(), 20)
+                .unwrap()
+                .unwrap()
+                .1
+        };
+        let ranked = search("draft");
+        assert_eq!(ranked.len(), 8);
+        for (hit, (path, ..)) in ranked
+            .iter()
+            .zip([5, 0, 1, 2, 6, 8, 4, 3].map(|i| &entries[i]))
+        {
+            // The two non-clean matches still sort by mtime, regardless of scope.
+            assert_eq!(hit.path, path.to_str().unwrap());
+        }
+        let hits = search("~/desktop/ draft brief .pdf");
+        assert_eq!(
+            hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+            [0, 2, 3].map(|i| entries[i].0.to_str().unwrap())
+        );
+        assert_eq!(
+            search("chengdu winter ext:pdf kind:doc")[0].matched_by,
+            "pinyin"
+        );
+        assert_eq!(search("desktop/draft brief").len(), 3);
+        assert!(search("kind:doc kind:app").is_empty());
+        for (kind, file) in [
+            ("image", "draft brief.png"),
+            ("video", "clip.mov"),
+            ("audio", "music.wav"),
+            ("code", "main.rs"),
+            ("archive", "backup.tar.gz"),
+            ("folder", "draft"),
+            ("app", "draft.app"),
+        ] {
+            let hits = search(&format!("~/desktop/ kind:{kind}"));
+            assert_eq!(
+                hits.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(),
+                [file]
+            );
+        }
         Ok(())
     }
 

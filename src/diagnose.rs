@@ -179,12 +179,63 @@ pub(super) fn validate_catalog_hit(
     let result = (|| -> crate::Result<bool> {
         let database = absolute(database)?;
         let conn = open_read(&database)?;
+        let sidecars = INDEX_SIDECARS.map(|suffix| with_suffix(&database, suffix));
         Ok(read_snapshot(&conn, |snapshot| {
-            validate_in_snapshot(snapshot, &database, path, kind, availability, stamp)
+            let Some(scope) = saved_index_scope(snapshot)? else {
+                return Ok(false);
+            };
+            validate_in_snapshot(
+                snapshot,
+                (&scope, &database, &sidecars),
+                path,
+                kind,
+                availability,
+                stamp,
+            )
         })?
         .unwrap_or(false))
     })();
     result.unwrap_or(false)
+}
+
+/// Validate an ordered batch using the session's existing catalog connection.
+/// The metadata checks never read the selected files' contents.
+pub(super) fn validate_session_hits(
+    conn: &Connection,
+    database: &Path,
+    hits: &[(&str, &str, &str, Option<&str>)],
+) -> Vec<bool> {
+    #[cfg(target_os = "macos")]
+    let Ok(_io) = crate::platform::NoMaterialization::enter() else {
+        return vec![false; hits.len()];
+    };
+    let Ok(snapshot) = conn.unchecked_transaction() else {
+        return vec![false; hits.len()];
+    };
+    let scope = saved_index_scope(&snapshot).ok().flatten();
+    let sidecars = INDEX_SIDECARS.map(|suffix| with_suffix(database, suffix));
+    hits.iter()
+        .map(|&(path, kind, availability, stamp)| {
+            let path = Path::new(path);
+            if !path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
+                return false;
+            }
+            if crate::external::is_external(path) {
+                return crate::external::validate(database, path, kind, availability, stamp);
+            }
+            scope.as_ref().is_some_and(|scope| {
+                validate_in_snapshot(
+                    &snapshot,
+                    (scope, database, &sidecars),
+                    path,
+                    kind,
+                    availability,
+                    stamp,
+                )
+                .unwrap_or(false)
+            })
+        })
+        .collect()
 }
 
 /// Retry a read raced by a catalog commit without repeating work outside SQLite.
@@ -207,7 +258,7 @@ pub(super) fn read_snapshot<T>(
 
 fn validate_in_snapshot(
     conn: &Connection,
-    database: &Path,
+    (scope, database, sidecars): (&Scope, &Path, &[PathBuf]),
     path: &Path,
     kind: &str,
     availability: &str,
@@ -221,14 +272,10 @@ fn validate_in_snapshot(
     {
         return Ok(false);
     }
-    let Some(scope) = saved_index_scope(conn)? else {
-        return Ok(false);
-    };
-    let sidecars = INDEX_SIDECARS.map(|suffix| with_suffix(database, suffix));
     let path = absolute(path)?;
     if !scope.roots.iter().any(|root| path.starts_with(root))
         || !scope.allows(&path)
-        || is_index_path(&path, database, &sidecars)
+        || is_index_path(&path, database, sidecars)
     {
         return Ok(false);
     }
@@ -236,12 +283,11 @@ fn validate_in_snapshot(
         return Ok(false);
     };
     let id: Option<i64> = conn
-        .query_row(
+        .prepare_cached(
             "SELECT id FROM item WHERE path=?1 AND kind=?2 AND availability=?3
              AND availability<>'unverified'",
-            [text, kind, availability],
-            |row| row.get(0),
-        )
+        )?
+        .query_row([text, kind, availability], |row| row.get(0))
         .optional()?;
     let Some(id) = id else {
         return Ok(false);
@@ -578,10 +624,13 @@ mod tests {
         .unwrap();
         let reader = open_read(&database).unwrap();
         let writer = Connection::open(&database).unwrap();
+        let scope = saved_index_scope(&reader).unwrap().unwrap();
+        let sidecars = INDEX_SIDECARS.map(|suffix| with_suffix(&database, suffix));
+        let context = (&scope, database.as_path(), sidecars.as_slice());
         let mut attempts = 0;
         let result = read_snapshot(&reader, |snapshot| {
             attempts += 1;
-            let visible = validate_in_snapshot(snapshot, &database, &path, "file", "local", None)?;
+            let visible = validate_in_snapshot(snapshot, context, &path, "file", "local", None)?;
             if attempts < 3 {
                 writer.execute("UPDATE item SET display=display || 'x'", [])?;
             }
@@ -597,7 +646,7 @@ mod tests {
         attempts = 0;
         let result = read_snapshot(&reader, |snapshot| {
             attempts += 1;
-            let visible = validate_in_snapshot(snapshot, &database, &path, "file", "local", None)?;
+            let visible = validate_in_snapshot(snapshot, context, &path, "file", "local", None)?;
             writer.execute("UPDATE item SET display=display || 'x'", [])?;
             Ok(visible)
         })

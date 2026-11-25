@@ -307,9 +307,36 @@ enum Action {
 struct Request {
     id: u64,
     query: String,
+    limit: Option<usize>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ServeOperation {
+    #[default]
+    Search,
+    Validate,
+}
+
+#[derive(Deserialize)]
+struct ServeRequest {
+    id: u64,
+    #[serde(default)]
+    op: ServeOperation,
+    query: Option<String>,
     #[serde(default)]
     mode: Mode,
     limit: Option<usize>,
+    check_access: Option<bool>,
+    hits: Option<Vec<ValidationHit>>,
+}
+
+#[derive(Deserialize)]
+struct ValidationHit {
+    path: String,
+    kind: String,
+    availability: String,
+    document_stamp: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -375,7 +402,85 @@ fn gemma_status(
     })
 }
 
-const SEMANTIC_REQUEST_LIMIT: u64 = 16 * 1024;
+const REQUEST_LINE_LIMIT: u64 = 16 * 1024;
+
+#[derive(Serialize)]
+struct ValidationReply {
+    id: u64,
+    valid: Vec<bool>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ServeReply {
+    Search(SearchReply),
+    Validate(ValidationReply),
+}
+
+fn serve(
+    mut input: impl BufRead,
+    mut output: impl Write,
+    session: &mut lumen::SearchSession,
+    check_access: bool,
+) -> Result<()> {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if std::io::Read::take(&mut input, REQUEST_LINE_LIMIT + 1).read_until(b'\n', &mut line)?
+            == 0
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            line.len() as u64 <= REQUEST_LINE_LIMIT && line.ends_with(b"\n"),
+            "invalid serve request frame"
+        );
+        match serde_json::from_slice::<ServeRequest>(&line) {
+            Ok(q) => {
+                let result = match q.op {
+                    ServeOperation::Search => (|| -> Result<ServeReply> {
+                        let query = q.query.context("search requires query")?;
+                        let hits = search_checked(
+                            q.limit.unwrap_or(20),
+                            q.check_access.unwrap_or(check_access),
+                            100,
+                            |limit| session.search(&query, q.mode, limit),
+                        )?;
+                        Ok(ServeReply::Search(SearchReply { id: q.id, hits }))
+                    })(),
+                    ServeOperation::Validate => (|| -> Result<ServeReply> {
+                        let hits = q.hits.context("validate requires hits")?;
+                        let hits: Vec<_> = hits
+                            .iter()
+                            .map(|hit| {
+                                (
+                                    hit.path.as_str(),
+                                    hit.kind.as_str(),
+                                    hit.availability.as_str(),
+                                    hit.document_stamp.as_deref(),
+                                )
+                            })
+                            .collect();
+                        Ok(ServeReply::Validate(ValidationReply {
+                            id: q.id,
+                            valid: session.validate(&hits),
+                        }))
+                    })(),
+                };
+                match result {
+                    Ok(reply) => serde_json::to_writer(&mut output, &reply)?,
+                    Err(error) => serde_json::to_writer(
+                        &mut output,
+                        &json!({"id":q.id,"error":error.to_string()}),
+                    )?,
+                }
+            }
+            Err(error) => serde_json::to_writer(&mut output, &json!({"error":error.to_string()}))?,
+        }
+        writeln!(output)?;
+        output.flush()?;
+    }
+}
 
 fn serve_gemma(
     mut input: impl BufRead,
@@ -385,14 +490,13 @@ fn serve_gemma(
     let mut line = Vec::new();
     loop {
         line.clear();
-        if std::io::Read::take(&mut input, SEMANTIC_REQUEST_LIMIT + 1)
-            .read_until(b'\n', &mut line)?
+        if std::io::Read::take(&mut input, REQUEST_LINE_LIMIT + 1).read_until(b'\n', &mut line)?
             == 0
         {
             return Ok(());
         }
         anyhow::ensure!(
-            line.len() as u64 <= SEMANTIC_REQUEST_LIMIT && line.ends_with(b"\n"),
+            line.len() as u64 <= REQUEST_LINE_LIMIT && line.ends_with(b"\n"),
             "invalid semantic request frame"
         );
         match serde_json::from_slice::<Request>(&line) {
@@ -657,28 +761,12 @@ fn main() -> Result<()> {
         Action::Serve { check_access } => {
             let mut search = lumen::SearchSession::open(&db)
                 .context("no usable index; run lumen index first")?;
-            let mut out = io::BufWriter::new(io::stdout().lock());
-            for line in io::stdin().lock().lines() {
-                let data = line?;
-                match serde_json::from_str::<Request>(&data) {
-                    Ok(q) => {
-                        match search_checked(q.limit.unwrap_or(20), check_access, 100, |limit| {
-                            search.search(&q.query, q.mode, limit)
-                        }) {
-                            Ok(hits) => {
-                                serde_json::to_writer(&mut out, &SearchReply { id: q.id, hits })?
-                            }
-                            Err(e) => serde_json::to_writer(
-                                &mut out,
-                                &json!({"id":q.id,"error":e.to_string()}),
-                            )?,
-                        }
-                    }
-                    Err(e) => serde_json::to_writer(&mut out, &json!({"error":e.to_string()}))?,
-                }
-                writeln!(out)?;
-                out.flush()?;
-            }
+            serve(
+                io::stdin().lock(),
+                io::BufWriter::new(io::stdout().lock()),
+                &mut search,
+                check_access,
+            )?;
         }
     }
     Ok(())
@@ -747,7 +835,7 @@ mod tests {
     #[test]
     fn semantic_json_lines_keep_their_limit_and_request_identity() {
         let prefix = br#"{"id":1,"query":"first","limit":9}"#;
-        let limit = SEMANTIC_REQUEST_LIMIT as usize;
+        let limit = REQUEST_LINE_LIMIT as usize;
         let mut input = prefix.to_vec();
         input.resize(limit - 1, b' ');
         input.push(b'\n');
@@ -772,7 +860,7 @@ mod tests {
 
     #[test]
     fn semantic_framing_stops_before_reading_or_processing_an_excess_line() {
-        let limit = SEMANTIC_REQUEST_LIMIT as usize;
+        let limit = REQUEST_LINE_LIMIT as usize;
         for (input, bytes_read) in [(vec![b' '; limit * 2], limit + 1), (b"{}".to_vec(), 2)] {
             let mut input = Cursor::new(input);
             let mut output = Vec::new();

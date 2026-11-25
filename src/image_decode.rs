@@ -1,4 +1,54 @@
 //! Decode already-authorized bytes with ImageIO. Never hand it a file or URL.
+use std::path::Path;
+
+pub(super) const MAX_FILE_BYTES: u64 = 12 * 1024 * 1024;
+
+pub(super) fn supported_path(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| {
+        ["png", "jpg", "jpeg", "heic", "heif", "webp"]
+            .iter()
+            .any(|kind| ext.eq_ignore_ascii_case(kind))
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn sniff(bytes: &[u8]) -> Option<&'static std::ffi::CStr> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some(c"public.png");
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return Some(c"public.jpeg");
+    }
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        return Some(c"org.webmproject.webp");
+    }
+    // HEIF's ftyp contains a major brand, minor version, and aligned compatible
+    // brands. Do not scan bytes beyond this box (e.g. inside EXIF or payloads).
+    if bytes.get(4..8)? != b"ftyp" {
+        return None;
+    }
+    let (header, size) = match u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?) {
+        1 => (
+            16,
+            usize::try_from(u64::from_be_bytes(bytes.get(8..16)?.try_into().ok()?)).ok()?,
+        ),
+        0 => (8, bytes.len()),
+        size => (8, size as usize),
+    };
+    let major = bytes.get(header..header + 4)?;
+    let (compatible, []) = bytes.get(header + 8..size)?.as_chunks::<4>() else {
+        return None;
+    };
+    let mut format = None;
+    for brand in std::iter::once(major).chain(compatible.iter().map(<[u8; 4]>::as_slice)) {
+        match brand {
+            b"heic" | b"heix" => return Some(c"public.heic"),
+            b"mif1" => format = Some(c"public.heif"),
+            _ => {}
+        }
+    }
+    format
+}
 #[cfg(target_os = "macos")]
 mod native {
     use std::{
@@ -111,14 +161,12 @@ mod native {
 
     pub(super) fn thumbnail(bytes: &[u8]) -> Option<Vec<u8>> {
         // Reject unapproved formats before sending even metadata to an OS decoder.
-        let expected_type = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-            c"public.png"
-        } else if bytes.starts_with(b"\xff\xd8\xff") {
-            c"public.jpeg"
-        } else {
-            return None;
-        };
+        let expected_type = super::sniff(bytes)?;
         let expected = Owned::string(expected_type)?;
+        // Generic HEIF (mif1) may still contain a HEVC-coded primary image.
+        let heic = (expected_type == c"public.heif")
+            .then(|| Owned::string(c"public.heic"))
+            .flatten();
         let png = Owned::string(c"public.png")?;
         unsafe {
             let data = Owned::new(CFDataCreate(
@@ -130,7 +178,10 @@ mod native {
             let source = Owned::new(CGImageSourceCreateWithData(data.0, no_cache.0))?;
             let format = CGImageSourceGetType(source.0);
             if format.is_null()
-                || CFEqual(format, expected.0) == 0
+                || (CFEqual(format, expected.0) == 0
+                    && heic
+                        .as_ref()
+                        .is_none_or(|heic| CFEqual(format, heic.0) == 0))
                 || CGImageSourceGetCount(source.0) != 1
             {
                 return None;
@@ -183,11 +234,76 @@ mod native {
 }
 
 pub(super) fn thumbnail(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return None;
+    }
     #[cfg(target_os = "macos")]
     return native::thumbnail(bytes);
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = bytes;
         None
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use std::{fs, process::Command};
+
+    #[test]
+    fn imageio_decodes_heic_heif_and_webp_with_original_limits() {
+        let root = std::env::temp_dir().join(format!("lumen-image-decode-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let ppm = root.join("colors.ppm");
+        fs::write(&ppm, b"P6\n2 2\n255\n\xff\0\0\0\xff\0\0\0\xff\xff\xff\xff").unwrap();
+        let png = root.join("colors.png");
+        let heic = root.join("colors.heic");
+        let sips = |options: &[&str], source: &Path, dest: &Path| {
+            let output = Command::new("/usr/bin/sips")
+                .args(options)
+                .arg(source)
+                .arg("--out")
+                .arg(dest)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            fs::read(dest).unwrap()
+        };
+        sips(&["-s", "format", "png"], &ppm, &png);
+        let heic_bytes = sips(&["-s", "format", "heic"], &png, &heic);
+        assert_eq!(sniff(&heic_bytes), Some(c"public.heic"));
+        let mut heif = heic_bytes.clone();
+        let end = u32::from_be_bytes(heif[..4].try_into().unwrap()) as usize;
+        heif[8..12].copy_from_slice(b"mif1");
+        for brand in heif[16..end].chunks_exact_mut(4) {
+            if matches!(&*brand, b"heic" | b"heix") {
+                brand.copy_from_slice(b"mif1");
+            }
+        }
+        assert_eq!(sniff(&heif), Some(c"public.heif"));
+        // Lossless 2x2 WebP of the same colors, generated with cwebp.
+        let webp = b"RIFF\x2c\0\0\0WEBPVP8L\x1f\0\0\0\x2f\x01\x40\0\0\x1f\x20\x10\x48\xde\x1f\x3a\x8d\xf9\x17\x10\x14\xfc\x1f\xdd\xfc\x47\x64\x0f\xe0\x06\x0c\x11\xfd\x0f\x01\0";
+        for bytes in [heic_bytes.as_slice(), &heif, webp] {
+            let scaled = thumbnail(bytes).expect("ImageIO should decode the still image");
+            assert_eq!(sniff(&scaled), Some(c"public.png"));
+            assert_eq!(&scaled[16..24], &[0, 0, 0, 2, 0, 0, 0, 2]);
+        }
+        let mut too_many_bytes = heic_bytes;
+        too_many_bytes.resize(MAX_FILE_BYTES as usize + 1, 0);
+        assert!(thumbnail(&too_many_bytes).is_none());
+        let oversized = sips(&["-z", "5400", "6000"], &png, &root.join("big.png"));
+        assert_eq!(&oversized[16..24], &[0, 0, 23, 112, 0, 0, 21, 24]);
+        assert!(thumbnail(&oversized).is_none());
+        // Two independently decodable frames in an animated WebP container.
+        let mut animated = b"RIFF\x92\0\0\0WEBPVP8X\x0a\0\0\0\x02\0\0\0\x01\0\0\x01\0\0ANIM\x06\0\0\0\xff\xff\xff\xff\0\0ANMF\x38\0\0\0\0\0\0\0\0\0\x01\0\0\x01\0\0\x64\0\0\x02".to_vec();
+        animated.extend_from_slice(&webp[12..]);
+        animated.extend_from_slice(b"ANMF\x26\0\0\0\0\0\0\0\0\0\x01\0\0\x01\0\0\x64\0\0\0VP8L\x0e\0\0\0\x2f\x01\x40\0\0\x07\x10\x11\xfd\x0f\x44\x44\xff\x03");
+        assert_eq!(animated.len(), 154);
+        assert!(thumbnail(&animated).is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 }

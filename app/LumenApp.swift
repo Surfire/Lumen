@@ -432,6 +432,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
         } ?? model.containsCurrentAction(action)
         guard searchPresented, current, !actionInFlight else { return }
+        if action.destination == .translation { showTranslation(); return }
         actionInFlight = true
         let query = model.query
         let finished: (Bool) -> Void = { [weak self] success in

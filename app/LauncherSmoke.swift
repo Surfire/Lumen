@@ -333,6 +333,13 @@ final class LauncherSmoke {
         try check(dispatchedActions.first == probe.destination && !NSApp.isActive && !wasActivated,
                   "the app action dispatched elsewhere or activated Lumen")
 
+        app.showSearch()
+        try type("翻译", into: app)
+        try check(chosen()?.destination == .translation, "translation did not appear in the search box")
+        try key(kVK_Return, "\r", in: app)
+        try check(app.translationWindow?.contentView != nil && !app.searchPresented, "translation window did not open")
+        app.translationWindow?.close()
+
         for (term, expected) in [
             ("无线局域网", "com.apple.wifi-settings-extension"),
             ("bluetooth", "com.apple.BluetoothSettings"),

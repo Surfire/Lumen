@@ -203,6 +203,7 @@ struct SearchWindow: View {
             let path = (url.path as NSString).abbreviatingWithTildeInPath
             detail = model.t("应用程序 · \(path)", "Application · \(path)")
         case .settings: detail = model.t("系统设置", "System Settings")
+        case .translation: detail = model.t("Lumen 工具", "Lumen Tool")
         }
         let title = action.title(chinese: model.zh)
         return HStack(spacing: 10) {

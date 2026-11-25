@@ -66,6 +66,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var previewPreparing = false
     private(set) var localPreview: LocalPreviewPanel?
     private(set) var searchPresented = false
+    private var searchPresentationGeneration: UInt64 = 0
 
     lazy var searchField: SearchField = {
         let field = SearchField()
@@ -290,6 +291,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     @objc func showSearch() {
         let firstShow = !searchPresented
+        searchPresentationGeneration &+= 1
         searchPresented = true
         if firstShow {
             let mouse = NSEvent.mouseLocation
@@ -324,10 +326,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private func dismissSearchIfFocusLeft() {
         guard searchPresented else { return }
+        let generation = searchPresentationGeneration
         // AppKit can report resignation or closure before the next key window is set.
         DispatchQueue.main.async { [weak self] in
-            guard let self, self.searchPresented, !self.panel.isKeyWindow,
-                  self.localPreview?.isKeyWindow != true else { return }
+            guard let self, self.searchPresented, self.searchPresentationGeneration == generation,
+                  !self.panel.isKeyWindow, self.localPreview?.isKeyWindow != true else { return }
             self.dismissSearch()
         }
     }
@@ -345,6 +348,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     @objc func dismissSearch() {
         guard searchPresented else { return }
+        searchPresentationGeneration &+= 1
         searchPresented = false
         translation.setCommand(nil)
         inlinePreview.close()

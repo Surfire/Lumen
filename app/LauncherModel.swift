@@ -67,7 +67,7 @@ enum FileDiagnosisState {
 }
 
 enum LauncherProblem {
-    case status, indexing, search, embeddings, embeddingNoProgress, opening, scope, scopeState, watch, online, stale
+    case status, indexing, search, embeddings, embeddingNoProgress, opening, scope, scopeState, watch, online, stale, preview, copiedName, copiedPath
 }
 
 struct LauncherNotice {
@@ -83,6 +83,7 @@ struct LauncherNotice {
 final class Launcher: ObservableObject {
     @Published private(set) var query = ""
     @Published private(set) var hits: [SearchHit] = []
+    @Published private(set) var launchMatches: [ActionMatch] = []
     @Published var selection: String?
     @Published private(set) var searching = false
     @Published private(set) var semanticBusy = false
@@ -155,6 +156,10 @@ final class Launcher: ObservableObject {
     private var actionIntent: UInt64 = 0
     private var supportsTargetedValidation = true
     private var closed = false
+    private let builtInActions: [LaunchAction]
+    private var appActions: [LaunchAction] = []
+    private var loadingApplications = false
+    private var applicationsLoadedAt: ContinuousClock.Instant?
 
     var zh: Bool {
         language == "zh" || (language == "system" && Locale.preferredLanguages.first?.hasPrefix("zh") == true)
@@ -164,6 +169,15 @@ final class Launcher: ObservableObject {
     var canApplyScope: Bool { !closed && indexWork == nil && indexPhase != .checking }
     var needsScopeSetup: Bool {
         scopePending || indexPhase == .needsIndex || indexPhase == .unreadable || watchState == .needsSetup
+    }
+
+    var showsResults: Bool { hasQuery && (canSearch || !launchMatches.isEmpty) }
+
+    var visibleResults: [LauncherResult] {
+        let actions = launchMatches.filter(\.primary).map { LauncherResult.action($0.action) }
+        let otherActions = launchMatches.filter { !$0.primary }.map { LauncherResult.action($0.action) }
+        let files = resultsRevision == revision || launchMatches.isEmpty ? hits.map(LauncherResult.file) : []
+        return actions + files + otherActions
     }
 
     var hasQuery: Bool { !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -180,6 +194,7 @@ final class Launcher: ObservableObject {
     init(engine: LauncherEngine, defaults: UserDefaults?, locale: String? = nil) {
         self.engine = engine
         self.defaults = defaults
+        builtInActions = LaunchCatalog.systemActions()
         scopePending = engine.hasPendingScope
         language = locale ?? defaults?.string(forKey: "language") ?? "system"
         scope = IndexScope(roots: IndexScope.storedPaths("roots", in: defaults),
@@ -240,6 +255,9 @@ final class Launcher: ObservableObject {
                                    "Local semantic indexing failed. Saved chunks are kept for the next run.")
         case .embeddingNoProgress: return t("本批没有新增或跳过片段，已停止生成。已完成的进度已保存。",
                                            "Indexing stopped after a batch made no progress. Completed work is saved.")
+        case .preview: return t("无法快速查看此文件。可预览的本机文件上限为 128 MB。", "Could not preview the file. The limit for local previews is 128 MB.")
+        case .copiedName: return t("已复制名称", "Name copied")
+        case .copiedPath: return t("已复制路径", "Path copied")
         case .opening: return t("macOS 无法打开这个项目。", "macOS could not open this item.")
         case .scope: return t("索引范围中的路径必须以 / 开头。", "Index scope paths must start with /.")
         case .scopeState: return t("无法保存索引范围更新状态。请检查索引目录权限后重试。", "Could not save the scope update state. Check index directory permissions and try again.")
@@ -264,10 +282,39 @@ final class Launcher: ObservableObject {
         }
     }
 
+    func loadApplications(roots: [URL], extraApps: [URL]) {
+        guard !closed, !loadingApplications,
+              applicationsLoadedAt.map({ $0.duration(to: .now) >= .seconds(20) }) ?? true else { return }
+        loadingApplications = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let registered = LaunchCatalog.discoverApplications(roots: roots, extraApps: extraApps)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.closed else { return }
+                self.loadingApplications = false
+                self.applicationsLoadedAt = .now
+                self.appActions = registered
+                self.updateLaunchMatches()
+                self.reconcileSelection()
+            }
+        }
+    }
+
     func setQuery(_ text: String) {
         guard text != query else { return }
         query = text
+        updateLaunchMatches()
         scheduleSearch()
+        if let preferred = launchMatches.first(where: \.primary) { selection = preferred.action.id }
+        reconcileSelection()
+    }
+
+    private func updateLaunchMatches() {
+        let current = LaunchCatalog.matches(query, actions: builtInActions + appActions)
+        if launchMatches != current { launchMatches = current }
+    }
+
+    func containsCurrentAction(_ action: LaunchAction) -> Bool {
+        !closed && launchMatches.contains(where: { $0.action == action })
     }
 
     func retrySearch() { scheduleSearch() }
@@ -278,6 +325,7 @@ final class Launcher: ObservableObject {
 
     func clear() {
         query = ""
+        launchMatches = []
         scheduleSearch(clearRows: true)
     }
 
@@ -459,18 +507,29 @@ final class Launcher: ObservableObject {
     private func publishHits(_ hits: [SearchHit]) {
         let visible = rejectedPaths.isEmpty ? hits : hits.filter { !rejectedPaths.contains($0.path) }
         if self.hits != visible { self.hits = visible }
-        if !visible.contains(where: { $0.path == selection }), selection != visible.first?.path {
-            selection = visible.first?.path
+        reconcileSelection()
+    }
+
+    private func reconcileSelection() {
+        let rows = visibleResults
+        if !rows.contains(where: { $0.id == selection }), selection != rows.first?.id {
+            selection = rows.first?.id
         }
     }
 
     func moveSelection(_ step: Int) {
-        guard !hits.isEmpty else { return }
-        guard let index = hits.firstIndex(where: { $0.path == selection }) else {
-            selection = (step > 0 ? hits.first : hits.last)?.path
+        let rows = visibleResults
+        guard !rows.isEmpty else { return }
+        guard let index = rows.firstIndex(where: { $0.id == selection }) else {
+            selection = (step > 0 ? rows.first : rows.last)?.id
             return
         }
-        selection = hits[min(max(index + step, 0), hits.count - 1)].path
+        selection = rows[min(max(index + step, 0), rows.count - 1)].id
+    }
+
+    var selectedResult: LauncherResult? {
+        if let action = launchMatches.first(where: { $0.action.id == selection }) { return .action(action.action) }
+        return selectedHit.map(LauncherResult.file)
     }
 
     var selectedHit: SearchHit? {
@@ -480,10 +539,21 @@ final class Launcher: ObservableObject {
 
     func openingFailed() { searchNotice = LauncherNotice(.opening) }
 
-    func resolve(_ hit: SearchHit, revealInFinder: Bool, complete: @escaping (URL) -> Void) {
-        guard canSearch, resultsRevision == revision, hits.contains(hit), actionProcess == nil else { return }
+    func previewFailed() { searchNotice = LauncherNotice(.preview) }
+
+    func copied(_ action: FileAction) {
+        searchNotice = LauncherNotice(action == .copyName ? .copiedName : .copiedPath)
+    }
+
+    func containsCurrentFile(_ hit: SearchHit) -> Bool {
+        !closed && canSearch && resultsRevision == revision && hits.contains(hit)
+    }
+
+    func resolve(_ hit: SearchHit, action: FileAction, complete: @escaping (URL) -> Void) {
+        guard containsCurrentFile(hit), actionProcess == nil else { return }
         guard !hit.isSemanticCandidate || localModelState == .ready else { return }
-        guard hit.isLocal || (revealInFinder && hit.isCloudReference) else {
+        if action == .preview && hit.kind != "file" { return }
+        guard hit.isLocal || (action.allowsCloudReference && hit.isCloudReference) else {
             if hit.isCloudReference { searchNotice = LauncherNotice(.online) }
             return
         }

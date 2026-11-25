@@ -16,14 +16,18 @@ struct SearchHit: Decodable, Equatable, Identifiable {
     var hasPreview: Bool { isLocal && snippet != nil }
 
     func pathStamp() -> String? {
+        Self.pathStamp(at: path, kind: kind, permitsDatalessLeaf: isCloudReference)
+    }
+
+    static func pathStamp(at path: String, kind: String, permitsDatalessLeaf: Bool = false) -> String? {
         guard path.hasPrefix("/") else { return nil }
-        let kind = IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES
+        let policy = IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES
         let scope = IOPOL_SCOPE_THREAD
-        let prior = getiopolicy_np(kind, scope)
-        guard prior >= 0, setiopolicy_np(kind, scope, IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0 else {
+        let prior = getiopolicy_np(policy, scope)
+        guard prior >= 0, setiopolicy_np(policy, scope, IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0 else {
             return nil
         }
-        defer { _ = setiopolicy_np(kind, scope, prior) }
+        defer { _ = setiopolicy_np(policy, scope, prior) }
 
         // Check parents from the root so a replaced symlink or dataless directory cannot redirect the action.
         let components = path.split(separator: "/")
@@ -37,9 +41,13 @@ struct SearchHit: Decodable, Equatable, Identifiable {
         }
         var stat = Darwin.stat()
         guard lstat(path, &stat) == 0,
-              stat.st_mode & S_IFMT == (self.kind == "directory" ? S_IFDIR : S_IFREG),
-              isCloudReference || stat.st_flags & UInt32(SF_DATALESS) == 0
+              stat.st_mode & S_IFMT == (kind == "directory" ? S_IFDIR : S_IFREG),
+              permitsDatalessLeaf || stat.st_flags & UInt32(SF_DATALESS) == 0
         else { return nil }
+        return Self.filesystemStamp(stat)
+    }
+
+    static func filesystemStamp(_ stat: stat) -> String {
         // Match the Rust document_state stamp, including the unsigned Unix device conversion.
         let device = UInt64(bitPattern: Int64(stat.st_dev))
         let size = UInt64(bitPattern: Int64(stat.st_size))

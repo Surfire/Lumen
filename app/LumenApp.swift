@@ -33,6 +33,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private(set) var settings: NSPanel?
     private(set) lazy var settingsSession = SettingsSession(model: model)
     private var configuredKey: HotKey?
+    private var actionInFlight = false
+    private var previewPreparing = false
+    private(set) var localPreview: LocalPreviewPanel?
     private(set) var searchPresented = false
     #if LUMEN_EXTENSIONS
     private var extensions: NSPanel?
@@ -70,9 +73,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         panel.delegate = self
         panel.onCancel = { [weak self] in self?.dismissSearch() }
         panel.onSettings = { [weak self] in self?.showSettings() }
-        panel.onReveal = { [weak self] in
+        panel.onFileAction = { [weak self] action in
             guard let self, let hit = self.model.selectedHit else { return }
-            self.revealInFinder(hit)
+            self.perform(action, on: hit)
         }
         let content = SearchBackdrop()
         content.material = .popover
@@ -104,7 +107,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             showSettings: { [weak self] in self?.showSettings() },
             beginIndex: { [weak self] in self?.startBackgroundIndex() },
             open: { [weak self] in self?.open($0) },
-            revealInFinder: { [weak self] in self?.revealInFinder($0) }
+            fileAction: { [weak self] action, hit in self?.perform(action, on: hit) }
         ))
         results.translatesAutoresizingMaskIntoConstraints = false
         results.sizingOptions = []
@@ -169,7 +172,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
         updateLanguage()
         model.start()
+        loadApplicationCatalog()
         if let smoke { Task { @MainActor in await smoke.run(self) } }
+    }
+
+    private func loadApplicationCatalog() {
+        if let smoke {
+            model.loadApplications(roots: smoke.appRoots, extraApps: [])
+        } else {
+            let home = FileManager.default.homeDirectoryForCurrentUser
+            let knownSystemApps = ["com.apple.finder", "com.apple.Safari"].compactMap { identifier -> URL? in
+                let path = NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier)?.resolvingSymlinksInPath()
+                return path?.path.hasPrefix("/System/") == true ? path : nil
+            }
+            model.loadApplications(roots: LaunchCatalog.applicationRoots(home: home), extraApps: knownSystemApps)
+        }
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -195,6 +212,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func applicationWillTerminate(_ notification: Notification) {
+        localPreview?.close()
         globalHotKey.close()
         model.close()
     }
@@ -214,6 +232,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
         focusSearch()
         if firstShow {
+            loadApplicationCatalog()
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.searchPresented else { return }
                 self.model.warmNameSearch()
@@ -282,11 +301,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func openSelection() {
-        if let selected = model.selectedHit { open(selected) }
+        if let selected = model.selectedResult { open(selected) }
     }
 
-    private func open(_ hit: SearchHit) {
-        model.resolve(hit, revealInFinder: false) { [weak self] url in
+    private func open(_ result: LauncherResult) {
+        switch result {
+        case .file(let hit): openFile(hit)
+        case .action(let action): runAction(action)
+        }
+    }
+
+    private func runAction(_ action: LaunchAction) {
+        guard searchPresented, model.containsCurrentAction(action), !actionInFlight else { return }
+        actionInFlight = true
+        let query = model.query
+        let finished: (Bool) -> Void = { [weak self] success in
+            guard let self else { return }
+            self.actionInFlight = false
+            guard self.searchPresented, self.model.query == query else { return }
+            if success { self.dismissSearch() }
+            else { self.model.openingFailed() }
+        }
+        if let smoke { smoke.dispatch(action, completion: finished) }
+        else { LaunchDispatcher.perform(action, completion: finished) }
+    }
+
+    private func openFile(_ hit: SearchHit) {
+        model.resolve(hit, action: .open) { [weak self] url in
             guard let self else { return }
             if let smoke = self.smoke {
                 smoke.opened = url
@@ -300,12 +341,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     func revealInFinder(_ hit: SearchHit) {
-        model.resolve(hit, revealInFinder: true) { [weak self] url in
+        model.resolve(hit, action: .reveal) { [weak self] url in
             guard let self else { return }
             if let smoke = self.smoke {
                 smoke.revealed = url
             } else {
                 NSWorkspace.shared.activateFileViewerSelecting([url])
+            }
+        }
+    }
+
+    private func perform(_ action: FileAction, on hit: SearchHit) {
+        switch action {
+        case .open: openFile(hit)
+        case .reveal: revealInFinder(hit)
+        case .preview: previewFile(hit)
+        case .copyName, .copyPath:
+            model.resolve(hit, action: action) { [weak self] _ in
+                guard let self, self.searchPresented else { return }
+                let pasteboard = self.smoke?.filePasteboard ?? NSPasteboard.general
+                let value = action == .copyName ? hit.name : hit.path
+                pasteboard.clearContents()
+                if pasteboard.setString(value, forType: .string) { self.model.copied(action) }
+                else { self.model.openingFailed() }
+            }
+        }
+    }
+
+    private func previewFile(_ hit: SearchHit) {
+        guard !previewPreparing else { return }
+        model.resolve(hit, action: .preview) { [weak self] _ in
+            guard let self, self.searchPresented else { return }
+            self.previewPreparing = true
+            let query = self.model.query
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let snapshot = try? PreviewSnapshot.make(for: hit)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { snapshot?.remove(); return }
+                    self.previewPreparing = false
+                    guard self.searchPresented, self.model.query == query, self.model.containsCurrentFile(hit) else {
+                        snapshot?.remove()
+                        return
+                    }
+                    guard let snapshot, let panel = LocalPreviewPanel(snapshot: snapshot, title: hit.name) else {
+                        snapshot?.remove()
+                        self.model.previewFailed()
+                        return
+                    }
+                    self.localPreview?.close()
+                    self.localPreview = panel
+                    panel.delegate = self
+                    if self.smoke == nil {
+                        panel.center()
+                        panel.makeKeyAndOrderFront(nil)
+                    } else {
+                        panel.setFrameOrigin(NSPoint(x: -12_000, y: -12_000))
+                    }
+                }
             }
         }
     }
@@ -381,6 +473,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     func windowWillClose(_ notification: Notification) {
+        if let localPreview, (notification.object as? NSWindow) === localPreview { self.localPreview = nil }
         if let settings, (notification.object as? NSWindow) === settings {
             settings.makeFirstResponder(nil)
             model.clearFileDiagnosis()
@@ -449,7 +542,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func updateSearchField() {
-        searchField.placeholderString = model.t("搜索本机文件和文件夹", "Search local files and folders")
+        searchField.placeholderString = model.t("搜索文件、应用和系统设置", "Search files, apps, and system settings")
         searchField.setAccessibilityLabel(model.t("搜索", "Search"))
     }
 
@@ -584,18 +677,23 @@ final class SearchBackdrop: NSVisualEffectView {
 @MainActor
 final class SearchPanel: NSPanel {
     var onCancel: (() -> Void)?
-    var onReveal: (() -> Void)?
+    var onFileAction: ((FileAction) -> Void)?
     var onSettings: (() -> Void)?
     override var canBecomeKey: Bool { true }
 
     private func handleCommand(_ event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
-        guard event.type == .keyDown, modifiers == [.command],
-              (firstResponder as? NSTextView)?.hasMarkedText() != true else { return false }
-        if event.charactersIgnoringModifiers == "," {
-            onSettings?()
-        } else if event.keyCode == kVK_Return || event.keyCode == kVK_ANSI_KeypadEnter {
-            onReveal?()
+        guard event.type == .keyDown, (firstResponder as? NSTextView)?.hasMarkedText() != true else { return false }
+        let key = event.charactersIgnoringModifiers?.lowercased()
+        if modifiers == [.command] {
+            if key == "," { onSettings?() }
+            else if key == "y" { onFileAction?(.preview) }
+            else if event.keyCode == kVK_Return || event.keyCode == kVK_ANSI_KeypadEnter { onFileAction?(.reveal) }
+            else { return false }
+        } else if key == "c", modifiers == [.command, .shift] {
+            onFileAction?(.copyName)
+        } else if key == "c", modifiers == [.command, .option] {
+            onFileAction?(.copyPath)
         } else {
             return false
         }

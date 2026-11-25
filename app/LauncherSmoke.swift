@@ -10,6 +10,9 @@ final class LauncherSmoke {
     let executable: URL?
     let gemmaHome: URL
     let language: String
+    let appRoots: [URL]
+    let filePasteboard = NSPasteboard.withUniqueName()
+    private(set) var dispatchedActions: [LaunchAction.Destination] = []
     let usesOffscreenWindows: Bool
     private let directory: URL
     private let startsWithIndex: Bool
@@ -25,6 +28,7 @@ final class LauncherSmoke {
 
     private init(_ directory: URL, language: String, usesOffscreenWindows: Bool) {
         self.directory = directory
+        self.appRoots = [directory.appendingPathComponent("Applications", isDirectory: true)]
         gemmaHome = ProcessInfo.processInfo.environment["LUMEN_GEMMA_TEST_HOME"]
             .map { URL(fileURLWithPath: $0, isDirectory: true) }
             ?? directory.appendingPathComponent("missing-gemma", isDirectory: true)
@@ -58,6 +62,17 @@ final class LauncherSmoke {
             exit(2)
         }
         return LauncherSmoke(directory, language: arguments[3], usesOffscreenWindows: mode == "--gui-smoke")
+    }
+
+    func dispatch(_ action: LaunchAction, completion: @escaping (Bool) -> Void) {
+        dispatchedActions.append(action.destination)
+        switch action.destination {
+        case .application(let url, _) where url.resolvingSymlinksInPath().path ==
+            appRoots[0].appendingPathComponent("Lumen Action Probe.app").resolvingSymlinksInPath().path:
+            LaunchDispatcher.perform(action, activates: false, completion: completion)
+        default:
+            completion(true)
+        }
     }
 
     func run(_ app: AppDelegate) async {
@@ -98,9 +113,14 @@ final class LauncherSmoke {
         app.panel.contentView?.layoutSubtreeIfNeeded()
         defer { app.globalHotKey.close() }
         try check(NSApp.activationPolicy() == .prohibited && !NSApp.isActive, "test app became active")
-        try check(app.searchField.placeholderString == (language == "zh" ? "搜索本机文件和文件夹" : "Search local files and folders"),
+        try check(app.searchField.placeholderString == (language == "zh" ? "搜索文件、应用和系统设置" : "Search files, apps, and system settings"),
                   "search field did not use requested language")
         _ = try editor(app)
+
+        if exists("action-scenario") {
+            try await verifyActions(app)
+            return
+        }
 
         if controlledTiming && startsWithIndex {
             if exists("settings-scenario") {
@@ -243,6 +263,13 @@ final class LauncherSmoke {
         let revealKey = try event(kVK_Return, "\r", in: app, flags: [.command])
         _ = app.panel.performKeyEquivalent(with: revealKey)
         try check(revealed == nil, "Command–Return interrupted IME composition")
+        let priorPasteboard = filePasteboard.string(forType: .string)
+        let previewKey = try event(kVK_ANSI_Y, "y", in: app, flags: [.command])
+        let pathKey = try event(kVK_ANSI_C, "c", in: app, flags: [.command, .option])
+        _ = app.panel.performKeyEquivalent(with: previewKey)
+        _ = app.panel.performKeyEquivalent(with: pathKey)
+        try check(fieldEditor.hasMarkedText() && app.localPreview == nil &&
+                  filePasteboard.string(forType: .string) == priorPasteboard, "file action interrupted IME composition")
         fieldEditor.unmarkText()
         try type("qingshan", into: app)
         try await until("pinyin filename found") { model.hits.first?.matched_by == "pinyin" }
@@ -265,6 +292,127 @@ final class LauncherSmoke {
             try await verifyFailedScopeApply(app)
             try await verifyInterruptedScopeApply(app)
         }
+    }
+
+    private func verifyActions(_ app: AppDelegate) async throws {
+        let model = app.model
+        try check(model.indexPhase == .needsIndex && !model.canSearch, "action smoke unexpectedly had a file index")
+        func chosen() -> LaunchAction? {
+            if case .action(let action)? = model.selectedResult { return action }
+            return nil
+        }
+
+        // All typed text passes through the real AppKit field editor.
+        try type("lumen action probe", into: app)
+        try await until("a discovered application is selectable before any file index exists") {
+            chosen()?.english == "Lumen Action Probe"
+        }
+        try type("lap", into: app)
+        try await until("an application initialism is selectable") { chosen()?.english == "Lumen Action Probe" }
+        guard let probe = chosen(), case .application = probe.destination else {
+            throw Failure("selected app reused the file-open route")
+        }
+        try check(!exists("app-started"), "app launched during lookup")
+        try key(kVK_Return, "\r", in: app)
+        try await until("a real application launched through NSWorkspace without activation") {
+            self.exists("app-started") && !app.searchPresented
+        }
+        try check(dispatchedActions.first == probe.destination && !NSApp.isActive && !wasActivated,
+                  "the app action dispatched elsewhere or activated Lumen")
+
+        for (term, expected) in [
+            ("无线局域网", "com.apple.wifi-settings-extension"),
+            ("bluetooth", "com.apple.BluetoothSettings"),
+            ("系统设置", ""),
+        ] {
+            app.showSearch()
+            try type(term, into: app)
+            guard let action = chosen(), case .settings(let url) = action.destination else {
+                throw Failure("setting alias was not actionable")
+            }
+            try check(url.absoluteString == "x-apple.systempreferences:" + expected, "setting alias targeted the wrong destination")
+            guard let handler = NSWorkspace.shared.urlForApplication(toOpen: url),
+                  Bundle(url: handler)?.bundleIdentifier == LaunchCatalog.settingsBundleID else {
+                throw Failure("Launch Services did not route the URL to Apple System Settings")
+            }
+            try key(kVK_Return, "\r", in: app)
+            try check(dispatchedActions.last == .settings(url) && !app.searchPresented,
+                      "the Return key did not pass the Settings URL to the dispatch seam")
+        }
+
+        app.showSearch()
+        try type("twin preview", into: app)
+        try await until("same-title applications remain separate by bundle identifier and path") {
+            model.launchMatches.filter { $0.action.english == "Twin Preview" }.count == 2
+        }
+        let twins = model.launchMatches.map(\.action).filter { $0.english == "Twin Preview" }
+        try check(twins[0].id != twins[1].id && twins[0].destination != twins[1].destination,
+                  "same-title applications shared a result identity")
+        try type("Wi-Fi", into: app)
+        let count = dispatchedActions.count
+        try type("not a registered action", into: app)
+        try key(kVK_Return, "\r", in: app)
+        try check(dispatchedActions.count == count, "Return dispatched an action from a previous query")
+
+        app.startBackgroundIndex()
+        try await until("the isolated file index became available alongside actions") { model.canSearch && model.watchState == .running }
+        app.showSearch()
+        try type("lumen action probe", into: app)
+        try await until("file and app results share the same visible list") {
+            if case .action(let action)? = model.visibleResults.first, action.id == probe.id {
+                return model.hits.contains { $0.name == "Lumen Action Probe notes.txt" }
+            }
+            return false
+        }
+        try check(chosen()?.id == probe.id, "late file results moved selection from the application")
+        try key(kVK_DownArrow, "\u{f701}", in: app)
+        try check(model.selectedHit?.name == "Lumen Action Probe notes.txt", "arrow selection did not reach the file result")
+        try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
+        try await until("the file retained its normal Finder route") { self.revealed?.lastPathComponent == "Lumen Action Probe notes.txt" }
+        try check(dispatchedActions.count == count, "a file Finder action unexpectedly dispatched a quick action")
+        guard let expected = model.selectedHit else { throw Failure("lost the selected file") }
+        try key(kVK_ANSI_C, "C", in: app, throughPanel: true, flags: [.command, .shift])
+        try await until("Command–Shift–C copied the selected file's name") {
+            self.filePasteboard.string(forType: .string) == expected.name && app.searchPresented
+        }
+        try key(kVK_ANSI_C, "c", in: app, throughPanel: true, flags: [.command, .option])
+        try await until("Command–Option–C copied the selected file's exact path") {
+            self.filePasteboard.string(forType: .string) == expected.path
+        }
+        try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
+        try await until("Command–Y assigned a local item to the native Quick Look view") { app.localPreview?.previewURL != nil }
+        guard let preview = app.localPreview, let snapshot = preview.previewURL else { throw Failure("Quick Look had no item") }
+        let snapshotContents = try String(contentsOf: snapshot, encoding: .utf8)
+        try check(snapshot.path != expected.path && snapshot.lastPathComponent == expected.name &&
+                  snapshotContents == "Synthetic unified search fixture." && !preview.isVisible && !NSApp.isActive,
+                  "Quick Look received the original path, bad contents or a visible window")
+        let mode = try FileManager.default.attributesOfItem(atPath: snapshot.path)[.posixPermissions] as? NSNumber
+        try check(mode?.intValue == 0o600, "Quick Look snapshot had broad file permissions")
+        preview.close()
+        try check(!FileManager.default.fileExists(atPath: snapshot.path), "closing the preview kept the snapshot")
+
+        if exists("syntax-scenario") { try await verifyRawFileQuery(app) }
+        print("Unified actions passed: real background app launch, routed Settings URLs, isolated file copies, and native local Quick Look input")
+    }
+
+    private func verifyRawFileQuery(_ app: AppDelegate) async throws {
+        let model = app.model
+        let expected = Set(["成都 卫健委.PPTX", "卫健委成都方案.pptx"])
+        let first = "成都　 卫健委   pptx"
+        try type(first, into: app)
+        try check(model.query == first, "the AppKit field rewrote the original multiword query")
+        try await until("multiple Chinese words and bare extension matched real files together") {
+            !model.searching && Set(model.hits.map(\.name)) == expected
+        }
+        try type("pptx 卫健委 成都", into: app)
+        try await until("reordered words with a bare extension returned the same files") {
+            !model.searching && Set(model.hits.map(\.name)) == expected
+        }
+        try type("pptx", into: app)
+        try await until("a bare extension filtered by actual file suffix") {
+            !model.searching && Set(model.hits.map(\.name)) == expected.union(["Other project.pptx"])
+        }
+        print("Raw AppKit multiword and bare-extension queries passed")
     }
 
     private func verifyLegacyMigration(_ app: AppDelegate) async throws {
@@ -664,6 +812,9 @@ final class LauncherSmoke {
         try key(kVK_Return, "\r", in: app)
         try check(model.searchNotice?.problem == .online && opened == nil && revealed == nil,
                   "Return activated a cloud reference")
+        try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
+        try check(app.localPreview == nil && model.searchNotice?.problem == .online,
+                  "Quick Look accepted online-only metadata")
         if controlledTiming { try signal("hold-cloud-reveal") }
         try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
         if controlledTiming {
@@ -702,7 +853,7 @@ final class LauncherSmoke {
         else { throw Failure("missing Gemma candidate") }
         try check(model.relatedExcerptsLabel == "相关原文", "candidate label did not say related excerpts")
         var resolved: URL?
-        model.resolve(hit, revealInFinder: false) { resolved = $0 }
+        model.resolve(hit, action: .open) { resolved = $0 }
         try await until("candidate action rechecked the query through explicit Gemma") { resolved?.path == hit.path }
         try Data("Replacement body".utf8).write(to: corpus.appendingPathComponent("notes.md"), options: .atomic)
         try signal("update-watch")
@@ -746,6 +897,22 @@ final class LauncherSmoke {
         try key(kVK_Return, "\r", in: app)
         try await until("open rechecked the missing filesystem path before watch updated") { model.searchNotice?.problem == .stale }
         try check(opened == nil && model.hits.isEmpty && model.selection == nil, "removed path remained actionable")
+
+        if controlledTiming {
+            try type("preview-safety", into: app)
+            try await until("a local result was visible before symlink replacement") {
+                model.selectedHit?.name == "preview-safety.txt"
+            }
+            let replaced = corpus.appendingPathComponent("preview-safety.txt")
+            try FileManager.default.removeItem(at: replaced)
+            try FileManager.default.createSymbolicLink(at: replaced, withDestinationURL: corpus.appendingPathComponent("notes.md"))
+            try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
+            try await until("Quick Look rejected the replacement before the watcher ran") {
+                model.searchNotice?.problem == .stale
+            }
+            try check(app.localPreview == nil && !model.hits.contains { $0.name == "preview-safety.txt" },
+                      "a stale result could preview a replacement symlink")
+        }
     }
 
     private func verifyReplacedDocument(_ app: AppDelegate) async throws {

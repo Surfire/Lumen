@@ -5,8 +5,8 @@ struct SearchWindow: View {
     @ObservedObject var model: Launcher
     let showSettings: () -> Void
     let beginIndex: () -> Void
-    let open: (SearchHit) -> Void
-    let revealInFinder: (SearchHit) -> Void
+    let open: (LauncherResult) -> Void
+    let fileAction: (FileAction, SearchHit) -> Void
 
     static let headerHeight: CGFloat = 56
     static let footerHeight: CGFloat = 28
@@ -14,16 +14,16 @@ struct SearchWindow: View {
 
     static func height(for model: Launcher) -> CGFloat {
         let shell = headerHeight + footerHeight
-        return model.canSearch && model.hasQuery ? shell + CGFloat(maximumVisibleRows * 44) : shell
+        return model.showsResults ? shell + CGFloat(maximumVisibleRows * 44) : shell
     }
 
     private static func rowHeight(_ hit: SearchHit) -> CGFloat { hit.hasPreview ? 60 : 44 }
 
     var body: some View {
         VStack(spacing: 0) {
-            if model.canSearch && model.hasQuery {
+            if model.showsResults {
                 results.overlay {
-                    if model.hits.isEmpty {
+                    if model.visibleResults.isEmpty {
                         Text(emptyResultsLabel)
                             .font(.callout).foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -38,16 +38,23 @@ struct SearchWindow: View {
 
     private var footer: some View {
         HStack(spacing: 12) {
-            if model.canSearch && model.hasQuery {
+            if model.showsResults {
                 keyHint("↑↓", model.t("选择", "Select"))
                 keyHint("↵", model.t("打开", "Open"))
-                keyHint("⌘↵", model.t("在 Finder 中显示", "Show in Finder"))
+                if let file = model.selectedHit {
+                    keyHint("⌘↵", model.t("在 Finder 中显示", "Show in Finder"))
+                    if file.isLocal && file.kind == "file" { keyHint("⌘Y", model.t("快速查看", "Quick Look")) }
+                }
             } else if model.activityBusy || !model.canSearch {
                 Label(model.activityTitle, systemImage: model.activityBusy ? "arrow.triangle.2.circlepath" : "internaldrive")
                     .lineLimit(1)
                 if let metrics = model.activityMetrics { Text(metrics).monospacedDigit().lineLimit(1) }
             } else {
                 Text(model.activityTitle).lineLimit(1)
+            }
+            if let notice = model.searchNotice, !model.visibleResults.isEmpty {
+                Text(model.title(for: notice)).lineLimit(1).help(model.title(for: notice))
+                    .accessibilityIdentifier("launcher-notice")
             }
             Spacer(minLength: 8)
             if model.canStartIndexFromLauncher {
@@ -87,8 +94,11 @@ struct SearchWindow: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(model.hits) { hit in
-                        resultRow(hit).id(hit.path)
+                    ForEach(model.visibleResults) { result in
+                        switch result {
+                        case .file(let hit): resultRow(hit).id(result.id)
+                        case .action(let action): actionRow(action).id(result.id)
+                        }
                     }
                 }
                 .padding(.horizontal, 8)
@@ -99,8 +109,8 @@ struct SearchWindow: View {
             .onKeyPress(.upArrow) { model.moveSelection(-1); return .handled }
             .onKeyPress(.downArrow) { model.moveSelection(1); return .handled }
             .onKeyPress(keys: [.return]) { press in
-                guard press.modifiers.isEmpty, let hit = model.selectedHit else { return .ignored }
-                open(hit)
+                guard press.modifiers.isEmpty, let result = model.selectedResult else { return .ignored }
+                open(result)
                 return .handled
             }
         }
@@ -112,6 +122,54 @@ struct SearchWindow: View {
             return model.t("正在搜索…", "Searching…")
         }
         return model.t("没有匹配结果", "No matches")
+    }
+
+    private func actionRow(_ action: LaunchAction) -> some View {
+        let selected = model.selection == action.id
+        let detail: String
+        switch action.destination {
+        case .application(let url, _):
+            let path = (url.path as NSString).abbreviatingWithTildeInPath
+            detail = model.t("应用程序 · \(path)", "Application · \(path)")
+        case .settings: detail = model.t("系统设置", "System Settings")
+        }
+        let title = action.title(chinese: model.zh)
+        return HStack(spacing: 10) {
+            Image(systemName: action.symbol)
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(selected ? Color.accentColor : .secondary)
+                .frame(width: 28, height: 28)
+                .background(.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 6))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                Text(detail).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                    .truncationMode(.middle).help(detail)
+            }
+            Spacer()
+            if selected {
+                Image(systemName: "return")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary).accessibilityHidden(true)
+            }
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 44)
+        .background { selectionBackground(selected) }
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) { open(.action(action)) }
+        .onTapGesture { model.selection = action.id }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityAction(named: Text(model.t("打开", "Open"))) { open(.action(action)) }
+        .accessibilityIdentifier(action.id)
+    }
+
+    @ViewBuilder private func selectionBackground(_ selected: Bool) -> some View {
+        if selected {
+            RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.15))
+            RoundedRectangle(cornerRadius: 8).strokeBorder(Color.accentColor.opacity(0.28), lineWidth: 1)
+        }
     }
 
     private func resultRow(_ hit: SearchHit) -> some View {
@@ -139,7 +197,7 @@ struct SearchWindow: View {
                       ? model.t("仅在线", "Online only")
                       : model.t("云盘 · 仅名称", "Cloud · Name only"), systemImage: "icloud")
                     .font(.caption).foregroundStyle(.secondary).fixedSize()
-                Button(model.t("在 Finder 中显示", "Show in Finder")) { revealInFinder(hit) }
+                Button(model.t("在 Finder 中显示", "Show in Finder")) { fileAction(.reveal, hit) }
                     .buttonStyle(.borderless).font(.caption).fixedSize()
                     .accessibilityIdentifier("reveal-cloud-result")
             } else if hit.isSemanticCandidate {
@@ -151,19 +209,30 @@ struct SearchWindow: View {
         }
         .padding(.horizontal, 8)
         .frame(height: Self.rowHeight(hit))
-        .background {
-            if selected {
-                RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.15))
-                RoundedRectangle(cornerRadius: 8).strokeBorder(Color.accentColor.opacity(0.28), lineWidth: 1)
-            }
-        }
+        .background { selectionBackground(selected) }
         .contentShape(Rectangle())
-        .onTapGesture(count: 2) { open(hit) }
+        .onTapGesture(count: 2) { open(.file(hit)) }
         .onTapGesture { model.selection = hit.path }
         .accessibilityElement(children: .contain)
         .accessibilityAddTraits(selected ? .isSelected : [])
-        .accessibilityAction(named: Text(model.t("打开", "Open"))) { open(hit) }
-        .accessibilityAction(named: Text(model.t("在 Finder 中显示", "Show in Finder"))) { revealInFinder(hit) }
+        .accessibilityAction(named: Text(model.t("打开", "Open"))) { open(.file(hit)) }
+        .accessibilityAction(named: Text(model.t("在 Finder 中显示", "Show in Finder"))) { fileAction(.reveal, hit) }
+        .accessibilityActions {
+            if hit.isLocal && hit.kind == "file" {
+                Button(model.t("快速查看", "Quick Look")) { fileAction(.preview, hit) }
+            }
+            Button(model.t("复制名称", "Copy Name")) { fileAction(.copyName, hit) }
+            Button(model.t("复制路径", "Copy Path")) { fileAction(.copyPath, hit) }
+        }
+        .contextMenu {
+            Button(model.t("打开", "Open")) { fileAction(.open, hit) }.disabled(!hit.isLocal)
+            Button(model.t("在 Finder 中显示", "Show in Finder")) { fileAction(.reveal, hit) }
+            Button(model.t("快速查看 · ⌘Y", "Quick Look · ⌘Y")) { fileAction(.preview, hit) }
+                .disabled(!hit.isLocal || hit.kind != "file")
+            Divider()
+            Button(model.t("复制名称 · ⇧⌘C", "Copy Name · ⇧⌘C")) { fileAction(.copyName, hit) }
+            Button(model.t("复制路径 · ⌥⌘C", "Copy Path · ⌥⌘C")) { fileAction(.copyPath, hit) }
+        }
     }
 
 }

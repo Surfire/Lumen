@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import plistlib
 from pathlib import Path
 import shutil
 import sqlite3
@@ -296,6 +297,7 @@ def make_corpus(root):
         "late lexical delivery.md": "A name reply held by the fixture.",
         "body-before-name.md": "A late lexical delivery once produced this note.",
         "open-safety.txt": "Stale action fixture.",
+        "preview-safety.txt": "Stale Quick Look fixture.",
         "Excluded/privateneedle.txt": "Synthetic excluded path.",
         "OneDrive - Synthetic/cloudledger.txt": "Synthetic provider path.",
         "青山月报.md": "合成测试样本。",
@@ -325,11 +327,45 @@ def run(root, language, gemma_home=None):
                    timeout=150 if gemma_home is not None else 45)
 
 
+def make_action_probe(root):
+    application = root / "Applications/Lumen Action Probe.app/Contents"
+    executable = application / "MacOS/probe"
+    executable.parent.mkdir(parents=True)
+    with (application / "Info.plist").open("wb") as handle:
+        plistlib.dump({
+            "CFBundleExecutable": "probe",
+            "CFBundleIdentifier": "io.github.surfire.lumen.smoke." + root.name,
+            "CFBundleName": "Lumen Action Probe",
+            "CFBundlePackageType": "APPL",
+            "LSBackgroundOnly": True,
+        }, handle)
+    source = root / "probe.c"
+    # The child can write only this synthetic test marker and then exits on its own.
+    source.write_text("#include <stdio.h>\n#include <unistd.h>\n"
+                      "int main(void) { FILE *out = fopen(" + json.dumps(str(root / "app-started")) +
+                      ", \"w\"); if (!out) return 1; fclose(out); sleep(1); return 0; }\n", encoding="utf-8")
+    subprocess.run(["xcrun", "clang", str(source), "-o", str(executable)], check=True, timeout=20)
+    subprocess.run(["codesign", "--force", "--sign", "-", str(application.parent)], check=True, timeout=15)
+    for index in (1, 2):
+        twin = root / f"Applications/Group {index}/Twin {index}.app/Contents"
+        (twin / "MacOS").mkdir(parents=True)
+        shutil.copyfile(executable, twin / "MacOS/probe")
+        (twin / "MacOS/probe").chmod(0o700)
+        with (twin / "Info.plist").open("wb") as handle:
+            plistlib.dump({
+                "CFBundleExecutable": "probe",
+                "CFBundleIdentifier": f"io.github.surfire.lumen.twin{index}." + root.name,
+                "CFBundleDisplayName": "Twin Preview",
+                "CFBundlePackageType": "APPL",
+            }, handle)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--watch-engine", type=Path, help="Also test an integrated lumen binary with persisted watch scopes")
     parser.add_argument("--real-gemma", type=Path,
                         help="Also verify the signed GUI with pinned offline Gemma resources in this directory")
+    parser.add_argument("--query-syntax", action="store_true", help="Also verify multiword and bare-extension queries in the unified field")
     parser.add_argument("--snapshots", type=Path, help="Save offscreen PNGs to this directory")
     args = parser.parse_args()
     if args.watch_engine and not args.watch_engine.is_file():
@@ -338,6 +374,21 @@ def main():
         parser.error("--real-gemma must point to a pinned Gemma resource directory")
     if not APP.is_file():
         raise SystemExit("Build the app first with scripts/build-app.sh")
+    with tempfile.TemporaryDirectory(prefix="lumen-gui-actions-") as tmp:
+        root = Path(tmp).resolve()
+        make_corpus(root)
+        make_action_probe(root)
+        (root / "corpus/Lumen Action Probe notes.txt").write_text("Synthetic unified search fixture.", encoding="utf-8")
+        (root / "action-scenario").touch()
+        if args.query_syntax:
+            fixtures = root / "corpus"
+            for name in ("成都 卫健委.PPTX", "卫健委成都方案.pptx", "Other project.pptx",
+                         "成都 卫健委.pptx.bak", "成都情况.txt"):
+                (fixtures / name).write_text("Synthetic query fixture.", encoding="utf-8")
+            (fixtures / "成都 卫健委目录.pptx").mkdir()
+            (root / "syntax-scenario").touch()
+
+        run(root, "zh")
     with tempfile.TemporaryDirectory(prefix="lumen-gui-") as tmp:
         root = Path(tmp)
         make_corpus(root)

@@ -22,7 +22,7 @@ done
 /usr/bin/iconutil -c icns -o "$APP/Contents/Resources/Lumen.icns" "$iconset"
 xcrun swiftc -O -swift-version 5 -target "$SWIFT_TARGET" -module-cache-path "$PWD/target/SwiftModuleCache" -parse-as-library -D LUMEN_EXTENSIONS \
     app/LumenApp.swift app/LauncherEngine.swift app/LauncherHotKey.swift app/LauncherModel.swift \
-    app/LauncherViews.swift app/LauncherSmoke.swift extensions/LumenExtensionPanel.swift -o "$APP/Contents/MacOS/Lumen"
+    app/LauncherViews.swift app/LauncherActions.swift app/LauncherPreview.swift app/LauncherSmoke.swift extensions/LumenExtensionPanel.swift -o "$APP/Contents/MacOS/Lumen"
 xcrun swiftc -O -swift-version 5 -target "$SWIFT_TARGET" -module-cache-path "$PWD/target/SwiftModuleCache" app/LocalEmbedding.swift -o "$APP/Contents/Resources/LumenLocalEmbedding"
 xcrun swiftc -O -swift-version 5 -target "$SWIFT_TARGET" -module-cache-path "$PWD/target/SwiftModuleCache" app/ExtractPdf.swift -o "$APP/Contents/Resources/LumenPdfExtractor"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
@@ -35,8 +35,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
  <key>CFBundleName</key><string>Lumen</string>
  <key>CFBundleIconFile</key><string>Lumen.icns</string>
  <key>CFBundlePackageType</key><string>APPL</string>
- <key>CFBundleShortVersionString</key><string>0.2.5</string>
- <key>CFBundleVersion</key><string>7</string>
+ <key>CFBundleShortVersionString</key><string>0.2.6</string>
+ <key>CFBundleVersion</key><string>8</string>
  <key>LSMinimumSystemVersion</key><string>14.0</string>
  <key>LSUIElement</key><true/>
 </dict>

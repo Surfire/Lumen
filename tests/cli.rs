@@ -540,6 +540,149 @@ mod live {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
+    fn index_progress(f: &Fixture, args: &[&str]) -> (Value, Vec<Value>) {
+        let output = f
+            .cli()
+            .args(["index", "--progress"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Parse the entire stdout document, so an extra JSONL event fails.
+        let summary = serde_json::from_slice(&output.stdout).unwrap();
+        let events = String::from_utf8(output.stderr)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| event["event"] == "progress")
+            .collect::<Vec<_>>();
+        let mut phases = events
+            .iter()
+            .map(|event| event["phase"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        phases.dedup();
+        assert_eq!(phases, ["preparing", "scanning", "finalizing", "done"]);
+        for pair in events.windows(2) {
+            for key in ["entries", "elapsed_ms"] {
+                assert!(pair[0][key].as_u64().unwrap() <= pair[1][key].as_u64().unwrap());
+            }
+        }
+        (summary, events)
+    }
+
+    #[test]
+    fn index_progress_keeps_stdout_atomic_and_estimates_only_a_matching_scope() {
+        let f = Fixture::new();
+        let root = f.0.join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("fresh-report.txt"), "eligible").unwrap();
+        fs::write(root.join(".hidden"), "excluded").unwrap();
+        let r = root.to_str().unwrap();
+
+        let (summary, cold) = index_progress(&f, &["--root", r]);
+        assert_eq!(summary["items"], 2);
+        assert!(
+            cold.iter()
+                .filter(|e| e["phase"] == "scanning")
+                .all(|e| { e.get("estimated_total").is_none() && e.get("eta_seconds").is_none() })
+        );
+        assert_eq!(cold.last().unwrap()["entries"], 3);
+        assert_eq!(cold.last().unwrap()["estimated_total"], 3);
+        assert_eq!(cold.last().unwrap()["eta_seconds"], 0);
+        assert_eq!(f.run(&["query", "report"])[0]["name"], "fresh-report.txt");
+
+        let (_, refresh) = index_progress(&f, &["--root", r]);
+        let estimate = refresh.iter().find(|e| e["phase"] == "scanning").unwrap();
+        assert_eq!(estimate["estimated_total"], 3);
+        assert_eq!(estimate["estimate_basis"], "previous_scan");
+
+        let excluded = root.join("fresh-report.txt");
+        let (_, changed) = index_progress(&f, &["--root", r, "--deny", excluded.to_str().unwrap()]);
+        let scanning = changed.iter().find(|e| e["phase"] == "scanning").unwrap();
+        assert!(scanning.get("estimated_total").is_none());
+        assert!(f.run(&["query", "report"]).as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn index_progress_heartbeats_during_a_slow_document_without_a_precount() {
+        let f = Fixture::new();
+        let root = f.0.join("root");
+        fs::create_dir(&root).unwrap();
+        let document = root.join("slow.pdf");
+        fs::write(&document, "first synthetic extracted text").unwrap();
+        let helper = f.0.join("extractor");
+        executable(&helper, "#!/bin/sh\ncat\nsleep 1\n");
+        let args = [
+            "--root",
+            root.to_str().unwrap(),
+            "--documents",
+            "--pdf-helper",
+            helper.to_str().unwrap(),
+        ];
+
+        let (_, cold) = index_progress(&f, &args);
+        assert!(cold.iter().any(|event| {
+            event["phase"] == "scanning"
+                && event["elapsed_ms"].as_u64().unwrap() >= 200
+                && event["entries"] == 1
+                && event["entries_per_second"].is_number()
+                && event.get("eta_seconds").is_none()
+        }));
+        fs::write(&document, "second synthetic extracted text").unwrap();
+        let (_, refresh) = index_progress(&f, &args);
+        assert!(refresh.iter().any(|event| {
+            event["phase"] == "scanning"
+                && event["eta_seconds"].is_number()
+                && event["estimated_total"] == 2
+                && event["estimate_basis"] == "previous_scan"
+        }));
+    }
+
+    #[test]
+    fn watch_progress_preserves_stdout_ready_and_following_updates() {
+        let f = Fixture::new();
+        let root = f.0.join("root");
+        fs::create_dir(&root).unwrap();
+        let mut watcher = Process::launch(
+            f.cli()
+                .args(["watch", "--progress", "--root", root.to_str().unwrap()])
+                .stdin(Stdio::null())
+                .stderr(Stdio::piped()),
+        );
+        let stderr = watcher.child.stderr.take().unwrap();
+        let (send, receive) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if let Ok(event) = serde_json::from_str::<Value>(&line)
+                    && send.send(event).is_err()
+                {
+                    break;
+                }
+            }
+        });
+        assert_eq!(watcher.json(), serde_json::json!({"event":"ready"}));
+        assert_eq!(
+            receive.recv_timeout(Duration::from_secs(5)).unwrap()["phase"],
+            "preparing"
+        );
+        loop {
+            let event = receive.recv_timeout(Duration::from_secs(5)).unwrap();
+            if event["phase"] == "done" {
+                break;
+            }
+        }
+        fs::write(root.join("live-report.txt"), "updated").unwrap();
+        assert_eq!(watcher.json(), serde_json::json!({"event":"updated"}));
+        assert_eq!(
+            f.run(&["query", "live-report"])[0]["name"],
+            "live-report.txt"
+        );
+    }
+
     #[test]
     fn native_watch_keeps_serve_current_and_repairs_after_restart() {
         let f = Fixture::new();

@@ -4,194 +4,269 @@ import SwiftUI
 struct SearchWindow: View {
     @ObservedObject var model: Launcher
     let showSettings: () -> Void
+    let beginIndex: () -> Void
     let open: (SearchHit) -> Void
     let revealInFinder: (SearchHit) -> Void
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if model.canSearch {
-                HStack {
-                    Picker(model.t("搜索方式", "Search mode"), selection: Binding(
-                        get: { model.mode }, set: { model.changeMode($0) }
-                    )) {
-                        Text(model.t("名称与拼音", "Names & Pinyin")).tag(SearchMode.name)
-                        Text(model.t("名称与正文", "Names & Text")).tag(SearchMode.all)
-                        Text(model.t("正文", "Text")).tag(SearchMode.text)
-                    }
-                    .labelsHidden().pickerStyle(.segmented).frame(maxWidth: 360)
-                    Spacer()
-                    Button(model.relatedExcerptsLabel) { model.semanticSearch() }
-                        .disabled(!model.hasQuery || model.semanticBusy || model.localModelState == .checking)
-                }
-            }
-            if let work = model.indexWork {
-                ProgressView(work.label(model)).controlSize(.small)
-            }
-            if let notice = model.indexNotice {
-                NoticeView(model: model, notice: notice)
-            }
-            if model.watchState == .needsSetup && model.indexPhase == .ready && !model.scopePending {
-                Text(model.t("当前索引未保存完整范围。请在设置中重建索引以启用自动更新。",
-                             "Rebuild this index in Settings to save its scope and enable automatic updates."))
-                    .foregroundStyle(.secondary).font(.callout)
-            }
-            switch model.indexPhase {
-            case .checking:
-                ProgressView(model.t("正在检查本地索引…", "Checking the local index…"))
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-            case .needsIndex, .unreadable:
-                onboarding
-            case .ready:
-                if model.canSearch {
-                    results
-                } else {
-                    Text(model.indexWork == nil
-                         ? model.t("请在设置中重新应用索引范围，以恢复搜索。",
-                                   "Apply the index scope again in Settings to resume search.")
-                         : model.t("索引范围更新完成后恢复搜索。", "Search resumes when the new scope is applied."))
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
-            }
-            Divider()
-            HStack {
-                if let shortcut = model.hotKey {
-                    Label(shortcut.label, systemImage: "keyboard")
-                        .accessibilityLabel(model.t("全局快捷键", "Global shortcut") + " " + shortcut.label)
-                } else if let issue = model.hotKeyIssue {
-                    Label(issue.title(model), systemImage: "exclamationmark.circle")
-                }
-                Spacer()
-                Button(action: showSettings) {
-                    Label(model.t("设置", "Settings"), systemImage: "gearshape")
-                }
-            }
-            .font(.callout)
-        }
+    static let headerHeight: CGFloat = 56
+    static let footerHeight: CGFloat = 28
+    static let maximumVisibleRows = 8
+
+    static func height(for model: Launcher) -> CGFloat {
+        let shell = headerHeight + footerHeight
+        guard model.canSearch, model.hasQuery else { return shell }
+        let height = model.hits.prefix(maximumVisibleRows).reduce(CGFloat(0)) { $0 + rowHeight($1) }
+        return shell + 34 + min(max(height, 44), CGFloat(maximumVisibleRows * 44)) +
+            (notice(for: model) == nil ? 0 : 28)
     }
 
-    private var onboarding: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Image(systemName: "internaldrive").font(.system(size: 32)).foregroundStyle(.secondary)
-            Text(model.t("先建立本地搜索索引", "Build your local search index"))
-                .font(.title2.weight(.semibold))
-            Text(model.t("Lumen 默认扫描启动盘上可访问的文件和文件夹，无需选择目录。首次扫描完成后即可按名称和拼音搜索。",
-                         "Lumen scans accessible files and folders on the startup disk by default. You can search by name and pinyin after the first scan."))
-            Text(model.t("索引保存在本机。正文索引可在设置中开启，扫描不会下载云端文件。",
-                         "The index stays on this Mac. You can enable text indexing in Settings. Scanning leaves cloud files online."))
-                .foregroundStyle(.secondary)
-            Button(model.indexPhase == .unreadable
-                   ? model.t("重新建立索引", "Rebuild Index")
-                   : model.t("建立索引", "Build Index")) {
-                model.buildIndex()
+    private static func rowHeight(_ hit: SearchHit) -> CGFloat { hit.hasPreview ? 60 : 44 }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if model.canSearch && model.hasQuery {
+                modes
+                if let notice = Self.notice(for: model) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "info.circle")
+                        Text(notice).lineLimit(1).help(notice)
+                        Spacer()
+                        if model.searchNotice?.problem == .search || model.searchNotice?.problem == .stale {
+                            Button(model.t("重试", "Retry")) { model.retrySearch() }
+                                .buttonStyle(.borderless)
+                        }
+                    }
+                    .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 16).frame(height: 28)
+                }
+                if model.hits.isEmpty {
+                    Text(emptyResultsLabel)
+                        .font(.callout).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16)
+                } else {
+                    results
+                }
             }
-            .buttonStyle(.borderedProminent)
-            .accessibilityIdentifier("build-index")
-            .disabled(model.indexWork != nil)
+            footer
         }
-        .frame(maxWidth: 500, alignment: .leading)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-        .padding(.horizontal, 12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+    }
+
+    private var modes: some View {
+        HStack(spacing: 12) {
+            Picker(model.t("搜索方式", "Search mode"), selection: Binding(
+                get: { model.mode }, set: { model.changeMode($0) }
+            )) {
+                Text(model.t("名称", "Names")).tag(SearchMode.name)
+                Text(model.t("名称与正文", "Names & Text")).tag(SearchMode.all)
+                Text(model.t("正文", "Text")).tag(SearchMode.text)
+            }
+            .labelsHidden().pickerStyle(.segmented).controlSize(.small).frame(maxWidth: 276)
+            Spacer()
+            Button { model.semanticSearch() } label: {
+                Label(model.relatedExcerptsLabel, systemImage: "text.magnifyingglass")
+            }
+            .buttonStyle(.borderless).font(.caption.weight(.medium))
+            .disabled(model.semanticBusy || model.localModelState == .checking)
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 34)
+    }
+
+    private var footer: some View {
+        HStack(spacing: 12) {
+            if model.activityBusy || !model.canSearch {
+                Label(model.activityTitle, systemImage: model.activityBusy ? "arrow.triangle.2.circlepath" : "internaldrive")
+                    .lineLimit(1)
+                if let metrics = model.activityMetrics { Text(metrics).monospacedDigit().lineLimit(1) }
+            } else if model.hits.isEmpty {
+                Text(model.activityTitle).lineLimit(1)
+            } else {
+                keyHint("↑↓", model.t("选择", "Select"))
+                keyHint("↵", model.t("打开", "Open"))
+            }
+            Spacer(minLength: 8)
+            if model.canStartIndexFromLauncher {
+                Button(model.t("在后台建立索引", "Build in Background"), action: beginIndex)
+                    .buttonStyle(.borderless).fontWeight(.semibold)
+                    .accessibilityIdentifier("build-index")
+            } else {
+                keyHint("esc", model.t("关闭", "Close"))
+            }
+            Button(action: showSettings) {
+                Image(systemName: "gearshape").font(.system(size: 12))
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel(model.t("设置", "Settings"))
+            .help(model.t("设置与索引详情", "Settings and index details"))
+        }
+        .font(.system(size: 11, weight: .medium))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 15)
+        .frame(height: Self.footerHeight)
+        .background(.primary.opacity(0.035))
+        .overlay(alignment: .top) { Divider() }
+    }
+
+    private func keyHint(_ key: String, _ action: String) -> some View {
+        HStack(spacing: 4) {
+            Text(key).font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .padding(.horizontal, 4).padding(.vertical, 1)
+                .background(.primary.opacity(0.075), in: RoundedRectangle(cornerRadius: 3))
+            Text(action)
+        }
+        .fixedSize()
+        .accessibilityElement(children: .combine)
     }
 
     private var results: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if model.localModelState == .checking {
-                ProgressView(model.t("正在校验本机 BGE 资源…", "Verifying local BGE resources…")).controlSize(.small)
-            } else if case .unavailable(let issue) = model.localModelState {
-                Label(model.modelDiagnostic(issue), systemImage: "info.circle")
-                    .font(.callout).foregroundStyle(.secondary)
-            }
-            if model.semanticBusy || model.searching {
-                ProgressView(model.semanticBusy
-                             ? model.t("正在查找相关原文…", "Finding related excerpts…")
-                             : model.t("正在搜索…", "Searching…")).controlSize(.small)
-            }
-            if model.showingRelatedExcerpts && !model.hits.isEmpty {
-                Text(model.t("按语义相似度呈现本地文档片段，请结合原文判断。",
-                             "These local excerpts are ranked by semantic similarity. Read the source for context."))
-                    .font(.callout).foregroundStyle(.secondary)
-            }
-            if let notice = model.searchNotice {
-                HStack(alignment: .top) {
-                    NoticeView(model: model, notice: notice)
-                    if notice.problem == .search || notice.problem == .stale {
-                        Button(model.t("重试", "Retry")) { model.retrySearch() }
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(model.hits) { hit in
+                        resultRow(hit).id(hit.path)
                     }
                 }
+                .padding(.horizontal, 8)
             }
-            if model.hits.isEmpty {
-                if model.searchNotice == nil && !model.searching && !model.semanticBusy {
-                    Text(emptyResultsLabel)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    Spacer()
-                }
-            } else {
-                ScrollViewReader { proxy in
-                    List(selection: $model.selection) {
-                        ForEach(model.hits) { hit in
-                            resultRow(hit)
-                                .tag(hit.path)
-                                .contentShape(Rectangle())
-                                .onTapGesture(count: 2) { open(hit) }
-                        }
-                    }
-                    .listStyle(.plain)
-                    .onKeyPress(.return) {
-                        guard let hit = model.selectedHit else { return .ignored }
-                        open(hit)
-                        return .handled
-                    }
-                    .onChange(of: model.selection) { _, value in
-                        if let value { proxy.scrollTo(value) }
-                    }
-                }
+            .onChange(of: model.selection) { _, value in
+                if let value { proxy.scrollTo(value) }
+            }
+            .onKeyPress(.upArrow) { model.moveSelection(-1); return .handled }
+            .onKeyPress(.downArrow) { model.moveSelection(1); return .handled }
+            .onKeyPress(.return) {
+                guard let hit = model.selectedHit else { return .ignored }
+                open(hit)
+                return .handled
             }
         }
-        .frame(maxHeight: .infinity)
     }
 
     private var emptyResultsLabel: String {
+        if model.semanticBusy { return model.t("正在查找相关原文…", "Finding related excerpts…") }
+        if model.searching { return model.t("正在搜索…", "Searching…") }
         if model.showingRelatedExcerpts { return model.t("未找到相关原文", "No related excerpts") }
-        if model.hasQuery { return model.t("没有匹配结果", "No matches") }
-        return model.t("输入文件名、文件夹名称或拼音", "Enter a file or folder name, or its pinyin")
+        return model.t("没有匹配结果", "No matches")
+    }
+
+    private static func notice(for model: Launcher) -> String? {
+        if let notice = model.searchNotice { return model.title(for: notice) }
+        if model.localModelState == .checking {
+            return model.t("正在校验本机 BGE 资源…", "Verifying local BGE resources…")
+        }
+        if case .unavailable(let issue) = model.localModelState { return model.modelDiagnostic(issue) }
+        if model.showingRelatedExcerpts && !model.hits.isEmpty {
+            return model.t("按语义相似度匹配原文片段", "Source excerpts ranked by semantic similarity")
+        }
+        return nil
     }
 
     private func resultRow(_ hit: SearchHit) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 8) {
-                Image(systemName: hit.kind == "directory" ? "folder" : "doc")
-                    .accessibilityHidden(true)
-                Text(hit.name).fontWeight(.medium).lineLimit(1)
-                Spacer()
-                Text(matchLabel(hit)).foregroundStyle(.secondary).font(.caption)
-                if hit.isCloudReference {
-                    Label(hit.availability == "placeholder"
-                          ? model.t("仅在线 · 仅索引名称", "Online only · Name indexed")
-                          : model.t("云盘 · 仅索引名称", "Cloud · Name indexed"), systemImage: "icloud")
-                        .font(.caption).foregroundStyle(.secondary)
-                    Button(model.t("在 Finder 中显示", "Show in Finder")) { revealInFinder(hit) }
-                        .buttonStyle(.borderless)
-                        .accessibilityIdentifier("reveal-cloud-result")
+        let selected = model.selection == hit.path
+        return HStack(spacing: 10) {
+            Image(systemName: hit.kind == "directory" ? "folder" : "doc.text")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(selected ? Color.accentColor : .secondary)
+                .frame(width: 28, height: 28)
+                .background(.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 6))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(hit.name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                let parent = (hit.path as NSString).deletingLastPathComponent as NSString
+                Text(parent.abbreviatingWithTildeInPath).font(.system(size: 11)).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.middle)
+                    .help(hit.path)
+                if hit.hasPreview, let snippet = hit.snippet {
+                    Text(snippet).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
                 }
             }
-            Text(hit.path).foregroundStyle(.secondary).font(.caption).lineLimit(1).truncationMode(.middle)
-            if hit.hasPreview, let snippet = hit.snippet { Text(snippet).font(.caption).lineLimit(2) }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if hit.isCloudReference {
+                Label(hit.availability == "placeholder"
+                      ? model.t("仅在线", "Online only")
+                      : model.t("云盘 · 仅名称", "Cloud · Name only"), systemImage: "icloud")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize()
+                Button(model.t("在 Finder 中显示", "Show in Finder")) { revealInFinder(hit) }
+                    .buttonStyle(.borderless).font(.caption).fixedSize()
+                    .accessibilityIdentifier("reveal-cloud-result")
+            } else if let match = matchLabel(hit) {
+                Text(match).font(.caption).foregroundStyle(.secondary).fixedSize()
+            } else if selected {
+                Image(systemName: "return").font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary).accessibilityHidden(true)
+            }
         }
-        .padding(.vertical, 4)
+        .padding(.horizontal, 8)
+        .frame(height: Self.rowHeight(hit))
+        .background {
+            if selected {
+                RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.15))
+                RoundedRectangle(cornerRadius: 8).strokeBorder(Color.accentColor.opacity(0.28), lineWidth: 1)
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) { open(hit) }
+        .onTapGesture { model.selection = hit.path }
         .accessibilityElement(children: .contain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityAction(named: Text(model.t("打开", "Open"))) { open(hit) }
     }
 
-    private func matchLabel(_ hit: SearchHit) -> String {
+    private func matchLabel(_ hit: SearchHit) -> String? {
         switch hit.matched_by {
         case "semantic_candidate": return model.relatedExcerptsLabel
         case "pinyin": return model.t("拼音", "Pinyin")
         case "text": return model.t("正文", "Text")
         case "path": return model.t("路径", "Path")
-        default: return model.t("名称", "Name")
+        default: return nil
         }
+    }
+}
+
+@MainActor
+extension Launcher {
+    var canStartIndexFromLauncher: Bool {
+        indexWork == nil && (indexPhase == .needsIndex || indexPhase == .unreadable || scopePending ||
+                             (indexPhase == .ready && watchState == .needsSetup))
+    }
+
+    var activityTitle: String {
+        if isIndexing || watchProgress != nil || watchState == .starting {
+            switch activeProgress?.phase {
+            case "preparing": return t("正在准备索引…", "Preparing index…")
+            case "finalizing", "done": return t("正在保存索引…", "Saving index…")
+            case "scanning": return t("正在扫描文件…", "Scanning files…")
+            default: return t("正在后台更新索引…", "Indexing in background…")
+            }
+        }
+        if indexWork == .embeddings { return t("正在生成语义索引…", "Building semantic index…") }
+        if scopePending || indexPhase == .unreadable { return t("索引需要更新", "Index needs attention") }
+        switch indexPhase {
+        case .checking: return t("正在检查索引…", "Checking index…")
+        case .needsIndex: return t("索引启动盘上的可访问文件", "Index accessible files on this Mac")
+        case .ready, .unreadable:
+            if watchState == .running { return t("实时更新", "Live updates") }
+            if watchState == .failed { return t("自动更新已停止", "Automatic updates stopped") }
+            if watchState == .needsSetup { return t("重建后可开启实时更新", "Rebuild to enable live updates") }
+            return t("索引就绪", "Index ready")
+        }
+    }
+
+    var activityMetrics: String? {
+        guard let progress = activeProgress else { return nil }
+        let elapsed = durationText(Double(progress.elapsed_ms) / 1_000)
+        let entries = progress.entries.formatted()
+        let eta = progress.eta.map {
+            let duration = durationText($0)
+            return t("约余 \(duration)", "About \(duration) left")
+        } ?? t("剩余时间待估", "ETA unavailable")
+        return t("\(entries) 项 · 已用 \(elapsed) · \(eta)", "\(entries) entries · \(elapsed) elapsed · \(eta)")
+    }
+
+    private func durationText(_ seconds: TimeInterval) -> String {
+        Duration.seconds(seconds.rounded()).formatted(.units(allowed: [.hours, .minutes, .seconds],
+                                                            width: .abbreviated, maximumUnitCount: 2)
+            .locale(zh ? Locale(identifier: "zh-Hans") : Locale(identifier: "en")))
     }
 }
 
@@ -221,6 +296,14 @@ struct LauncherSettings: View {
                     Label(issue.title(model), systemImage: "exclamationmark.circle")
                         .font(.callout).foregroundStyle(.secondary)
                 }
+                if model.hotKey?.cyclesMacWindows == true {
+                    Text(model.t("macOS 也使用 ⌘` 切换窗口。可随时在菜单栏中打开 Lumen 搜索。",
+                                 "macOS also uses ⌘` to cycle windows. Open Search is always available in the Lumen menu bar item."))
+                        .font(.callout).foregroundStyle(.secondary)
+                } else if model.hotKeyIssue != nil {
+                    Text(model.t("仍可从菜单栏打开搜索。", "You can still open Search from the Lumen menu bar item."))
+                        .font(.callout).foregroundStyle(.secondary)
+                }
             }
             Section(model.t("本地索引", "Local Index")) {
                 Toggle(model.t("索引本地 TXT、Markdown、DOCX 和 PDF 文本层", "Index local TXT, Markdown, DOCX and PDF text"),
@@ -239,6 +322,13 @@ struct LauncherSettings: View {
                        : model.t("建立索引", "Build Index")) { model.buildIndex() }
                     .disabled(model.indexWork != nil || model.indexPhase == .checking)
                 if let work = model.indexWork { ProgressView(work.label(model)).controlSize(.small) }
+                if let progress = model.activeProgress, let metrics = model.activityMetrics {
+                    if let fraction = progress.fraction {
+                        ProgressView(metrics, value: fraction)
+                    } else {
+                        Text(metrics).font(.callout).monospacedDigit()
+                    }
+                }
                 if let report = model.indexReport { scanCounts(report) }
                 Text(watchLabel).foregroundStyle(.secondary)
                 if let notice = model.watchNotice { NoticeView(model: model, notice: notice) }
@@ -380,8 +470,8 @@ private struct ShortcutControl: NSViewRepresentable {
         let title = model.t("录制…", "Record…")
         let prompt = model.t("按下组合键（Esc 取消）", "Press Shortcut (Esc Cancels)")
         if !button.recording { button.title = title }
-        button.toolTip = model.t("使用至少两个修饰键，包含 Control 或 Command。",
-                                 "Use at least two modifiers, including Control or Command.")
+        button.toolTip = model.t("按一个含 ⌘、⌃ 或 ⌥ 的组合键。",
+                                 "Press a shortcut that includes Command, Control, or Option.")
         button.stopRecording = { [weak button] in
             button?.recording = false
             button?.title = title
@@ -421,8 +511,8 @@ private extension IndexWork {
 private extension HotKeyIssue {
     func title(_ model: Launcher) -> String {
         switch self {
-        case .invalid: return model.t("请用至少两个修饰键（含 Control 或 Command）加字母、数字或空格。",
-                                      "Use at least two modifiers, including Control or Command, with a letter, number or Space.")
+        case .invalid: return model.t("请将 ⌘、⌃ 或 ⌥ 与字母、数字、符号或空格组合。",
+                                      "Combine Command, Control, or Option with a letter, number, symbol, or Space.")
         case .system: return model.t("此快捷键由 macOS 保留。请录制其他组合。",
                                      "macOS reserves this shortcut. Choose another combination.")
         case .occupied: return model.t("此快捷键已被注册。请录制其他组合。",

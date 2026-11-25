@@ -57,6 +57,25 @@ struct IndexReport: Decodable {
     let documents_not_read: Int?
 }
 
+struct IndexProgress: Decodable, Equatable {
+    let event: String
+    let phase: String
+    let entries: Int
+    let elapsed_ms: Int
+    let estimated_total: Int?
+    let eta_seconds: Double?
+
+    var fraction: Double? {
+        guard let total = estimated_total, total > 0, total >= entries else { return nil }
+        return Double(entries) / Double(total)
+    }
+
+    var eta: TimeInterval? {
+        guard let seconds = eta_seconds, seconds.isFinite, seconds >= 0 else { return nil }
+        return seconds
+    }
+}
+
 struct IndexScope: Equatable {
     var allow = ""
     var deny = ""
@@ -139,6 +158,7 @@ final class LauncherEngine {
 
     func run(
         _ command: [String], onLine: ((Data) -> Void)? = nil,
+        onProgress: ((IndexProgress) -> Void)? = nil,
         complete: @escaping (EngineResponse) -> Void
     ) -> Process? {
         let process = Process()
@@ -157,9 +177,22 @@ final class LauncherEngine {
         // Both pipes are drained while the child is running, including for long-lived watch.
         let errors = Task.detached(priority: .utility) {
             var recent = Data()
-            while case let bytes = stderr.fileHandleForReading.availableData, !bytes.isEmpty {
-                recent.append(bytes)
+            func remember(_ bytes: Data) {
+                recent.append(bytes.suffix(65_536))
                 if recent.count > 65_536 { recent.removeFirst(recent.count - 65_536) }
+            }
+            if let onProgress {
+                Self.readLines(stderr.fileHandleForReading) { line in
+                    if let progress = try? JSONDecoder().decode(IndexProgress.self, from: line),
+                       progress.event == "progress", progress.entries >= 0, progress.elapsed_ms >= 0 {
+                        DispatchQueue.main.async { onProgress(progress) }
+                    } else {
+                        remember(line)
+                        remember(Data([10]))
+                    }
+                }
+            } else {
+                while case let bytes = stderr.fileHandleForReading.availableData, !bytes.isEmpty { remember(bytes) }
             }
             return recent
         }
@@ -176,7 +209,10 @@ final class LauncherEngine {
             process.waitUntilExit()
             Task { @MainActor in
                 let recent = await errors.value
-                complete(EngineResponse(exitStatus: process.terminationStatus, output: output, errors: recent))
+                // Both readers enqueue their final line ahead of completion.
+                DispatchQueue.main.async {
+                    complete(EngineResponse(exitStatus: process.terminationStatus, output: output, errors: recent))
+                }
             }
         }
         return process

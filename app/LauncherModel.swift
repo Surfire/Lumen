@@ -88,6 +88,8 @@ final class Launcher: ObservableObject {
     @Published private(set) var indexWork: IndexWork?
     @Published private(set) var indexReport: IndexReport?
     @Published private(set) var indexNotice: LauncherNotice?
+    @Published private(set) var scanProgress: IndexProgress?
+    @Published private(set) var watchProgress: IndexProgress?
     @Published private(set) var scopePending: Bool
     @Published private(set) var embeddingState = EmbeddingState.idle
     @Published private(set) var embeddingBatch: EmbeddingBatch?
@@ -123,6 +125,9 @@ final class Launcher: ObservableObject {
     private let engine: LauncherEngine
     private let defaults: UserDefaults?
     private var watchSupported: Bool?
+    private var watchReportsProgress = false
+    private var indexReportsProgress = true
+    private var scanGeneration: UInt64 = 0
     private var revision: UInt64 = 0
     private var searchInputGeneration: UInt64 = 0
     private var debounce: Task<Void, Never>?
@@ -144,6 +149,9 @@ final class Launcher: ObservableObject {
 
     var hasQuery: Bool { !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     var canSearch: Bool { indexPhase == .ready && (!scopePending || firstNamesReady) }
+    var isIndexing: Bool { indexWork == .names || indexWork == .documents }
+    var activeProgress: IndexProgress? { isIndexing ? scanProgress : watchProgress }
+    var activityBusy: Bool { indexWork != nil || watchState == .starting || watchProgress != nil }
     var relatedExcerptsLabel: String { t("相关原文", "Related Excerpts") }
     var canBuildEmbeddings: Bool {
         canSearch && !scopePending && indexWork == nil && localModelState != .checking && embeddingState != .verifying
@@ -178,6 +186,7 @@ final class Launcher: ObservableObject {
         _ = engine.run(["watch", "--help"]) { [weak self] response in
             guard let self, !self.closed else { return }
             self.watchSupported = response.succeeded
+            self.watchReportsProgress = response.succeeded && String(decoding: response.output, as: UTF8.self).contains("--progress")
             self.watchState = response.succeeded ? (self.scopePending ? .paused : .needsSetup) : .unavailable
             self.startWatcherIfReady()
         }
@@ -487,9 +496,25 @@ final class Launcher: ObservableObject {
     }
 
     private func scan(_ scope: IndexScope, then next: IndexScope?) {
-        writer = engine.run(engine.indexArguments(scope: scope)) { [weak self] response in
-            guard let self, !self.closed else { return }
+        scanGeneration &+= 1
+        let generation = scanGeneration
+        scanProgress = nil
+        let progressOption = indexReportsProgress ? ["--progress"] : []
+        writer = engine.run(engine.indexArguments(scope: scope) + progressOption, onProgress: { [weak self] progress in
+            guard let self, !self.closed, self.scanGeneration == generation else { return }
+            if self.scanProgress != progress { self.scanProgress = progress }
+        }) { [weak self] response in
+            guard let self, !self.closed, self.scanGeneration == generation else { return }
+            self.scanGeneration &+= 1
             self.writer = nil
+            let didReport = self.scanProgress != nil
+            self.scanProgress = nil
+            if !response.succeeded, !didReport, self.indexReportsProgress,
+               response.diagnostic.contains("unexpected argument '--progress'") {
+                self.indexReportsProgress = false
+                self.scan(scope, then: next)
+                return
+            }
             guard let report = self.report(from: response) else {
                 self.firstNamesReady = false
                 self.invalidateSearch()
@@ -605,13 +630,19 @@ final class Launcher: ObservableObject {
         watchNotice = nil
         watchGeneration &+= 1
         let generation = watchGeneration
-        watcher = engine.run(["watch"], onLine: { [weak self] line in
+        let arguments = ["watch"] + (watchReportsProgress ? ["--progress"] : [])
+        watcher = engine.run(arguments, onLine: { [weak self] line in
             guard let self, self.watchGeneration == generation, !self.closed else { return }
             self.watchEvent(line)
+        }, onProgress: { [weak self] progress in
+            guard let self, !self.closed, self.watchGeneration == generation, !self.stoppingWatcher else { return }
+            let active = progress.phase == "done" ? nil : progress
+            if self.watchProgress != active { self.watchProgress = active }
         }) { [weak self] response in
             guard let self, !self.closed, self.watchGeneration == generation else { return }
             self.watchGeneration &+= 1
             self.watcher = nil
+            self.watchProgress = nil
             if self.stoppingWatcher {
                 self.stoppingWatcher = false
                 let next = self.afterWatcherStops
@@ -631,11 +662,13 @@ final class Launcher: ObservableObject {
         guard !stoppingWatcher, !scopePending,
               let notice = try? JSONDecoder().decode(WatchEvent.self, from: line) else { return }
         if notice.event == .ready { watchState = .running }
+        watchProgress = nil
         scheduleSearch()
     }
 
     private func withWatcherStopped(_ next: @escaping () -> Void) {
         if watchSupported == true { watchState = .paused }
+        watchProgress = nil
         guard let watcher else { next(); return }
         stoppingWatcher = true
         afterWatcherStops = next

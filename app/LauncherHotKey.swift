@@ -42,6 +42,8 @@ struct HotKey: Codable, Equatable {
         return prefix + key
     }
 
+    var cyclesMacWindows: Bool { modifiers == UInt32(cmdKey) && (code == kVK_ANSI_Grave || key == "`") }
+
     func checkSystemShortcut() throws {
         // Some fixed system shortcuts are not necessarily listed as configurable shortcuts.
         switch (Int(code), Int(modifiers)) {
@@ -59,12 +61,16 @@ struct HotKey: Codable, Equatable {
         // Control–Option is a default VoiceOver modifier, including when combined with other modifiers.
         let voiceOver = UInt32(controlKey | optionKey)
         if modifiers & voiceOver == voiceOver { throw HotKeyIssue.system }
-        guard modifiers & ~Self.mask == 0, modifiers.nonzeroBitCount >= 2,
-              modifiers & UInt32(cmdKey | controlKey) != 0,
-              key == "␣" || (key.count == 1 && key.unicodeScalars.allSatisfy(CharacterSet.alphanumerics.contains))
+        let permittedKeys = CharacterSet.alphanumerics.union(.punctuationCharacters).union(.symbols)
+        guard modifiers & ~Self.mask == 0,
+              modifiers & UInt32(cmdKey | controlKey | optionKey) != 0,
+              key == "␣" || (key.count == 1 && key.unicodeScalars.allSatisfy(permittedKeys.contains))
         else { throw HotKeyIssue.invalid }
+        // This is an explicit choice, never a default. Let Carbon return the real registration result.
+        if cyclesMacWindows { return }
         let keys = try symbolicHotKeys()
         if keys.contains(where: { entry in
+            guard (entry["kHISymbolicHotKeyEnabled"] as? NSNumber)?.boolValue == true else { return false }
             let code = (entry["kHISymbolicHotKeyCode"] as? NSNumber)?.uint32Value
             let modifiers = (entry["kHISymbolicHotKeyModifiers"] as? NSNumber)?.uint32Value
             return code == self.code && modifiers.map { $0 & Self.mask } == self.modifiers
@@ -92,7 +98,6 @@ final class GlobalHotKey {
     private var handler: EventHandlerRef?
     private var registration: EventHotKeyRef?
     private var serial: UInt32 = 0
-    private var pressed = false
     private(set) var shortcut: HotKey?
     private static let signature: OSType = 0x4c756d6e // Lumn
     var identifier: EventHotKeyID? {
@@ -127,7 +132,6 @@ final class GlobalHotKey {
         if let registration { UnregisterEventHotKey(registration) }
         registration = nil
         shortcut = nil
-        pressed = false
     }
 
     func close() {
@@ -137,10 +141,7 @@ final class GlobalHotKey {
     }
 
     private func installHandler() throws {
-        let types = [
-            EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed)),
-            EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyReleased))
-        ]
+        let types = [EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))]
         let status = InstallEventHandler(GetApplicationEventTarget(), { _, event, context in
             guard let event, let context else { return OSStatus(eventNotHandledErr) }
             let owner = Unmanaged<GlobalHotKey>.fromOpaque(context).takeUnretainedValue()
@@ -158,12 +159,7 @@ final class GlobalHotKey {
               incoming.id == identifier.id
         else { return OSStatus(eventNotHandledErr) }
 
-        if GetEventKind(event) == kEventHotKeyReleased {
-            pressed = false
-        } else if !pressed {
-            pressed = true
-            action()
-        }
+        action()
         return noErr
     }
 }

@@ -2,6 +2,7 @@
 """Exercise the signed app's native controls using a synthetic corpus without desktop input."""
 import argparse
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -36,6 +37,15 @@ def gate(name):
     wait_for("finish-" + name)
 
 
+def progress(phase, entries, elapsed, **optional):
+    line = (json.dumps(dict(event="progress", phase=phase, entries=entries,
+                            elapsed_ms=elapsed, **optional)) + chr(10)).encode()
+    middle = len(line) // 2
+    os.write(2, line[:middle])
+    time.sleep(0.01)
+    os.write(2, line[middle:])
+
+
 def save_document_stamps():
     documents = {}
     for path in (work / "corpus").rglob("*"):
@@ -66,6 +76,16 @@ def query_hits(args):
 
 
 if action == "index":
+    if "--progress" in args:
+        args.remove("--progress")
+        progress("preparing", 0, 0)
+        if not (work / "index-args.json").exists():
+            for _ in range(40):
+                print("progress pipe fixture " + "x" * 2048, file=sys.stderr)
+            progress("scanning", 17, 750)
+            gate("cold-progress")
+        elif "--documents" in args:
+            progress("scanning", 18, 3000, estimated_total=25, eta_seconds=12)
     if "--documents" in args and not (work / "finish-documents").exists():
         gate("documents")
     if "--deny" in args and (work / "reject-scope").exists():
@@ -74,13 +94,15 @@ if action == "index":
     output = subprocess.check_output([engine, db, database, action, *args])
     save_document_stamps()
     (work / "index-args.json").write_text(json.dumps(args))
+    progress("done", 20, 3500)
     sys.stdout.buffer.write(output)
     sys.exit(0)
 
 if action == "watch":
     if "--help" in args:
+        print("  --progress  Report JSON lines on stderr")
         sys.exit(0)
-    assert not args, "watch resumption must use its saved scope"
+    assert args == ["--progress"], "watch must only receive the progress option and use saved scope"
     with (work / "watch-launches").open("a") as handle:
         handle.write("start\\n")
     print(json.dumps({"event": "ready"}), flush=True)
@@ -88,9 +110,15 @@ if action == "watch":
         marker = work / "update-watch"
         if marker.exists():
             marker.unlink()
+            progress("scanning", 6, 800)
+            hold = work / "hold-watch-progress"
+            if hold.exists():
+                hold.unlink()
+                gate("watch-progress")
             scope = json.loads((work / "index-args.json").read_text())
             subprocess.check_call([engine, db, database, "index", *scope], stdout=subprocess.DEVNULL)
             save_document_stamps()
+            progress("done", 8, 1000)
             print(json.dumps({"event": "updated"}), flush=True)
         time.sleep(0.02)
 
@@ -197,6 +225,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--watch-engine", type=Path, help="Also test an integrated lumen binary with persisted watch scopes")
     parser.add_argument("--real-bge", action="store_true", help="Also verify the packaged GUI with installed offline BGE profiles")
+    parser.add_argument("--snapshots", type=Path, help="Save offscreen PNGs to this directory")
     args = parser.parse_args()
     if args.watch_engine and not args.watch_engine.is_file():
         parser.error("--watch-engine must point to a lumen binary")
@@ -205,11 +234,20 @@ def main():
     with tempfile.TemporaryDirectory(prefix="lumen-gui-") as tmp:
         root = Path(tmp)
         make_corpus(root)
+        subprocess.run([str(APP), "--verify-resident-startup", str(root), "en"], check=True, timeout=10)
         run(root, "en")
         run(root, "zh")
     with tempfile.TemporaryDirectory(prefix="lumen-gui-") as tmp:
         root = Path(tmp)
         make_corpus(root)
+        if args.snapshots:
+            (root / "capture-snapshots").touch()
+            design = root / "corpus/Design"
+            design.mkdir()
+            for name in ("Design brief.md", "Design notes.txt", "Design review.md", "Design spec.md",
+                         "Design references.md", "Design accessibility.md", "Design decisions.md",
+                         "Design prototype.md", "Design options.md"):
+                (design / name).write_text("Synthetic design fixture.", encoding="utf-8")
         script = root / "fixture-engine"
         script.write_text(FIXTURE_ENGINE, encoding="utf-8")
         script.chmod(0o700)
@@ -217,13 +255,21 @@ def main():
         (root / "native-engine").symlink_to(resources / "lumen")
         (root / "LumenPdfExtractor").symlink_to(resources / "LumenPdfExtractor")
         run(root, "zh")
+        if args.snapshots:
+            args.snapshots.mkdir(parents=True, exist_ok=True)
+            for name in ("lumen-idle-light.png", "lumen-results-light.png", "lumen-results-dark.png"):
+                shutil.copyfile(root / name, args.snapshots / name)
         run(root, "en")
     if args.watch_engine:
+        help_text = subprocess.check_output([str(args.watch_engine.resolve()), "watch", "--help"], text=True, timeout=10)
         with tempfile.TemporaryDirectory(prefix="lumen-gui-") as tmp:
             root = Path(tmp)
             make_corpus(root)
             (root / "watch-engine").symlink_to(args.watch_engine.resolve())
+            if "--progress" in help_text:
+                (root / "verify-engine-progress").touch()
             run(root, "en")
+            (root / "verify-engine-progress").unlink(missing_ok=True)
             run(root, "zh")
         with tempfile.TemporaryDirectory(prefix="lumen-gui-") as tmp:
             root = Path(tmp).resolve()

@@ -1,5 +1,6 @@
 import AppKit
 import Carbon
+import Combine
 
 // Runs inside the built app with app-local AppKit and Carbon events and an isolated index.
 @MainActor
@@ -8,13 +9,15 @@ final class LauncherSmoke {
     let database: URL
     let executable: URL?
     let language: String
+    let usesOffscreenWindows: Bool
     private let directory: URL
     private let startsWithIndex: Bool
     private let controlledTiming: Bool
     var opened: URL?
     var revealed: URL?
+    var wasActivated = false
 
-    private init(_ directory: URL, language: String) {
+    private init(_ directory: URL, language: String, usesOffscreenWindows: Bool) {
         self.directory = directory
         corpus = directory.appendingPathComponent("corpus", isDirectory: true)
         database = directory.appendingPathComponent("index.sqlite")
@@ -25,11 +28,12 @@ final class LauncherSmoke {
         executable = controlledTiming ? fixture
             : (FileManager.default.isExecutableFile(atPath: live.path) ? live : nil)
         self.language = language
+        self.usesOffscreenWindows = usesOffscreenWindows
     }
 
     static func configuration() -> LauncherSmoke? {
         let arguments = CommandLine.arguments
-        guard arguments.dropFirst().first == "--gui-smoke" else { return nil }
+        guard let mode = arguments.dropFirst().first, ["--gui-smoke", "--verify-resident-startup"].contains(mode) else { return nil }
         guard arguments.count == 4, ["en", "zh"].contains(arguments[3]) else {
             fputs("usage: Lumen --gui-smoke TEMP_DIRECTORY en|zh\n", stderr)
             exit(2)
@@ -44,11 +48,22 @@ final class LauncherSmoke {
             fputs("GUI smoke requires an isolated temporary directory with a synthetic corpus.\n", stderr)
             exit(2)
         }
-        return LauncherSmoke(directory, language: arguments[3])
+        return LauncherSmoke(directory, language: arguments[3], usesOffscreenWindows: mode == "--gui-smoke")
     }
 
     func run(_ app: AppDelegate) async {
         do {
+            if !usesOffscreenWindows {
+                try await Task.sleep(for: .milliseconds(150))
+                try check(NSApp.activationPolicy() == .accessory && !wasActivated && !NSApp.isActive && !app.searchPresented &&
+                          NSWorkspace.shared.frontmostApplication?.processIdentifier != ProcessInfo.processInfo.processIdentifier &&
+                          !NSApp.windows.contains { $0 is SearchPanel }, "ordinary launch activated or created a search panel")
+                try check(app.statusMenu?.items.first?.action == #selector(AppDelegate.showSearch),
+                          "ordinary launch did not expose the menu fallback")
+                print("Accessory startup passed without panel creation or activation")
+                NSApp.terminate(nil)
+                return
+            }
             try await verify(app)
             let engine = controlledTiming ? "controlled timing fixture" : (executable == nil ? "bundled engine" : "live engine")
             print("GUI smoke passed (\(language), \(engine), \(startsWithIndex ? "existing index" : "first run"))")
@@ -63,6 +78,14 @@ final class LauncherSmoke {
 
     private func verify(_ app: AppDelegate) async throws {
         let model = app.model
+        var observedScan: [IndexProgress] = []
+        var observedWatch: [IndexProgress] = []
+        let scanObservation = model.$scanProgress.compactMap { $0 }.sink { observedScan.append($0) }
+        let watchObservation = model.$watchProgress.compactMap { $0 }.sink { observedWatch.append($0) }
+        defer { scanObservation.cancel(); watchObservation.cancel() }
+        try check(!app.searchPresented && !NSApp.windows.contains { $0 is SearchPanel }, "startup opened the search panel")
+        guard let search = app.statusMenu?.items.first, let action = search.action else { throw Failure("missing status menu item") }
+        try check(NSApp.sendAction(action, to: search.target, from: search), "menu fallback did not open search")
         app.panel.contentView?.layoutSubtreeIfNeeded()
         defer { app.globalHotKey.close() }
         try check(NSApp.activationPolicy() == .prohibited && !NSApp.isActive, "test app became active")
@@ -81,13 +104,27 @@ final class LauncherSmoke {
             try check(model.indexPhase == .needsIndex, "first run did not enter the index guide")
             try type("archive", into: app)
             try check(model.query == "archive" && model.hits.isEmpty, "search input did not reach first-run state")
-            // Exercise the action bound to the first-run Build Index button.
             model.scope.documents = controlledTiming
-            model.buildIndex()
-            do {
-                try await until("first names snapshot searchable") {
-                    model.indexPhase == .ready && model.hits.contains { $0.name == "archive-one.txt" }
+            app.startBackgroundIndex()
+            try check(model.isIndexing && !app.searchPresented, "first-run index did not dismiss the launcher")
+            if controlledTiming {
+                try await until("cold progress available while launcher stays hidden") {
+                    model.scanProgress?.entries == 17 && !app.searchPresented &&
+                        app.statusMenu?.items.contains(where: { $0.title.contains("剩余时间待估") }) == true
                 }
+                try check(model.scanProgress?.fraction == nil && model.scanProgress?.eta == nil &&
+                          app.statusMenu?.items.contains(where: { $0.title.contains("剩余时间待估") }) == true,
+                          "cold progress showed an estimate or was missing from menu")
+                app.showSearch()
+                try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+                try check(!app.searchPresented && model.isIndexing, "Escape canceled background indexing")
+                try signal("finish-cold-progress")
+            }
+            do {
+                try await until("first names snapshot ready without reopening") { model.indexPhase == .ready && !app.searchPresented }
+                app.showSearch()
+                try type("archive", into: app)
+                try await until("names searchable after an explicit reopen") { model.hits.contains { $0.name == "archive-one.txt" } }
             } catch {
                 let detail = model.indexNotice?.detail ?? model.searchNotice?.detail ?? "no engine error"
                 throw Failure("\(error) (phase \(model.indexPhase), work \(String(describing: model.indexWork)), searching \(model.searching): \(detail))")
@@ -96,6 +133,9 @@ final class LauncherSmoke {
 
         if controlledTiming {
             try await until("document task held by fixture") { self.exists("documents-started") }
+            try await until("engine estimate rendered during document pass") {
+                model.scanProgress?.eta == 12 && model.activityMetrics?.contains("剩余时间待估") == false
+            }
             try check(model.indexWork == .documents, "names were not searchable during document indexing")
             try check(model.hits.allSatisfy { $0.matched_by != "text" }, "first scan included text")
             try signal("finish-documents")
@@ -108,6 +148,7 @@ final class LauncherSmoke {
             try await verifyReplacedDocument(app)
             try await verifyMissingPath(app)
             try await verifyEmbeddingRun(app)
+            if exists("capture-snapshots") { try await captureSnapshots(app) }
         } else {
             try await until("watch capability checked") { model.watchState != .checking }
             if model.watchState == .unavailable {
@@ -122,6 +163,11 @@ final class LauncherSmoke {
                 return
             } else {
                 try await until("real watch ready event received") { model.watchState == .running }
+                if exists("verify-engine-progress") {
+                    try await until("real engine progress reached the launcher from both processes") {
+                        observedScan.contains { $0.phase == "done" && $0.entries > 0 } && !observedWatch.isEmpty
+                    }
+                }
                 if exists("actual-bge") {
                     try await verifyInstalledModel(app)
                     return
@@ -226,14 +272,53 @@ final class LauncherSmoke {
 
     }
 
+    private func captureSnapshots(_ app: AppDelegate) async throws {
+        try type("", into: app)
+        try await until("idle launcher is 84 points tall") { app.panel.frame.height == 84 }
+        try capture("lumen-idle-light.png", appearance: .aqua, app: app)
+        try type("design", into: app)
+        try await until("eight visible result rows are laid out") {
+            app.model.hits.count >= 8 && !app.model.searching && app.panel.frame.height == 470
+        }
+        try capture("lumen-results-light.png", appearance: .aqua, app: app)
+        try capture("lumen-results-dark.png", appearance: .darkAqua, app: app)
+        app.panel.appearance = nil
+        try check(!NSApp.isActive && !app.panel.isVisible, "offscreen snapshots activated the app")
+    }
+
+    private func capture(_ filename: String, appearance: NSAppearance.Name, app: AppDelegate) throws {
+        guard let surface = app.panel.contentView, let appearance = NSAppearance(named: appearance) else {
+            throw Failure("could not configure snapshot appearance")
+        }
+        app.panel.appearance = appearance
+        surface.layoutSubtreeIfNeeded()
+        let bounds = surface.bounds
+        guard let image = surface.bitmapImageRepForCachingDisplay(in: bounds) else {
+            throw Failure("could not allocate offscreen snapshot")
+        }
+        appearance.performAsCurrentDrawingAppearance { surface.cacheDisplay(in: bounds, to: image) }
+        guard let png = image.representation(using: .png, properties: [:]) else {
+            throw Failure("could not encode offscreen snapshot")
+        }
+        try png.write(to: directory.appendingPathComponent(filename))
+    }
+
     private func verifyWatch(_ app: AppDelegate) async throws {
         let model = app.model
         try type("watchneedle", into: app)
         try await until("watch query starts with no results") { model.hits.isEmpty && !model.searching }
         let file = corpus.appendingPathComponent("watchneedle.txt")
         try Data().write(to: file)
-        if controlledTiming { try signal("update-watch") }
+        if controlledTiming {
+            try signal("hold-watch-progress")
+            try signal("update-watch")
+            try await until("watch progress streamed independently of stdout") {
+                model.watchProgress?.entries == 6 && model.watchState == .running && model.hits.isEmpty
+            }
+            try signal("finish-watch-progress")
+        }
         try await until("watch notification refreshed active results") { model.hits.first?.name == "watchneedle.txt" }
+        try check(model.watchProgress == nil, "watch completion left progress busy")
         if !controlledTiming {
             try FileManager.default.removeItem(at: file)
             try await until("watch notification removed deleted result") { model.hits.isEmpty && !model.searching }
@@ -518,6 +603,9 @@ final class LauncherSmoke {
     }
 
     private func verifyShortcut(_ app: AppDelegate) throws {
+        let grave = try HotKey(event: event(kVK_ANSI_Grave, "`", in: app, flags: [.command]))
+        try grave.checkSystemShortcut()
+        try check(grave.cyclesMacWindows && grave.label == "⌘`", "single-modifier Command–grave was rejected")
         let spotlight = try event(kVK_Space, " ", in: app, flags: [.command])
         app.recordShortcut(spotlight)
         guard case .system? = app.model.hotKeyIssue else { throw Failure("Spotlight chord was not diagnosed as reserved") }
@@ -552,6 +640,9 @@ final class LauncherSmoke {
                                     MemoryLayout<EventHotKeyID>.size, &identifier) == noErr, "cannot set Carbon hotkey ID")
         try check(SendEventToEventTarget(carbon, GetApplicationEventTarget()) == noErr, "Carbon hotkey handler did not accept the event")
         _ = try editor(app)
+        app.dismissSearch()
+        try check(SendEventToEventTarget(carbon, GetApplicationEventTarget()) == noErr && app.searchPresented,
+                  "a missing release event suppressed the next shortcut")
     }
 
     private func type(_ text: String, into app: AppDelegate) throws {

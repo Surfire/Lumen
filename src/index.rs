@@ -1,5 +1,6 @@
 use super::{
-    MAX_DOCUMENT, ScanStats, Scope, absolute, docx, norm, open_write, platform, with_suffix,
+    MAX_DOCUMENT, ScanPhase, ScanProgressReporter, ScanStats, Scope, absolute, docx, norm,
+    open_write, platform, with_suffix,
 };
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -10,7 +11,7 @@ use std::{
     os::unix::{fs::MetadataExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub(super) struct Coverage {
@@ -70,6 +71,14 @@ impl Coverage {
 }
 
 pub fn scan(database: &Path, scope: &Scope) -> Result<ScanStats> {
+    scan_with_progress(database, scope, None)
+}
+
+pub fn scan_with_progress(
+    database: &Path,
+    scope: &Scope,
+    progress: Option<&ScanProgressReporter>,
+) -> Result<ScanStats> {
     #[cfg(target_os = "macos")]
     let _io = platform::NoMaterialization::enter()?;
     let file = absolute(database)?;
@@ -77,7 +86,7 @@ pub fn scan(database: &Path, scope: &Scope) -> Result<ScanStats> {
     let (mut conn, _lease) =
         open_write(&file, true).with_context(|| format!("open index {}", file.display()))?;
     restrict_scope(&mut conn, &coverage)?;
-    reconcile(&mut conn, &coverage, true)
+    reconcile(&mut conn, &coverage, true, progress)
 }
 
 /// Load only the complete scope. Legacy "scan" reports recorded roots but omitted
@@ -140,23 +149,68 @@ pub(super) fn restrict_scope(conn: &mut Connection, coverage: &Coverage) -> Resu
     if !coverage.scope.documents {
         tx.execute_batch("DELETE FROM content_fts; DELETE FROM document; DELETE FROM document_state; DELETE FROM embedding;")?;
     }
+    tx.execute("DELETE FROM info WHERE key='walk_sample'", [])?;
     write_info(&tx, "scope", &coverage.scope)?;
     tx.commit()?;
     Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WalkSample {
+    entries: u64,
+    saved_at: u64,
+}
+
+fn epoch_seconds() -> Option<u64> {
+    Some(SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs())
+}
+
+fn previous_walk_entries(tx: &Transaction<'_>) -> Result<Option<u64>> {
+    const SAMPLE_AGE_LIMIT: u64 = 7 * 24 * 60 * 60;
+    let saved: Option<String> = tx
+        .query_row(
+            "SELECT value FROM info WHERE key='walk_sample'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let sample = saved.and_then(|raw| serde_json::from_str::<WalkSample>(&raw).ok());
+    Ok(sample.and_then(|sample| {
+        let age = epoch_seconds()?.checked_sub(sample.saved_at)?;
+        (age <= SAMPLE_AGE_LIMIT && sample.entries > 0).then_some(sample.entries)
+    }))
 }
 
 pub(super) fn reconcile(
     conn: &mut Connection,
     coverage: &Coverage,
     manual: bool,
+    progress: Option<&ScanProgressReporter>,
 ) -> Result<ScanStats> {
     let started = Instant::now();
     #[cfg(target_os = "macos")]
     let _io = platform::NoMaterialization::enter()?;
     let tx = begin(conn)?;
+    // An empty filename index has no old rows to look up or retire. Keep the
+    // regular path for overlapping roots, document extraction and refreshes.
+    let cold = !coverage.scope.documents
+        && coverage.scope.roots.len() == 1
+        && tx.query_row("SELECT NOT EXISTS(SELECT 1 FROM item)", [], |row| {
+            row.get::<_, bool>(0)
+        })?;
+    if let Some(progress) = progress {
+        let estimate = previous_walk_entries(&tx)?;
+        progress.phase(ScanPhase::Scanning, 0, estimate);
+    }
     let mut walk = Walk::new(&tx, coverage);
+    walk.cold = cold;
+    walk.progress = progress;
     for root in &coverage.scope.roots {
         walk.visit(root, true, true)?;
+    }
+    let entries = walk.entries;
+    if let Some(progress) = progress {
+        progress.phase(ScanPhase::Finalizing, entries, Some(entries));
     }
     let failed = manual && walk.readable_roots == 0;
     if failed {
@@ -164,17 +218,35 @@ pub(super) fn reconcile(
         // returning paths or contents we could not verify.
         tx.execute("INSERT OR IGNORE INTO unverified SELECT id FROM item", [])?;
     } else {
-        tx.execute(
-            "INSERT INTO stale SELECT id FROM item WHERE id NOT IN (SELECT id FROM observed)
-             AND id NOT IN (SELECT id FROM unverified)",
-            [],
-        )?;
-        purge(&tx)?;
+        if !cold {
+            tx.execute(
+                "INSERT INTO stale SELECT id FROM item WHERE id NOT IN (SELECT id FROM observed)
+                 AND id NOT IN (SELECT id FROM unverified)",
+                [],
+            )?;
+            purge(&tx)?;
+        }
         if manual {
             crate::semantic::clear_model(&tx)?;
         }
     }
     hide_unverified(&tx)?;
+    if cold {
+        tx.execute(
+            "INSERT INTO name_fts(rowid,name,full,initials,searchable_path)
+             SELECT id,name,full,initials,searchable_path FROM item ORDER BY id",
+            [],
+        )?;
+    }
+    if !failed
+        && walk.readable_roots == coverage.scope.roots.len()
+        && walk.stats.entries_unreadable == 0
+        && let Some(saved_at) = epoch_seconds()
+    {
+        write_info(&tx, "walk_sample", &WalkSample { entries, saved_at })?;
+    } else {
+        tx.execute("DELETE FROM info WHERE key='walk_sample'", [])?;
+    }
     let mut stats = walk.stats;
     stats.roots = coverage
         .scope
@@ -201,6 +273,9 @@ pub(super) fn reconcile(
     // so upgrading a large database cannot delay publishing exclusions.
     if let Err(error) = conn.execute_batch(crate::name_fast::CREATE_NAME_ORDER) {
         eprintln!("lumen: could not build name ordering index: {error}");
+    }
+    if let Some(progress) = progress {
+        progress.phase(ScanPhase::Done, entries, Some(entries));
     }
     Ok(stats)
 }
@@ -315,6 +390,9 @@ struct Walk<'a> {
     tx: &'a Transaction<'a>,
     coverage: &'a Coverage,
     stats: ScanStats,
+    cold: bool,
+    entries: u64,
+    progress: Option<&'a ScanProgressReporter>,
     readable_roots: usize,
     changed: bool,
     seen_directories: HashSet<(u64, u64)>,
@@ -327,6 +405,9 @@ impl<'a> Walk<'a> {
             tx,
             coverage,
             stats: ScanStats::default(),
+            cold: false,
+            entries: 0,
+            progress: None,
             readable_roots: 0,
             changed: false,
             seen_directories: HashSet::new(),
@@ -360,6 +441,12 @@ impl<'a> Walk<'a> {
         let mut stack = vec![(target.to_path_buf(), root, None)];
         let mut subtree = recursive;
         while let Some((path, is_root, cached)) = stack.pop() {
+            if let Some(progress) = self.progress
+                && (self.entries <= 16 || self.entries.is_multiple_of(64))
+            {
+                progress.entries(self.entries);
+            }
+            self.entries += 1;
             if !self.coverage.allows(&path) {
                 self.stats.skipped += 1;
                 continue;
@@ -406,17 +493,33 @@ impl<'a> Walk<'a> {
                     .and_then(|name| name.to_str())
                     .unwrap_or(path_text);
                 let kind = if directory { "directory" } else { "file" };
-                let (id, prior, first) = self.observe(path_text, display, kind, availability)?;
-                if directory
-                    && availability != "placeholder"
-                    && prior.as_deref() != Some(availability)
-                {
-                    // New, replaced, or re-materialized directory, even if the
-                    // notification described only the directory itself.
-                    descend = true;
-                }
-                if first {
-                    self.refresh_document(id, &path, directory, availability, metadata.as_ref())?;
+                if self.cold {
+                    if self
+                        .insert_item(path_text, display, kind, availability)?
+                        .is_some()
+                    {
+                        self.stats.items += 1;
+                    }
+                } else {
+                    let (id, prior, first) =
+                        self.observe(path_text, display, kind, availability)?;
+                    if directory
+                        && availability != "placeholder"
+                        && prior.as_deref() != Some(availability)
+                    {
+                        // New, replaced, or re-materialized directory, even if
+                        // the notification described only the directory itself.
+                        descend = true;
+                    }
+                    if first {
+                        self.refresh_document(
+                            id,
+                            &path,
+                            directory,
+                            availability,
+                            metadata.as_ref(),
+                        )?;
+                    }
                 }
             }
             if path == target {
@@ -487,26 +590,9 @@ impl<'a> Walk<'a> {
             }
             (id, (old_kind == kind).then_some(old_availability))
         } else {
-            self.changed = true;
-            if self.pinyin.len() >= 4096 {
-                self.pinyin.clear();
-            }
-            let (full, initials) = self
-                .pinyin
-                .entry(display.to_owned())
-                .or_insert_with(|| platform::pinyin(display));
-            let name = norm(display);
-            let searchable_path = norm(path);
-            let id: i64 = self.tx.prepare_cached(
-                "INSERT INTO item(path,display,kind,availability,name,full,initials,searchable_path)
-                 VALUES(?,?,?,?,?,?,?,?) RETURNING id",
-            )?.query_row(
-                params![path, display, kind, availability, name, full.as_str(), initials.as_str(), searchable_path],
-                |row| row.get(0),
-            )?;
-            self.tx.prepare_cached(
-                "INSERT INTO name_fts(rowid,name,full,initials,searchable_path) VALUES(?,?,?,?,?)",
-            )?.execute(params![id, name, full.as_str(), initials.as_str(), searchable_path])?;
+            let id = self
+                .insert_item(path, display, kind, availability)?
+                .context("new index row unexpectedly conflicts with an existing path")?;
             (id, None)
         };
         let first = self
@@ -516,6 +602,44 @@ impl<'a> Walk<'a> {
             != 0;
         self.stats.items += u64::from(first);
         Ok((id, prior, first))
+    }
+
+    fn insert_item(
+        &mut self,
+        path: &str,
+        display: &str,
+        kind: &str,
+        availability: &str,
+    ) -> Result<Option<i64>> {
+        let (full, initials) = if display.is_ascii() {
+            ("", "")
+        } else {
+            if self.pinyin.len() >= 4096 {
+                self.pinyin.clear();
+            }
+            let (full, initials) = self
+                .pinyin
+                .entry(display.to_owned())
+                .or_insert_with(|| platform::pinyin(display));
+            (full.as_str(), initials.as_str())
+        };
+        let name = norm(display);
+        let searchable_path = norm(path);
+        let changed = self.tx.prepare_cached(
+            "INSERT INTO item(path,display,kind,availability,name,full,initials,searchable_path)
+             VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(path) DO NOTHING",
+        )?.execute(params![path, display, kind, availability, name, full, initials, searchable_path])?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.changed = true;
+        let id = self.tx.last_insert_rowid();
+        if !self.cold {
+            self.tx.prepare_cached(
+                "INSERT INTO name_fts(rowid,name,full,initials,searchable_path) VALUES(?,?,?,?,?)",
+            )?.execute(params![id, name, full, initials, searchable_path])?;
+        }
+        Ok(Some(id))
     }
 
     fn refresh_document(

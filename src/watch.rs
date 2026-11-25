@@ -1,4 +1,4 @@
-use super::Scope;
+use super::{ScanProgressReporter, Scope};
 use anyhow::Result;
 use std::path::Path;
 
@@ -14,14 +14,27 @@ pub enum WatchEvent {
     Updated,
 }
 
+pub fn watch(
+    database: &Path,
+    scope: &Scope,
+    emit: impl FnMut(WatchEvent) -> Result<()>,
+) -> Result<()> {
+    watch_with_progress(database, scope, None, emit)
+}
+
 #[cfg(not(target_os = "macos"))]
-pub fn watch(_: &Path, _: &Scope, _: impl FnMut(WatchEvent) -> Result<()>) -> Result<()> {
+pub fn watch_with_progress(
+    _: &Path,
+    _: &Scope,
+    _: Option<&ScanProgressReporter>,
+    _: impl FnMut(WatchEvent) -> Result<()>,
+) -> Result<()> {
     anyhow::bail!("live indexing currently requires macOS FSEvents");
 }
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::{Path, Result, Scope, WatchEvent, fsevents};
+    use super::{Path, Result, ScanProgressReporter, Scope, WatchEvent, fsevents};
     use crate::index::{Coverage, apply_changes, reconcile, restrict_scope, startup_scope};
     use crate::{ScanStats, absolute, open_write, platform};
     use anyhow::Context;
@@ -48,9 +61,10 @@ mod macos {
     const QUEUE_CAPACITY: usize = 8192;
     const BATCH_SIZE: usize = 512;
 
-    pub fn watch(
+    pub fn watch_with_progress(
         database: &Path,
         scope: &Scope,
+        progress: Option<&ScanProgressReporter>,
         emit: impl FnMut(WatchEvent) -> Result<()>,
     ) -> Result<()> {
         let _io = platform::NoMaterialization::enter()?;
@@ -72,13 +86,14 @@ mod macos {
             periodic: Duration::from_secs(30 * 60),
             recovery_cooldown: Duration::from_secs(30),
         };
-        maintain(&mut conn, coverage, timing, start_stream, emit)
+        maintain(&mut conn, coverage, timing, progress, start_stream, emit)
     }
 
     fn maintain<S>(
         conn: &mut Connection,
         mut coverage: Arc<Coverage>,
         timing: Timing,
+        progress: Option<&ScanProgressReporter>,
         start: impl Fn(&Arc<Sink>) -> Result<S>,
         mut emit: impl FnMut(WatchEvent) -> Result<()>,
     ) -> Result<()> {
@@ -95,7 +110,8 @@ mod macos {
 
         // Subscribe first, then reconcile. Changes during this pass are queued
         // independently on the FSEvents dispatch queue, even on a large volume.
-        let stats = reconcile(conn, &coverage, false).context("startup index reconciliation")?;
+        let stats =
+            reconcile(conn, &coverage, false, progress).context("startup index reconciliation")?;
         report_unreadable(&stats);
         emit(WatchEvent::Ready).context("emit watch ready event")?;
 
@@ -173,7 +189,7 @@ mod macos {
                 };
             }
             if full {
-                let stats = reconcile(conn, &coverage, false)
+                let stats = reconcile(conn, &coverage, false, None)
                     .context("reconcile configured watch roots")?;
                 report_unreadable(&stats);
                 last_reconciled = Instant::now();
@@ -401,6 +417,7 @@ mod macos {
                 &mut conn,
                 coverage,
                 timing,
+                None,
                 |s| {
                     *sink.borrow_mut() = Some(s.clone());
                     Ok(())
@@ -452,4 +469,4 @@ mod macos {
 }
 
 #[cfg(target_os = "macos")]
-pub use macos::watch;
+pub use macos::watch_with_progress;

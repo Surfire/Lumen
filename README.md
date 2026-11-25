@@ -11,7 +11,7 @@ scripts/build-app.sh
 open target/Lumen.app
 ```
 
-启动后在菜单栏打开 Lumen，或使用默认快捷键 **Control + Shift + Space**；可在设置里修改或关闭。首次明确点击「建立索引」后才开始。白名单留空时使用启动盘可访问的范围，不必逐个选择文件夹；跳过系统、隐私、缓存、隐藏目录及默认范围外的卷。黑名单优先。支持简体中文、英语及随系统语言。
+启动后在菜单栏打开 Lumen，或使用默认快捷键 **Control + Shift + Space**；可在设置里修改或关闭。首次明确点击「建立索引」后，搜索窗会收起，索引留在后台；在菜单栏可看阶段、已扫描数量和耗时，有同范围样本时才显示估算剩余时间。可设置单修饰键组合（含 Command + 反引号）；该组合也是系统的窗口切换键，若被占用会保留原快捷键，菜单栏仍可打开搜索。白名单留空时使用启动盘可访问的范围，不必逐个选择文件夹；跳过系统、隐私、缓存、隐藏目录及默认范围外的卷。黑名单优先。支持简体中文、英语及随系统语言。
 
 ## 搜索和文件更新
 
@@ -38,7 +38,7 @@ python3 scripts/smoke-launcher.py
 extensions/tests/smoke-panel.sh
 ```
 
-验证使用合成文件。macOS 命令环境若阻止 AppKit 或 FSEvents，不能把相应测试失败、跳过或模拟结果算成真实系统验收。历史开发基线见 [0.1 合成实测](docs/BASELINE-0.1.md)，本版核验与对照见 [0.2 验证](docs/VERIFICATION-0.2.md)，测量规则见 [基准协议](docs/BENCHMARK.md)。命令行或引擎级基准不能代替原生启动器的正确首帧，更不能概括竞品所有功能。
+验证使用合成文件。macOS 命令环境若阻止 AppKit 或 FSEvents，不能把相应测试失败、跳过或模拟结果算成真实系统验收。历史开发基线见 [0.1 合成实测](docs/BASELINE-0.1.md)，本版核验见 [0.2.1 验证](docs/VERIFICATION-0.2.1.md)，上一版对照见 [0.2 验证](docs/VERIFICATION-0.2.md)，测量规则见 [基准协议](docs/BENCHMARK.md)。命令行或引擎级基准不能代替原生启动器的正确首帧，更不能概括竞品所有功能。
 
 设计：[产品](docs/PRODUCT.md) · [架构](docs/ARCHITECTURE.md) · [兼容范围](docs/COMPATIBILITY.md) · [第三方依赖](THIRD_PARTY.md)。
 

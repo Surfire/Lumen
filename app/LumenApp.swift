@@ -10,70 +10,120 @@ struct LumenApp {
         let smoke = LauncherSmoke.configuration()
         let launcher = AppDelegate(smoke: smoke)
         application.delegate = launcher
-        application.setActivationPolicy(smoke == nil ? .accessory : .prohibited)
+        application.setActivationPolicy(smoke?.usesOffscreenWindows == true ? .prohibited : .accessory)
         withExtendedLifetime(launcher) { application.run() }
     }
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSearchFieldDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate {
     let model: Launcher
     let smoke: LauncherSmoke?
     private let defaults: UserDefaults?
     private(set) lazy var globalHotKey = GlobalHotKey { [weak self] in self?.showSearch() }
     private var statusItem: NSStatusItem?
+    private var statusSymbol: String?
+    private(set) var statusMenu: NSMenu?
+    private var activityItem: NSMenuItem?
+    private var metricsItem: NSMenuItem?
+    private var buildIndexItem: NSMenuItem?
     private var languageChange: AnyCancellable?
+    private var presentationChange: AnyCancellable?
     private var settings: NSPanel?
     private var configuredKey: HotKey?
+    private(set) var searchPresented = false
     #if LUMEN_EXTENSIONS
     private var extensions: NSPanel?
     #endif
 
-    lazy var searchField: NSSearchField = {
-        let field = NSSearchField()
+    lazy var searchField: SearchField = {
+        let field = SearchField()
         field.delegate = self
         field.target = self
         field.action = #selector(searchFieldAction)
-        field.font = .systemFont(ofSize: 21)
+        field.font = .systemFont(ofSize: 22, weight: .regular)
+        field.textColor = .labelColor
+        field.isBezeled = false
+        field.isBordered = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.isEditable = true
+        field.cell?.isScrollable = true
         field.translatesAutoresizingMaskIntoConstraints = false
         return field
     }()
 
     private(set) lazy var panel: SearchPanel = {
-        let panel = SearchPanel(contentRect: NSRect(x: 0, y: 0, width: 660, height: 450),
-                                styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
+        let panel = SearchPanel(contentRect: NSRect(x: 0, y: 0, width: 680, height: 84),
+                                styleMask: [.borderless],
                                 backing: .buffered, defer: false)
         panel.title = "Lumen"
-        panel.titlebarAppearsTransparent = true
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
         panel.isReleasedWhenClosed = false
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
-        panel.minSize = NSSize(width: 530, height: 360)
         panel.delegate = self
         panel.onCancel = { [weak self] in self?.dismissSearch() }
-        let content = NSView()
+        let content = SearchBackdrop()
+        content.material = .popover
+        content.blendingMode = .behindWindow
+        content.state = .active
+        content.wantsLayer = true
+        content.layer?.cornerRadius = 15
+        content.layer?.masksToBounds = true
+        let icon = NSImageView(image: NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil) ?? NSImage())
+        icon.image?.isTemplate = true
+        icon.symbolConfiguration = .init(pointSize: 18, weight: .medium)
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        let close = NSButton(image: NSImage(systemSymbolName: "xmark.circle.fill",
+                                            accessibilityDescription: model.t("关闭搜索", "Close Search")) ?? NSImage(),
+                             target: self, action: #selector(dismissSearch))
+        close.isBordered = false
+        close.image?.isTemplate = true
+        close.setAccessibilityLabel(model.t("关闭搜索", "Close Search"))
+        content.appearanceChanged = { [weak icon, weak close, weak content] in
+            content?.effectiveAppearance.performAsCurrentDrawingAppearance {
+                let tint = NSColor(cgColor: NSColor.secondaryLabelColor.cgColor) ?? .secondaryLabelColor
+                icon?.contentTintColor = tint
+                close?.contentTintColor = tint
+            }
+        }
+        close.translatesAutoresizingMaskIntoConstraints = false
         let results = NSHostingView(rootView: SearchWindow(
             model: model,
             showSettings: { [weak self] in self?.showSettings() },
+            beginIndex: { [weak self] in self?.startBackgroundIndex() },
             open: { [weak self] in self?.open($0) },
             revealInFinder: { [weak self] in self?.revealInFinder($0) }
         ))
         results.translatesAutoresizingMaskIntoConstraints = false
         results.sizingOptions = []
+        content.addSubview(icon)
         content.addSubview(searchField)
+        content.addSubview(close)
         content.addSubview(results)
         panel.contentView = content
         panel.initialFirstResponder = searchField
         NSLayoutConstraint.activate([
-            searchField.topAnchor.constraint(equalTo: content.safeAreaLayoutGuide.topAnchor, constant: 12),
-            searchField.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
-            searchField.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            searchField.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            icon.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            icon.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 22),
+            icon.heightAnchor.constraint(equalToConstant: 26),
+            searchField.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 10),
+            searchField.trailingAnchor.constraint(equalTo: close.leadingAnchor, constant: -11),
             searchField.heightAnchor.constraint(equalToConstant: 32),
-            results.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 10),
-            results.leadingAnchor.constraint(equalTo: searchField.leadingAnchor),
-            results.trailingAnchor.constraint(equalTo: searchField.trailingAnchor),
-            results.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12)
+            close.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
+            close.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            close.widthAnchor.constraint(equalToConstant: 22),
+            close.heightAnchor.constraint(equalToConstant: 25),
+            results.topAnchor.constraint(equalTo: content.topAnchor, constant: 56),
+            results.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            results.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            results.bottomAnchor.constraint(equalTo: content.bottomAnchor)
         ])
         panel.center()
         updateSearchField()
@@ -93,21 +143,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSe
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if smoke == nil {
-            statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-            statusItem?.button?.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: "Lumen")
-            statusItem?.button?.image?.isTemplate = true
+            statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+            statusItem?.button?.imagePosition = .imageLeading
             loadShortcut()
         }
         languageChange = model.$language.dropFirst().sink { [weak self] _ in
             DispatchQueue.main.async { [weak self] in self?.updateLanguage() }
         }
+        presentationChange = model.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async { [weak self] in self?.updatePresentation() }
+        }
         updateLanguage()
         model.start()
-        showSearch()
         if let smoke { Task { @MainActor in await smoke.run(self) } }
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
+        smoke?.wasActivated = true
         // Revalidate when returning from System Settings.
         guard smoke == nil, let configuredKey else { return }
         do {
@@ -134,6 +186,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSe
     }
 
     @objc func showSearch() {
+        let firstShow = !searchPresented
+        searchPresented = true
+        updatePresentation()
+        if firstShow { panel.center() }
+        (panel.contentView as? SearchBackdrop)?.refreshTransparency()
         if smoke == nil {
             NSApp.activate()
             panel.makeKeyAndOrderFront(nil)
@@ -145,20 +202,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSe
     }
 
     func windowDidBecomeKey(_ notification: Notification) {
-        if (notification.object as? NSWindow) === panel { focusSearch() }
+        if notification.object is SearchPanel { focusSearch() }
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        if notification.object is SearchPanel { dismissSearch() }
     }
 
     private func focusSearch() {
         panel.makeFirstResponder(searchField)
+        searchField.refreshTextColor()
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        if sender !== panel { return true }
+        if !(sender is SearchPanel) { return true }
         dismissSearch()
         return false
     }
 
-    func dismissSearch() {
+    @objc func dismissSearch() {
+        guard searchPresented else { return }
+        searchPresented = false
         // Release the field editor first so an earlier composition cannot be restored on reopen.
         panel.makeFirstResponder(nil)
         searchField.stringValue = ""
@@ -167,6 +231,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSe
         if smoke == nil, NSApp.isActive, !NSApp.windows.contains(where: { $0.isVisible && $0.canBecomeKey }) {
             NSApp.deactivate()
         }
+    }
+
+    @objc func startBackgroundIndex() {
+        model.buildIndex()
+        if model.isIndexing { dismissSearch() }
     }
 
     func controlTextDidChange(_ notification: Notification) {
@@ -308,16 +377,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSe
     }
 
     private func updateStatusMenu() {
-        guard let statusItem else { return }
         let menu = NSMenu()
         menu.addItem(withTitle: model.t("打开搜索", "Open Search"), action: #selector(showSearch), keyEquivalent: "").target = self
+        buildIndexItem = menu.addItem(withTitle: model.t("在后台建立索引", "Build Index in Background"),
+                                      action: #selector(startBackgroundIndex), keyEquivalent: "")
+        buildIndexItem?.target = self
+        menu.addItem(.separator())
+        activityItem = menu.addItem(withTitle: "", action: nil, keyEquivalent: "")
+        metricsItem = menu.addItem(withTitle: "", action: nil, keyEquivalent: "")
+        menu.addItem(.separator())
         #if LUMEN_EXTENSIONS
         menu.addItem(withTitle: model.t("扩展…", "Extensions…"), action: #selector(showExtensions), keyEquivalent: "").target = self
         #endif
         menu.addItem(withTitle: model.t("设置…", "Settings…"), action: #selector(showSettings), keyEquivalent: "").target = self
         menu.addItem(.separator())
         menu.addItem(withTitle: model.t("退出 Lumen", "Quit Lumen"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "").target = NSApp
-        statusItem.menu = menu
+        statusItem?.menu = menu
+        statusMenu = menu
+        updatePresentation()
+    }
+
+    private func updatePresentation() {
+        activityItem?.title = model.activityTitle
+        metricsItem?.title = model.activityMetrics ?? ""
+        metricsItem?.isHidden = model.activityMetrics == nil
+        buildIndexItem?.isHidden = !model.canStartIndexFromLauncher
+        if let button = statusItem?.button {
+            let symbol = model.activityBusy ? "arrow.triangle.2.circlepath" : "magnifyingglass"
+            if statusSymbol != symbol {
+                button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+                button.image?.isTemplate = true
+                statusSymbol = symbol
+            }
+            button.title = model.activeProgress?.entries.formatted(.number.notation(.compactName)) ?? ""
+            let summary = ["Lumen", model.activityTitle, model.activityMetrics].compactMap { $0 }.joined(separator: " · ")
+            button.toolTip = summary
+            button.setAccessibilityLabel(summary)
+        }
+        guard searchPresented else { return }
+        var frame = panel.frame
+        let height = SearchWindow.height(for: model)
+        guard frame.height != height else { return }
+        frame.origin.y += frame.height - height
+        frame.size.height = height
+        panel.setFrame(frame, display: true)
     }
 
     private func installEditMenu() {
@@ -345,8 +448,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSe
 }
 
 @MainActor
+final class SearchField: NSTextField {
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refreshTextColor()
+    }
+
+    func refreshTextColor() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let color = NSColor(cgColor: NSColor.labelColor.cgColor) ?? .labelColor
+            textColor = color
+            if let editor = currentEditor() as? NSTextView {
+                editor.textColor = color
+                editor.insertionPointColor = color
+            }
+        }
+    }
+}
+
+@MainActor
+final class SearchBackdrop: NSVisualEffectView {
+    private var transparencyChange: AnyCancellable?
+    var appearanceChanged: (() -> Void)?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        appearanceChanged?()
+        transparencyChange = NSWorkspace.shared.notificationCenter
+            .publisher(for: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.refreshTransparency() }
+        refreshTransparency()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        appearanceChanged?()
+        refreshTransparency()
+    }
+
+    func refreshTransparency() {
+        let reduced = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
+        material = reduced ? .windowBackground : .popover
+        blendingMode = reduced ? .withinWindow : .behindWindow
+    }
+}
+
+@MainActor
 final class SearchPanel: NSPanel {
     var onCancel: (() -> Void)?
+    override var canBecomeKey: Bool { true }
 
     override func sendEvent(_ event: NSEvent) {
         let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])

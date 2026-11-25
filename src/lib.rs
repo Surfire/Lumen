@@ -4,13 +4,15 @@ mod index;
 mod model;
 mod name_fast;
 mod platform;
+mod progress;
 mod semantic;
 mod watch;
 
-pub use index::scan;
+pub use index::{scan, scan_with_progress};
 pub use model::{BgeModel, Model, ModelBackend};
+pub use progress::{ScanPhase, ScanProgress, ScanProgressReporter};
 pub use semantic::{EmbedBatch, embed, embed_batch, embed_with_backend};
-pub use watch::{WatchEvent, watch};
+pub use watch::{WatchEvent, watch, watch_with_progress};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, params};
@@ -112,16 +114,19 @@ fn sensitive_path(path: &Path) -> bool {
     path.components().any(|part| {
         part.as_os_str().to_str().is_some_and(|p| {
             p.starts_with('.')
-                || matches!(
-                    p.to_ascii_lowercase().as_str(),
-                    "keychains" | "cookies" | "caches"
-                )
+                || ["keychains", "cookies", "caches"]
+                    .iter()
+                    .any(|name| p.eq_ignore_ascii_case(name))
         })
     })
 }
 
 fn norm(text: &str) -> String {
-    text.nfkc().flat_map(char::to_lowercase).collect()
+    if text.is_ascii() {
+        text.to_ascii_lowercase()
+    } else {
+        text.nfkc().flat_map(char::to_lowercase).collect()
+    }
 }
 
 fn fts_phrase(text: &str) -> String {

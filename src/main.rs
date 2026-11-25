@@ -35,6 +35,9 @@ impl From<SearchMode> for Mode {
 }
 #[derive(Args)]
 struct ScopeArgs {
+    /// Send scan progress as JSON lines to stderr.
+    #[arg(long)]
+    progress: bool,
     #[arg(long)]
     root: Vec<PathBuf>,
     #[arg(long)]
@@ -179,23 +182,39 @@ struct SearchReply {
     hits: Vec<lumen::Hit>,
 }
 
+fn scan_progress(enabled: bool) -> io::Result<Option<lumen::ScanProgressReporter>> {
+    enabled
+        .then(|| {
+            lumen::ScanProgressReporter::start(|event| {
+                let mut err = io::stderr().lock();
+                serde_json::to_writer(&mut err, &event)?;
+                writeln!(err)?;
+                err.flush()
+            })
+        })
+        .transpose()
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let db = cli.db.unwrap_or_else(lumen::standard_database);
     match cli.command {
         Action::Index(args) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&lumen::scan(&db, &args.into())?)?
-            );
+            let progress = scan_progress(args.progress)?;
+            let stats = lumen::scan_with_progress(&db, &args.into(), progress.as_ref())?;
+            drop(progress);
+            println!("{}", serde_json::to_string_pretty(&stats)?);
         }
-        Action::Watch(args) => lumen::watch(&db, &args.into(), |event| {
-            let mut out = io::stdout().lock();
-            serde_json::to_writer(&mut out, &event)?;
-            writeln!(out)?;
-            out.flush()?;
-            Ok(())
-        })?,
+        Action::Watch(args) => {
+            let progress = scan_progress(args.progress)?;
+            lumen::watch_with_progress(&db, &args.into(), progress.as_ref(), |event| {
+                let mut out = io::stdout().lock();
+                serde_json::to_writer(&mut out, &event)?;
+                writeln!(out)?;
+                out.flush()?;
+                Ok(())
+            })?;
+        }
         Action::Query {
             text,
             mode,

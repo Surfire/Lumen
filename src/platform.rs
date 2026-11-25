@@ -20,16 +20,24 @@ pub fn classify(path: &Path, dataless: bool) -> &'static str {
 fn provider(path: &Path) -> bool {
     let mut prior_library = false;
     for part in path.components() {
-        let value = part.as_os_str().to_string_lossy().to_ascii_lowercase();
-        if prior_library && matches!(value.as_str(), "cloudstorage" | "mobile documents") {
+        let value = part.as_os_str().as_encoded_bytes();
+        let equals = |name: &[u8]| value.eq_ignore_ascii_case(name);
+        let starts = |prefix: &[u8]| {
+            value
+                .get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        };
+        if prior_library && (equals(b"cloudstorage") || equals(b"mobile documents")) {
             return true;
         }
-        prior_library = value == "library";
-        if matches!(
-            value.as_str(),
-            "onedrive" | "dropbox" | "google drive" | "icloud drive" | "box sync"
-        ) || value.starts_with("onedrive - ")
-            || value.starts_with("onedrive-")
+        prior_library = equals(b"library");
+        if equals(b"onedrive")
+            || equals(b"dropbox")
+            || equals(b"google drive")
+            || equals(b"icloud drive")
+            || equals(b"box sync")
+            || starts(b"onedrive - ")
+            || starts(b"onedrive-")
         {
             return true;
         }

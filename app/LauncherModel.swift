@@ -235,7 +235,7 @@ final class Launcher: ObservableObject {
         self.defaults = defaults
         let frecency = LauncherFrecency(defaults: defaults)
         self.frecency = frecency
-        shortcuts = ShortcutLibrary(defaults: defaults, frecency: frecency)
+        shortcuts = ShortcutLibrary(defaults: defaults)
         builtInActions = LaunchCatalog.systemActions()
         scopePending = engine.hasPendingScope
         language = locale ?? defaults?.string(forKey: "language") ?? "system"
@@ -694,6 +694,10 @@ final class Launcher: ObservableObject {
 
     func openingFailed() { searchNotice = LauncherNotice(.opening) }
 
+    func noteFileOpened(_ hit: SearchHit) {
+        frecency.noteOpened(LauncherFrecency.fileID(hit.path))
+    }
+
     func previewFailed() { searchNotice = LauncherNotice(.preview) }
 
     func copied(_ action: FileAction) {
@@ -712,12 +716,7 @@ final class Launcher: ObservableObject {
             if hit.isCloudReference { searchNotice = LauncherNotice(.online) }
             return
         }
-        revalidate(hit, retry: true) { [weak self] url in
-            // The UI owns NSWorkspace.open; count only opens that passed validation,
-            // not previews, reveals, copies or stale results.
-            if action == .open { self?.frecency.noteOpened(LauncherFrecency.fileID(hit.path)) }
-            complete(url)
-        }
+        revalidate(hit, retry: true, complete: complete)
     }
 
     private func revalidate(_ hit: SearchHit, retry: Bool, complete: @escaping (URL) -> Void) {

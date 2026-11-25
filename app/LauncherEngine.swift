@@ -22,6 +22,10 @@ struct SearchHit: Decodable, Equatable, Identifiable {
     }
 
     static func pathStamp(at path: String, kind: String, permitsDatalessLeaf: Bool = false) -> String? {
+        pathAttributes(at: path, kind: kind, permitsDatalessLeaf: permitsDatalessLeaf).map(filesystemStamp)
+    }
+
+    static func pathAttributes(at path: String, kind: String, permitsDatalessLeaf: Bool = false) -> stat? {
         guard path.hasPrefix("/") else { return nil }
         let policy = IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES
         let scope = IOPOL_SCOPE_THREAD
@@ -46,7 +50,7 @@ struct SearchHit: Decodable, Equatable, Identifiable {
               stat.st_mode & S_IFMT == (kind == "directory" ? S_IFDIR : S_IFREG),
               permitsDatalessLeaf || stat.st_flags & UInt32(SF_DATALESS) == 0
         else { return nil }
-        return Self.filesystemStamp(stat)
+        return stat
     }
 
     static func filesystemStamp(_ stat: stat) -> String {
@@ -343,20 +347,20 @@ final class LauncherEngine {
     var nameSearchBusy: Bool { connection?.isBusy == true }
 
     func warmNameSearch() {
-        _ = try? connect(&connection, command: ["serve"])
+        _ = try? connect(\.connection, command: ["serve"])
     }
 
     func search(_ query: String, mode: String, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
-        submit(query, mode: mode, limit: 60, to: &connection, command: ["serve"], complete: complete)
+        submit(query, mode: mode, limit: 60, to: \.connection, command: ["serve"], complete: complete)
     }
 
     func searchSemantic(_ query: String, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
-        submit(query, mode: "semantic", limit: 12, to: &semanticConnection,
+        submit(query, mode: "semantic", limit: 12, to: \.semanticConnection,
                command: ["semantic-serve"] + gemmaOptions, idleTimeout: .seconds(45), complete: complete)
     }
 
     func searchImages(_ query: String, projector: URL, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
-        submit(query, mode: "semantic", limit: 5, to: &imageConnection,
+        submit(query, mode: "semantic", limit: 5, to: \.imageConnection,
                command: ["image-serve", "--projector", projector.path] + gemmaOptions,
                idleTimeout: .seconds(45), complete: complete)
     }
@@ -370,26 +374,33 @@ final class LauncherEngine {
 
     var gemmaOptions: [String] { gemmaHome.map { ["--gemma-home", $0.path] } ?? [] }
 
-    private func submit(_ query: String, mode: String, limit: Int, to connection: inout SearchConnection?,
-                        command: [String], idleTimeout: Duration? = nil,
-                        complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
+    private func submit(_ query: String, mode: String, limit: Int,
+                        to lane: ReferenceWritableKeyPath<LauncherEngine, SearchConnection?>,
+                        command: [String], idleTimeout: Duration? = nil, complete: @escaping SearchCompletion) {
         nextID &+= 1
+        submit(SearchRequest(id: nextID, query: query, mode: mode, limit: limit),
+               to: lane, command: command, idleTimeout: idleTimeout, complete: complete)
+    }
+
+    private func submit(_ request: SearchRequest, to lane: ReferenceWritableKeyPath<LauncherEngine, SearchConnection?>,
+                        command: [String], idleTimeout: Duration?, complete: @escaping SearchCompletion) {
         do {
-            let server = try connect(&connection, command: command, idleTimeout: idleTimeout)
-            server.enqueue(SearchRequest(id: nextID, query: query, mode: mode, limit: limit), complete: complete)
+            let server = try connect(lane, command: command, idleTimeout: idleTimeout)
+            server.enqueue(request, complete: complete)
         } catch {
-            // Leave the caller's inout connection before a completion can reenter the engine.
             DispatchQueue.main.async { complete(.failure(SearchFailure(error.localizedDescription))) }
         }
     }
 
-    private func connect(_ connection: inout SearchConnection?, command: [String],
+    private func connect(_ lane: ReferenceWritableKeyPath<LauncherEngine, SearchConnection?>, command: [String],
                          idleTimeout: Duration? = nil) throws -> SearchConnection {
-        if let connection, connection.isRunning { return connection }
+        if let connection = self[keyPath: lane], connection.isRunning { return connection }
         let started = SearchConnection(executable: executable, arguments: arguments(command),
-                                       requestTimeout: requestTimeout, idleTimeout: idleTimeout)
+                                       requestTimeout: requestTimeout, idleTimeout: idleTimeout) { [weak self] request, complete in
+            self?.submit(request, to: lane, command: command, idleTimeout: idleTimeout, complete: complete)
+        }
         try started.start()
-        connection = started
+        self[keyPath: lane] = started
         return started
     }
 
@@ -426,6 +437,8 @@ struct SearchFailure: Error {
     init(_ detail: String) { self.detail = detail }
 }
 
+private typealias SearchCompletion = (Result<[SearchHit], SearchFailure>) -> Void
+
 private struct SearchRequest: Encodable {
     let id: UInt64
     let query: String
@@ -443,7 +456,7 @@ private struct SearchReply: Decodable {
 private final class SearchConnection {
     private struct Pending {
         let request: SearchRequest
-        let complete: (Result<[SearchHit], SearchFailure>) -> Void
+        let complete: SearchCompletion
     }
 
     private let process = Process()
@@ -453,15 +466,18 @@ private final class SearchConnection {
     private var queued: Pending?
     private let requestTimeout: Duration
     private let idleTimeout: Duration?
+    private let restartWith: (SearchRequest, @escaping SearchCompletion) -> Void
     private var deadline: Task<Void, Never>?
     private var stopped = false
 
     var isRunning: Bool { !stopped && process.isRunning }
     var isBusy: Bool { active != nil }
 
-    init(executable: URL, arguments: [String], requestTimeout: Duration, idleTimeout: Duration?) {
+    init(executable: URL, arguments: [String], requestTimeout: Duration, idleTimeout: Duration?,
+         restartWith: @escaping (SearchRequest, @escaping SearchCompletion) -> Void) {
         self.requestTimeout = requestTimeout
         self.idleTimeout = idleTimeout
+        self.restartWith = restartWith
         process.executableURL = executable
         process.arguments = arguments
         process.standardInput = stdin
@@ -486,7 +502,7 @@ private final class SearchConnection {
         }
     }
 
-    func enqueue(_ request: SearchRequest, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
+    func enqueue(_ request: SearchRequest, complete: @escaping SearchCompletion) {
         queued = Pending(request: request, complete: complete)
         sendNext()
     }
@@ -549,8 +565,12 @@ private final class SearchConnection {
         deadline = Task { @MainActor [weak self] in
             try? await Task.sleep(for: timeout)
             guard !Task.isCancelled, let self, self.active?.request.id == requestID else { return }
-            if requestID != nil { self.fail(SearchFailure("lumen search request timed out")) }
-            else { self.stop() }
+            let active = self.active, queued = self.queued
+            self.stop()
+            guard let active else { return }
+            // Install the replacement before notifying a caller that may submit again.
+            if let queued { self.restartWith(queued.request, queued.complete) }
+            active.complete(.failure(SearchFailure("lumen search request timed out")))
         }
     }
 

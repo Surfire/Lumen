@@ -52,17 +52,7 @@ actor ApplicationIcons {
 
     private static func readIcon(_ key: Key) -> CGImage? {
         withNoDatalessMaterialization { () -> CGImage? in
-            guard let bundle = residentBundle(at: key.url) else { return nil }
-            let resources = key.url.appendingPathComponent("Contents/Resources", isDirectory: true)
-            // IconServices may run outside our thread's I/O policy. Check for unsafe
-            // references, but leave icon format and representation selection to AppKit.
-            guard resources.isResidentIfPresent(kind: S_IFDIR) else { return nil }
-            var names = ["Assets.car"]
-            if let name = bundle.object(forInfoDictionaryKey: "CFBundleIconFile") as? String, !name.isEmpty {
-                guard !name.contains("/"), name != ".", name != ".." else { return nil }
-                names.append((name as NSString).pathExtension.isEmpty ? name + ".icns" : name)
-            }
-            guard names.allSatisfy({ resources.appendingPathComponent($0).isResidentIfPresent(kind: S_IFREG) }) else { return nil }
+            guard residentApplicationAttributes(key.url) != nil else { return nil }
             let icon = NSWorkspace.shared.icon(forFile: key.url.path)
             var rect = NSRect(x: 0, y: 0, width: 64, height: 64)
             return icon.cgImage(forProposedRect: &rect, context: nil, hints: nil)
@@ -198,10 +188,10 @@ enum LaunchCatalog {
             } else {
                 target = URL(fileURLWithPath: source, isDirectory: true)
             }
-            // pathStamp does not follow symlinks: a second bundle link is not accepted.
+            // A second bundle link is not accepted.
             guard target.pathExtension.lowercased() == "app",
-                  let stamp = SearchHit.pathStamp(at: target.path, kind: "directory"),
-                  let bundle = residentBundle(at: target), let identifier = bundle.bundleIdentifier,
+                  let attributes = residentApplicationAttributes(target),
+                  let bundle = Bundle(url: target), let identifier = bundle.bundleIdentifier,
                   identifier != settingsBundleID, identifier != "io.github.surfire.lumen",
                   bundle.object(forInfoDictionaryKey: "CFBundlePackageType") as? String == "APPL",
                   seen.insert(identifier).inserted else { return }
@@ -216,7 +206,8 @@ enum LaunchCatalog {
                 + (commonAliases[normalizedID] ?? []) + (initials.count > 1 ? [String(initials)] : [])
                 + pinyinAliases(chinese) + (localized == chinese ? [] : pinyinAliases(localized))
             actions.append(LaunchAction(id: "app:" + identifier, english: english, chinese: chinese,
-                                        symbol: "app", destination: .application(target, stamp: stamp), aliases: aliases))
+                                        symbol: "app", destination: .application(target, stamp: SearchHit.filesystemStamp(attributes)),
+                                        aliases: aliases))
         }
 
         // Limit discovery to app roots and one level of organizational folders.
@@ -270,7 +261,7 @@ enum LaunchCatalog {
             .filter { $0.isLetter || $0.isNumber }
     }
 
-    static func match(_ term: String, in candidate: String) -> Int {
+    private static func match(_ term: String, in candidate: String) -> Int {
         if candidate == term { return 100 }
         if candidate.hasPrefix(term) { return term.count == 1 ? 45 : 80 }
         guard term.count >= 2 else { return 0 }
@@ -298,17 +289,12 @@ private func withNoDatalessMaterialization<T>(_ body: () -> T?) -> T? {
     return body()
 }
 
-private func residentBundle(at url: URL) -> Bundle? {
-    guard !url.isInCloudStorage,
-          let values = url.resourceValuesIfLocal([.isDirectoryKey, .isSymbolicLinkKey, .isUbiquitousItemKey, .volumeIsLocalKey]),
-          values.isDirectory == true, values.volumeIsLocal == true else { return nil }
-    let plist = url.appendingPathComponent("Contents/Info.plist").path
-    let fd = Darwin.open(plist, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW_ANY)
-    guard fd >= 0 else { return nil }
-    defer { Darwin.close(fd) }
-    var info = stat()
-    guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_flags & UInt32(SF_DATALESS) == 0 else { return nil }
-    return Bundle(url: url)
+private func residentApplicationAttributes(_ url: URL) -> stat? {
+    // Check the resolved bundle and its ancestors, not Launch Services' internal bundle layout.
+    guard !url.isInCloudStorage, let attributes = SearchHit.pathAttributes(at: url.path, kind: "directory"),
+          let values = try? url.resourceValues(forKeys: [.isUbiquitousItemKey, .volumeIsLocalKey]),
+          values.isUbiquitousItem != true, values.volumeIsLocal == true else { return nil }
+    return attributes
 }
 
 private extension URL {
@@ -316,12 +302,6 @@ private extension URL {
         // Launch Services and IconServices can access the bundle outside our I/O policy.
         let path = path + "/"
         return path.contains("/Library/CloudStorage/") || path.contains("/Library/Mobile Documents/")
-    }
-
-    func isResidentIfPresent(kind: mode_t) -> Bool {
-        var attributes = stat()
-        if lstat(path, &attributes) != 0 { return errno == ENOENT }
-        return attributes.st_mode & S_IFMT == kind && attributes.st_flags & UInt32(SF_DATALESS) == 0
     }
 
     func resourceValuesIfLocal(_ keys: Set<URLResourceKey>) -> URLResourceValues? {
@@ -348,9 +328,8 @@ enum LaunchDispatcher {
         let workspace = NSWorkspace.shared
         switch action.destination {
         case .application(let url, _):
-            let started = withNoDatalessMaterialization {
-                guard let bundle = residentBundle(at: url),
-                      bundle.executableURL?.isResidentIfPresent(kind: S_IFREG) != false else { return nil as Bool? }
+            let started = withNoDatalessMaterialization { () -> Bool? in
+                guard residentApplicationAttributes(url) != nil else { return nil }
                 let options = NSWorkspace.OpenConfiguration()
                 options.activates = activates
                 options.addsToRecentItems = activates

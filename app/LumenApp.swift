@@ -604,10 +604,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
         model.resolve(hit, action: .open) { [weak self] url in
             guard let self else { return }
-            if let smoke = self.smoke {
+            if let smoke = self.smoke, smoke.simulatesFileOpen(url) {
                 smoke.opened = url
                 self.dismissSearch()
             } else if NSWorkspace.shared.open(url) {
+                self.model.noteFileOpened(hit)
                 self.dismissSearch()
             } else {
                 self.model.openingFailed()

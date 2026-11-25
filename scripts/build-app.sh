@@ -22,7 +22,8 @@ done
 /usr/bin/iconutil -c icns -o "$APP/Contents/Resources/Lumen.icns" "$iconset"
 xcrun swiftc -O -swift-version 5 -target "$SWIFT_TARGET" -module-cache-path "$PWD/target/SwiftModuleCache" -parse-as-library -D LUMEN_EXTENSIONS \
     app/LumenApp.swift app/LauncherEngine.swift app/LauncherHotKey.swift app/LauncherModel.swift \
-    app/LauncherViews.swift app/LauncherActions.swift app/LauncherPreview.swift app/LauncherShortcuts.swift app/LauncherCalculation.swift app/LauncherSmoke.swift extensions/LumenExtensionPanel.swift -o "$APP/Contents/MacOS/Lumen"
+    app/LauncherViews.swift app/LauncherActions.swift app/LauncherPreview.swift app/LauncherShortcuts.swift app/LauncherCalculation.swift app/LauncherSmoke.swift \
+    app/TranslationClient.swift app/TranslationModel.swift app/TranslationPanel.swift extensions/LumenExtensionPanel.swift -o "$APP/Contents/MacOS/Lumen"
 xcrun swiftc -O -swift-version 5 -target "$SWIFT_TARGET" -module-cache-path "$PWD/target/SwiftModuleCache" app/LocalEmbedding.swift -o "$APP/Contents/Resources/LumenLocalEmbedding"
 xcrun swiftc -O -swift-version 5 -target "$SWIFT_TARGET" -module-cache-path "$PWD/target/SwiftModuleCache" app/ExtractPdf.swift -o "$APP/Contents/Resources/LumenPdfExtractor"
 cat > "$APP/Contents/Info.plist" <<'PLIST'

@@ -207,6 +207,9 @@ enum Action {
         /// Emit progress reports as JSON lines on stderr.
         #[arg(long)]
         progress: bool,
+        /// Verify that this is still the volume selected by the client.
+        #[arg(long)]
+        uuid: Option<String>,
         path: PathBuf,
     },
     /// Remove an external volume catalog and its authorization.
@@ -425,9 +428,13 @@ fn main() -> Result<()> {
             );
         }
         Action::Volumes => println!("{}", serde_json::to_string(&lumen::volumes(&db))?),
-        Action::IndexVolume { path, progress } => {
+        Action::IndexVolume {
+            path,
+            progress,
+            uuid,
+        } => {
             let progress = scan_progress(progress)?;
-            let stats = lumen::index_volume(&db, &path, progress.as_ref())?;
+            let stats = lumen::index_volume(&db, &path, uuid.as_deref(), progress.as_ref())?;
             drop(progress);
             println!("{}", serde_json::to_string(&stats)?);
         }

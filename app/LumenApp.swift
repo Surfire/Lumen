@@ -34,6 +34,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var languageChange: AnyCancellable?
     private var presentationChange: AnyCancellable?
     private var presentationScheduled = false
+    private var volumeChanges: AnyCancellable?
+    private var externalVolumesWindow: NSPanel?
+    let externalVolumes: ExternalVolumeCatalog
     private(set) var settings: NSPanel?
     private(set) var translationWindow: NSPanel?
     private(set) lazy var settingsSession = SettingsSession(model: model)
@@ -159,6 +162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         let engine = LauncherEngine(executable: executable, database: database,
                                     syntheticRoot: smoke?.corpus, gemmaHome: smoke?.gemmaHome)
         model = Launcher(engine: engine, defaults: defaults, locale: smoke?.language)
+        externalVolumes = ExternalVolumeCatalog(engine: engine)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -184,6 +188,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
         updateLanguage()
         model.start()
+        if smoke == nil {
+            let workspace = NSWorkspace.shared.notificationCenter
+            volumeChanges = workspace.publisher(for: NSWorkspace.didMountNotification)
+                .merge(with: workspace.publisher(for: NSWorkspace.didUnmountNotification),
+                       workspace.publisher(for: NSWorkspace.didRenameVolumeNotification))
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in self?.externalVolumeStateChanged() }
+        }
         loadApplicationCatalog()
         if let smoke { Task { @MainActor in await smoke.run(self) } }
     }
@@ -225,6 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     func applicationWillTerminate(_ notification: Notification) {
         localPreview?.close()
+        externalVolumes.stop()
         globalHotKey.close()
         model.close()
     }
@@ -560,6 +573,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if searchPresented { dismissSearch() }
     }
 
+    func externalVolumeStateChanged() {
+        model.externalVolumesChanged()
+        if externalVolumesWindow?.isVisible == true { externalVolumes.reload() }
+    }
+
+    @objc func showExternalVolumes() {
+        externalVolumes.reload()
+        if externalVolumesWindow == nil {
+            let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 540, height: 330),
+                                 styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            window.hidesOnDeactivate = false
+            window.contentMinSize = NSSize(width: 480, height: 240)
+            window.contentView = NSHostingView(rootView: LauncherExternalVolumes(
+                launcher: model, catalog: externalVolumes,
+                changed: { [weak self] in self?.model.externalVolumesChanged() }
+            ))
+            if smoke == nil { window.center() }
+            externalVolumesWindow = window
+        }
+        externalVolumesWindow?.title = model.t("外置卷", "External Volumes")
+        if smoke == nil {
+            NSApp.activate()
+            externalVolumesWindow?.makeKeyAndOrderFront(nil)
+        }
+    }
+
     @objc func showSettings() {
         if smoke == nil { NSApp.activate() }
         if settings == nil {
@@ -722,6 +762,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         updateStatusMenu()
         installEditMenu()
         settings?.title = model.t("Lumen 设置", "Lumen Settings")
+        externalVolumesWindow?.title = model.t("外置卷", "External Volumes")
     }
 
     private func updateSearchField() {
@@ -744,6 +785,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         menu.addItem(withTitle: model.t("扩展…", "Extensions…"), action: #selector(showExtensions), keyEquivalent: "").target = self
         #endif
         menu.addItem(withTitle: model.t("快捷链接…", "Quicklinks…"), action: #selector(showQuicklinks), keyEquivalent: "").target = self
+        menu.addItem(withTitle: model.t("外置卷…", "External Volumes…"),
+                     action: #selector(showExternalVolumes), keyEquivalent: "").target = self
         menu.addItem(withTitle: model.t("设置…", "Settings…"), action: #selector(showSettings), keyEquivalent: "").target = self
         menu.addItem(.separator())
         menu.addItem(withTitle: model.t("退出 Lumen", "Quit Lumen"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "").target = NSApp

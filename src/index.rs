@@ -245,6 +245,10 @@ pub(super) fn scan_external(
 ) -> Result<ScanStats> {
     #[cfg(target_os = "macos")]
     let _io = platform::NoMaterialization::enter()?;
+    ensure!(
+        boundary.device().is_some(),
+        "external volume device is unverified"
+    );
     let root = boundary.root().to_owned();
     deny.extend(
         [
@@ -695,7 +699,7 @@ impl<'a> Walk<'a> {
             if let Some(boundary) = &self.coverage.external
                 && metadata
                     .as_ref()
-                    .is_none_or(|metadata| metadata.dev() != boundary.device())
+                    .is_none_or(|metadata| Some(metadata.dev()) != boundary.device())
             {
                 self.stats.skipped += 1;
                 continue;
@@ -776,7 +780,7 @@ impl<'a> Walk<'a> {
                     self.coverage
                         .external
                         .as_ref()
-                        .map(|boundary| boundary.device()),
+                        .and_then(|boundary| boundary.device()),
                 ) {
                     Ok(children) => {
                         self.readable_roots += usize::from(is_root);

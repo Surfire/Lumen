@@ -80,6 +80,29 @@ def query_hits(args):
     return hits
 
 
+volume_uuid = "01234567-89ab-cdef-0123-456789abcdef"
+volume_mount = "/Volumes/Lumen-Synthetic"
+volume_catalog = work / "volume-indexed"
+volume_connected = not (work / "volume-disconnected").exists()
+if action == "volumes":
+    registered = volume_catalog.exists()
+    rows = [dict(uuid=volume_uuid, path=volume_mount, available=volume_connected,
+                 indexed=registered and volume_connected, needs_refresh=registered and not volume_connected)]
+    print(json.dumps(rows if registered or volume_connected else []))
+    sys.exit(0)
+if action == "index-volume":
+    assert args == ["--progress", "--uuid", volume_uuid, "--", volume_mount]
+    assert volume_connected
+    progress("scanning", 17, 750)
+    volume_catalog.touch()
+    print(json.dumps({"items": 17}))
+    sys.exit(0)
+if action == "forget-volume":
+    assert args == ["--", volume_uuid]
+    volume_catalog.unlink()
+    print(json.dumps({"removed": True}))
+    sys.exit(0)
+
 if action == "index":
     if "--progress" in args:
         args.remove("--progress")
@@ -268,6 +291,14 @@ if action == "serve":
             gate("pre-han-name")
         if req["query"] == "late lexical delivery" and not (work / "finish-late-name").exists():
             gate("late-name")
+        if req["query"] == "external-volume-fixture":
+            hits = []
+            if volume_catalog.exists() and not (work / "volume-disconnected").exists():
+                name = "external-volume-fixture.txt"
+                hits.append(dict(path=volume_mount + "/" + name, name=name, kind="file",
+                                 availability="local", matched_by="name"))
+            print(json.dumps({"id": req["id"], "hits": hits}), flush=True)
+            continue
         try:
             hits = query_hits(["--mode", req["mode"], "--limit", str(req["limit"]), "--", req["query"]])
             reply = {"id": req["id"], "hits": hits}
@@ -432,6 +463,7 @@ def main():
                         help="Also verify the signed GUI with pinned offline Gemma resources in this directory")
     parser.add_argument("--content-only", action="store_true", help="Only verify selected content folders and native PDF page opening")
     parser.add_argument("--query-syntax", action="store_true", help="Also verify multiword and bare-extension queries in the unified field")
+    parser.add_argument("--external-volumes", action="store_true", help="Run only the synthetic external volume panel scenario")
     parser.add_argument("--snapshots", type=Path, help="Save offscreen PNGs to this directory")
     args = parser.parse_args()
     if args.watch_engine and not args.watch_engine.is_file():
@@ -440,6 +472,17 @@ def main():
         parser.error("--real-gemma must point to a pinned Gemma resource directory")
     if not APP.is_file():
         raise SystemExit("Build the app first with scripts/build-app.sh")
+    if args.external_volumes:
+        with tempfile.TemporaryDirectory(prefix="lumen-gui-volumes-") as tmp:
+            root = Path(tmp).resolve()
+            make_corpus(root)
+            fixture = install_fixture(root)
+            (root / "external-volume-scenario").touch()
+            subprocess.run([str(fixture), "--db", str(root / "index.sqlite"),
+                            "index", "--root", str(root / "corpus")],
+                           check=True, timeout=15, capture_output=True)
+            run(root, "en")
+        return
     verify_content_pipeline()
     if args.content_only:
         return

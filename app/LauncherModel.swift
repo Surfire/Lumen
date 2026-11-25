@@ -368,6 +368,14 @@ final class Launcher: ObservableObject {
 
     func retrySearch() { scheduleSearch() }
 
+    func externalVolumesChanged() {
+        guard hasQuery, canSearch, !closed else { return }
+        let isLocal: (SearchHit) -> Bool = { !$0.path.lowercased().hasPrefix("/volumes/") }
+        directHits = directHits.filter(isLocal)
+        publishHits(hits.filter(isLocal))
+        scheduleSearch()
+    }
+
     func warmNameSearch() {
         if canSearch && !closed { engine.warmNameSearch() }
     }

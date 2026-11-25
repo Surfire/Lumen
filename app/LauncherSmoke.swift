@@ -128,6 +128,11 @@ final class LauncherSmoke {
             return
         }
 
+        if exists("external-volume-scenario") {
+            try await verifyExternalVolumes(app)
+            return
+        }
+
         if controlledTiming && startsWithIndex {
             if exists("settings-scenario") {
                 try await verifySettings(app)
@@ -1216,6 +1221,42 @@ final class LauncherSmoke {
         try check(!exists("embedding-8-started"), "editing scope queued a batch for the old scope")
         try await until("document coverage settled after controlled batches") { model.gemmaCoverage?.complete == true }
         try check(model.watchState == .running && watchLaunches() == 1, "embedding generation restarted the watcher")
+    }
+
+    private func verifyExternalVolumes(_ app: AppDelegate) async throws {
+        let model = app.model
+        let catalog = app.externalVolumes
+        try await until("the synthetic main index is available") { model.canSearch }
+        guard let menu = app.statusMenu?.items.first(where: { $0.action == #selector(AppDelegate.showExternalVolumes) }),
+              let action = menu.action
+        else { throw Failure("external volumes menu item is missing") }
+        try check(NSApp.sendAction(action, to: menu.target, from: menu), "external volumes menu did not open")
+        try await until("eligible volume was listed") { !catalog.refreshing && catalog.volumes.count == 1 }
+        guard let offered = catalog.volumes.first else { throw Failure("eligible volume list was empty") }
+        try check(offered.available && !offered.indexed && !offered.needs_refresh, "new volume was not opt-in")
+
+        try type("external-volume-fixture", into: app)
+        try await until("unregistered volume remained hidden") { !model.searching }
+        try check(model.hits.isEmpty, "unregistered external volume appeared")
+        catalog.index(offered, changed: model.externalVolumesChanged)
+        try await until("explicit volume index was applied") {
+            catalog.editing == nil && catalog.volumes.first?.indexed == true &&
+                model.hits.contains { $0.name == "external-volume-fixture.txt" }
+        }
+
+        try signal("volume-disconnected")
+        app.externalVolumeStateChanged()
+        try check(model.hits.isEmpty, "disconnected volume lingered in existing results")
+        catalog.reload()
+        try await until("disconnected snapshot was listed") {
+            catalog.volumes.first?.available == false && catalog.volumes.first?.needs_refresh == true
+        }
+        guard let oldVolume = catalog.volumes.first else { throw Failure("saved unavailable volume was missing") }
+        catalog.forget(oldVolume, changed: model.externalVolumesChanged)
+        try await until("external index was removed") {
+            catalog.editing == nil && !catalog.refreshing && catalog.volumes.isEmpty
+        }
+        try check(!catalog.failed && model.hits.isEmpty, "forget left external results behind")
     }
 
     private func waitForEmbeddingBatch(_ batch: Int) async throws {

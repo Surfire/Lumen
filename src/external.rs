@@ -17,29 +17,30 @@ const KEY: &str = "external_volume";
 pub(super) struct Mount {
     pub(super) path: PathBuf,
     uuid: String,
-    pub(super) device: u64,
+    filesystem_id: [i32; 2],
+    media_id: u64,
     boot: String,
     source: String,
 }
 
 #[derive(Clone)]
 pub(super) struct Boundary {
-    mount: Mount,
+    root: PathBuf,
+    device: Option<u64>,
     nested: Vec<PathBuf>,
 }
 
 impl Boundary {
     pub(super) fn root(&self) -> &Path {
-        &self.mount.path
+        &self.root
     }
 
-    pub(super) fn device(&self) -> u64 {
-        self.mount.device
+    pub(super) fn device(&self) -> Option<u64> {
+        self.device
     }
 
     pub(super) fn allows(&self, path: &Path) -> bool {
-        path.starts_with(&self.mount.path)
-            && !self.nested.iter().any(|nested| path.starts_with(nested))
+        path.starts_with(&self.root) && !self.nested.iter().any(|nested| path.starts_with(nested))
     }
 }
 
@@ -52,7 +53,8 @@ struct Mounted {
 impl Mounted {
     fn boundary(&self, volume: &Mount) -> Boundary {
         Boundary {
-            mount: volume.clone(),
+            root: volume.path.clone(),
+            device: None,
             nested: self
                 .points
                 .iter()
@@ -163,14 +165,20 @@ pub struct VolumeStatus {
 }
 
 pub fn volumes(database: &Path) -> Vec<VolumeStatus> {
-    let Ok(deny) = deny_rules(database) else {
-        return Vec::new();
+    let (deny, registered) = match deny_rules(database) {
+        Ok(deny) => (
+            deny,
+            registrations(database)
+                .into_iter()
+                .map(|(_, _, volume)| volume)
+                .collect::<Vec<_>>(),
+        ),
+        // Before first indexing the panel can list eligible devices, but
+        // publishing an existing catalog requires a verified primary scope.
+        Err(_) if database.try_exists().is_ok_and(|exists| !exists) => (Vec::new(), Vec::new()),
+        Err(_) => return Vec::new(),
     };
     let attached = mounted();
-    let registered: Vec<_> = registrations(database)
-        .into_iter()
-        .map(|(_, _, volume)| volume)
-        .collect();
     let uuids: std::collections::BTreeSet<_> = registered
         .iter()
         .chain(&attached.eligible)
@@ -201,9 +209,6 @@ pub fn volumes(database: &Path) -> Vec<VolumeStatus> {
 }
 
 fn deny_rules(database: &Path) -> Result<Vec<PathBuf>> {
-    if !database.try_exists()? {
-        return Ok(Vec::new());
-    }
     let conn = open_read(database)?;
     let scope = crate::saved_index_scope(&conn)?.context("main catalog scope is not verified")?;
     Ok(scope.deny)
@@ -218,8 +223,12 @@ fn permitted(deny: &[PathBuf], path: &Path) -> bool {
 pub fn index_volume(
     database: &Path,
     root: &Path,
+    expected_uuid: Option<&str>,
     progress: Option<&crate::ScanProgressReporter>,
 ) -> Result<crate::ScanStats> {
+    use std::os::unix::fs::MetadataExt;
+    #[cfg(target_os = "macos")]
+    let _io = crate::platform::NoMaterialization::enter()?;
     let root = absolute(root)?;
     ensure!(
         root.parent() == Some(Path::new("/Volumes")),
@@ -246,6 +255,16 @@ pub fn index_volume(
         matches.next().is_none() && attached.matches(volume),
         "external volume mount identity is ambiguous"
     );
+    ensure!(
+        expected_uuid.is_none_or(|expected| expected.eq_ignore_ascii_case(&volume.uuid)),
+        "the selected external volume was replaced"
+    );
+    let metadata = fs::symlink_metadata(&root)?;
+    let current = mounted();
+    ensure!(
+        metadata.is_dir() && current.matches(volume),
+        "the selected external volume changed"
+    );
     let directory = folder(database)?;
     crate::secure_dir(&directory)?;
     check_folder(&directory)?;
@@ -253,7 +272,10 @@ pub fn index_volume(
     let (mut conn, _lease) = crate::open_write(&catalog, true)?;
     // A partially completed manual scan must never become searchable.
     conn.execute("DELETE FROM info WHERE key=?1", [KEY])?;
-    let boundary = attached.boundary(volume);
+    let boundary = Boundary {
+        device: Some(metadata.dev()),
+        ..current.boundary(volume)
+    };
     let stats = crate::index::scan_external(&catalog, &mut conn, boundary, deny, progress)?;
     let current = mounted();
     ensure!(
@@ -511,13 +533,14 @@ mod tests {
         }
     }
 
-    fn mount(path: PathBuf, device: u64) -> Mount {
+    fn mount(path: PathBuf, filesystem_id: [i32; 2]) -> Mount {
         Mount {
             path,
-            device,
+            filesystem_id,
             uuid: UUID.into(),
             boot: "test-boot".into(),
             source: "test-device".into(),
+            media_id: 1,
         }
     }
 
@@ -529,7 +552,7 @@ mod tests {
         crate::secure_dir(&directory).unwrap();
         let sidecar = directory.join(format!("{UUID}.sqlite"));
         let root = PathBuf::from("/Volumes/Lumen-Synthetic-External");
-        let volume = mount(root.clone(), 42);
+        let volume = mount(root.clone(), [42, 1]);
         let nested = root.join("Nested");
         let (conn, lease) = crate::open_write(&sidecar, true).unwrap();
         for relative in ["report.txt", "Nested/report-secret.txt"] {
@@ -572,14 +595,28 @@ mod tests {
             hits.into_iter().map(|hit| hit.name).collect::<Vec<_>>()
         };
         let active = || state(vec![volume.clone()]);
+        assert!(query(&active).is_empty());
+        let (conn, _lease) = crate::open_write(&primary, true).unwrap();
+        let mut scope = crate::Scope {
+            roots: vec![scratch.0.clone()],
+            ..crate::Scope::default()
+        };
+        conn.execute(
+            "INSERT INTO info(key,value) VALUES('scope',?1)",
+            [serde_json::to_string(&scope).unwrap()],
+        )
+        .unwrap();
         assert_eq!(query(&active), ["report.txt"]);
         assert!(query(&Mounted::default).is_empty());
         let mut replacement = volume.clone();
         replacement.uuid = "01234567-89ab-cdef-0123-456789abcdee".into();
         assert!(query(&|| state(vec![replacement.clone()])).is_empty());
         let mut reconnected = volume.clone();
-        reconnected.device += 1;
+        reconnected.filesystem_id[0] += 1;
         assert!(query(&|| state(vec![reconnected.clone()])).is_empty());
+        let mut reused_mount = volume.clone();
+        reused_mount.media_id += 1;
+        assert!(query(&|| state(vec![reused_mount.clone()])).is_empty());
         assert!(query(&|| state(vec![volume.clone(), volume.clone()])).is_empty());
         let calls = Cell::new(0);
         assert!(
@@ -594,13 +631,9 @@ mod tests {
             .is_empty()
         );
 
-        let (conn, _lease) = crate::open_write(&primary, true).unwrap();
-        let scope = crate::Scope {
-            deny: vec![root.clone()],
-            ..crate::Scope::default()
-        };
+        scope.deny = vec![root.clone()];
         conn.execute(
-            "INSERT INTO info(key,value) VALUES('scope',?1)",
+            "UPDATE info SET value=?1 WHERE key='scope'",
             [serde_json::to_string(&scope).unwrap()],
         )
         .unwrap();
@@ -628,11 +661,12 @@ mod tests {
         let body = "private body must not be indexed";
         fs::write(root.join("report.txt"), body).unwrap();
         symlink(root.join("report.txt"), root.join("linked.txt")).unwrap();
-        let volume = mount(root.clone(), fs::metadata(&root).unwrap().dev());
+        let device = fs::metadata(&root).unwrap().dev();
         let sidecar = scratch.0.join("volume.sqlite");
         let (mut conn, _lease) = crate::open_write(&sidecar, true).unwrap();
         let boundary = Boundary {
-            mount: volume,
+            root: root.clone(),
+            device: Some(device),
             nested: vec![root.join("Nested")],
         };
         crate::index::scan_external(
@@ -651,10 +685,7 @@ mod tests {
         assert!(query(&conn, "linked", Mode::Name).is_empty());
         assert!(query(&conn, body, Mode::Text).is_empty());
         let wrong_device = Boundary {
-            mount: Mount {
-                device: boundary.mount.device + 1,
-                ..boundary.mount
-            },
+            device: Some(device + 1),
             ..boundary
         };
         assert!(
@@ -662,5 +693,21 @@ mod tests {
                 .is_err()
         );
         assert!(query(&conn, "report", Mode::Name).is_empty());
+    }
+
+    #[test]
+    fn mixed_legacy_watch_scope_never_widens_to_the_startup_volume() {
+        let external = PathBuf::from("/Volumes/Lumen-Synthetic");
+        let local = PathBuf::from("/Users/Example");
+        let mut mixed = crate::Scope {
+            roots: vec![local.clone(), external.clone()],
+            allow: vec![local.clone(), external.clone()],
+            ..crate::Scope::default()
+        };
+        retain_local_watch_scope(&mut mixed).unwrap();
+        assert_eq!(mixed.roots, std::slice::from_ref(&local));
+        assert_eq!(mixed.allow, std::slice::from_ref(&local));
+        mixed.allow = vec![external];
+        assert!(retain_local_watch_scope(&mut mixed).is_err());
     }
 }

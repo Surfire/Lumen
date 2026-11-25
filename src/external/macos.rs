@@ -1,9 +1,8 @@
 use super::{Mount, Mounted, uuid_valid};
 use std::{
     ffi::{CStr, OsStr, c_char, c_void},
-    fs,
     mem::{MaybeUninit, size_of},
-    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    os::unix::ffi::OsStrExt,
     path::Path,
     ptr::{null, null_mut},
 };
@@ -28,9 +27,16 @@ unsafe extern "C" {
     fn DASessionCreate(allocator: Cf) -> Cf;
     fn DADiskCreateFromBSDName(allocator: Cf, session: Cf, name: *const c_char) -> Cf;
     fn DADiskCopyDescription(disk: Cf) -> Cf;
+    fn DADiskCopyIOMedia(disk: Cf) -> u32;
     static kDADiskDescriptionDeviceInternalKey: Cf;
     static kDADiskDescriptionDeviceProtocolKey: Cf;
     static kDADiskDescriptionVolumeUUIDKey: Cf;
+}
+
+#[link(name = "IOKit", kind = "framework")]
+unsafe extern "C" {
+    fn IORegistryEntryGetRegistryEntryID(media: u32, id: *mut u64) -> libc::c_int;
+    fn IOObjectRelease(media: u32) -> libc::c_int;
 }
 
 struct Owned(Cf);
@@ -87,7 +93,7 @@ fn boot_session() -> Option<String> {
     )
 }
 
-fn physical_uuid(session: &Owned, source: &CStr) -> Option<String> {
+fn physical_identity(session: &Owned, source: &CStr) -> Option<(String, u64)> {
     if !source.to_bytes().starts_with(b"/dev/disk") {
         return None;
     }
@@ -125,7 +131,19 @@ fn physical_uuid(session: &Owned, source: &CStr) -> Option<String> {
     }
     let uuid = Owned::new(unsafe { CFUUIDCreateString(null(), uuid) })?;
     let uuid = string(uuid.0)?.to_ascii_lowercase();
-    uuid_valid(&uuid).then_some(uuid)
+    if !uuid_valid(&uuid) {
+        return None;
+    }
+    // The boot-local media registry entry disambiguates clones even if macOS
+    // recycles a device number, filesystem ID and mount point.
+    let media = unsafe { DADiskCopyIOMedia(disk.0) };
+    if media == 0 {
+        return None;
+    }
+    let mut media_id = 0;
+    let status = unsafe { IORegistryEntryGetRegistryEntryID(media, &mut media_id) };
+    unsafe { IOObjectRelease(media) };
+    (status == 0 && media_id != 0).then_some((uuid, media_id))
 }
 
 pub(super) fn mounted() -> Option<Mounted> {
@@ -151,23 +169,22 @@ pub(super) fn mounted() -> Option<Mounted> {
         result.points.push(path.to_owned());
         if path.parent() != Some(Path::new("/Volumes"))
             || mount.f_flags & libc::MNT_LOCAL as u32 == 0
+            || mount.f_flags & libc::MNT_DONTBROWSE as u32 != 0
         {
             continue;
         }
         let source = unsafe { CStr::from_ptr(mount.f_mntfromname.as_ptr()) };
-        let Some(uuid) = physical_uuid(&session, source) else {
+        let Some((uuid, media_id)) = physical_identity(&session, source) else {
             continue;
         };
-        let Ok(metadata) = fs::symlink_metadata(path) else {
-            continue;
-        };
-        if !metadata.is_dir() || metadata.dev() == 0 {
-            continue;
-        }
+        // Darwin's fsid_t contains exactly two i32 words. Reading them from
+        // the mount table avoids stat'ing an external root before opt-in.
+        let filesystem_id = unsafe { std::mem::transmute::<libc::fsid_t, [i32; 2]>(mount.f_fsid) };
         result.eligible.push(Mount {
             path: path.to_owned(),
             uuid,
-            device: metadata.dev(),
+            filesystem_id,
+            media_id,
             boot: boot.clone(),
             source: source.to_string_lossy().into_owned(),
         });

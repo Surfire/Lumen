@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import Darwin
 import PDFKit
 import Quartz
@@ -90,6 +91,20 @@ struct PreviewSnapshot {
 }
 
 enum LocalFile {
+    static func dragURL(for hit: SearchHit) -> URL? {
+        guard hit.isLocal, SearchHit.pathAttributes(at: hit.path, kind: hit.kind) != nil else { return nil }
+        let policy = IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES
+        let scope = IOPOL_SCOPE_THREAD
+        let prior = getiopolicy_np(policy, scope)
+        guard prior >= 0, setiopolicy_np(policy, scope, IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0 else { return nil }
+        defer { _ = setiopolicy_np(policy, scope, prior) }
+        var volume = statfs()
+        let path = hit.path + "/"
+        guard !path.contains("/Library/CloudStorage/"), !path.contains("/Library/Mobile Documents/"),
+              statfs(hit.path, &volume) == 0, volume.f_flags & UInt32(MNT_LOCAL) != 0 else { return nil }
+        return URL(fileURLWithPath: hit.path, isDirectory: hit.kind == "directory")
+    }
+
     static func openReadOnly(_ path: String) -> Int32? {
         let components = path.split(separator: "/")
         guard path.hasPrefix("/"), !components.isEmpty,
@@ -167,6 +182,20 @@ final class LocalPreviewPanel: NSPanel {
         pdf?.document = nil
         super.close()
         snapshot.remove()
+    }
+
+    var onToggle: (() -> Void)?
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown {
+            let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+            if modifiers.isEmpty && event.keyCode == kVK_Space ||
+                modifiers == [.command] && event.charactersIgnoringModifiers?.lowercased() == "y" {
+                if !event.isARepeat { onToggle?() }
+                return
+            }
+        }
+        super.sendEvent(event)
     }
 
     var previewURL: URL? { closed ? nil : snapshot.url }

@@ -31,6 +31,7 @@ final class LauncherSmoke {
     var dispatchedQuicklinks: [URL] = []
     var chosenQuicklinkFolder: URL?
     var chosenSettingsDirectories: [URL]?
+    var automaticIndexScenario: Bool { exists("automatic-index-scenario") }
     var chosenDiagnosticFile: URL?
     var chosenImageFolder: URL?
     var chosenImageProjector: URL?
@@ -186,6 +187,21 @@ final class LauncherSmoke {
             try await verifyContentPipeline(app)
             return
         }
+        if automaticIndexScenario {
+            app.showSearch()
+            try type("archive", into: app)
+            try await until("automatic name indexing reports progress without dismissing the search") {
+                model.scanProgress?.entries == 17 && model.isIndexing && app.searchPresented
+            }
+            try signal("finish-cold-progress")
+            try await until("automatic first launch returned names without reopening") {
+                model.watchState == .running && model.hits.contains { $0.name == "archive-one.txt" }
+            }
+            try check(app.searchPresented && model.query == "archive" && model.savedScope?.documents == false,
+                      "automatic indexing stole focus, cleared input, or enabled document indexing")
+            return
+        }
+
         if exists("action-scenario") {
             try await verifyActions(app)
             return
@@ -226,25 +242,29 @@ final class LauncherSmoke {
             if controlledTiming { model.scope.content_roots = nil }
             model.scope.documents = controlledTiming
             app.startBackgroundIndex()
-            try check(model.isIndexing && !app.searchPresented, "first-run index did not dismiss the launcher")
+            try check(model.isIndexing && app.searchPresented, "starting the name index dismissed the launcher")
             if controlledTiming {
-                try await until("cold progress available while launcher stays hidden") {
-                    model.scanProgress?.entries == 17 && !app.searchPresented &&
+                try await until("cold progress available while launcher stays open") {
+                    model.scanProgress?.entries == 17 && app.searchPresented &&
                         app.statusMenu?.items.contains(where: { $0.title.contains("剩余时间待估") }) == true
                 }
                 try check(model.scanProgress?.fraction == nil && model.scanProgress?.eta == nil &&
                           app.statusMenu?.items.contains(where: { $0.title.contains("剩余时间待估") }) == true,
                           "cold progress showed an estimate or was missing from menu")
-                app.showSearch()
                 try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
                 try check(!app.searchPresented && model.isIndexing, "Escape canceled background indexing")
                 try signal("finish-cold-progress")
             }
             do {
-                try await until("first names snapshot ready without reopening") { model.indexPhase == .ready && !app.searchPresented }
-                app.showSearch()
-                try type("archive", into: app)
-                try await until("names searchable after an explicit reopen") { model.hits.contains { $0.name == "archive-one.txt" } }
+                try await until("first names snapshot ready") { model.indexPhase == .ready }
+                if controlledTiming {
+                    try check(!app.searchPresented, "completing the scan reopened a dismissed panel")
+                    app.showSearch()
+                    try type("archive", into: app)
+                } else {
+                    try check(app.searchPresented && model.query == "archive", "completing the scan reset launcher input")
+                }
+                try await until("names searchable after the first scan") { model.hits.contains { $0.name == "archive-one.txt" } }
             } catch {
                 let detail = model.indexNotice?.detail ?? model.searchNotice?.detail ?? "no engine error"
                 throw Failure("\(error) (phase \(model.indexPhase), work \(String(describing: model.indexWork)), searching \(model.searching): \(detail))")
@@ -529,8 +549,40 @@ final class LauncherSmoke {
                   "Quick Look received the original path, bad contents or a visible window")
         let mode = try FileManager.default.attributesOfItem(atPath: snapshot.path)[.posixPermissions] as? NSNumber
         try check(mode?.intValue == 0o600, "Quick Look snapshot had broad file permissions")
-        preview.close()
-        try check(!FileManager.default.fileExists(atPath: snapshot.path), "closing the preview kept the snapshot")
+        try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
+        try check(app.localPreview == nil && app.searchPresented && !FileManager.default.fileExists(atPath: snapshot.path),
+                  "Command–Y did not toggle the snapshot away while leaving the search open")
+        try key(kVK_Space, " ", in: app, throughPanel: true)
+        try await until("Space in browse mode toggles real Quick Look") { app.localPreview?.previewURL != nil }
+        try key(kVK_Space, " ", in: app, throughPanel: true)
+        try check(app.localPreview == nil && app.searchPresented, "Space closed the search rather than just the preview")
+        try check(LocalFile.dragURL(for: expected)?.path == expected.path, "the local file did not export a drag URL")
+        try type("lumen action", into: app)
+        try check(!app.panel.browsing, "editing the search field did not return to typing mode")
+        try key(kVK_Space, " ", in: app)
+        try check(try editor(app).string.hasSuffix(" ") && app.localPreview == nil, "Space did not insert whitespace while typing")
+
+        let folder = URL(fileURLWithPath: expected.path).deletingLastPathComponent().path
+        try type("kind:file ext:txt path:\"\(folder)/\" lumen action probe", into: app)
+        try await until("kind, extension, and path prefix combine in launcher search") {
+            !model.searching && model.hits.map(\.path) == [expected.path]
+        }
+        let operations: [(String, LauncherSystemActions.Operation)] = [
+            ("suoping", .lock), ("睡眠", .sleep), ("empty trash", .emptyTrash), ("切换深色模式", .darkMode),
+            ("mute", .mute), ("quxiaojingyin", .unmute), ("eject", .eject), ("define macintosh", .define("macintosh")),
+        ]
+        for (term, operation) in operations {
+            app.showSearch()
+            try type(term, into: app)
+            guard chosen()?.destination == .system(operation) else { throw Failure("System action not found: \(term)") }
+            try key(kVK_Return, "\r", in: app)
+            try check(dispatchedActions.last == .system(operation), "System action did not route: \(term)")
+        }
+        if let defaults = shortcutFixturePreferences {
+            try check(LauncherFrecency(defaults: defaults).boost("system:lock") > 0,
+                      "a completed system action was not saved to the shared frecency store")
+        }
+        app.showSearch()
 
         if exists("syntax-scenario") { try await verifyRawFileQuery(app) }
         if let fixtures = frecencyFixtures {
@@ -681,12 +733,30 @@ final class LauncherSmoke {
                 print('--cached-start --progress')
             else:
                 mark(Path(db).name + '-watch-started')
+                print('{"event":"cached"}', flush=True)
+                while not (root / 'release-cached').exists():
+                    time.sleep(.01)
                 print('{"event":"ready"}', flush=True)
                 signal.pause()
         elif command == 'serve':
             for line in sys.stdin:
                 request = json.loads(line)
+                if request.get('op') == 'validate':
+                    assert set(request) == {'id', 'op', 'hits'}
+                    hits = request['hits']
+                    names = [Path(hit['path']).stem for hit in hits]
+                    assert all(hit['document_stamp'] == 'fixture' for hit in hits)
+                    if names[0].startswith('hold-'):
+                        hold(names[0])
+                    assert names == ['keep', 'drop'], names
+                    mark('one-image-batch')
+                    print(json.dumps(dict(id=request['id'], valid=[True, False])), flush=True)
+                    continue
                 query = request['query']
+                assert request['check_access'] == (query == 'cached probe'), request
+                assert request['check_access'] == ('--check-access' in args), args
+                if query == 'cached probe':
+                    mark('checked-cached-' + request['mode'])
                 if query == 'stall':
                     mark(f'stalled-pid-{os.getpid()}')
                     hold('stalled-request')
@@ -695,7 +765,7 @@ final class LauncherSmoke {
                 if query == 'recover' and not (root / f'stalled-pid-{os.getpid()}').exists():
                     mark('fresh-worker-recovered')
                 reply = {'id': request['id']}
-                if query in ('x', 'no text matches'):
+                if query in ('x', 'no text matches') and request['mode'] == 'name':
                     reply['error'] = 'fixture name search failed'
                 else:
                     reply['hits'] = []
@@ -707,14 +777,9 @@ final class LauncherSmoke {
                 hits = [dict(path=str(root / name), name=name, kind='file', availability='local',
                              matched_by='image_embedding', document_stamp='fixture') for name in names]
                 print(json.dumps(dict(id=request['id'], hits=hits)), flush=True)
-        elif command == 'validate-hit':
-            name = Path(args[-1]).stem
-            if name.startswith('hold-'):
-                hold(name)
-            else:
-                print(json.dumps(dict(valid=name == 'keep')))
-        elif command == 'query':
-            print('[]')
+        elif command in ('query', 'validate-hit'):
+            mark('unexpected-standalone-query')
+            sys.exit(1)
         elif command == 'pipes':
             os.write(2, b'e' * 131072 + b'error tail')
             os.write(1, b'o' * 131072 + b'output tail')
@@ -751,6 +816,15 @@ final class LauncherSmoke {
         let model = Launcher(engine: engine, defaults: nil)
         defer { model.close() }
         model.start()
+        try await until("the cached snapshot did not become searchable") {
+            model.canSearch && model.watchState == .starting
+        }
+        model.setQuery("cached probe")
+        try await until("cached searches did not pass access checks for both modes") {
+            marked("checked-cached-name") && marked("checked-cached-text") && !model.searching
+        }
+        model.clear()
+        try Data().write(to: root.appendingPathComponent("release-cached"))
         try await until("valid startup did not reach a searchable watcher") { model.canSearch && model.watchState == .running }
         for query in ["x", "no text matches"] {
             model.setQuery(query)
@@ -787,9 +861,10 @@ final class LauncherSmoke {
         model.setImageQuery("hold-query", projector: projector)
         try await until("image hit validation did not start") { marked("hold-query-started") }
         model.setImageQuery("accept", projector: projector)
-        try await until("superseded image validation did not terminate or replacement hits were wrong") {
-            marked("hold-query-terminated") && !model.searching && model.hits.map(\.name) == ["keep.jpg"]
+        try await until("timed-out image batch did not terminate or replacement hits were wrong") {
+            marked("hold-query-terminated") && marked("one-image-batch") && !model.searching && model.hits.map(\.name) == ["keep.jpg"]
         }
+        try check(!marked("unexpected-standalone-query"), "search or batch validation spawned a standalone CLI")
         model.setImageQuery("hold-close", projector: projector)
         try await until("image hit validation did not restart") { marked("hold-close-started") }
         model.close()
@@ -1345,21 +1420,22 @@ final class LauncherSmoke {
         }
         defer { observeFirst.cancel() }
         try type("鹿鸣", into: app)
-        try await until("the Han body lookup was held independently") { self.exists("han-body-started") }
-        try await until("the Han filename became actionable while text was held") {
-            model.selectedHit?.name == "鹿鸣.md" && model.searching && self.exists("han-disk-name-started")
+        try check(model.selectedHit == nil, "the old in-flight name result stayed actionable")
+        try signal("finish-pre-han-name")
+        try await until("the Han filename became actionable while text was held on the shared server") {
+            self.exists("han-body-started") && model.selectedHit?.name == "鹿鸣.md" && model.searching
         }
         let enter: ContinuousClock.Instant = .now
         try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
-        try await until("Finder dispatch did not wait for the held Han body query") {
-            self.revealed?.lastPathComponent == "鹿鸣.md" && model.searching && self.exists("han-validation-started")
+        try check(revealed == nil, "Finder dispatched without validating on the shared server")
+        try signal("finish-han-body")
+        try await until("Finder dispatched the validated filename") {
+            self.revealed?.lastPathComponent == "鹿鸣.md" && self.exists("han-validation-started")
         }
         guard let firstName, let revealDispatch else { throw Failure("missing search or Finder timestamps") }
         print(String(format: "Han control-path timing: input to first name %.1f ms, Command–Return to dispatch %.1f ms",
                      milliseconds(began.duration(to: firstName)), milliseconds(enter.duration(to: revealDispatch))))
         revealed = nil
-        try signal("finish-pre-han-name")
-        try signal("finish-han-body")
         try await until("the delayed Han body merged below the selected filename") {
             !model.searching && model.selectedHit?.name == "鹿鸣.md" &&
                 model.hits.contains { $0.name == "local-field-notes.md" && $0.matched_by == "text" }
@@ -1378,16 +1454,13 @@ final class LauncherSmoke {
 
         try type("late lexical delivery", into: app)
         try await until("the lexical name lane was held") { self.exists("late-name-started") }
-        try await until("validated text was shown while names were still held") {
-            model.searching && model.selectedHit?.name == "body-before-name.md" &&
-                model.selectedHit?.matched_by == "text"
-        }
-        let bodySelection = model.selection
+        try check(model.searching && model.selectedHit == nil, "blocked serve left old rows actionable")
         let bodyResponder = try editor(app)
         try signal("finish-late-name")
-        try await until("late strong names ranked first without moving selection") {
+        try await until("strong names ranked first and body hits followed from the shared server") {
             !model.searching && model.hits.first?.name == "late lexical delivery.md" &&
-                model.selection == bodySelection
+                model.selectedHit?.name == "late lexical delivery.md" &&
+                model.hits.contains { $0.name == "body-before-name.md" && $0.matched_by == "text" }
         }
         try check(app.panel.firstResponder === bodyResponder, "late lexical delivery stole the search field focus")
         let latestSelection = model.selection
@@ -1609,7 +1682,7 @@ final class LauncherSmoke {
                 preview.close()
                 NSApp.setActivationPolicy(.prohibited)
             }
-            func focusPreview() async throws {
+            func focusPreview(_ preview: LocalPreviewPanel) async throws {
                 app.panel.setFrameOrigin(NSPoint(x: -12_000, y: -12_000))
                 app.panel.makeKeyAndOrderFront(nil)
                 try check(app.panel.isKeyWindow && !preview.isKeyWindow, "search was not key before the preview handoff")
@@ -1627,15 +1700,22 @@ final class LauncherSmoke {
             }
             NSApp.activate(ignoringOtherApps: true)
             try await until("app did not activate for the preview focus test") { NSApp.isActive }
-            try await focusPreview()
+            try await focusPreview(preview)
             NSApp.deactivate()
             try await verifyFocusLeft("focus leaving the preview did not dismiss and reset search")
 
             app.showSearch()
             _ = try await findPDF()
-            try await focusPreview()
+            try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+            guard let windowPreview = app.contextActions.items.firstIndex(where: { $0.id == "quick-look" }) else {
+                throw Failure("missing explicit window preview action after focus loss")
+            }
+            app.contextActions.run(windowPreview)
+            try await until("reopening after losing focus created a new preview") { app.localPreview != nil && app.localPreview !== preview }
+            guard let nextPreview = app.localPreview else { throw Failure("second preview panel missing") }
+            try await focusPreview(nextPreview)
             app.panel.orderOut(nil) // Prevent AppKit from restoring key focus to search when the preview closes.
-            preview.close()
+            nextPreview.close()
             try await verifyFocusLeft("closing the preview without returning focus to search did not dismiss it")
         }
         app.showSearch()
@@ -1915,6 +1995,7 @@ final class LauncherSmoke {
             model.selectedHit?.availability == "provider_metadata_only" && !model.searching
         }
         guard let hit = model.selectedHit else { throw Failure("missing cloud result") }
+        try check(LocalFile.dragURL(for: hit) == nil, "a cloud-only row exported a file drag URL")
         try key(kVK_Return, "\r", in: app)
         try check(model.searchNotice?.problem == .online && opened == nil && revealed == nil,
                   "Return activated a cloud reference")
@@ -1929,10 +2010,12 @@ final class LauncherSmoke {
             let refresh = model.$searching.sink { if $0 { refreshed = true } }
             defer { refresh.cancel() }
             try signal("update-watch")
-            try await until("watch refreshed the current query during Finder validation") {
-                refreshed && !model.searching
+            try await until("watch invalidated the current query during Finder validation") {
+                refreshed && model.selectedHit == nil
             }
+            try check(revealed == nil, "Finder received a result from the superseded watch revision")
             try signal("finish-cloud-reveal")
+            try await until("shared serve finished the watch refresh") { !model.searching }
         }
         try await until("Command–Return revealed the cloud reference") { self.revealed?.path == hit.path }
         try check(opened == nil && model.query == "cloudledger", "Finder action opened the file or closed search")
@@ -1962,7 +2045,7 @@ final class LauncherSmoke {
         try check(model.relatedExcerptsLabel == "相关原文", "candidate label did not say related excerpts")
         var resolved: URL?
         model.resolve(hit, action: .open) { resolved = $0 }
-        try await until("candidate action rechecked the query through explicit Gemma") { resolved?.path == hit.path }
+        try await until("candidate action validated the indexed document snapshot") { resolved?.path == hit.path }
         try Data("Replacement body".utf8).write(to: corpus.appendingPathComponent("notes.md"), options: .atomic)
         try signal("update-watch")
         try await until("watch replaced a stale semantic excerpt") {
@@ -1978,8 +2061,8 @@ final class LauncherSmoke {
         try await until("obsolete related query could not attach to newly typed text") {
             model.hits.count == 1 && model.selectedHit?.name == "青山月报.md" && !model.semanticBusy
         }
-        try check(lineCount("semantic-serve-launches") == 1 && exists("explicit-gemma-query-started"),
-                  "refinements did not reuse one worker or result action skipped explicit Gemma")
+        try check(lineCount("semantic-serve-launches") == 1 && exists("semantic-batch-validated"),
+                  "refinements did not reuse one worker or semantic result skipped batch validation")
 
         try signal("gemma-cap")
         try signal("update-watch")

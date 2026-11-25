@@ -207,7 +207,15 @@ final class LauncherEngine {
     private let gemmaHome: URL?
     private let requestTimeout: Duration
     private var nextID: UInt64 = 0
-    var checksCachedHitAccess = false
+    private(set) var checksCachedHitAccess = false
+    private var legacyValidation = false
+
+    func setCachedHitAccess(_ enabled: Bool) {
+        guard checksCachedHitAccess != enabled else { return }
+        checksCachedHitAccess = enabled
+        // M1 accepts access checking only as a startup flag; don't leave that server running after ready.
+        close()
+    }
 
     init(executable: URL, database: URL, syntheticRoot: URL? = nil, gemmaHome: URL? = nil,
          requestTimeout: Duration = .seconds(20)) {
@@ -351,7 +359,32 @@ final class LauncherEngine {
     }
 
     func search(_ query: String, mode: String, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
-        submit(query, mode: mode, limit: 60, to: \.connection, command: ["serve"], complete: complete)
+        submit(query, mode: mode, limit: mode == "text" ? 24 : 60, to: \.connection, command: ["serve"], complete: complete)
+    }
+
+    // nil means the server explicitly rejected the validation operation as unsupported.
+    func validate(_ hits: [SearchHit], explicit: Bool = false,
+                  complete: @escaping (Result<[Bool]?, SearchFailure>) -> Void) {
+        guard !legacyValidation else { complete(.success(nil)); return }
+        nextID &+= 1
+        let request = SearchRequest(id: nextID, op: "validate", hits: hits.map(ValidationHit.init))
+        submit(request, to: \.connection, command: ["serve"], idleTimeout: nil, explicit: explicit) { [weak self] result in
+            switch result {
+            case .success(let reply):
+                guard let valid = reply.valid, valid.count == hits.count else {
+                    complete(.failure(SearchFailure("Invalid validation response from lumen serve")))
+                    return
+                }
+                complete(.success(valid))
+            case .failure(let error):
+                let detail = error.detail.lowercased()
+                if (detail.contains("missing field") && detail.contains("query")) ||
+                    detail.contains("unsupported op") || detail.contains("unknown op") {
+                    self?.legacyValidation = true
+                    complete(.success(nil))
+                } else { complete(.failure(error)) }
+            }
+        }
     }
 
     func searchSemantic(_ query: String, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
@@ -378,15 +411,21 @@ final class LauncherEngine {
                         to lane: ReferenceWritableKeyPath<LauncherEngine, SearchConnection?>,
                         command: [String], idleTimeout: Duration? = nil, complete: @escaping SearchCompletion) {
         nextID &+= 1
-        submit(SearchRequest(id: nextID, query: query, mode: mode, limit: limit),
-               to: lane, command: command, idleTimeout: idleTimeout, complete: complete)
+        let request = SearchRequest(id: nextID, query: query, mode: mode, limit: limit,
+                                    check_access: command.first == "serve" ? checksCachedHitAccess : nil)
+        submit(request, to: lane, command: command, idleTimeout: idleTimeout) { result in
+            complete(result.flatMap { reply in
+                reply.hits.map { .success($0) } ?? .failure(SearchFailure("Invalid search response from lumen serve"))
+            })
+        }
     }
 
     private func submit(_ request: SearchRequest, to lane: ReferenceWritableKeyPath<LauncherEngine, SearchConnection?>,
-                        command: [String], idleTimeout: Duration?, complete: @escaping SearchCompletion) {
+                        command: [String], idleTimeout: Duration?, explicit: Bool = false,
+                        complete: @escaping ServeCompletion) {
         do {
             let server = try connect(lane, command: command, idleTimeout: idleTimeout)
-            server.enqueue(request, complete: complete)
+            server.enqueue(request, explicit: explicit, complete: complete)
         } catch {
             DispatchQueue.main.async { complete(.failure(SearchFailure(error.localizedDescription))) }
         }
@@ -396,8 +435,9 @@ final class LauncherEngine {
                          idleTimeout: Duration? = nil) throws -> SearchConnection {
         if let connection = self[keyPath: lane], connection.isRunning { return connection }
         let started = SearchConnection(executable: executable, arguments: arguments(command),
-                                       requestTimeout: requestTimeout, idleTimeout: idleTimeout) { [weak self] request, complete in
-            self?.submit(request, to: lane, command: command, idleTimeout: idleTimeout, complete: complete)
+                                       requestTimeout: requestTimeout, idleTimeout: idleTimeout) { [weak self] request, explicit, complete in
+            self?.submit(request, to: lane, command: command, idleTimeout: idleTimeout,
+                         explicit: explicit, complete: complete)
         }
         try started.start()
         self[keyPath: lane] = started
@@ -439,16 +479,36 @@ struct SearchFailure: Error {
 
 private typealias SearchCompletion = (Result<[SearchHit], SearchFailure>) -> Void
 
+private typealias ServeCompletion = (Result<SearchReply, SearchFailure>) -> Void
+
 private struct SearchRequest: Encodable {
     let id: UInt64
-    let query: String
-    let mode: String
-    let limit: Int
+    var query: String? = nil
+    var mode: String? = nil
+    var limit: Int? = nil
+    var check_access: Bool? = nil
+    var op: String? = nil
+    var hits: [ValidationHit]? = nil
+}
+
+private struct ValidationHit: Encodable {
+    let path: String
+    let kind: String
+    let availability: String
+    let document_stamp: String?
+
+    init(_ hit: SearchHit) {
+        path = hit.path
+        kind = hit.kind
+        availability = hit.availability
+        document_stamp = hit.document_stamp
+    }
 }
 
 private struct SearchReply: Decodable {
     let id: UInt64?
     let hits: [SearchHit]?
+    let valid: [Bool]?
     let error: String?
 }
 
@@ -456,17 +516,18 @@ private struct SearchReply: Decodable {
 private final class SearchConnection {
     private struct Pending {
         let request: SearchRequest
-        let complete: SearchCompletion
+        let explicit: Bool
+        let complete: ServeCompletion
     }
 
     private let process = Process()
     private let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
     private let inputQueue = DispatchQueue(label: "lumen.pipe.stdin", qos: .userInitiated)
     private var active: Pending?
-    private var queued: Pending?
+    private var queued: [Pending] = []
     private let requestTimeout: Duration
     private let idleTimeout: Duration?
-    private let restartWith: (SearchRequest, @escaping SearchCompletion) -> Void
+    private let restartWith: (SearchRequest, Bool, @escaping ServeCompletion) -> Void
     private var deadline: Task<Void, Never>?
     private var stopped = false
 
@@ -474,7 +535,7 @@ private final class SearchConnection {
     var isBusy: Bool { active != nil }
 
     init(executable: URL, arguments: [String], requestTimeout: Duration, idleTimeout: Duration?,
-         restartWith: @escaping (SearchRequest, @escaping SearchCompletion) -> Void) {
+         restartWith: @escaping (SearchRequest, Bool, @escaping ServeCompletion) -> Void) {
         self.requestTimeout = requestTimeout
         self.idleTimeout = idleTimeout
         self.restartWith = restartWith
@@ -502,12 +563,17 @@ private final class SearchConnection {
         }
     }
 
-    func enqueue(_ request: SearchRequest, complete: @escaping SearchCompletion) {
-        queued = Pending(request: request, complete: complete)
+    func enqueue(_ request: SearchRequest, explicit: Bool, complete: @escaping ServeCompletion) {
+        let pending = Pending(request: request, explicit: explicit, complete: complete)
+        if explicit { queued.insert(pending, at: 0) }
+        else {
+            if let mode = request.mode { queued.removeAll { $0.request.mode == mode } }
+            queued.append(pending)
+        }
         sendNext()
     }
 
-    func discardQueued() { queued = nil }
+    func discardQueued() { queued.removeAll { !$0.explicit } }
 
     func stop() {
         guard !stopped else { return }
@@ -515,15 +581,15 @@ private final class SearchConnection {
         deadline?.cancel()
         deadline = nil
         active = nil
-        queued = nil
+        queued.removeAll()
         if process.isRunning { process.terminate() }
         let input = stdin.fileHandleForWriting
         inputQueue.async { try? input.close() }
     }
 
     private func sendNext() {
-        guard active == nil, let next = queued else { return }
-        queued = nil
+        guard active == nil, !queued.isEmpty else { return }
+        let next = queued.removeFirst()
         active = next
         armDeadline(requestID: next.request.id)
         let input = stdin.fileHandleForWriting
@@ -553,9 +619,9 @@ private final class SearchConnection {
         self.active = nil
         deadline?.cancel()
         deadline = nil
-        if let hits = reply.hits { active.complete(.success(hits)) }
-        else { active.complete(.failure(SearchFailure(reply.error ?? ""))) }
-        if !stopped && self.active == nil && queued == nil { armDeadline() }
+        if let error = reply.error { active.complete(.failure(SearchFailure(error))) }
+        else { active.complete(.success(reply)) }
+        if !stopped && self.active == nil && queued.isEmpty { armDeadline() }
         sendNext()
     }
 
@@ -569,14 +635,14 @@ private final class SearchConnection {
             self.stop()
             guard let active else { return }
             // Install the replacement before notifying a caller that may submit again.
-            if let queued { self.restartWith(queued.request, queued.complete) }
+            for item in queued { self.restartWith(item.request, item.explicit, item.complete) }
             active.complete(.failure(SearchFailure("lumen search request timed out")))
         }
     }
 
     private func fail(_ error: SearchFailure) {
-        let latest = queued ?? active
+        let pending = [active].compactMap { $0 } + queued
         stop()
-        latest?.complete(.failure(error))
+        pending.forEach { $0.complete(.failure(error)) }
     }
 }

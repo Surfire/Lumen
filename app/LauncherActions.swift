@@ -4,7 +4,7 @@ import Darwin
 
 struct LaunchAction: Equatable, Identifiable {
     enum Destination: Equatable {
-        case application(URL, stamp: String), settings(URL)
+        case application(URL, stamp: String), settings(URL), system(LauncherSystemActions.Operation)
     }
 
     let id: String
@@ -121,7 +121,7 @@ enum LaunchCatalog {
             ("com.apple.Keyboard-Settings.extension", "Keyboard", "键盘", "keyboard", []),
             ("com.apple.Trackpad-Settings.extension", "Trackpad", "触控板", "trackpad", ["触摸板"]),
             ("com.apple.Notifications-Settings.extension", "Notifications", "通知", "bell", ["notification"]),
-            ("com.apple.Appearance-Settings.extension", "Appearance", "外观", "circle.lefthalf.filled", ["dark mode", "深色模式"]),
+            ("com.apple.Appearance-Settings.extension", "Appearance", "外观", "circle.lefthalf.filled", []),
             ("com.apple.settings.PrivacySecurity.extension", "Privacy & Security", "隐私与安全性", "lock.shield", ["privacy", "security", "隐私", "安全"]),
             ("com.apple.Accessibility-Settings.extension", "Accessibility", "辅助功能", "accessibility", ["辅助"]),
             ("com.apple.Software-Update-Settings.extension", "Software Update", "软件更新", "arrow.down.circle", ["macos update", "系统更新"]),
@@ -134,7 +134,29 @@ enum LaunchCatalog {
                                 destination: .settings(url),
                                 aliases: aliases + [english + " settings", chinese + "设置"] + pinyinAliases(chinese))
         }
-        return settings
+        let operations: [(String, String, String, String, [String], LauncherSystemActions.Operation)] = [
+            ("lock", "Lock Screen", "锁定屏幕", "lock", ["lock", "锁屏", "suoping"], .lock),
+            ("sleep", "Sleep", "睡眠", "moon.zzz", ["sleep mac", "休眠", "xiumian"], .sleep),
+            ("empty-trash", "Empty Trash", "清倒废纸篓", "trash", ["empty bin", "清空废纸篓", "qingkongfeizhilou"], .emptyTrash),
+            ("dark-mode", "Toggle Dark Mode", "切换深色模式", "circle.lefthalf.filled", ["dark mode", "深色模式", "shensemoshi"], .darkMode),
+            ("mute", "Mute Audio", "静音", "speaker.slash", ["mute"], .mute),
+            ("unmute", "Unmute Audio", "取消静音", "speaker.wave.2", ["unmute"], .unmute),
+            ("eject", "Eject External Volume", "推出外置卷", "eject", ["eject", "推出磁盘", "tuichucipan"], .eject),
+        ]
+        return settings + operations.map { id, english, chinese, symbol, aliases, operation in
+            LaunchAction(id: "system:" + id, english: english, chinese: chinese, symbol: symbol,
+                         destination: .system(operation), aliases: aliases + pinyinAliases(chinese))
+        }
+    }
+
+    static func dictionaryAction(_ query: String) -> LaunchAction? {
+        let input = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let split = input.firstIndex(where: \.isWhitespace),
+              ["define", "定义", "查词", "dingyi", "chaci"].contains(input[..<split].lowercased()) else { return nil }
+        let word = input[split...].trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !word.isEmpty, word.count <= 100 else { return nil }
+        return LaunchAction(id: "system:define", english: "Look Up in Dictionary", chinese: "在词典中查找",
+                            symbol: "book", destination: .system(.define(word)), aliases: [])
     }
 
     static func applicationRoots(home: URL) -> [URL] {
@@ -228,6 +250,9 @@ enum LaunchCatalog {
     }
 
     static func matches(_ query: String, actions: [LaunchAction], boost: (String) -> Int = { _ in 0 }) -> [ActionMatch] {
+        if let dictionary = dictionaryAction(query) {
+            return [ActionMatch(action: dictionary, score: 110 + boost(dictionary.id))]
+        }
         let term = normalized(query)
         guard !term.isEmpty, term.utf8.count <= 128, !query.contains("/") && !query.contains("\\") else { return [] }
         return actions.compactMap { action -> ActionMatch? in
@@ -323,7 +348,7 @@ private extension NSString {
 enum LaunchDispatcher {
     static let didOpenApplication = PassthroughSubject<LaunchAction, Never>()
 
-    static func perform(_ action: LaunchAction, activates: Bool = true,
+    static func perform(_ action: LaunchAction, activates: Bool = true, chinese: Bool = false,
                         completion: @escaping (Bool) -> Void) {
         let workspace = NSWorkspace.shared
         switch action.destination {
@@ -351,7 +376,8 @@ enum LaunchDispatcher {
                 return
             }
             completion(workspace.open(url))
-
+        case .system(let operation):
+            LauncherSystemActions.perform(operation, chinese: chinese, completion: completion)
         }
     }
 }

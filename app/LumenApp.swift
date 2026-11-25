@@ -19,6 +19,7 @@ struct LumenApp {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate {
     let model: Launcher
     let smoke: LauncherSmoke?
+    let applicationIcons = ResultIconDisplay()
     private let defaults: UserDefaults?
     private(set) lazy var globalHotKey = GlobalHotKey { [weak self] in self?.showSearch() }
     private var statusItem: NSStatusItem?
@@ -105,6 +106,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         close.translatesAutoresizingMaskIntoConstraints = false
         let results = NSHostingView(rootView: SearchWindow(
             model: model,
+            applicationIcons: applicationIcons,
             showSettings: { [weak self] in self?.showSettings() },
             beginIndex: { [weak self] in self?.startBackgroundIndex() },
             open: { [weak self] in self?.open($0) },
@@ -595,6 +597,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func updatePresentation() {
+        applicationIcons.update(for: searchPresented ? model.launchMatches : [])
+
         let activity = model.activityTitle
         let metrics = model.activityMetrics
         let metricsTitle = metrics ?? ""

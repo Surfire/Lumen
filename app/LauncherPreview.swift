@@ -31,7 +31,7 @@ struct PreviewSnapshot {
         else { throw Failure.unavailable }
         defer { _ = setiopolicy_np(policy, scope, prior) }
 
-        let descriptor = try openLocalFile(hit.path)
+        guard let descriptor = LocalFile.openReadOnly(hit.path) else { throw Failure.unavailable }
         let input = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         defer { try? input.close() }
         var attributes = stat()
@@ -78,24 +78,26 @@ struct PreviewSnapshot {
         info.st_mode & S_IFMT == S_IFREG && info.st_flags & UInt32(SF_DATALESS) == 0 &&
             SearchHit.filesystemStamp(info) == stamp
     }
+}
 
-    private static func openLocalFile(_ path: String) throws -> Int32 {
+enum LocalFile {
+    static func openReadOnly(_ path: String) -> Int32? {
         let components = path.split(separator: "/")
         guard path.hasPrefix("/"), !components.isEmpty,
-              components.allSatisfy({ $0 != "." && $0 != ".." }) else { throw Failure.unavailable }
+              components.allSatisfy({ $0 != "." && $0 != ".." }) else { return nil }
         let options = O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
         var parent = Darwin.open("/", options | O_DIRECTORY)
-        guard parent >= 0 else { throw Failure.unavailable }
+        guard parent >= 0 else { return nil }
         defer { if parent >= 0 { Darwin.close(parent) } }
         for (index, name) in components.enumerated() {
             let isFile = index == components.count - 1
             let next = openat(parent, String(name), options | (isFile ? 0 : O_DIRECTORY))
-            guard next >= 0 else { throw Failure.unavailable }
+            guard next >= 0 else { return nil }
             Darwin.close(parent)
             parent = next
             var info = stat()
             guard fstat(parent, &info) == 0, info.st_flags & UInt32(SF_DATALESS) == 0,
-                  info.st_mode & S_IFMT == (isFile ? S_IFREG : S_IFDIR) else { throw Failure.unavailable }
+                  info.st_mode & S_IFMT == (isFile ? S_IFREG : S_IFDIR) else { return nil }
         }
         let opened = parent
         parent = -1

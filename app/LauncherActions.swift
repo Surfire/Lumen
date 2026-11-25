@@ -1,5 +1,7 @@
 import AppKit
+import Combine
 import Darwin
+import ImageIO
 
 struct LaunchAction: Equatable, Identifiable {
     enum Destination: Equatable {
@@ -16,6 +18,124 @@ struct LaunchAction: Equatable, Identifiable {
     func title(chinese useChinese: Bool) -> String { useChinese ? chinese : english }
 
     fileprivate var searchable: [String] { [english, chinese] + aliases }
+}
+
+actor ApplicationIcons {
+    struct Key: Hashable, Sendable {
+        let url: URL
+        let stamp: String
+
+        init?(_ action: LaunchAction) {
+            guard case .application(let url, let stamp) = action.destination else { return nil }
+            self.url = url
+            self.stamp = stamp
+        }
+    }
+
+    private enum Entry {
+        case image(CGImage), unavailable
+    }
+
+    private let capacity = 64
+    private var entries: [Key: Entry] = [:]
+    private var recent: [Key] = []
+
+    func image(for key: Key) -> CGImage? {
+        guard !Task.isCancelled else { return nil }
+        let entry = entries[key] ?? Self.readIcon(key).map(Entry.image) ?? .unavailable
+        entries[key] = entry
+        recent.removeAll { $0 == key }
+        recent.append(key)
+        if recent.count > capacity { entries.removeValue(forKey: recent.removeFirst()) }
+        if case .image(let image) = entry { return image }
+        return nil
+    }
+
+    private static func readIcon(_ key: Key) -> CGImage? {
+        let policy = IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES
+        let scope = IOPOL_SCOPE_THREAD
+        let prior = getiopolicy_np(policy, scope)
+        guard prior >= 0, setiopolicy_np(policy, scope, IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0 else { return nil }
+        defer { _ = setiopolicy_np(policy, scope, prior) }
+
+        // Read declared icon bytes in this process. IconServices may read the source
+        // bundle on another thread or in a service without our no-download policy.
+        guard SearchHit.pathStamp(at: key.url.path, kind: "directory") == key.stamp else { return nil }
+        let contents = key.url.appendingPathComponent("Contents", isDirectory: true)
+        guard let plist = readLocal(contents.appendingPathComponent("Info.plist"), limit: 512 * 1024),
+              let info = (try? PropertyListSerialization.propertyList(from: plist, format: nil)) as? [String: Any]
+        else { return nil }
+        let resources = contents.appendingPathComponent("Resources", isDirectory: true)
+        for field in ["CFBundleIconFile", "CFBundleIconName"] {
+            guard let name = info[field] as? String, !name.isEmpty,
+                  name != ".", name != "..", !name.contains("/"), !name.contains("\\") else { continue }
+            let ext = (name as NSString).pathExtension.lowercased()
+            guard ext.isEmpty || ["icns", "png", "tiff"].contains(ext) else { continue }
+            let file = resources.appendingPathComponent(ext.isEmpty ? name + ".icns" : name)
+            if let bytes = readLocal(file, limit: 8 * 1024 * 1024), let image = thumbnail(bytes) { return image }
+        }
+        return nil
+    }
+
+    private static func readLocal(_ url: URL, limit: Int) -> Data? {
+        guard let fd = LocalFile.openReadOnly(url.path) else { return nil }
+        let input = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        defer { try? input.close() }
+        var file = stat()
+        var volume = statfs()
+        guard fstat(fd, &file) == 0, file.st_size > 0, file.st_size <= limit,
+              fstatfs(fd, &volume) == 0, volume.f_flags & UInt32(MNT_LOCAL) != 0,
+              let data = try? input.read(upToCount: limit + 1), data.count == file.st_size else { return nil }
+        return data
+    }
+
+    private static func thumbnail(_ data: Data) -> CGImage? {
+        let noCache = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithData(data as CFData, noCache) else { return nil }
+        let count = min(CGImageSourceGetCount(source), 32)
+        guard count > 0 else { return nil }
+        let size = 64
+        let representations = (0..<count).compactMap { index -> (Int, Int)? in
+            guard let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any],
+                  let width = properties[kCGImagePropertyPixelWidth] as? Int,
+                  let height = properties[kCGImagePropertyPixelHeight] as? Int else { return nil }
+            return (index, max(width, height))
+        }
+        let index = representations.filter { $0.1 >= size }.min(by: { $0.1 < $1.1 })?.0
+            ?? representations.max(by: { $0.1 < $1.1 })?.0 ?? 0
+        let options = [kCGImageSourceThumbnailMaxPixelSize: size,
+                       kCGImageSourceCreateThumbnailFromImageAlways: true,
+                       kCGImageSourceShouldCacheImmediately: true] as CFDictionary
+        return CGImageSourceCreateThumbnailAtIndex(source, index, options)
+    }
+}
+
+@MainActor
+final class ResultIconDisplay: ObservableObject {
+    @Published private(set) var images: [ApplicationIcons.Key: CGImage] = [:]
+
+    private let icons = ApplicationIcons()
+    private var visible = Set<ApplicationIcons.Key>()
+    private var tasks: [ApplicationIcons.Key: Task<Void, Never>] = [:]
+
+    func update(for matches: [ActionMatch]) {
+        let keys = Set(matches.compactMap { ApplicationIcons.Key($0.action) })
+        guard keys != visible else { return }
+        let added = keys.subtracting(visible)
+        for removed in visible.subtracting(keys) {
+            tasks.removeValue(forKey: removed)?.cancel()
+            images.removeValue(forKey: removed)
+        }
+        visible = keys
+        for key in added {
+            tasks[key] = Task { [weak self, icons] in
+                let image = await icons.image(for: key)
+                guard !Task.isCancelled, let self else { return }
+                self.tasks[key] = nil
+                if let image { self.images[key] = image }
+            }
+        }
+    }
 }
 
 struct ActionMatch: Equatable {

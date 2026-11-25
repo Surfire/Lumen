@@ -305,13 +305,24 @@ final class LauncherSmoke {
         // All typed text passes through the real AppKit field editor.
         try type("lumen action probe", into: app)
         try await until("a discovered application is selectable before any file index exists") {
-            chosen()?.english == "Lumen Action Probe"
+            chosen()?.english == "Lumen Action Probe" && app.panel.frame.height == 436
         }
         try type("lap", into: app)
         try await until("an application initialism is selectable") { chosen()?.english == "Lumen Action Probe" }
         guard let probe = chosen(), case .application = probe.destination else {
             throw Failure("selected app reused the file-open route")
         }
+        let selectedBeforeArtwork = model.selection
+        let orderBeforeArtwork = model.visibleResults.map(\.id)
+        let frameBeforeArtwork = app.panel.frame
+        guard let artworkKey = ApplicationIcons.Key(probe) else { throw Failure("missing app artwork key") }
+        try await until("the visible app row received its bundle artwork") { app.applicationIcons.images[artworkKey] != nil }
+        try await until("the actual app row painted its bundle artwork") { self.hasProbeIcon(in: app.panel) }
+        app.panel.appearance = nil
+        try check(model.selection == selectedBeforeArtwork && model.visibleResults.map(\.id) == orderBeforeArtwork &&
+                  app.panel.frame == frameBeforeArtwork,
+                  "icon loading changed search order, selection, or the window frame")
+        if exists("capture-icons") { try capture("lumen-app-icon.png", appearance: .aqua, window: app.panel) }
         try check(!exists("app-started"), "app launched during lookup")
         try key(kVK_Return, "\r", in: app)
         try await until("a real application launched through NSWorkspace without activation") {
@@ -335,6 +346,10 @@ final class LauncherSmoke {
                   Bundle(url: handler)?.bundleIdentifier == LaunchCatalog.settingsBundleID else {
                 throw Failure("Launch Services did not route the URL to Apple System Settings")
             }
+            if term == "无线局域网" && exists("capture-icons") {
+                try await until("the setting row is laid out offscreen") { app.panel.frame.height == 436 }
+                try capture("lumen-setting-icon.png", appearance: .aqua, window: app.panel)
+            }
             try key(kVK_Return, "\r", in: app)
             try check(dispatchedActions.last == .settings(url) && !app.searchPresented,
                       "the Return key did not pass the Settings URL to the dispatch seam")
@@ -348,6 +363,12 @@ final class LauncherSmoke {
         let twins = model.launchMatches.map(\.action).filter { $0.english == "Twin Preview" }
         try check(twins[0].id != twins[1].id && twins[0].destination != twins[1].destination,
                   "same-title applications shared a result identity")
+        let icons = ApplicationIcons()
+        for twin in twins {
+            guard let key = ApplicationIcons.Key(twin) else { throw Failure("missing application icon key") }
+            let icon = await icons.image(for: key)
+            try check(icon == nil, "a missing or symlinked resource was loaded instead of using the fallback")
+        }
         try type("Wi-Fi", into: app)
         let count = dispatchedActions.count
         try type("not a registered action", into: app)
@@ -356,6 +377,8 @@ final class LauncherSmoke {
 
         app.startBackgroundIndex()
         try await until("the isolated file index became available alongside actions") { model.canSearch && model.watchState == .running }
+        try check(model.launcherActivityTitle == nil && model.activityTitle == model.t("正在监听文件变化", "Watching file changes"),
+                  "normal watching remained in the launcher or was lost from diagnostics")
         app.showSearch()
         try type("lumen action probe", into: app)
         try await until("file and app results share the same visible list") {
@@ -728,6 +751,11 @@ final class LauncherSmoke {
         }
         settings.close()
         if case .idle = model.fileDiagnosis {} else { throw Failure("closing settings retained a selected file report") }
+        try signal("fail-watch")
+        try await until("the launcher still has an activity notice when watching fails") {
+            model.watchState == .failed &&
+                model.launcherActivityTitle == model.t("文件监听已停止", "File watching stopped")
+        }
         print("Settings smoke passed (four pages, shortcut, draft, exact-scope rebuild, Apply, and file diagnostics)")
     }
 
@@ -755,6 +783,29 @@ final class LauncherSmoke {
         try capture("lumen-results-dark.png", appearance: .darkAqua, window: app.panel)
         app.panel.appearance = nil
         try check(!NSApp.isActive && !app.panel.isVisible, "offscreen snapshots activated the app")
+    }
+
+    private func hasProbeIcon(in window: NSWindow) -> Bool {
+        guard let surface = window.contentView, let appearance = NSAppearance(named: .aqua) else { return false }
+        window.appearance = appearance
+        surface.layoutSubtreeIfNeeded()
+        let bounds = surface.bounds
+        guard let backing = surface.bitmapImageRepForCachingDisplay(in: bounds) else { return false }
+        appearance.performAsCurrentDrawingAppearance { surface.cacheDisplay(in: bounds, to: backing) }
+        guard let png = backing.representation(using: .png, properties: [:]),
+              let image = NSBitmapImageRep(data: png) else { return false }
+        var pixels = 0
+        for x in stride(from: 0, to: min(110, image.pixelsWide), by: 3) {
+            for y in stride(from: 0, to: image.pixelsHigh, by: 3) {
+                guard let color = image.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
+                if color.redComponent - color.greenComponent > 0.35 &&
+                    color.blueComponent - color.greenComponent > 0.25 {
+                    pixels += 1
+                    if pixels >= 30 { return true }
+                }
+            }
+        }
+        return false
     }
 
     private func capture(_ filename: String, appearance: NSAppearance.Name, window: NSWindow) throws {
@@ -789,7 +840,8 @@ final class LauncherSmoke {
             try signal("hold-watch-progress")
             try signal("update-watch")
             try await until("watch progress streamed independently of stdout") {
-                model.watchProgress?.entries == 6 && model.watchState == .running && model.hits.isEmpty
+                model.watchProgress?.entries == 6 && model.watchState == .running && model.hits.isEmpty &&
+                    model.launcherActivityTitle == model.t("正在扫描文件…", "Scanning files…")
             }
             try signal("finish-watch-progress")
         }

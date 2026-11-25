@@ -9,6 +9,8 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import struct
+import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 BUNDLE = ROOT / "target/Lumen.app/Contents"
@@ -112,6 +114,8 @@ if action == "watch":
         gate("startup-watch")
     print(json.dumps({"event": "ready"}), flush=True)
     while True:
+        if (work / "fail-watch").exists():
+            sys.exit("controlled watcher failure")
         marker = work / "update-watch"
         if marker.exists():
             marker.unlink()
@@ -338,7 +342,16 @@ def make_action_probe(root):
             "CFBundleName": "Lumen Action Probe",
             "CFBundlePackageType": "APPL",
             "LSBackgroundOnly": True,
+            "CFBundleIconFile": "Probe.png",
         }, handle)
+    icon = application / "Resources/Probe.png"
+    icon.parent.mkdir()
+    def png_chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+    rows = (b"\x00" + bytes((224, 38, 179, 255)) * 64) * 64
+    icon.write_bytes(b"\x89PNG\r\n\x1a\n" +
+                     png_chunk(b"IHDR", struct.pack(">IIBBBBB", 64, 64, 8, 6, 0, 0, 0)) +
+                     png_chunk(b"IDAT", zlib.compress(rows)) + png_chunk(b"IEND", b""))
     source = root / "probe.c"
     # The child can write only this synthetic test marker and then exits on its own.
     source.write_text("#include <stdio.h>\n#include <unistd.h>\n"
@@ -352,12 +365,18 @@ def make_action_probe(root):
         shutil.copyfile(executable, twin / "MacOS/probe")
         (twin / "MacOS/probe").chmod(0o700)
         with (twin / "Info.plist").open("wb") as handle:
-            plistlib.dump({
+            metadata = {
                 "CFBundleExecutable": "probe",
                 "CFBundleIdentifier": f"io.github.surfire.lumen.twin{index}." + root.name,
                 "CFBundleDisplayName": "Twin Preview",
                 "CFBundlePackageType": "APPL",
-            }, handle)
+            }
+            if index == 1:
+                borrowed = twin / "Resources/Borrowed.png"
+                borrowed.parent.mkdir()
+                borrowed.symlink_to(icon)
+                metadata["CFBundleIconFile"] = borrowed.name
+            plistlib.dump(metadata, handle)
 
 
 def main():
@@ -388,7 +407,13 @@ def main():
             (fixtures / "成都 卫健委目录.pptx").mkdir()
             (root / "syntax-scenario").touch()
 
+        if args.snapshots:
+            (root / "capture-icons").touch()
         run(root, "zh")
+        if args.snapshots:
+            args.snapshots.mkdir(parents=True, exist_ok=True)
+            for name in ("lumen-app-icon.png", "lumen-setting-icon.png"):
+                shutil.copyfile(root / name, args.snapshots / name)
     with tempfile.TemporaryDirectory(prefix="lumen-gui-") as tmp:
         root = Path(tmp)
         make_corpus(root)

@@ -3,6 +3,7 @@ import SwiftUI
 
 struct SearchWindow: View {
     @ObservedObject var model: Launcher
+    @ObservedObject var applicationIcons: ResultIconDisplay
     let showSettings: () -> Void
     let beginIndex: () -> Void
     let open: (LauncherResult) -> Void
@@ -45,12 +46,16 @@ struct SearchWindow: View {
                     keyHint("⌘↵", model.t("在 Finder 中显示", "Show in Finder"))
                     if file.isLocal && file.kind == "file" { keyHint("⌘Y", model.t("快速查看", "Quick Look")) }
                 }
-            } else if model.activityBusy || !model.canSearch {
-                Label(model.activityTitle, systemImage: model.activityBusy ? "arrow.triangle.2.circlepath" : "internaldrive")
-                    .lineLimit(1)
-                if let metrics = model.activityMetrics { Text(metrics).monospacedDigit().lineLimit(1) }
-            } else {
-                Text(model.activityTitle).lineLimit(1)
+            }
+            if let title = model.launcherActivityTitle,
+               !model.showsResults || model.activityBusy || model.watchState == .failed || model.scopePending {
+                if model.activityBusy || !model.canSearch {
+                    Label(title, systemImage: model.activityBusy ? "arrow.triangle.2.circlepath" : "internaldrive")
+                        .lineLimit(1)
+                    if let metrics = model.activityMetrics { Text(metrics).monospacedDigit().lineLimit(1) }
+                } else {
+                    Text(title).lineLimit(1)
+                }
             }
             if let notice = model.searchNotice, !model.visibleResults.isEmpty {
                 Text(model.title(for: notice)).lineLimit(1).help(model.title(for: notice))
@@ -135,12 +140,8 @@ struct SearchWindow: View {
         }
         let title = action.title(chinese: model.zh)
         return HStack(spacing: 10) {
-            Image(systemName: action.symbol)
-                .font(.system(size: 14, weight: .medium))
-                .foregroundStyle(selected ? Color.accentColor : .secondary)
-                .frame(width: 28, height: 28)
-                .background(.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 6))
-                .accessibilityHidden(true)
+            ActionResultIcon(action: action, image: ApplicationIcons.Key(action).flatMap { applicationIcons.images[$0] },
+                             selected: selected)
             VStack(alignment: .leading, spacing: 1) {
                 Text(title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
                 Text(detail).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
@@ -237,11 +238,44 @@ struct SearchWindow: View {
 
 }
 
+private struct ActionResultIcon: View {
+    let action: LaunchAction
+    let image: CGImage?
+    let selected: Bool
+
+    var body: some View {
+        let isApplication = ApplicationIcons.Key(action) != nil
+        Group {
+            if let image {
+                Image(decorative: image, scale: 1).renderingMode(.original).resizable().interpolation(.high).scaledToFit()
+                    .frame(width: 26, height: 26)
+            } else if let symbol = NSImage(systemSymbolName: action.symbol, accessibilityDescription: nil)
+                ?? NSImage(systemSymbolName: isApplication ? "app" : "gearshape", accessibilityDescription: nil) {
+                Image(nsImage: symbol)
+                    .renderingMode(.template).resizable().scaledToFit()
+                    .frame(width: 16, height: 16)
+            } else {
+                Text(isApplication ? "▣" : "⚙").font(.system(size: 14, weight: .medium))
+            }
+        }
+        .foregroundStyle(selected ? Color.accentColor : .secondary)
+        .frame(width: 28, height: 28)
+        .background(.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 6))
+        .accessibilityHidden(true)
+
+    }
+}
+
 @MainActor
 extension Launcher {
     var canStartIndexFromLauncher: Bool {
         indexWork == nil && (indexPhase == .needsIndex || indexPhase == .unreadable || scopePending ||
                              (indexPhase == .ready && watchState == .needsSetup))
+    }
+
+    var launcherActivityTitle: String? {
+        if canSearch && !activityBusy && watchState == .running { return nil }
+        return activityTitle
     }
 
     var activityTitle: String {

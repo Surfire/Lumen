@@ -103,6 +103,10 @@ final class LauncherFrecency {
 @MainActor
 final class ShortcutLibrary: ObservableObject {
     @Published private(set) var entries: [SavedShortcut]
+    @Published var includeOptionalLinks: Bool {
+        didSet { defaults?.set(includeOptionalLinks, forKey: Self.optionalLinksKey) }
+    }
+    private static let optionalLinksKey = "launcher.includeOptionalLinks"
     private let defaults: UserDefaults?
     private let key = "launcher.savedShortcuts.v1"
 
@@ -110,6 +114,7 @@ final class ShortcutLibrary: ObservableObject {
         self.defaults = defaults
         let data = defaults?.data(forKey: key)
         entries = data.flatMap { try? JSONDecoder().decode([SavedShortcut].self, from: $0) } ?? []
+        includeOptionalLinks = defaults?.bool(forKey: Self.optionalLinksKey) ?? false
     }
 
     func save(_ shortcut: SavedShortcut) -> Bool {
@@ -235,6 +240,13 @@ struct QuicklinksView: View {
 
     var body: some View {
         Form {
+            Section(model.t("内置网页搜索", "Built-in Web Search")) {
+                Toggle(model.t("启用 GitHub、维基百科和 Google 地图搜索",
+                               "Enable GitHub, Wikipedia, and Google Maps Search"), isOn: $library.includeOptionalLinks)
+                Text(model.t("输入 gh、wiki 或 map，空一格后输入搜索词，按回车在浏览器中打开。",
+                             "Type gh, wiki, or map followed by a search term, then press Return to open it in your browser."))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Section(model.t("已保存", "Saved")) {
                 if library.entries.isEmpty { Text(model.t("暂无快捷链接", "No Quicklinks yet")).foregroundStyle(.secondary) }
                 ForEach(library.entries) { shortcut in

@@ -49,9 +49,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var volumeChanges: AnyCancellable?
     let externalVolumes: ExternalVolumeCatalog
     let translation: TranslationPanelModel
-    #if LUMEN_EXTENSIONS
-    private let extensionModel = LumenExtensionPanelModel()
-    #endif
     private(set) var settings: NSPanel?
     private(set) lazy var settingsSession = SettingsSession(model: model, manageLoginItem: smoke == nil) { [weak self] oldPage, page in
         guard let self else { return }
@@ -231,11 +228,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         providerUpdates = translation.$providers.combineLatest(translation.$selected)
             .map { providers, selected in providers.first { $0.id == selected } }
             .removeDuplicates().dropFirst().sink { [weak self] _ in self?.commands.invalidateAnswer() }
-        shortcutUpdates = model.shortcuts.$entries.sink { [weak self] entries in
-            guard let self else { return }
-            self.catalog = LumenCommandCatalog(additionalLinks: entries.compactMap(\.queryLink))
-            if self.searchPresented { self.searchFieldAction() }
-        }
+        shortcutUpdates = model.shortcuts.$entries.combineLatest(model.shortcuts.$includeOptionalLinks)
+            .sink { [weak self] entries, includeOptionalLinks in
+                guard let self else { return }
+                self.catalog = LumenCommandCatalog(includeOptionalLinks: includeOptionalLinks,
+                                                   additionalLinks: entries.compactMap(\.queryLink))
+                if self.searchPresented { self.searchFieldAction() }
+            }
         imageUpdates = imageSearch.objectWillChange.sink { [weak self] _ in
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.searchPresented, self.commands.isImageCommand else { return }
@@ -397,8 +396,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     @objc private func searchFieldAction() {
-        guard (searchField.currentEditor() as? NSTextView)?.hasMarkedText() != true else { return }
         let text = searchText
+        if (searchField.currentEditor() as? NSTextView)?.hasMarkedText() == true {
+            if text != commands.raw {
+                if commands.answer == .loading { commands.invalidateAnswer() }
+                if translation.activity == .translating { translation.cancel() }
+            }
+            return
+        }
         if literalCommand != text { literalCommand = nil }
         let previousCommand = commands.resolution
         let priorRaw = commands.raw
@@ -807,15 +812,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             window.hidesOnDeactivate = false
             window.contentMinSize = NSSize(width: 700, height: 488)
             window.delegate = self
-            let extensionContent: AnyView?
-            #if LUMEN_EXTENSIONS
-            extensionContent = AnyView(LumenExtensionPanel(
-                model: extensionModel, chinese: { [weak self] in self?.model.zh ?? false },
-                parentWindow: { [weak window] in window }
-            ))
-            #else
-            extensionContent = nil
-            #endif
             window.contentView = NSHostingView(rootView: LauncherSettings(
                 model: model,
                 session: settingsSession,
@@ -824,7 +820,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 images: imageSearch,
                 chooseImageFolder: { [weak self] in self?.chooseImageResource(folder: true) },
                 chooseImageProjector: { [weak self] in self?.chooseImageResource(folder: false) },
-                extensionContent: extensionContent,
                 chooseQuicklinkFolder: { [weak self] in self?.chooseQuicklinkFolder($0) },
                 recordShortcut: { [weak self] in self?.recordShortcut($0) },
                 disableShortcut: { [weak self] in self?.disableShortcut() },
@@ -921,7 +916,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func activateTranslation() {
-        guard searchPresented, let command = translation.command, searchText == command.raw,
+        guard searchPresented, translation.activity == nil, let command = translation.command, searchText == command.raw,
               (panel.firstResponder as? NSTextView)?.hasMarkedText() != true else { return }
         if translation.output.isEmpty {
             translation.translate()

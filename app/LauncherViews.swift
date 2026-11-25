@@ -562,9 +562,6 @@ extension Launcher {
 
 enum SettingsPage: String, CaseIterable, Identifiable {
     case general, index, quicklinks, translation
-    #if LUMEN_EXTENSIONS
-    case extensions
-    #endif
     case advanced
 
     var id: Self { self }
@@ -575,9 +572,6 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .index: return model.t("索引与隐私", "Index & Privacy")
         case .quicklinks: return model.t("快捷链接", "Quicklinks")
         case .translation: return model.t("翻译", "Translation")
-        #if LUMEN_EXTENSIONS
-        case .extensions: return model.t("扩展", "Extensions")
-        #endif
         case .advanced: return model.t("高级与诊断", "Advanced & Diagnostics")
         }
     }
@@ -588,9 +582,6 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .index: return "folder.badge.gearshape"
         case .quicklinks: return "link"
         case .translation: return "character.bubble"
-        #if LUMEN_EXTENSIONS
-        case .extensions: return "puzzlepiece.extension"
-        #endif
         case .advanced: return "waveform.path.ecg"
         }
     }
@@ -709,7 +700,6 @@ struct LauncherSettings: View {
     let images: LauncherImageSearch
     let chooseImageFolder: () -> Void
     let chooseImageProjector: () -> Void
-    let extensionContent: AnyView?
     let chooseQuicklinkFolder: (@escaping (URL) -> Void) -> Void
     let recordShortcut: (NSEvent) -> Void
     let disableShortcut: () -> Void
@@ -728,11 +718,6 @@ struct LauncherSettings: View {
                 case .quicklinks:
                     pageHeading.padding(.horizontal, 28).padding(.top, 26)
                     QuicklinksView(model: model, library: model.shortcuts, chooseFolder: chooseQuicklinkFolder)
-                #if LUMEN_EXTENSIONS
-                case .extensions:
-                    pageHeading.padding(.horizontal, 28).padding(.top, 26)
-                    extensionContent
-                #endif
                 default:
                     ScrollView {
                         VStack(alignment: .leading, spacing: 19) {

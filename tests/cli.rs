@@ -3,7 +3,7 @@ use std::{
     ffi::{CStr, OsStr},
     fs,
     io::Write,
-    os::unix::ffi::OsStrExt,
+    os::unix::ffi::{OsStrExt, OsStringExt},
     path::PathBuf,
     process::{Command, Stdio},
 };
@@ -11,7 +11,11 @@ use std::{
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
-        let mut template = *b"/tmp/lumen-test-XXXXXX\0";
+        Self::under(std::path::Path::new("/tmp"))
+    }
+    fn under(parent: &std::path::Path) -> Self {
+        let mut template = parent.join("lumen-test-XXXXXX").into_os_string().into_vec();
+        template.push(0);
         // mkdtemp mutates this writable C template and atomically creates a
         // private directory, even when tests start in the same clock tick.
         let path = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
@@ -43,6 +47,47 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn custom_root_indexes_project_material_but_not_development_noise() {
+    let f = Fixture::new();
+    let root = f.0.join("project");
+    for dir in [
+        "node_modules",
+        "target",
+        "DerivedData",
+        ".venv",
+        "venv",
+        "__pycache__",
+        "Pods",
+        ".gradle",
+        ".cargo",
+        ".rustup",
+        ".npm",
+        ".pnpm-store",
+        ".yarn",
+        ".next",
+        ".nuxt",
+        ".build",
+        ".swiftpm",
+        "bower_components",
+        "CMakeFiles",
+        "src",
+    ] {
+        let path = root.join(dir);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("scope-probe.txt"), "").unwrap();
+    }
+    f.run(&["index", "--root", root.to_str().unwrap()]);
+    let hits = f.run(&["query", "scope-probe"]);
+    assert_eq!(hits.as_array().unwrap().len(), 1);
+    assert!(
+        hits[0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("/src/scope-probe.txt")
+    );
 }
 
 const WORD_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
@@ -828,7 +873,19 @@ mod live {
         assert_eq!(serve.names("鹿鸣 成都", "name"), ["鹿鸣资料.md"]);
         assert_eq!(serve.names("成都 鹿鸣", "name"), ["鹿鸣资料.md"]);
         assert!(serve.names("成都 pptx pdf", "all").is_empty());
-        assert_eq!(serve.names("ＰＰＴＸ", "name").len(), 5);
+        assert_eq!(serve.names(".ＰＰＴＸ", "name").len(), 5);
+        assert_eq!(
+            serve.names("ext:pptx", "name"),
+            serve.names(".pptx", "name")
+        );
+        assert!(
+            serve
+                .names("ＰＰＴＸ", "name")
+                .contains(&"成都卫健委pptx.txt".to_owned())
+        );
+        let mut text_matches = serve.names("pptx", "text");
+        text_matches.sort_unstable();
+        assert_eq!(text_matches, ["letters.md", "missing.txt"]);
 
         assert_eq!(serve.names("成都 卫健委 txt", "text"), ["words.txt"]);
         assert_eq!(serve.names("卫健委 .TXT 成都", "text"), ["words.txt"]);
@@ -1210,6 +1267,361 @@ mod live {
                 && event["estimated_total"] == 2
                 && event["estimate_basis"] == "previous_scan"
         }));
+    }
+
+    #[test]
+    fn legacy_pdf_extraction_does_not_lock_out_background_writers() {
+        let f = Fixture::new();
+        let root = f.0.join("scope");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("legacy.pdf"), "%PDF-synthetic fixture").unwrap();
+        let helper = f.0.join("legacy-extractor");
+        executable(
+            &helper,
+            r#"#!/bin/sh
+: > "$0.started"
+i=0
+while [ ! -f "$0.release" ] && [ "$i" -lt 250 ]; do i=$((i+1)); sleep 0.02; done
+printf 'legacy indexed body'
+"#,
+        );
+        let mut scanner = Process::launch(f.cli().args([
+            "index",
+            "--root",
+            root.to_str().unwrap(),
+            "--documents",
+            "--pdf-helper",
+            helper.to_str().unwrap(),
+        ]));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !helper.with_extension("started").exists() {
+            assert!(Instant::now() < deadline, "legacy extractor did not start");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+        db.busy_timeout(Duration::ZERO).unwrap();
+        let write = db.execute("INSERT INTO info VALUES('write_probe','background')", []);
+        fs::write(helper.with_extension("release"), "").unwrap();
+        assert_eq!(
+            write.unwrap(),
+            1,
+            "a background write must not wait for PDF extraction"
+        );
+        assert!(scanner.child.wait().unwrap().success());
+        assert_eq!(f.run(&["status"])["documents"], 1);
+    }
+
+    #[test]
+    fn unreadable_legacy_body_stays_hidden_between_write_batches() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let f = Fixture::new();
+        let root = f.0.join("scope");
+        let later = f.0.join("later");
+        for dir in [&root, &later] {
+            fs::create_dir(dir).unwrap();
+        }
+        let secret = root.join("record.md");
+        fs::write(&secret, "unreadable legacy prose").unwrap();
+        let helper = f.0.join("extractor");
+        executable(
+            &helper,
+            r#"#!/bin/sh
+: > "$0.started"
+while [ ! -f "$0.release" ]; do sleep 0.02; done
+printf 'second batch text'
+"#,
+        );
+        let args = [
+            "index",
+            "--root",
+            root.to_str().unwrap(),
+            "--root",
+            later.to_str().unwrap(),
+            "--documents",
+            "--pdf-helper",
+            helper.to_str().unwrap(),
+        ];
+        f.run(&args);
+        let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+        db.execute_batch(
+            "UPDATE item SET availability='unverified' WHERE display='record.md';
+             DELETE FROM document_state;",
+        )
+        .unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(fs::read_dir(&root).unwrap().next().unwrap().is_ok());
+        assert_eq!(
+            fs::File::open(&secret).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        // Finish a batch after the denial before pausing at a later root.
+        let flush_root = f.0.join("flush");
+        fs::create_dir(&flush_root).unwrap();
+        fs::write(flush_root.join("flush.md"), "flush marker prose").unwrap();
+        fs::write(later.join("pause.pdf"), "%PDF-synthetic").unwrap();
+        let mut scanner = Process::launch(
+            f.cli()
+                .args(&args[..3])
+                .args(["--root", flush_root.to_str().unwrap()])
+                .args(&args[3..]),
+        );
+        wait_for_path(&helper.with_extension("started"));
+        let mut serve = Serve::new(&f);
+        assert_eq!(serve.names("flush marker prose", "text"), ["flush.md"]);
+        assert!(serve.names("unreadable legacy prose", "text").is_empty());
+        fs::write(helper.with_extension("release"), "").unwrap();
+        assert!(scanner.child.wait().unwrap().success());
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        f.run(&args);
+        assert_eq!(
+            serve.names("unreadable legacy prose", "text"),
+            ["record.md"]
+        );
+    }
+
+    fn wait_for_path(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "never reached {}",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn upgraded_scope_removes_old_exclusions_before_cached_start() {
+        let f = Fixture::new();
+        let root = f.0.join("scope");
+        let dev = root.join("node_modules");
+        let package = root.join("Editor.app/Contents");
+        for dir in [&dev, &package] {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join("retired-scope.txt"), "").unwrap();
+        }
+        fs::write(root.join("retained-scope.txt"), "").unwrap();
+        f.run(&[
+            "index",
+            "--root",
+            root.to_str().unwrap(),
+            "--root",
+            dev.to_str().unwrap(),
+            "--root",
+            package.to_str().unwrap(),
+        ]);
+        let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+        let info = |key| -> String {
+            db.query_row("SELECT value FROM info WHERE key=?", [key], |r| r.get(0))
+                .unwrap()
+        };
+        let mut checkpoint: Value = serde_json::from_str(&info("watch_checkpoint_v1")).unwrap();
+        checkpoint[1]["roots"].as_array_mut().unwrap().truncate(1);
+        db.execute(
+            "UPDATE info SET value=? WHERE key='scope'",
+            [checkpoint[1].to_string()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO info(key,value) VALUES('watch_checkpoint_v1',?)",
+            [checkpoint.to_string()],
+        )
+        .unwrap();
+        db.execute_batch("PRAGMA user_version=2; DELETE FROM info WHERE key IN ('scope_policy_v3','scope_policy_v4');")
+            .unwrap();
+        let prior_scan = info("scan");
+        let mut serve = Serve::new(&f);
+        assert_eq!(serve.names("retired-scope", "name").len(), 2);
+
+        let watcher = Process::launch(f.cli().args(["watch", "--cached-start"]));
+        assert_eq!(watcher.json()["event"], "cached");
+        assert!(serve.names("retired-scope", "name").is_empty());
+        assert_eq!(watcher.json()["event"], "ready");
+        assert_ne!(
+            info("scan"),
+            prior_scan,
+            "the pre-upgrade journal must not authorize replay"
+        );
+        assert_eq!(
+            serve.names("retained-scope", "name"),
+            ["retained-scope.txt"]
+        );
+        let excluded: i64 = db
+            .query_row(
+                "SELECT count(*) FROM item WHERE display='retired-scope.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(excluded, 0);
+    }
+
+    #[test]
+    fn cached_start_removes_traversal_only_rows_from_an_unchanged_scope() {
+        let f = Fixture::new();
+        let home = fs::canonicalize(&f.0).unwrap().join("home");
+        let library = home.join("Library");
+        let child = library.join("CloudStorage");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("retained-cloud-file.txt"), "").unwrap();
+        let library_path = library.to_str().unwrap();
+        assert!(
+            f.cli()
+                .env("HOME", &home)
+                .args(["index", "--root", library_path])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+        let library_present = || -> bool {
+            db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM item WHERE path=?)",
+                [library_path],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(!library_present(), "the walker must only traverse Library");
+        db.execute(
+            "INSERT INTO item(path,display,kind,availability,name,full,initials,searchable_path)
+             VALUES(?1,'Library','directory','local','library','','',?1)",
+            [library_path],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO name_fts(rowid,name,full,initials,searchable_path)
+             SELECT id,name,full,initials,searchable_path FROM item WHERE path=?1",
+            [library_path],
+        )
+        .unwrap();
+        // Simulate a catalog already reconciled by the previous policy.
+        db.execute_batch(
+            "DELETE FROM info WHERE key IN ('scope_policy_v4','watch_checkpoint_v1');
+             INSERT OR REPLACE INTO info VALUES('scope_policy_v3','true');",
+        )
+        .unwrap();
+        let mut serve = Serve::new(&f);
+        assert!(
+            serve
+                .names("library", "name")
+                .iter()
+                .any(|name| name == "Library")
+        );
+
+        let mut command = f.cli();
+        command.env("HOME", &home).args(["watch", "--cached-start"]);
+        let (marker, release) = pause_lstat(&f, &mut command, &child, 1);
+        let watcher = Process::launch(&mut command);
+        assert_eq!(watcher.json()["event"], "cached");
+        wait_for_path(&marker);
+        assert!(
+            !library_present(),
+            "restrict_scope must purge Library before Cached"
+        );
+        assert!(
+            !serve
+                .names("library", "name")
+                .iter()
+                .any(|name| name == "Library")
+        );
+        assert_eq!(
+            serve.names("retained-cloud-file", "name"),
+            ["retained-cloud-file.txt"]
+        );
+        fs::write(release, "").unwrap();
+        assert_eq!(watcher.json()["event"], "ready");
+    }
+
+    #[test]
+    fn package_subtree_event_revisits_a_directly_nested_explicit_root() {
+        let f = Fixture::new();
+        let root = f.0.join("scope");
+        let app = root.join("Editor.app");
+        let nested = app.join("Contents");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("explicit-note.md"), "indexed explicit prose").unwrap();
+        fs::write(app.join("implicit-note.md"), "opaque to the outer root").unwrap();
+        let watcher = watch(
+            &f,
+            &[
+                "--root",
+                root.to_str().unwrap(),
+                "--root",
+                nested.to_str().unwrap(),
+                "--documents",
+            ],
+        );
+        let mut serve = Serve::new(&f);
+        assert_eq!(
+            serve.names("indexed explicit prose", "text"),
+            ["explicit-note.md"]
+        );
+        assert!(serve.names("implicit-note", "name").is_empty());
+        let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+        db.execute(
+            "UPDATE item SET availability='unverified' WHERE display='explicit-note.md'",
+            [],
+        )
+        .unwrap();
+        fs::set_permissions(&app, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(watcher.json()["event"], "updated");
+        assert_eq!(
+            serve.names("indexed explicit prose", "text"),
+            ["explicit-note.md"]
+        );
+    }
+
+    #[test]
+    fn explicit_root_overrides_system_defaults_but_not_privacy_rules() {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let f = Fixture::under(&home.join("Library"));
+        let root = f.0.join("projects");
+        for dir in [
+            "src",
+            "Keychains",
+            "Cookies",
+            "Caches",
+            ".private",
+            "explicit-deny",
+        ] {
+            let dir = root.join(dir);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("system-root-probe.md"), "selected project body").unwrap();
+        }
+        assert!(!lumen::Scope::default().allows(&root));
+        assert!(
+            lumen::Scope {
+                roots: vec!["/opt/projects".into()],
+                ..Default::default()
+            }
+            .allows(Path::new("/opt/projects/src"))
+        );
+        f.run(&[
+            "index",
+            "--root",
+            root.to_str().unwrap(),
+            "--documents",
+            "--deny",
+            root.join("explicit-deny").to_str().unwrap(),
+        ]);
+        let mut serve = Serve::new(&f);
+        let hits = serve.hits("system-root-probe", "name");
+        assert_eq!(hits.as_array().unwrap().len(), 1);
+        assert!(
+            hits[0]["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("/src/system-root-probe.md")
+        );
+        assert_eq!(
+            serve.names("selected project body", "text"),
+            ["system-root-probe.md"]
+        );
     }
 
     #[test]
@@ -1598,8 +2010,10 @@ mod live {
         fs::write(root.join("existing.txt"), "legacy document").unwrap();
         f.run(&["index", "--root", r, "--documents"]);
         let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
-        db.execute_batch("DELETE FROM info WHERE key='scope'; DROP TABLE document_state;")
-            .unwrap();
+        db.execute_batch(
+            "PRAGMA user_version=1; DELETE FROM info WHERE key='scope'; DROP TABLE document_state;",
+        )
+        .unwrap();
         drop(db);
 
         let output = f.cli().arg("watch").output().unwrap();
@@ -1925,6 +2339,10 @@ esac
             assert_eq!(result[0]["matched_by"], "semantic");
             assert!(result[0].get("page").is_none());
         }
+        let all_hits = f.run(&["query", "distant orbit", "--mode", "all", "--helper", m]);
+        assert_eq!(all_hits.as_array().unwrap().len(), 1);
+        assert_eq!(all_hits[0]["name"], "reference.docx");
+        assert_eq!(all_hits[0]["matched_by"], "semantic");
         let filler_hits = f.run(&["query", "invoice", "--mode", "semantic", "--helper", m]);
         assert_eq!(filler_hits.as_array().unwrap().len(), 1);
     }
@@ -2029,7 +2447,8 @@ esac
         let path = f.0.join("test.sqlite");
         let db = rusqlite::Connection::open(&path).unwrap();
         db.execute_batch(
-            "DROP TRIGGER semantic_document_inserted; DROP TRIGGER semantic_document_deleted;
+            "PRAGMA user_version=1;
+             DROP TRIGGER semantic_document_inserted; DROP TRIGGER semantic_document_deleted;
              DROP TABLE semantic_chunk; DROP TABLE semantic_document; DROP TABLE semantic_state;
              INSERT INTO embedding SELECT id, zeroblob(32) FROM document;
              INSERT INTO info VALUES('model','legacy-prefix-model');",
@@ -2137,7 +2556,8 @@ esac
         );
 
         let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
-        db.execute_batch("DROP TABLE document_state").unwrap();
+        db.execute_batch("PRAGMA user_version=1; DROP TABLE document_state")
+            .unwrap();
         for hits in [serve.hits("older paragraph", "text"), semantic()] {
             assert_eq!(hits[0]["snippet"], old);
             assert!(hits[0].get("document_stamp").is_none());
@@ -2412,8 +2832,9 @@ done
         );
         let raw = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
         raw.execute_batch(
-            "DROP TRIGGER semantic_versioned_chunk_deleted;
-                           DROP TABLE semantic_vector; DROP TABLE semantic_vector_count;",
+            "PRAGMA user_version=1;
+             DROP TRIGGER semantic_versioned_chunk_deleted;
+             DROP TABLE semantic_vector; DROP TABLE semantic_vector_count;",
         )
         .unwrap();
         let before = f.run(&["gemma-status", "--gemma-home", home]);
@@ -2817,6 +3238,306 @@ done
         assert_eq!(search.names("c.md", "name"), ["c.md"]);
         assert_eq!(f.run(&["content"])["indexed"], 1);
         assert_eq!(search.names("updatedneedle", "text"), ["c.md"]);
+    }
+
+    #[test]
+    fn separate_content_keeps_denied_body_hidden_after_ready() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let f = Fixture::new();
+        let scope = f.0.join("scope");
+        fs::create_dir(&scope).unwrap();
+        let secret = scope.join("restricted.md");
+        fs::write(&secret, "restricted separate prose").unwrap();
+        let root = scope.to_str().unwrap();
+        f.run(&["index", "--root", root, "--content-root", root]);
+        assert_eq!(f.run(&["content"])["indexed"], 1);
+        let mut serve = Serve::new(&f);
+        assert_eq!(
+            serve.names("restricted separate prose", "text"),
+            ["restricted.md"]
+        );
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(fs::read_dir(&scope).unwrap().next().unwrap().is_ok());
+        assert_eq!(
+            fs::File::open(&secret).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+        db.execute("DELETE FROM info WHERE key='watch_checkpoint_v1'", [])
+            .unwrap();
+        let watcher = watch(&f, &[]);
+        assert!(serve.names("restricted separate prose", "text").is_empty());
+        f.run(&["content"]);
+        assert!(serve.names("restricted separate prose", "text").is_empty());
+        drop(watcher);
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        let _watcher = watch(&f, &[]);
+        f.run(&["content"]);
+        assert_eq!(
+            serve.names("restricted separate prose", "text"),
+            ["restricted.md"]
+        );
+    }
+
+    #[test]
+    fn pending_legacy_content_is_cleared_on_permission_denied() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let f = Fixture::new();
+        let scope = f.0.join("scope");
+        let nested = scope.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let unreadable = scope.join("unreadable.md");
+        let unreachable = nested.join("unreachable.md");
+        fs::write(&unreadable, "unreadable legacy body").unwrap();
+        fs::write(&unreachable, "unreachable legacy body").unwrap();
+        let root = scope.to_str().unwrap();
+        f.run(&["index", "--root", root, "--documents"]);
+        assert_eq!(
+            f.run(&["content-scope", "--content-root", root])["content"]["pending"],
+            2
+        );
+        let mut serve = Serve::new(&f);
+        assert_eq!(
+            serve.names("unreadable legacy body", "text"),
+            ["unreadable.md"]
+        );
+        assert_eq!(
+            serve.names("unreachable legacy body", "text"),
+            ["unreachable.md"]
+        );
+
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            fs::File::open(&unreadable).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            fs::symlink_metadata(&unreachable).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let batch = f.run(&["content"]);
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(batch["processed"], 0);
+        assert_eq!(batch["pending"], 2);
+        assert!(serve.names("legacy body", "text").is_empty());
+        assert_eq!(f.run(&["content"])["indexed"], 2);
+        assert_eq!(
+            serve.names("unreadable legacy body", "text"),
+            ["unreadable.md"]
+        );
+        assert_eq!(
+            serve.names("unreachable legacy body", "text"),
+            ["unreachable.md"]
+        );
+    }
+
+    #[test]
+    fn failed_low_ids_do_not_starve_later_content_jobs() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let f = Fixture::new();
+        let scope = f.0.join("scope");
+        fs::create_dir(&scope).unwrap();
+        for name in ["first.txt", "second.txt", "third.txt"] {
+            fs::write(scope.join(name), format!("queue prose for {name}")).unwrap();
+        }
+        let root = scope.to_str().unwrap();
+        f.run(&["index", "--root", root, "--content-root", root]);
+        let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+        let paths = db
+            .prepare("SELECT path FROM content_job JOIN item ON item_id=id ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for path in &paths[..2] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let batch = f.run(&["content", "--max", "1"]);
+        assert_eq!(batch["processed"], 1);
+        assert_eq!(batch["indexed"], 1);
+        assert_eq!(batch["pending"], 2);
+        let mut serve = Serve::new(&f);
+        assert_eq!(
+            serve.names("queue prose", "text"),
+            [Path::new(&paths[2]).file_name().unwrap().to_str().unwrap()]
+        );
+        assert_eq!(f.run(&["content", "--max", "1"])["processed"], 0);
+        fs::set_permissions(&paths[0], fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(f.run(&["content", "--max", "1"])["indexed"], 1);
+    }
+
+    #[test]
+    fn retry_cursor_survives_a_failed_job_that_exhausts_the_batch_budget() {
+        let f = Fixture::new();
+        let first = f.0.join("first");
+        let second = f.0.join("second");
+        for root in [&first, &second] {
+            fs::create_dir(root).unwrap();
+        }
+        fs::write(first.join("slow.pdf"), "%PDF-synthetic").unwrap();
+        fs::write(second.join("later.md"), "later pending prose").unwrap();
+        let helper = f.0.join("extractor");
+        executable(
+            &helper,
+            r#"#!/bin/sh
+# Deliberately exceed the batch budget, then make the extraction stale.
+sleep 2.2
+printf 'changed' >> "${0%/*}/first/slow.pdf"
+printf 'stale extraction'
+"#,
+        );
+        let first = first.to_str().unwrap();
+        let second = second.to_str().unwrap();
+        f.run(&[
+            "index",
+            "--root",
+            first,
+            "--root",
+            second,
+            "--content-root",
+            first,
+            "--content-root",
+            second,
+            "--documents",
+            "--pdf-helper",
+            helper.to_str().unwrap(),
+        ]);
+        let stale = f.run(&["content"]);
+        assert_eq!(stale["processed"], 0);
+        assert_eq!(stale["pending"], 2);
+        let next = f.run(&["content", "--max", "1"]);
+        assert_eq!(next["indexed"], 1);
+        assert_eq!(next["pending"], 1);
+        assert_eq!(
+            Serve::new(&f).names("later pending prose", "text"),
+            ["later.md"]
+        );
+    }
+
+    fn pause_lstat(
+        f: &Fixture,
+        command: &mut Command,
+        target: &Path,
+        occurrence: u32,
+    ) -> (PathBuf, PathBuf) {
+        let source = f.0.join("pause-stat.c");
+        let library = f.0.join("pause-stat.dylib");
+        let marker = f.0.join("stat-started");
+        let release = f.0.join("stat-release");
+        // Pause the real metadata syscall without replacing the walker, worker, or DB.
+        fs::write(
+            &source,
+            r#"
+#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+static int paused_lstat(const char *path, struct stat *buf) {
+    const char *target = getenv("LUMEN_TEST_STAT_TARGET");
+    static int calls;
+    if (target && strcmp(target, path) == 0 && ++calls == atoi(getenv("LUMEN_TEST_STAT_OCCURRENCE"))) {
+        int fd = open(getenv("LUMEN_TEST_STAT_STARTED"), O_CREAT | O_WRONLY, 0600);
+        if (fd >= 0) close(fd);
+        for (int i = 0; i < 500 && access(getenv("LUMEN_TEST_STAT_RELEASE"), F_OK) != 0; ++i)
+            usleep(20000);
+    }
+    return lstat(path, buf);
+}
+__attribute__((used, section("__DATA,__interpose")))
+static const struct { const void *replacement; const void *original; } hook = {paused_lstat, lstat};
+"#,
+        )
+        .unwrap();
+        let compile = Command::new("cc")
+            .args(["-dynamiclib", "-o"])
+            .arg(&library)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        command
+            .env("DYLD_INSERT_LIBRARIES", &library)
+            .env("LUMEN_TEST_STAT_TARGET", fs::canonicalize(target).unwrap())
+            .env("LUMEN_TEST_STAT_OCCURRENCE", occurrence.to_string())
+            .env("LUMEN_TEST_STAT_STARTED", &marker)
+            .env("LUMEN_TEST_STAT_RELEASE", &release);
+        (marker, release)
+    }
+
+    fn assert_stat_does_not_hold_writer(f: &Fixture, marker: &Path, release: &Path) {
+        wait_for_path(marker);
+        let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+        db.busy_timeout(Duration::ZERO).unwrap();
+        let write = db.execute(
+            "INSERT INTO info VALUES('stat_probe','background write')",
+            [],
+        );
+        fs::write(release, "").unwrap();
+        assert_eq!(
+            write.expect("metadata lookup must not hold SQLite's write lock"),
+            1
+        );
+    }
+
+    #[test]
+    fn bulk_document_metadata_does_not_hold_a_writer_transaction() {
+        let f = Fixture::new();
+        let root = f.0.join("scope");
+        fs::create_dir(&root).unwrap();
+        let file = root.join("metadata-probe.md");
+        fs::write(&file, "content version probe").unwrap();
+        let r = root.to_str().unwrap();
+        assert!(
+            f.run(&["index", "--root", r])["bulk_directories"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        let mut command = f.cli();
+        command.args(["index", "--root", r, "--content-root", r]);
+        let (marker, release) = pause_lstat(&f, &mut command, &file, 1);
+        let mut scan = Process::launch(&mut command);
+        assert_stat_does_not_hold_writer(&f, &marker, &release);
+        let output = scan.output.iter().collect::<Vec<_>>().join("\n");
+        assert!(scan.child.wait().unwrap().success());
+        let stats: Value = serde_json::from_str(&output).unwrap();
+        assert!(stats["bulk_directories"].as_u64().unwrap() > 0);
+        assert_eq!(f.run(&["content"])["indexed"], 1);
+    }
+
+    #[test]
+    fn content_worker_rechecks_ancestor_metadata_before_the_writer_transaction() {
+        let f = Fixture::new();
+        let root = f.0.join("scope");
+        let ancestor = root.join("nested");
+        fs::create_dir_all(&ancestor).unwrap();
+        fs::write(ancestor.join("pending.md"), "metadata lock probe").unwrap();
+        let r = root.to_str().unwrap();
+        f.run(&["index", "--root", r, "--content-root", r]);
+        let mut command = f.cli();
+        command.arg("content");
+        // The first ancestor stat precedes extraction; pause the second one,
+        // which revalidates the result just before it can be published.
+        let (marker, release) = pause_lstat(&f, &mut command, &ancestor, 2);
+        let mut worker = Process::launch(&mut command);
+        assert_stat_does_not_hold_writer(&f, &marker, &release);
+        assert_eq!(worker.json()["indexed"], 1);
+        assert!(worker.child.wait().unwrap().success());
     }
 
     #[test]

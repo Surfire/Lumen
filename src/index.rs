@@ -103,12 +103,40 @@ impl PdfExtractor {
 pub(super) const INDEX_SIDECARS: [&str; 5] =
     ["-wal", "-shm", "-journal", "-watch-lock", "-external"];
 
+fn opaque_package(path: &Path) -> bool {
+    const EXTENSIONS: &[&str] = &[
+        "app",
+        "framework",
+        "bundle",
+        "xcodeproj",
+        "xcworkspace",
+        "photoslibrary",
+        "musiclibrary",
+        "fcpbundle",
+        "imovielibrary",
+        "playground",
+        "xcarchive",
+        "dsym",
+        "lproj",
+        "kext",
+        "plugin",
+        "appex",
+        "xpc",
+    ];
+    path.extension().is_some_and(|extension| {
+        EXTENSIONS
+            .iter()
+            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    })
+}
+
 pub(super) fn is_index_path(path: &Path, database: &Path, sidecars: &[PathBuf]) -> bool {
-    path == database
-        || sidecars.iter().any(|sidecar| path.starts_with(sidecar))
-        || database
-            .parent()
-            .is_some_and(|p| p.ends_with("Lumen") && path.starts_with(p))
+    path == database || sidecars.iter().any(|sidecar| path.starts_with(sidecar))
+}
+
+// Traversal may pass through these paths without publishing rows for them.
+fn visible_entry_path(path: &Path) -> bool {
+    path != Path::new("/") && !super::scope_ancestor(path)
 }
 
 pub(super) struct Coverage {
@@ -193,7 +221,9 @@ impl Coverage {
     }
 
     pub(super) fn contains(&self, path: &Path) -> bool {
-        self.scope.roots.iter().any(|root| path.starts_with(root)) && self.allows(path)
+        visible_entry_path(path)
+            && self.scope.roots.iter().any(|root| path.starts_with(root))
+            && self.allows(path)
     }
 
     pub(super) fn permits_content(&self, path: &Path) -> bool {
@@ -212,6 +242,19 @@ impl Coverage {
             |boundary| boundary.allows(path),
         ) && self.scope.allows(path)
             && !is_index_path(path, &self.database, &self.sidecars)
+            && self
+                .scope
+                .roots
+                .iter()
+                .filter(|root| path.starts_with(root))
+                .max_by_key(|root| root.components().count())
+                .is_none_or(|root| {
+                    !path
+                        .ancestors()
+                        .skip(1)
+                        .take_while(|parent| parent.starts_with(root))
+                        .any(opaque_package)
+                })
     }
 }
 
@@ -349,17 +392,26 @@ pub(super) fn restrict_scope(conn: &mut Connection, coverage: &Coverage) -> Resu
     let prior: Option<String> = tx
         .query_row("SELECT value FROM info WHERE key='scope'", [], |r| r.get(0))
         .optional()?;
-    if prior.as_deref() == Some(&requested) {
+    // Recheck unchanged scopes from catalogs written before traversal-only
+    // paths were excluded here as well as in the walk.
+    const POLICY_KEY: &str = "scope_policy_v4";
+    let policy_reconciled = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM info WHERE key=?)",
+        [POLICY_KEY],
+        |r| r.get::<_, bool>(0),
+    )?;
+    if policy_reconciled && prior.as_deref() == Some(&requested) {
         return Ok(());
     }
-    let same_names = prior
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<Scope>(raw).ok())
-        .is_some_and(|scope| {
-            scope.roots == coverage.scope.roots
-                && scope.allow == coverage.scope.allow
-                && scope.deny == coverage.scope.deny
-        });
+    let same_names = policy_reconciled
+        && prior
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Scope>(raw).ok())
+            .is_some_and(|scope| {
+                scope.roots == coverage.scope.roots
+                    && scope.allow == coverage.scope.allow
+                    && scope.deny == coverage.scope.deny
+            });
     if !same_names {
         let mut items = tx.prepare("SELECT id,path FROM item")?;
         let mut rows = items.query([])?;
@@ -381,6 +433,7 @@ pub(super) fn restrict_scope(conn: &mut Connection, coverage: &Coverage) -> Resu
         tx.execute("DELETE FROM info WHERE key='walk_sample'", [])?;
     }
     write_info(&tx, "scope", &coverage.scope)?;
+    write_info(&tx, POLICY_KEY, &true)?;
     tx.commit()?;
     Ok(())
 }
@@ -461,13 +514,16 @@ pub(super) fn reconcile(
         let estimate = previous_walk_entries(&tx)?;
         progress.phase(ScanPhase::Scanning, 0, estimate);
     }
-    let mut walk = Walk::new(&tx, coverage);
+    tx.commit()?;
+    let mut walk = Walk::new(conn, coverage);
     walk.cold = cold;
     walk.progress = progress;
     for root in &coverage.scope.roots {
         walk.visit(root, true, true)?;
     }
+    walk.flush()?;
     let entries = walk.entries;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     if let Some(progress) = progress {
         progress.phase(ScanPhase::Finalizing, entries, Some(entries));
     }
@@ -487,13 +543,6 @@ pub(super) fn reconcile(
         }
     }
     hide_unverified(&tx)?;
-    if cold {
-        tx.execute(
-            "INSERT INTO name_fts(rowid,name,full,initials,searchable_path)
-             SELECT id,name,full,initials,searchable_path FROM item ORDER BY id",
-            [],
-        )?;
-    }
     if !failed
         && walk.readable_roots == coverage.scope.roots.len()
         && walk.stats.entries_unreadable == 0
@@ -549,8 +598,9 @@ pub(super) fn apply_changes(
     targets: std::collections::BTreeMap<PathBuf, bool>,
 ) -> Result<(ScanStats, bool)> {
     let _io = platform::NoMaterialization::enter()?;
-    let tx = begin(conn)?;
-    let mut walk = Walk::new(&tx, coverage);
+    begin(conn)?.commit()?;
+    let mut walk = Walk::new(conn, coverage);
+    let mut checked = Vec::new();
     for (path, recurse) in &targets {
         if path
             .ancestors()
@@ -562,19 +612,25 @@ pub(super) fn apply_changes(
         let subtree = walk.visit(path, false, *recurse)?;
         if subtree {
             // An explicit nested root may be reachable only by starting at
-            // that root, e.g. a temporary fixture under the system exclusions.
+            // that root. Include the event target: it may itself be opaque.
             for root in &coverage.scope.roots {
                 if root != path
                     && root.starts_with(path)
                     && root
                         .ancestors()
-                        .take_while(|p| *p != path)
-                        .any(|p| !coverage.allows(p))
+                        .skip(1)
+                        .take_while(|p| p.starts_with(path))
+                        .any(|p| opaque_package(p) || !coverage.allows(p))
                 {
                     walk.visit(root, true, true)?;
                 }
             }
         }
+        checked.push((path, subtree));
+    }
+    walk.flush()?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    for (path, subtree) in checked {
         mark_stale(&tx, path, subtree)?;
     }
     let removed = purge(&tx)?;
@@ -649,8 +705,35 @@ fn purge(tx: &Transaction<'_>) -> Result<usize> {
     Ok(tx.execute("DELETE FROM item WHERE id IN (SELECT id FROM stale)", [])?)
 }
 
+const WRITE_BATCH: usize = 5000;
+
+enum Pending {
+    Item {
+        path: PathBuf,
+        directory: bool,
+        availability: &'static str,
+        legacy: Option<Box<LegacyDocument>>,
+        content: Option<crate::content::Observation>,
+    },
+    Gap(PathBuf),
+}
+
+enum LegacyDocument {
+    Current,
+    Unreadable,
+    Empty,
+    Extracted {
+        stamp: String,
+        restamp: bool,
+        text: crate::content::Extracted,
+    },
+}
+
 struct Walk<'a> {
-    tx: &'a Transaction<'a>,
+    conn: &'a Connection,
+    tx: Option<Transaction<'a>>,
+    pending: Vec<Pending>,
+    scratch: Vec<u64>,
     coverage: &'a Coverage,
     stats: ScanStats,
     cold: bool,
@@ -663,9 +746,12 @@ struct Walk<'a> {
 }
 
 impl<'a> Walk<'a> {
-    fn new(tx: &'a Transaction<'a>, coverage: &'a Coverage) -> Self {
+    fn new(conn: &'a Connection, coverage: &'a Coverage) -> Self {
         Self {
-            tx,
+            conn,
+            tx: None,
+            pending: Vec::with_capacity(WRITE_BATCH),
+            scratch: Vec::new(),
             coverage,
             stats: ScanStats::default(),
             cold: false,
@@ -757,44 +843,85 @@ impl<'a> Walk<'a> {
                 self.stats.skipped += 1;
                 continue;
             };
-            let mut descend = recursive && directory && availability != "placeholder";
-            if path != Path::new("/") {
-                let display = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or(path_text);
-                let kind = if directory { "directory" } else { "file" };
-                if self.cold {
-                    if self
-                        .insert_item(path_text, display, kind, availability)?
-                        .is_some()
-                    {
-                        self.stats.items += 1;
+            let opaque = directory && opaque_package(&path);
+            let mut descend = recursive && directory && availability != "placeholder" && !opaque;
+            if !recursive && directory && availability != "placeholder" && !opaque {
+                let prior: Option<(String, String)> = self
+                    .conn
+                    .prepare_cached("SELECT kind,availability FROM item WHERE path=?")?
+                    .query_row([path_text], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .optional()?;
+                // New, replaced, or re-materialized directory, even if
+                // the notification described only the directory itself.
+                descend = prior
+                    .as_ref()
+                    .is_none_or(|(kind, old)| kind != "directory" || old != availability);
+            }
+            if visible_entry_path(&path) {
+                let mut legacy = None;
+                let mut content = None;
+                if !directory
+                    && self.coverage.permits_content(&path)
+                    && let Some(kind) = DocumentKind::for_path(&path)
+                    && (kind != DocumentKind::Pdf || self.coverage.pdf.is_some())
+                {
+                    // Bulk enumeration omits document version metadata. Fetch
+                    // it here, before the pending batch can acquire a write lock.
+                    let fetched;
+                    let meta = match (availability, metadata.as_ref()) {
+                        ("local", Some(meta)) => Some(meta),
+                        ("local", None) => match fs::symlink_metadata(&path) {
+                            Ok(meta) => {
+                                fetched = meta;
+                                Some(&fetched)
+                            }
+                            Err(error) if confirmed_absent(&error) => None,
+                            Err(_) => {
+                                self.gap(&path)?;
+                                continue;
+                            }
+                        },
+                        _ => None,
                     }
-                } else {
-                    let (id, prior, first) =
-                        self.observe(path_text, display, kind, availability)?;
-                    if directory
-                        && availability != "placeholder"
-                        && prior.as_deref() != Some(availability)
-                    {
-                        // New, replaced, or re-materialized directory, even if
-                        // the notification described only the directory itself.
-                        descend = true;
+                    .filter(|meta| {
+                        meta.is_file() && platform::availability(&path, meta) == "local"
+                    });
+                    if self.coverage.scope.content_roots.is_none() {
+                        let document = self.read_document(&path, meta, kind)?;
+                        if matches!(document, LegacyDocument::Unreadable) {
+                            self.stats.documents_not_read += 1;
+                            self.gap(&path)?;
+                            continue;
+                        }
+                        legacy = Some(Box::new(document));
+                    } else if availability == "local" {
+                        match crate::content::prepare(self.conn, self.coverage, &path, meta, kind)?
+                        {
+                            Some(observation) => content = Some(observation),
+                            None => {
+                                self.gap(&path)?;
+                                continue;
+                            }
+                        }
                     }
-                    if first {
-                        self.refresh_document(
-                            id,
-                            &path,
-                            directory,
-                            availability,
-                            metadata.as_ref(),
-                        )?;
-                    }
+                }
+                // Do not accumulate extracted document bodies in a metadata batch.
+                let flush_document = legacy.is_some();
+                self.pending.push(Pending::Item {
+                    path: path.clone(),
+                    directory,
+                    availability,
+                    legacy,
+                    content,
+                });
+                if flush_document || self.pending.len() >= WRITE_BATCH {
+                    self.flush()?;
                 }
             }
             if path == target {
-                subtree |= descend || !directory || availability == "placeholder";
+                subtree |= descend || opaque || !directory || availability == "placeholder";
+                self.readable_roots +=
+                    usize::from(is_root && opaque && availability != "placeholder");
             }
             if !descend {
                 continue;
@@ -804,7 +931,7 @@ impl<'a> Walk<'a> {
                 continue;
             }
             if self.coverage.external.is_none()
-                && let Some(children) = platform::bulk_children(&path)
+                && let Some(children) = platform::bulk_children(&path, &mut self.scratch)
             {
                 self.stats.bulk_directories += 1;
                 self.readable_roots += usize::from(is_root);
@@ -837,13 +964,93 @@ impl<'a> Walk<'a> {
         Ok(subtree)
     }
 
+    fn tx(&self) -> &Transaction<'a> {
+        self.tx.as_ref().expect("writer batch is active")
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        self.tx = Some(Transaction::new_unchecked(
+            self.conn,
+            TransactionBehavior::Immediate,
+        )?);
+        let first_id: i64 = if self.cold {
+            self.tx()
+                .query_row("SELECT coalesce(max(id),0) FROM item", [], |row| row.get(0))?
+        } else {
+            0
+        };
+        let pending = std::mem::take(&mut self.pending);
+        for entry in &pending {
+            match entry {
+                Pending::Gap(path) => {
+                    if let Some(path) = path.to_str() {
+                        let base = path.strip_suffix('/').unwrap_or(path);
+                        self.tx().prepare_cached(
+                            "INSERT OR IGNORE INTO unverified SELECT id FROM item WHERE path=?1 OR (path>=?2 AND path<?3)",
+                        )?.execute(params![path, format!("{base}/"), format!("{base}0")])?;
+                    }
+                }
+                Pending::Item {
+                    path,
+                    directory,
+                    availability,
+                    legacy,
+                    content,
+                } => {
+                    let path_text = path.to_str().expect("checked UTF-8 path");
+                    let display = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(path_text);
+                    let kind = if *directory { "directory" } else { "file" };
+                    if self.cold {
+                        if self
+                            .insert_item(path_text, display, kind, availability)?
+                            .is_some()
+                        {
+                            self.stats.items += 1;
+                        }
+                    } else {
+                        let (id, _, first) =
+                            self.observe(path_text, display, kind, availability)?;
+                        if first {
+                            if let Some(document) = legacy {
+                                self.apply_document(id, document)?;
+                            } else if let Some(observation) = content {
+                                self.changed |=
+                                    crate::content::observe(self.tx(), id, observation)?;
+                            } else if DocumentKind::for_path(path).is_some() {
+                                self.changed |= crate::content::retire(self.tx(), id)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if self.cold {
+            self.tx().execute(
+                "INSERT INTO name_fts(rowid,name,full,initials,searchable_path)
+                 SELECT id,name,full,initials,searchable_path FROM item WHERE id>? ORDER BY id",
+                [first_id],
+            )?;
+        }
+        // Lookups may run between flushes. Publish access gaps atomically
+        // with observations instead of waiting for finalization to hide them.
+        self.changed |= hide_unverified(self.tx())? != 0;
+        self.tx.take().expect("writer batch is active").commit()?;
+        self.pending = pending;
+        self.pending.clear();
+        Ok(())
+    }
+
     fn gap(&mut self, path: &Path) -> Result<()> {
         self.stats.entries_unreadable += 1;
-        if let Some(path) = path.to_str() {
-            let base = path.strip_suffix('/').unwrap_or(path);
-            self.tx.prepare_cached(
-                "INSERT OR IGNORE INTO unverified SELECT id FROM item WHERE path=?1 OR (path>=?2 AND path<?3)",
-            )?.execute(params![path, format!("{base}/"), format!("{base}0")])?;
+        self.pending.push(Pending::Gap(path.to_owned()));
+        if self.pending.len() >= WRITE_BATCH {
+            self.flush()?;
         }
         Ok(())
     }
@@ -856,14 +1063,14 @@ impl<'a> Walk<'a> {
         availability: &str,
     ) -> Result<(i64, Option<String>, bool)> {
         let previous: Option<(i64, String, String)> = self
-            .tx
+            .tx()
             .prepare_cached("SELECT id,kind,availability FROM item WHERE path=?")?
             .query_row([path], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .optional()?;
         let (id, prior) = if let Some((id, old_kind, old_availability)) = previous {
             if old_kind != kind || old_availability != availability {
                 self.changed = true;
-                self.tx
+                self.tx()
                     .prepare_cached("UPDATE item SET kind=?,availability=? WHERE id=?")?
                     .execute(params![kind, availability, id])?;
             }
@@ -875,7 +1082,7 @@ impl<'a> Walk<'a> {
             (id, None)
         };
         let first = self
-            .tx
+            .tx()
             .prepare_cached("INSERT OR IGNORE INTO observed VALUES(?)")?
             .execute([id])?
             != 0;
@@ -890,6 +1097,7 @@ impl<'a> Walk<'a> {
         kind: &str,
         availability: &str,
     ) -> Result<Option<i64>> {
+        let tx = self.tx.as_ref().expect("writer batch is active");
         let (full, initials) = if display.is_ascii() {
             ("", "")
         } else {
@@ -904,7 +1112,7 @@ impl<'a> Walk<'a> {
         };
         let name = norm(display);
         let searchable_path = norm(path);
-        let changed = self.tx.prepare_cached(
+        let changed = tx.prepare_cached(
             "INSERT INTO item(path,display,kind,availability,name,full,initials,searchable_path)
              VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(path) DO NOTHING",
         )?.execute(params![path, display, kind, availability, name, full, initials, searchable_path])?;
@@ -912,140 +1120,140 @@ impl<'a> Walk<'a> {
             return Ok(None);
         }
         self.changed = true;
-        let id = self.tx.last_insert_rowid();
+        let id = tx.last_insert_rowid();
         if !self.cold {
-            self.tx.prepare_cached(
+            tx.prepare_cached(
                 "INSERT INTO name_fts(rowid,name,full,initials,searchable_path) VALUES(?,?,?,?,?)",
-            )?.execute(params![id, name, full, initials, searchable_path])?;
+            )?
+            .execute(params![id, name, full, initials, searchable_path])?;
         }
         Ok(Some(id))
     }
 
-    fn refresh_document(
-        &mut self,
-        id: i64,
-        path: &Path,
-        directory: bool,
-        availability: &str,
-        metadata: Option<&fs::Metadata>,
-    ) -> Result<()> {
-        let Some(kind) = DocumentKind::for_path(path) else {
-            return Ok(());
-        };
-        let available = kind != DocumentKind::Pdf || self.coverage.pdf.is_some();
-        if !self.coverage.permits_content(path) || directory || !available {
-            // A prior scope may have allowed extraction of this path.
-            return self.clear_document(id);
-        }
-        if self.coverage.scope.content_roots.is_some() {
-            self.changed |= crate::content::observe(
-                self.tx,
-                self.coverage,
-                id,
-                path,
-                availability,
-                metadata,
-                kind,
-            )?;
-            return Ok(());
-        }
-        self.read_document(id, path, availability, metadata, kind)
-    }
-
     fn read_document(
-        &mut self,
-        id: i64,
+        &self,
         path: &Path,
-        availability: &str,
         metadata: Option<&fs::Metadata>,
         kind: DocumentKind,
-    ) -> Result<()> {
+    ) -> Result<LegacyDocument> {
         let version = |meta: &fs::Metadata| document_version(self.coverage, kind, meta);
-        if availability == "local" {
-            let fetched;
-            let metadata = match metadata {
-                Some(m) => Some(m),
-                None => {
-                    fetched = fs::symlink_metadata(path).ok();
-                    fetched.as_ref()
-                }
-            };
-            if let Some(meta) =
-                metadata.filter(|m| m.is_file() && platform::availability(path, m) == "local")
-            {
-                let current = version(meta);
-                let previous: Option<String> = self
-                    .tx
-                    .prepare_cached("SELECT stamp FROM document_state WHERE id=?")?
-                    .query_row([id], |r| r.get(0))
+        if let Some(meta) = metadata {
+            let current = version(meta);
+            let previous: Option<String> = self
+                    .conn
+                    .prepare_cached(
+                        "SELECT ds.stamp FROM item i JOIN document_state ds ON i.id=ds.id WHERE i.path=?",
+                    )?
+                    .query_row([path.to_str().expect("checked UTF-8 path")], |r| r.get(0))
                     .optional()?;
-                if previous.as_deref() == Some(&current) {
-                    self.stats.documents += 1;
-                    return Ok(());
-                }
-                let extracted = extract_document(self.coverage, path, kind);
-                if kind == DocumentKind::Pdf
-                    && let Some(pdf) = &self.coverage.pdf
+            if previous.as_deref() == Some(&current) {
+                return Ok(if can_open_document(path, meta) {
+                    LegacyDocument::Current
+                } else {
+                    LegacyDocument::Unreadable
+                });
+            }
+            let extracted = extract_document(self.coverage, path, kind);
+            if kind == DocumentKind::Pdf
+                && let Some(pdf) = &self.coverage.pdf
+            {
+                pdf.executable()?;
+            }
+            let body = match extracted {
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied) =>
                 {
-                    pdf.executable()?;
+                    return Ok(LegacyDocument::Unreadable);
                 }
-                let body = match extracted {
-                    Err(error)
-                        if error.downcast_ref::<std::io::Error>().is_some_and(|io| {
-                            io.kind() == std::io::ErrorKind::PermissionDenied
-                        }) =>
-                    {
-                        self.gap(path)?;
-                        self.stats.documents_not_read += 1;
-                        return Ok(());
-                    }
-                    other => other,
-                };
-                if let Ok(body) = body
-                    && !body.body.is_empty()
-                    && fs::symlink_metadata(path).is_ok_and(|m| {
-                        m.is_file()
-                            && platform::availability(path, &m) == "local"
-                            && version(&m) == current
-                    })
-                {
-                    // The old stamp identified a binary path, not an extraction
-                    // format. Verify its text once with the current app. Existing
-                    // vectors are valid only if the exact same text was produced.
-                    let legacy = previous.is_none()
-                        || (kind == DocumentKind::Pdf
-                            && previous.as_deref().is_some_and(|prior| {
-                                self.coverage
-                                    .pdf
-                                    .as_ref()
-                                    .is_some_and(|pdf| pdf.can_restamp_legacy(prior, &stamp(meta)))
-                            }));
-                    let unchanged_legacy = legacy
-                        && self
-                            .tx
-                            .prepare_cached(
-                                "SELECT EXISTS(SELECT 1 FROM document WHERE id=? AND body=?)",
-                            )?
-                            .query_row(params![id, body.body], |r| r.get::<_, bool>(0))?;
-                    if !unchanged_legacy {
-                        self.changed |= save_document(self.tx, id, &current, &body)?;
-                    } else {
-                        store_document_state(self.tx, id, &current, &body.pages)?;
-                    }
-                    self.stats.documents += 1;
-                    return Ok(());
-                }
+                other => other,
+            };
+            if let Ok(body) = body
+                && !body.body.is_empty()
+                && fs::symlink_metadata(path).is_ok_and(|m| {
+                    m.is_file()
+                        && platform::availability(path, &m) == "local"
+                        && version(&m) == current
+                })
+            {
+                // The old stamp identified a binary path, not an extraction
+                // format. Verify its text once with the current app. Existing
+                // vectors are valid only if the exact same text was produced.
+                let legacy = previous.is_none()
+                    || (kind == DocumentKind::Pdf
+                        && previous.as_deref().is_some_and(|prior| {
+                            self.coverage
+                                .pdf
+                                .as_ref()
+                                .is_some_and(|pdf| pdf.can_restamp_legacy(prior, &stamp(meta)))
+                        }));
+                return Ok(LegacyDocument::Extracted {
+                    stamp: current,
+                    restamp: legacy,
+                    text: body,
+                });
             }
         }
-        self.clear_document(id)?;
-        self.stats.documents_not_read += 1;
+        Ok(LegacyDocument::Empty)
+    }
+
+    fn apply_document(&mut self, id: i64, document: &LegacyDocument) -> Result<()> {
+        match document {
+            LegacyDocument::Current => self.stats.documents += 1,
+            LegacyDocument::Unreadable => unreachable!("staged as an access gap"),
+            LegacyDocument::Empty => {
+                self.clear_document(id)?;
+                self.stats.documents_not_read += 1;
+            }
+            LegacyDocument::Extracted {
+                stamp,
+                restamp,
+                text,
+            } => {
+                let unchanged_legacy = *restamp
+                    && self
+                        .tx()
+                        .prepare_cached(
+                            "SELECT EXISTS(SELECT 1 FROM document WHERE id=? AND body=?)",
+                        )?
+                        .query_row(params![id, text.body], |r| r.get::<_, bool>(0))?;
+                if unchanged_legacy {
+                    store_document_state(self.tx(), id, stamp, &text.pages)?;
+                } else {
+                    self.changed |= save_document(self.tx(), id, stamp, text)?;
+                }
+                self.stats.documents += 1;
+            }
+        }
         Ok(())
     }
 
     fn clear_document(&mut self, id: i64) -> Result<()> {
-        self.changed |= remove_document(self.tx, id)?;
+        self.changed |= remove_document(self.tx(), id)?;
         Ok(())
     }
+}
+
+/// Verify access to the same local document version without reading bytes.
+pub(super) fn can_open_document(path: &Path, expected: &fs::Metadata) -> bool {
+    check_document_access(path, expected).unwrap_or(false)
+}
+
+pub(super) fn check_document_access(path: &Path, expected: &fs::Metadata) -> std::io::Result<bool> {
+    use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(target_os = "macos")]
+    let flags = libc::O_NOFOLLOW_ANY | libc::O_NONBLOCK;
+    #[cfg(not(target_os = "macos"))]
+    let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    let opened = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)?
+        .metadata()?;
+    Ok(opened.is_file()
+        && platform::availability(path, &opened) == "local"
+        && stamp(&opened) == stamp(expected))
 }
 
 pub(super) fn document_version(
@@ -1235,5 +1443,224 @@ fn extract_pdf(path: &Path, helper: &PdfExtractor) -> Result<crate::content::Ext
             body: String::from_utf8(text)?,
             pages: Vec::new(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let root = fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!("lumen-index-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn paths(conn: &Connection) -> Vec<String> {
+        conn.prepare("SELECT path FROM item ORDER BY path")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn lumen_directory_is_not_an_index_artifact() {
+        let fixture = Fixture::new("lumen-directory");
+        let root = fixture.0.join("Lumen");
+        fs::create_dir(&root).unwrap();
+        let database = root.join("index.db");
+        let document = root.join("notes.txt");
+        fs::write(&document, "keep this searchable").unwrap();
+        fs::create_dir(root.join("other")).unwrap();
+        scan(
+            &database,
+            &Scope {
+                roots: vec![root.clone()],
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        let conn = super::super::open_read(&database).unwrap();
+        let indexed = paths(&conn);
+        assert!(indexed.contains(&document.to_str().unwrap().to_owned()));
+        assert!(indexed.contains(&root.join("other").to_str().unwrap().to_owned()));
+        assert!(!indexed.contains(&database.to_str().unwrap().to_owned()));
+        assert!(!indexed.iter().any(|path| {
+            INDEX_SIDECARS
+                .iter()
+                .any(|suffix| path == &format!("{}{suffix}", database.display()))
+        }));
+    }
+
+    #[test]
+    fn packages_are_opaque_but_explicit_nested_roots_work() {
+        let fixture = Fixture::new("packages");
+        let root = fixture.0.join("files");
+        fs::create_dir(&root).unwrap();
+        let extensions = [
+            "APP",
+            "framework",
+            "bundle",
+            "xcodeproj",
+            "xcworkspace",
+            "photoslibrary",
+            "musiclibrary",
+            "fcpbundle",
+            "imovielibrary",
+            "playground",
+            "xcarchive",
+            "dSYM",
+            "lproj",
+            "kext",
+            "plugin",
+            "appex",
+            "xpc",
+        ];
+        let database = fixture.0.join("index.db");
+        for extension in extensions {
+            let package = root.join(format!("Example.{extension}"));
+            fs::create_dir(&package).unwrap();
+            fs::write(package.join("hidden.txt"), "private implementation").unwrap();
+        }
+        let scope = Scope {
+            roots: vec![root.clone()],
+            ..Scope::default()
+        };
+        scan(&database, &scope).unwrap();
+        let conn = super::super::open_read(&database).unwrap();
+        let indexed = paths(&conn);
+        assert_eq!(indexed.len(), extensions.len() + 1);
+        let coverage = Coverage::new(database.clone(), &scope).unwrap();
+        for extension in extensions {
+            let package = root.join(format!("Example.{extension}"));
+            assert!(indexed.contains(&package.to_str().unwrap().to_owned()));
+            assert!(!coverage.contains(&package.join("hidden.txt")));
+        }
+        // An explicitly selected package is still indexed as one opaque entry,
+        // not mistaken for an unreadable root just because it is not enumerated.
+        let package_database = fixture.0.join("package.db");
+        scan(
+            &package_database,
+            &Scope {
+                roots: vec![root.join("Example.APP")],
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        let package_reader = super::super::open_read(&package_database).unwrap();
+        assert_eq!(
+            paths(&package_reader),
+            vec![root.join("Example.APP").to_str().unwrap().to_owned()]
+        );
+        let nested = root.join("Example.APP").join("Sources");
+        fs::create_dir(&nested).unwrap();
+        let explicit = nested.join("explicit.txt");
+        fs::write(&explicit, "explicit root").unwrap();
+        let explicit_scope = Scope {
+            roots: vec![root, nested],
+            ..Scope::default()
+        };
+        scan(&database, &explicit_scope).unwrap();
+        assert!(paths(&conn).contains(&explicit.to_str().unwrap().to_owned()));
+        // Narrowing back removes the now-opaque descendant, including old rows.
+        scan(&database, &scope).unwrap();
+        assert!(!paths(&conn).contains(&explicit.to_str().unwrap().to_owned()));
+    }
+
+    #[test]
+    fn legacy_inline_documents_do_not_accumulate_in_a_writer_batch() {
+        let fixture = Fixture::new("inline-batches");
+        let root = fixture.0.join("files");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("first.txt"), "first searchable document").unwrap();
+        fs::write(root.join("second.txt"), "second searchable document").unwrap();
+        let database = fixture.0.join("index.db");
+        let coverage = Coverage::new(
+            database.clone(),
+            &Scope {
+                roots: vec![root.clone()],
+                documents: true,
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        let (mut conn, _lease) = open_write(&database, true).unwrap();
+        begin(&mut conn).unwrap().commit().unwrap();
+        let mut walk = Walk::new(&conn, &coverage);
+        walk.visit(&root, true, true).unwrap();
+        assert!(conn.is_autocommit());
+        assert!(
+            walk.pending.is_empty(),
+            "each legacy document must flush rather than await a full metadata batch"
+        );
+        assert_eq!(paths(&conn).len(), 3);
+        let documents: i64 = conn
+            .query_row("SELECT count(*) FROM document", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(documents, 2);
+    }
+
+    #[test]
+    fn scan_publishes_bounded_batches_without_holding_a_walk_transaction() {
+        let fixture = Fixture::new("batches");
+        let root = fixture.0.join("files");
+        fs::create_dir(&root).unwrap();
+        for number in 0..WRITE_BATCH + 1 {
+            fs::write(root.join(format!("record-{number}.txt")), "").unwrap();
+        }
+        let database = fixture.0.join("index.db");
+        let scope = Scope {
+            roots: vec![root.clone()],
+            ..Scope::default()
+        };
+        let coverage = Coverage::new(database.clone(), &scope).unwrap();
+        let (mut conn, _lease) = open_write(&database, true).unwrap();
+        begin(&mut conn).unwrap().commit().unwrap();
+        let mut walk = Walk::new(&conn, &coverage);
+        walk.cold = true;
+        walk.visit(&root, true, true).unwrap();
+        assert!(
+            conn.is_autocommit(),
+            "filesystem traversal must not retain a writer transaction"
+        );
+        let reader = super::super::open_read(&database).unwrap();
+        assert_eq!(paths(&reader).len(), WRITE_BATCH);
+        let searchable: i64 = reader
+            .query_row(
+                "SELECT count(*) FROM name_fts WHERE name_fts MATCH 'record'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            searchable >= (WRITE_BATCH - 1) as i64,
+            "each committed batch must already be searchable"
+        );
+        assert_eq!(walk.pending.len(), 2);
+        walk.flush().unwrap();
+        assert_eq!(paths(&reader).len(), WRITE_BATCH + 2);
+        assert!(conn.is_autocommit());
+        drop(walk);
+        drop(_lease);
+        drop(conn);
+        fs::remove_file(root.join("record-0.txt")).unwrap();
+        scan(&database, &scope).unwrap();
+        assert_eq!(paths(&reader).len(), WRITE_BATCH + 1);
+        assert!(!paths(&reader).contains(&root.join("record-0.txt").to_str().unwrap().to_owned()));
     }
 }

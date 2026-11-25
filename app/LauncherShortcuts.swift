@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import SwiftUI
 
 struct SavedShortcut: Codable, Equatable, Identifiable {
@@ -45,6 +46,57 @@ struct SavedShortcut: Codable, Equatable, Identifiable {
               let host = parts.host, !host.isEmpty, parts.user == nil, parts.password == nil
         else { return nil }
         return parts.url
+    }
+}
+
+@MainActor
+final class LauncherFrecency {
+    private struct Entry: Codable {
+        var count: Double
+        var lastOpened: Date
+    }
+
+    private let defaults: UserDefaults?
+    private let key = "launcher.frecency.v1"
+    private let capacity = 512
+    private var entries: [String: Entry]
+
+    init(defaults: UserDefaults?) {
+        self.defaults = defaults
+        entries = defaults?.data(forKey: key).flatMap { try? JSONDecoder().decode([String: Entry].self, from: $0) } ?? [:]
+    }
+
+    nonisolated static func fileID(_ path: String) -> String {
+        // Do not keep a plaintext list of opened file paths in preferences.
+        "file:" + Data(SHA256.hash(data: Data(path.utf8))).base64EncodedString()
+    }
+
+    func noteOpened(_ id: String, now: Date = .now) {
+        let prior = entries[id].map { $0.count * decay($0.lastOpened, now: now, days: 14) } ?? 0
+        entries[id] = Entry(count: min(prior + 1, 64), lastOpened: now)
+        if entries.count > capacity {
+            let keep = entries.sorted { $0.value.lastOpened > $1.value.lastOpened }.prefix(capacity)
+            entries = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
+        }
+        if let data = try? JSONEncoder().encode(entries) { defaults?.set(data, forKey: key) }
+    }
+
+    func boost(_ id: String, now: Date = .now) -> Int {
+        guard let entry = entries[id] else { return 0 }
+        let frequency = entry.count * decay(entry.lastOpened, now: now, days: 14)
+        let recency = decay(entry.lastOpened, now: now, days: 3)
+        return min(12, Int(3 * log2(1 + frequency) + 4 * recency))
+    }
+
+    private func decay(_ lastOpened: Date, now: Date, days: Double) -> Double {
+        exp2(-max(0, now.timeIntervalSince(lastOpened)) / (86_400 * days))
+    }
+
+    func rankFiles(_ hits: [SearchHit]) -> [SearchHit] {
+        guard hits.count > 1, !entries.isEmpty else { return hits }
+        let now = Date.now
+        return hits.enumerated().map { (index: $0.offset, hit: $0.element, rank: $0.offset - boost(Self.fileID($0.element.path), now: now)) }
+            .sorted { ($0.rank, $0.index) < ($1.rank, $1.index) }.map(\.hit)
     }
 }
 

@@ -179,13 +179,30 @@ pub(super) fn validate_catalog_hit(
     let result = (|| -> crate::Result<bool> {
         let database = absolute(database)?;
         let conn = open_read(&database)?;
-        let before = crate::name_fast::data_version(&conn)?;
-        let snapshot = conn.unchecked_transaction()?;
-        let visible = validate_in_snapshot(&snapshot, &database, path, kind, availability, stamp)?;
-        drop(snapshot);
-        Ok(visible && before == crate::name_fast::data_version(&conn)?)
+        Ok(read_snapshot(&conn, |snapshot| {
+            validate_in_snapshot(snapshot, &database, path, kind, availability, stamp)
+        })?
+        .unwrap_or(false))
     })();
     result.unwrap_or(false)
+}
+
+/// Retry a read raced by a catalog commit without repeating work outside SQLite.
+/// A continuously changing catalog still has a bounded, fail-closed fallback.
+pub(super) fn read_snapshot<T>(
+    conn: &Connection,
+    mut read: impl FnMut(&Connection) -> crate::Result<T>,
+) -> crate::Result<Option<T>> {
+    for _ in 0..3 {
+        let before = crate::name_fast::data_version(conn)?;
+        let snapshot = conn.unchecked_transaction()?;
+        let value = read(&snapshot)?;
+        drop(snapshot);
+        if before == crate::name_fast::data_version(conn)? {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
 }
 
 fn validate_in_snapshot(
@@ -540,6 +557,57 @@ fn selected_metadata(path: &Path, directory_hit: bool) -> Result<Selected, Reaso
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_validation_retries_concurrent_commits_and_is_bounded() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-snapshot-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        let path = root.join("docs/file.txt");
+        std::fs::write(&path, "document").unwrap();
+        let database = root.join("index.db");
+        crate::index::scan(
+            &database,
+            &Scope {
+                roots: vec![root.join("docs")],
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        let reader = open_read(&database).unwrap();
+        let writer = Connection::open(&database).unwrap();
+        let mut attempts = 0;
+        let result = read_snapshot(&reader, |snapshot| {
+            attempts += 1;
+            let visible = validate_in_snapshot(snapshot, &database, &path, "file", "local", None)?;
+            if attempts < 3 {
+                writer.execute("UPDATE item SET display=display || 'x'", [])?;
+            }
+            Ok(visible)
+        })
+        .unwrap();
+        assert_eq!(result, Some(true));
+        assert_eq!(attempts, 3);
+        assert!(validate_catalog_hit(
+            &database, &path, "file", "local", None
+        ));
+
+        attempts = 0;
+        let result = read_snapshot(&reader, |snapshot| {
+            attempts += 1;
+            let visible = validate_in_snapshot(snapshot, &database, &path, "file", "local", None)?;
+            writer.execute("UPDATE item SET display=display || 'x'", [])?;
+            Ok(visible)
+        })
+        .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(attempts, 3);
+        drop(reader);
+        drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn synthetic_dataless_flag_preserves_name_and_blocks_cloud_children() {

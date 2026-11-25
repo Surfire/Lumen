@@ -32,7 +32,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var contextUpdates: AnyCancellable?
     private var contextResultID: String?
     private let defaults: UserDefaults?
-    private(set) lazy var globalHotKey = GlobalHotKey { [weak self] in self?.showSearch() }
+    private(set) lazy var globalHotKey = GlobalHotKey { [weak self] in
+        guard let self else { return }
+        if self.searchPresented && self.panel.isKeyWindow { self.dismissSearch() }
+        else { self.showSearch() }
+    }
     private var statusItem: NSStatusItem?
     private var statusSymbol: String?
     private(set) var statusMenu: NSMenu?
@@ -62,6 +66,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var previewPreparing = false
     private(set) var localPreview: LocalPreviewPanel?
     private(set) var searchPresented = false
+    private var searchPresentationGeneration: UInt64 = 0
 
     lazy var searchField: SearchField = {
         let field = SearchField()
@@ -82,7 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private(set) lazy var panel: SearchPanel = {
         let panel = SearchPanel(contentRect: NSRect(x: 0, y: 0, width: 680, height: 84),
-                                styleMask: [.borderless],
+                                styleMask: [.borderless, .nonactivatingPanel],
                                 backing: .buffered, defer: false)
         panel.title = "Lumen"
         panel.isOpaque = false
@@ -91,7 +96,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         panel.isReleasedWhenClosed = false
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
-        panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         panel.delegate = self
         panel.onCancel = { [weak self] in self?.cancelCurrentPanelAction() }
         panel.onContextActions = { [weak self] in self?.toggleContextActions() }
@@ -137,7 +142,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             imageSearch: imageSearch,
             activateCommand: { [weak self] in self?.activateCommand() },
             searchCommandAsFiles: { [weak self] in self?.searchCommandAsFiles() },
-            closeInlinePreview: { [weak self] in _ = self?.inlinePreview.close() },
+            closeInlinePreview: { [weak self] in self?.closeInlinePreview() },
             activateTranslation: { [weak self] in self?.activateTranslation() },
             toggleContextActions: { [weak self] in self?.toggleContextActions() },
             showSettings: { [weak self] in self?.showSearchSettings() },
@@ -171,7 +176,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             results.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             results.bottomAnchor.constraint(equalTo: content.bottomAnchor)
         ])
-        panel.center()
         updateSearchField()
         return panel
     }()
@@ -287,17 +291,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     @objc func showSearch() {
         let firstShow = !searchPresented
+        searchPresentationGeneration &+= 1
         searchPresented = true
-        updatePresentation()
-        if firstShow { panel.center() }
-        (panel.contentView as? SearchBackdrop)?.refreshTransparency()
-        if smoke == nil {
-            NSApp.activate()
-            panel.makeKeyAndOrderFront(nil)
-        } else {
-            // Exercise the same responder and rendering code inside this process only.
-            panel.setFrameOrigin(NSPoint(x: -12_000, y: -12_000))
+        if firstShow {
+            let mouse = NSEvent.mouseLocation
+            if let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main {
+                let visible = screen.visibleFrame
+                panel.setFrameTopLeftPoint(NSPoint(x: visible.midX - panel.frame.width / 2,
+                                                   y: visible.maxY - visible.height / 3))
+            }
         }
+        updatePresentation()
+        (panel.contentView as? SearchBackdrop)?.refreshTransparency()
+        if smoke == nil { panel.makeKeyAndOrderFront(nil) }
         focusSearch()
         if firstShow {
             loadApplicationCatalog()
@@ -313,7 +319,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     func windowDidResignKey(_ notification: Notification) {
-        if notification.object is SearchPanel { dismissSearch() }
+        guard let window = notification.object as? NSWindow,
+              window is SearchPanel || window === localPreview else { return }
+        dismissSearchIfFocusLeft()
+    }
+
+    private func dismissSearchIfFocusLeft() {
+        guard searchPresented else { return }
+        let generation = searchPresentationGeneration
+        // AppKit can report resignation or closure before the next key window is set.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.searchPresented, self.searchPresentationGeneration == generation,
+                  !self.panel.isKeyWindow, self.localPreview?.isKeyWindow != true else { return }
+            self.dismissSearch()
+        }
     }
 
     private func focusSearch() {
@@ -329,6 +348,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     @objc func dismissSearch() {
         guard searchPresented else { return }
+        searchPresentationGeneration &+= 1
         searchPresented = false
         translation.setCommand(nil)
         inlinePreview.close()
@@ -361,6 +381,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     @objc private func searchFieldAction() {
+        guard (searchField.currentEditor() as? NSTextView)?.hasMarkedText() != true else { return }
         let text = searchText
         if literalCommand != text { literalCommand = nil }
         let previousCommand = commands.resolution
@@ -445,9 +466,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         else { model.moveSelection(delta); refreshInlinePreview() }
     }
 
+    @discardableResult func closeInlinePreview() -> Bool {
+        guard inlinePreview.close() else { return false }
+        updatePresentation()
+        return true
+    }
+
     private func cancelCurrentPanelAction() {
-        if inlinePreview.close() { updatePresentation() }
-        else if commands.answer == .loading { commands.invalidateAnswer() }
+        if closeInlinePreview() { return }
+        if commands.answer == .loading { commands.invalidateAnswer() }
         else if translation.activity == .translating { translation.cancel() }
         else if contextActions.isOpen { contextActions.close() }
         else { dismissSearch() }
@@ -598,16 +625,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func openFile(_ hit: SearchHit) {
-        if hit.pdf_page != nil {
-            previewFile(hit, action: .open)
-            return
-        }
         model.resolve(hit, action: .open) { [weak self] url in
             guard let self else { return }
-            if let smoke = self.smoke {
+            if let smoke = self.smoke, smoke.simulatesFileOpen(url) {
                 smoke.opened = url
                 self.dismissSearch()
             } else if NSWorkspace.shared.open(url) {
+                self.model.noteFileOpened(hit)
                 self.dismissSearch()
             } else {
                 self.model.openingFailed()
@@ -650,8 +674,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         inlinePreview.show(hit)
     }
 
-    private func previewFile(_ hit: SearchHit, action: FileAction = .preview, forceWindow: Bool = false) {
-        if action == .preview, !forceWindow, LauncherInlinePreview.kind(hit) != nil {
+    private func previewFile(_ hit: SearchHit, forceWindow: Bool = false) {
+        if !forceWindow, LauncherInlinePreview.kind(hit) != nil {
             guard searchPresented, !model.scopePending, model.containsCurrentFile(hit),
                   hit.isLocal || hit.isCloudReference else { return }
             model.selection = hit.path
@@ -661,7 +685,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             return
         }
         guard !previewPreparing else { return }
-        model.resolve(hit, action: action) { [weak self] _ in
+        model.resolve(hit, action: .preview) { [weak self] _ in
             guard let self, self.searchPresented else { return }
             self.previewPreparing = true
             let query = self.model.query
@@ -684,13 +708,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                     panel.delegate = self
                     if self.smoke == nil {
                         panel.center()
-                        panel.makeKeyAndOrderFront(nil)
+                        self.makeLocalPreviewKey()
                     } else {
                         panel.setFrameOrigin(NSPoint(x: -12_000, y: -12_000))
                     }
                 }
             }
         }
+    }
+
+    func makeLocalPreviewKey() {
+        guard let localPreview else { return }
+        if smoke == nil { NSApp.activate() }
+        localPreview.makeKeyAndOrderFront(nil)
     }
 
     private func chooseQuicklinkFolder(_ complete: @escaping (URL) -> Void) {
@@ -832,7 +862,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     func windowWillClose(_ notification: Notification) {
-        if let localPreview, (notification.object as? NSWindow) === localPreview { self.localPreview = nil }
+        if let localPreview, (notification.object as? NSWindow) === localPreview {
+            self.localPreview = nil
+            dismissSearchIfFocusLeft()
+        }
         if let settings, (notification.object as? NSWindow) === settings {
             settings.makeFirstResponder(nil)
             translation.endSettingsSession()

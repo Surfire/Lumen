@@ -218,7 +218,7 @@ type Children = Vec<(std::ffi::OsString, Option<FastInfo>)>;
 /// Darwin batch metadata enumeration. If the filesystem or any record layout
 /// is not compatible, discard the incomplete batch and use normal enumeration.
 #[cfg(target_os = "macos")]
-pub fn bulk_children(path: &Path) -> Option<Children> {
+pub fn bulk_children(path: &Path, scratch: &mut Vec<u64>) -> Option<Children> {
     use std::ffi::OsString;
     use std::os::{
         fd::AsRawFd,
@@ -254,7 +254,8 @@ pub fn bulk_children(path: &Path) -> Option<Children> {
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW_ANY)
         .open(path)
         .ok()?;
-    let mut buf = vec![0u64; 8192];
+    scratch.resize(8192, 0);
+    let buf = scratch;
     let mut children = Vec::new();
     let u32at = |data: &[u8], offset: usize| {
         Some(u32::from_ne_bytes(
@@ -324,7 +325,7 @@ pub fn bulk_children(path: &Path) -> Option<Children> {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn bulk_children(_: &Path) -> Option<Children> {
+pub fn bulk_children(_: &Path, _: &mut Vec<u64>) -> Option<Children> {
     None
 }
 
@@ -491,4 +492,34 @@ fn equal_folded(a: &[u8], b: &[u8]) -> bool {
         }
     }
     same
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bulk_enumeration_reuses_scratch_between_directories() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-bulk-scratch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let first = root.join("first");
+        let second = root.join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        fs::write(first.join("one.txt"), "one").unwrap();
+        fs::write(second.join("two.txt"), "two").unwrap();
+        let mut scratch = Vec::new();
+        let entries = bulk_children(&first, &mut scratch).expect("APFS batch enumeration");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "one.txt");
+        assert!(!entries[0].1.as_ref().unwrap().directory);
+        let allocation = scratch.as_ptr();
+        let entries = bulk_children(&second, &mut scratch).expect("APFS batch enumeration");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "two.txt");
+        assert_eq!(scratch.as_ptr(), allocation);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

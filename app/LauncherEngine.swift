@@ -22,6 +22,10 @@ struct SearchHit: Decodable, Equatable, Identifiable {
     }
 
     static func pathStamp(at path: String, kind: String, permitsDatalessLeaf: Bool = false) -> String? {
+        pathAttributes(at: path, kind: kind, permitsDatalessLeaf: permitsDatalessLeaf).map(filesystemStamp)
+    }
+
+    static func pathAttributes(at path: String, kind: String, permitsDatalessLeaf: Bool = false) -> stat? {
         guard path.hasPrefix("/") else { return nil }
         let policy = IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES
         let scope = IOPOL_SCOPE_THREAD
@@ -46,7 +50,7 @@ struct SearchHit: Decodable, Equatable, Identifiable {
               stat.st_mode & S_IFMT == (kind == "directory" ? S_IFDIR : S_IFREG),
               permitsDatalessLeaf || stat.st_flags & UInt32(SF_DATALESS) == 0
         else { return nil }
-        return Self.filesystemStamp(stat)
+        return stat
     }
 
     static func filesystemStamp(_ stat: stat) -> String {
@@ -201,14 +205,17 @@ final class LauncherEngine {
     private var semanticConnection: SearchConnection?
     private var imageConnection: SearchConnection?
     private let gemmaHome: URL?
+    private let requestTimeout: Duration
     private var nextID: UInt64 = 0
     var checksCachedHitAccess = false
 
-    init(executable: URL, database: URL, syntheticRoot: URL? = nil, gemmaHome: URL? = nil) {
+    init(executable: URL, database: URL, syntheticRoot: URL? = nil, gemmaHome: URL? = nil,
+         requestTimeout: Duration = .seconds(20)) {
         self.executable = executable
         self.database = database
         self.root = syntheticRoot
         self.gemmaHome = gemmaHome
+        self.requestTimeout = requestTimeout
     }
 
     var hasDatabase: Bool {
@@ -248,7 +255,7 @@ final class LauncherEngine {
     func run(
         _ command: [String], onLine: ((Data) -> Void)? = nil,
         onProgress: ((IndexProgress) -> Void)? = nil, priority: DispatchQoS.QoSClass = .utility,
-        complete: @escaping (EngineResponse) -> Void
+        complete: @escaping @MainActor (EngineResponse) -> Void
     ) -> Process? {
         let process = Process()
         let stdout = Pipe(), stderr = Pipe()
@@ -259,12 +266,22 @@ final class LauncherEngine {
         process.standardError = stderr
         do { try process.run() }
         catch {
-            complete(EngineResponse(exitStatus: -1, output: Data(), errors: Data(error.localizedDescription.utf8)))
+            DispatchQueue.main.async {
+                complete(EngineResponse(exitStatus: -1, output: Data(), errors: Data(error.localizedDescription.utf8)))
+            }
             return nil
         }
 
         // Both pipes are drained while the child is running, including for long-lived watch.
-        let errors = Task.detached(priority: .utility) {
+        Self.drain(process, priority: priority, readOutput: {
+            if let onLine {
+                Self.readLines(stdout.fileHandleForReading) { data in
+                    DispatchQueue.main.async { onLine(data) }
+                }
+                return Data()
+            }
+            return (try? stdout.fileHandleForReading.readToEnd()) ?? Data()
+        }, readErrors: {
             var recent = Data()
             func remember(_ bytes: Data) {
                 recent.append(bytes.suffix(65_536))
@@ -281,49 +298,69 @@ final class LauncherEngine {
                     }
                 }
             } else {
-                while case let bytes = stderr.fileHandleForReading.availableData, !bytes.isEmpty { remember(bytes) }
+                return Self.readTail(stderr.fileHandleForReading)
             }
             return recent
-        }
-        DispatchQueue.global(qos: priority).async {
-            let output: Data
-            if let onLine {
-                Self.readLines(stdout.fileHandleForReading) { data in
-                    DispatchQueue.main.async { onLine(data) }
-                }
-                output = Data()
-            } else {
-                output = (try? stdout.fileHandleForReading.readToEnd()) ?? Data()
-            }
-            process.waitUntilExit()
-            Task { @MainActor in
-                let recent = await errors.value
-                // Both readers enqueue their final line ahead of completion.
-                DispatchQueue.main.async {
-                    complete(EngineResponse(exitStatus: process.terminationStatus, output: output, errors: recent))
-                }
-            }
-        }
+        }, complete: complete)
         return process
+    }
+
+    fileprivate static func drain(_ process: Process, priority: DispatchQoS.QoSClass,
+                                  readOutput: @escaping () -> Data, readErrors: @escaping () -> Data,
+                                  complete: @escaping @MainActor (EngineResponse) -> Void) {
+        // Each child needs independent readers. In particular a long-lived watch/serve
+        // cannot block stderr draining for other children or occupy a cooperative thread.
+        let readers = DispatchGroup()
+        var output = Data(), errors = Data()
+        readers.enter()
+        DispatchQueue(label: "lumen.pipe.stdout", qos: DispatchQoS(qosClass: priority, relativePriority: 0)).async {
+            let data = readOutput()
+            process.waitUntilExit()
+            DispatchQueue.main.async {
+                output = data
+                readers.leave()
+            }
+        }
+        readers.enter()
+        DispatchQueue(label: "lumen.pipe.stderr", qos: .utility).async {
+            let data = readErrors()
+            DispatchQueue.main.async {
+                errors = data
+                readers.leave()
+            }
+        }
+        // Both readers enqueue their final line ahead of completion.
+        readers.notify(queue: .main) {
+            complete(EngineResponse(exitStatus: process.terminationStatus, output: output, errors: errors))
+        }
+    }
+
+    nonisolated fileprivate static func readTail(_ file: FileHandle) -> Data {
+        var tail = Data()
+        while case let chunk = file.availableData, !chunk.isEmpty {
+            tail.append(chunk.suffix(65_536))
+            if tail.count > 65_536 { tail.removeFirst(tail.count - 65_536) }
+        }
+        return tail
     }
 
     var nameSearchBusy: Bool { connection?.isBusy == true }
 
     func warmNameSearch() {
-        _ = try? connect(&connection, command: ["serve"])
+        _ = try? connect(\.connection, command: ["serve"])
     }
 
     func search(_ query: String, mode: String, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
-        submit(query, mode: mode, limit: 60, to: &connection, command: ["serve"], complete: complete)
+        submit(query, mode: mode, limit: 60, to: \.connection, command: ["serve"], complete: complete)
     }
 
     func searchSemantic(_ query: String, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
-        submit(query, mode: "semantic", limit: 12, to: &semanticConnection,
+        submit(query, mode: "semantic", limit: 12, to: \.semanticConnection,
                command: ["semantic-serve"] + gemmaOptions, idleTimeout: .seconds(45), complete: complete)
     }
 
     func searchImages(_ query: String, projector: URL, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
-        submit(query, mode: "semantic", limit: 5, to: &imageConnection,
+        submit(query, mode: "semantic", limit: 5, to: \.imageConnection,
                command: ["image-serve", "--projector", projector.path] + gemmaOptions,
                idleTimeout: .seconds(45), complete: complete)
     }
@@ -337,25 +374,33 @@ final class LauncherEngine {
 
     var gemmaOptions: [String] { gemmaHome.map { ["--gemma-home", $0.path] } ?? [] }
 
-    private func submit(_ query: String, mode: String, limit: Int, to connection: inout SearchConnection?,
-                        command: [String], idleTimeout: Duration? = nil,
-                        complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
+    private func submit(_ query: String, mode: String, limit: Int,
+                        to lane: ReferenceWritableKeyPath<LauncherEngine, SearchConnection?>,
+                        command: [String], idleTimeout: Duration? = nil, complete: @escaping SearchCompletion) {
         nextID &+= 1
+        submit(SearchRequest(id: nextID, query: query, mode: mode, limit: limit),
+               to: lane, command: command, idleTimeout: idleTimeout, complete: complete)
+    }
+
+    private func submit(_ request: SearchRequest, to lane: ReferenceWritableKeyPath<LauncherEngine, SearchConnection?>,
+                        command: [String], idleTimeout: Duration?, complete: @escaping SearchCompletion) {
         do {
-            let server = try connect(&connection, command: command, idleTimeout: idleTimeout)
-            server.enqueue(SearchRequest(id: nextID, query: query, mode: mode, limit: limit), complete: complete)
+            let server = try connect(lane, command: command, idleTimeout: idleTimeout)
+            server.enqueue(request, complete: complete)
         } catch {
-            // Leave the caller's inout connection before a completion can reenter the engine.
             DispatchQueue.main.async { complete(.failure(SearchFailure(error.localizedDescription))) }
         }
     }
 
-    private func connect(_ connection: inout SearchConnection?, command: [String],
+    private func connect(_ lane: ReferenceWritableKeyPath<LauncherEngine, SearchConnection?>, command: [String],
                          idleTimeout: Duration? = nil) throws -> SearchConnection {
-        if let connection, connection.isRunning { return connection }
-        let started = SearchConnection(executable: executable, arguments: arguments(command), idleTimeout: idleTimeout)
+        if let connection = self[keyPath: lane], connection.isRunning { return connection }
+        let started = SearchConnection(executable: executable, arguments: arguments(command),
+                                       requestTimeout: requestTimeout, idleTimeout: idleTimeout) { [weak self] request, complete in
+            self?.submit(request, to: lane, command: command, idleTimeout: idleTimeout, complete: complete)
+        }
         try started.start()
-        connection = started
+        self[keyPath: lane] = started
         return started
     }
 
@@ -392,6 +437,8 @@ struct SearchFailure: Error {
     init(_ detail: String) { self.detail = detail }
 }
 
+private typealias SearchCompletion = (Result<[SearchHit], SearchFailure>) -> Void
+
 private struct SearchRequest: Encodable {
     let id: UInt64
     let query: String
@@ -409,22 +456,28 @@ private struct SearchReply: Decodable {
 private final class SearchConnection {
     private struct Pending {
         let request: SearchRequest
-        let complete: (Result<[SearchHit], SearchFailure>) -> Void
+        let complete: SearchCompletion
     }
 
     private let process = Process()
     private let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
+    private let inputQueue = DispatchQueue(label: "lumen.pipe.stdin", qos: .userInitiated)
     private var active: Pending?
     private var queued: Pending?
+    private let requestTimeout: Duration
     private let idleTimeout: Duration?
+    private let restartWith: (SearchRequest, @escaping SearchCompletion) -> Void
     private var deadline: Task<Void, Never>?
     private var stopped = false
 
     var isRunning: Bool { !stopped && process.isRunning }
     var isBusy: Bool { active != nil }
 
-    init(executable: URL, arguments: [String], idleTimeout: Duration?) {
+    init(executable: URL, arguments: [String], requestTimeout: Duration, idleTimeout: Duration?,
+         restartWith: @escaping (SearchRequest, @escaping SearchCompletion) -> Void) {
+        self.requestTimeout = requestTimeout
         self.idleTimeout = idleTimeout
+        self.restartWith = restartWith
         process.executableURL = executable
         process.arguments = arguments
         process.standardInput = stdin
@@ -439,27 +492,17 @@ private final class SearchConnection {
         let process = self.process
         let output = stdout.fileHandleForReading
         let errors = stderr.fileHandleForReading
-        let diagnostic = Task.detached(priority: .utility) {
-            var tail = Data()
-            while case let chunk = errors.availableData, !chunk.isEmpty {
-                tail.append(chunk.suffix(65_536))
-                if tail.count > 65_536 { tail.removeFirst(tail.count - 65_536) }
-            }
-            return tail
-        }
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        LauncherEngine.drain(process, priority: .userInitiated, readOutput: { [weak self] in
             LauncherEngine.readLines(output) { bytes in
                 DispatchQueue.main.async { [weak self] in self?.reply(bytes) }
             }
-            process.waitUntilExit()
-            Task { @MainActor [weak self] in
-                let errors = await diagnostic.value
-                self?.fail(SearchFailure(String(decoding: errors, as: UTF8.self)))
-            }
+            return Data()
+        }, readErrors: { LauncherEngine.readTail(errors) }) { [weak self] response in
+            self?.fail(SearchFailure(response.diagnostic))
         }
     }
 
-    func enqueue(_ request: SearchRequest, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
+    func enqueue(_ request: SearchRequest, complete: @escaping SearchCompletion) {
         queued = Pending(request: request, complete: complete)
         sendNext()
     }
@@ -467,23 +510,25 @@ private final class SearchConnection {
     func discardQueued() { queued = nil }
 
     func stop() {
+        guard !stopped else { return }
         stopped = true
         deadline?.cancel()
         deadline = nil
         active = nil
         queued = nil
         if process.isRunning { process.terminate() }
-        try? stdin.fileHandleForWriting.close()
+        let input = stdin.fileHandleForWriting
+        inputQueue.async { try? input.close() }
     }
 
     private func sendNext() {
         guard active == nil, let next = queued else { return }
         queued = nil
         active = next
-        armDeadline(active: true)
+        armDeadline(requestID: next.request.id)
         let input = stdin.fileHandleForWriting
         let request = next.request
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        inputQueue.async { [weak self] in
             do {
                 var bytes = try JSONEncoder().encode(request)
                 bytes.append(10)
@@ -506,20 +551,26 @@ private final class SearchConnection {
             return
         }
         self.active = nil
+        deadline?.cancel()
+        deadline = nil
         if let hits = reply.hits { active.complete(.success(hits)) }
         else { active.complete(.failure(SearchFailure(reply.error ?? ""))) }
-        if !stopped && self.active == nil && queued == nil { armDeadline(active: false) }
+        if !stopped && self.active == nil && queued == nil { armDeadline() }
         sendNext()
     }
 
-    private func armDeadline(active: Bool) {
-        guard let idleTimeout else { return }
+    private func armDeadline(requestID: UInt64? = nil) {
         deadline?.cancel()
+        guard let timeout = requestID == nil ? idleTimeout : requestTimeout else { return }
         deadline = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: active ? .seconds(20) : idleTimeout)
-            guard !Task.isCancelled, let self else { return }
-            if active { self.fail(SearchFailure("Semantic search worker timed out")) }
-            else { self.stop() }
+            try? await Task.sleep(for: timeout)
+            guard !Task.isCancelled, let self, self.active?.request.id == requestID else { return }
+            let active = self.active, queued = self.queued
+            self.stop()
+            guard let active else { return }
+            // Install the replacement before notifying a caller that may submit again.
+            if let queued { self.restartWith(queued.request, queued.complete) }
+            active.complete(.failure(SearchFailure("lumen search request timed out")))
         }
     }
 

@@ -6,10 +6,21 @@ import UniformTypeIdentifiers
 final class LauncherInlinePreview: ObservableObject {
     @Published private(set) var state: InlinePreviewState = .closed
     @Published private(set) var hit: SearchHit?
+    private(set) var image: NSImage?
 
     private lazy var coordinator: InlinePreviewCoordinator = {
         let coordinator = InlinePreviewCoordinator { item in try await Self.render(item) }
-        coordinator.onChange = { [weak self] in self?.state = $0 }
+        coordinator.onChange = { [weak self] state in
+            guard let self else { return }
+            self.image = nil
+            if case .ready(_, let document) = state {
+                switch document.visual {
+                case .image(let bytes), .pdf(let bytes, _, _): self.image = NSImage(data: bytes)
+                case nil: break
+                }
+            }
+            self.state = state
+        }
         return coordinator
     }()
 

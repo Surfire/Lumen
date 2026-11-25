@@ -277,7 +277,7 @@ unsafe extern "C" fn callback(
                 || flag & MUST_SCAN_SUBDIRS != 0
                 || flag == 0
                 || flag & IS_DIRECTORY != 0 && flag & TREE_CHANGED != 0;
-            if sink.native_change(path, subtree, rearm, flag & MUST_SCAN_SUBDIRS != 0) {
+            if sink.native_change(path, id, subtree, rearm, flag & MUST_SCAN_SUBDIRS != 0) {
                 watermark = watermark.max(id);
             }
         }

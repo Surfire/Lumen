@@ -233,7 +233,12 @@ pub fn scan_with_progress(
     let (mut conn, _lease) =
         open_write(&file, true).with_context(|| format!("open index {}", file.display()))?;
     restrict_scope(&mut conn, &coverage)?;
-    reconcile(&mut conn, &coverage, true, progress)
+    #[cfg(target_os = "macos")]
+    let checkpoint = crate::watch::checkpoint_before_scan(&conn, &coverage)?;
+    let stats = reconcile(&mut conn, &coverage, true, progress)?;
+    #[cfg(target_os = "macos")]
+    checkpoint(&conn)?;
+    Ok(stats)
 }
 
 pub(super) fn scan_external(
@@ -390,6 +395,35 @@ fn epoch_seconds() -> Option<u64> {
     Some(SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs())
 }
 
+#[cfg(target_os = "macos")]
+pub(super) fn reconciliation_overdue(conn: &Connection, limit: Duration) -> Result<bool> {
+    let completed: Option<String> = conn
+        .query_row(
+            "SELECT value FROM info WHERE key='watch_reconciled_at'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let completed = match completed {
+        Some(completed) => completed.parse::<u64>().ok(),
+        None => {
+            let sample: Option<String> = conn
+                .query_row("SELECT value FROM info WHERE key='walk_sample'", [], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            sample
+                .as_deref()
+                .and_then(|sample| serde_json::from_str::<WalkSample>(sample).ok())
+                .map(|sample| sample.saved_at)
+        }
+    };
+    Ok(epoch_seconds()
+        .zip(completed)
+        .and_then(|(now, completed)| now.checked_sub(completed))
+        .is_none_or(|age| age >= limit.as_secs()))
+}
+
 fn previous_walk_entries(tx: &Transaction<'_>) -> Result<Option<u64>> {
     const SAMPLE_AGE_LIMIT: u64 = 7 * 24 * 60 * 60;
     let saved: Option<String> = tx
@@ -477,6 +511,7 @@ pub(super) fn reconcile(
         .map(|p| p.display().to_string())
         .collect();
     stats.elapsed_ms = started.elapsed().as_millis();
+    stats.entries_visited = entries;
     let prior_scan: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM info WHERE key='scan')",
         [],
@@ -484,6 +519,10 @@ pub(super) fn reconcile(
     )?;
     if !failed || prior_scan {
         write_info(&tx, "scan", &stats)?;
+    }
+    #[cfg(target_os = "macos")]
+    if !failed && let Some(now) = epoch_seconds() {
+        write_info(&tx, "watch_reconciled_at", &now)?;
     }
     tx.commit()?;
     if failed {
@@ -540,6 +579,7 @@ pub(super) fn apply_changes(
     }
     let removed = purge(&tx)?;
     let hidden = hide_unverified(&tx)?;
+    walk.stats.entries_visited = walk.entries;
     let (stats, changed) = (walk.stats, walk.changed || removed != 0 || hidden != 0);
     tx.commit()?;
     Ok((stats, changed))

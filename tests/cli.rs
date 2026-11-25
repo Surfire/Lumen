@@ -504,7 +504,12 @@ mod live {
 
     impl Serve {
         fn new(f: &Fixture) -> Self {
-            let mut process = Process::launch(f.cli().arg("serve").stdin(Stdio::piped()));
+            Self::launch(f, &[])
+        }
+
+        fn launch(f: &Fixture, args: &[&str]) -> Self {
+            let mut process =
+                Process::launch(f.cli().arg("serve").args(args).stdin(Stdio::piped()));
             let input = process.child.stdin.take().unwrap();
             Self {
                 process,
@@ -1208,6 +1213,65 @@ mod live {
     }
 
     #[test]
+    fn cached_start_checks_results_before_historical_changes_finish() {
+        let f = Fixture::new();
+        let root = f.0.join("scope");
+        let private = root.join("private");
+        fs::create_dir_all(&private).unwrap();
+        let moved = root.join("old-record.md");
+        let denied = private.join("protected-record.md");
+        fs::write(&moved, "old indexed body").unwrap();
+        fs::write(&denied, "private cached prose").unwrap();
+        let stable = root.join("stable-record.md");
+        fs::write(&stable, "original cached prose").unwrap();
+        f.run(&["index", "--root", root.to_str().unwrap(), "--documents"]);
+        let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+        let saved_scan = || {
+            db.query_row("SELECT value FROM info WHERE key='scan'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+        };
+        let first_scan = saved_scan();
+        let mut checked = Serve::launch(&f, &["--check-access"]);
+        assert_eq!(
+            checked.names("original cached prose", "text"),
+            ["stable-record.md"]
+        );
+        fs::rename(moved, root.join("new-record.md")).unwrap();
+        let replacement = root.join("replacement");
+        fs::write(&replacement, "replacement document prose").unwrap();
+        fs::rename(replacement, &stable).unwrap();
+        assert!(checked.names("old-record", "name").is_empty());
+        assert!(checked.names("original cached prose", "text").is_empty());
+        assert_eq!(checked.names("stable-record", "name"), ["stable-record.md"]);
+
+        if unsafe { libc::geteuid() } != 0 {
+            // The directory is searchable by exact path, but not enumerable.
+            fs::set_permissions(&private, fs::Permissions::from_mode(0o100)).unwrap();
+            let names = checked.names("protected-record", "name");
+            let text = checked.names("private cached prose", "text");
+            fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(names.is_empty());
+            assert!(text.is_empty());
+        }
+        thread::sleep(Duration::from_millis(650));
+        let watcher = Process::launch(
+            f.cli()
+                .args(["watch", "--cached-start"])
+                .stdin(Stdio::null()),
+        );
+        assert_eq!(watcher.json()["event"], "cached");
+        assert_eq!(watcher.json()["event"], "ready");
+        assert_eq!(saved_scan(), first_scan);
+        assert_eq!(checked.names("new-record", "name"), ["new-record.md"]);
+        assert_eq!(
+            checked.names("replacement document prose", "text"),
+            ["stable-record.md"]
+        );
+    }
+
+    #[test]
     fn watcher_seeds_legacy_catalog_and_resumes_persisted_native_events() {
         let f = Fixture::new();
         let root = f.0.join("scope");
@@ -1232,7 +1296,10 @@ mod live {
             .optional()
             .unwrap()
         };
-        assert!(get_info("watch_checkpoint_v1").is_none());
+        assert!(get_info("watch_checkpoint_v1").is_some());
+        // A catalog from before manual scans seeded the watch needs one repair.
+        db.execute("DELETE FROM info WHERE key='watch_checkpoint_v1'", [])
+            .unwrap();
         let seed = watch(&f, &[]);
         let scan = get_info("scan").unwrap();
         let checkpoint = get_info("watch_checkpoint_v1").expect("native startup volume checkpoint");
@@ -1280,6 +1347,22 @@ mod live {
             invalid.to_string()
         );
         drop(fallback);
+
+        let mut prior_boot: Value =
+            serde_json::from_str(&get_info("watch_checkpoint_v1").unwrap()).unwrap();
+        prior_boot[0]["boot"] = serde_json::json!("synthetic-prior-boot-session");
+        db.execute(
+            "UPDATE info SET value=?1 WHERE key='watch_checkpoint_v1'",
+            [prior_boot.to_string()],
+        )
+        .unwrap();
+        fs::write(root.join("after-reboot.txt"), "synthetic reboot catch-up").unwrap();
+        let reboot = watch(&f, &[]);
+        assert_eq!(serve.names("after-reboot", "name"), ["after-reboot.txt"]);
+        let renewed: Value =
+            serde_json::from_str(&get_info("watch_checkpoint_v1").unwrap()).unwrap();
+        assert_ne!(renewed[0]["boot"], prior_boot[0]["boot"]);
+        drop(reboot);
 
         if unsafe { libc::geteuid() } != 0 {
             struct RestoreMode<'a>(&'a Path);

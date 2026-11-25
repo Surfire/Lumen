@@ -202,6 +202,7 @@ final class LauncherEngine {
     private var imageConnection: SearchConnection?
     private let gemmaHome: URL?
     private var nextID: UInt64 = 0
+    var checksCachedHitAccess = false
 
     init(executable: URL, database: URL, syntheticRoot: URL? = nil, gemmaHome: URL? = nil) {
         self.executable = executable
@@ -233,7 +234,9 @@ final class LauncherEngine {
     }
 
     private func arguments(_ command: [String]) -> [String] {
-        ["--db", database.path] + command
+        let guarded = checksCachedHitAccess && ["query", "serve", "semantic-serve", "image-serve"].contains(command.first ?? "")
+        let command = guarded ? Array(command.prefix(1)) + ["--check-access"] + command.dropFirst() : command
+        return ["--db", database.path] + command
     }
 
     func indexArguments(scope: IndexScope) -> [String] {

@@ -6,10 +6,16 @@ use std::path::Path;
 mod fsevents;
 #[cfg(target_os = "macos")]
 mod resume;
+#[cfg(target_os = "macos")]
+pub(crate) use macos::checkpoint_before_scan;
+#[cfg(target_os = "macos")]
+pub(crate) use resume::{can_enumerate, can_read_document};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum WatchEvent {
+    /// The saved scope is committed. Clients must verify live access per hit.
+    Cached,
     /// Startup replay or reconciliation is committed and search clients can connect.
     Ready,
     /// A committed change is available to existing search clients.
@@ -24,11 +30,21 @@ pub fn watch(
     watch_with_progress(database, scope, None, emit)
 }
 
-#[cfg(not(target_os = "macos"))]
 pub fn watch_with_progress(
+    database: &Path,
+    scope: &Scope,
+    progress: Option<&ScanProgressReporter>,
+    emit: impl FnMut(WatchEvent) -> Result<()>,
+) -> Result<()> {
+    watch_with_launch_progress(database, scope, progress, false, emit)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn watch_with_launch_progress(
     _: &Path,
     _: &Scope,
     _: Option<&ScanProgressReporter>,
+    _: bool,
     _: impl FnMut(WatchEvent) -> Result<()>,
 ) -> Result<()> {
     anyhow::bail!("live indexing currently requires macOS FSEvents");
@@ -38,7 +54,7 @@ pub fn watch_with_progress(
 mod macos {
     use super::{Path, Result, ScanProgressReporter, Scope, WatchEvent, fsevents, resume};
     use crate::index::{Coverage, apply_changes, reconcile, restrict_scope, startup_scope};
-    use crate::{ScanStats, absolute, open_write, platform};
+    use crate::{ScanPhase, ScanStats, absolute, open_write, platform};
     use anyhow::Context;
     use rusqlite::Connection;
     use std::{
@@ -63,12 +79,32 @@ mod macos {
     const QUEUE_CAPACITY: usize = 8192;
     const BATCH_SIZE: usize = 512;
     const REPLAY_LIMIT: Duration = Duration::from_secs(4);
+    const MAX_PERSISTED_RECONCILIATION_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-    pub fn watch_with_progress(
+    pub(crate) fn checkpoint_before_scan<'a>(
+        conn: &Connection,
+        coverage: &'a Coverage,
+    ) -> Result<impl FnOnce(&Connection) -> Result<()> + use<'a>> {
+        resume::install_invalidation(conn)?;
+        let roots = configured_watches(coverage);
+        let fence = resume::Journal::open(coverage, &roots)
+            .and_then(|journal| Some((journal.current_id()?, journal)));
+        Ok(move |conn: &Connection| {
+            if let Some((cursor, journal)) = fence
+                && journal.unchanged(coverage, &roots)
+            {
+                journal.save(conn, &coverage.scope, cursor)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn watch_with_launch_progress(
         database: &Path,
         scope: &Scope,
         progress: Option<&ScanProgressReporter>,
-        emit: impl FnMut(WatchEvent) -> Result<()>,
+        guarded_cache: bool,
+        mut emit: impl FnMut(WatchEvent) -> Result<()>,
     ) -> Result<()> {
         crate::external::check_primary_scope(scope)?;
         let _io = platform::NoMaterialization::enter()?;
@@ -88,8 +124,19 @@ mod macos {
         crate::external::check_primary_scope(&scope)?;
         let coverage = Arc::new(Coverage::new(file, &scope)?);
         crate::external::check_primary_scope(&coverage.scope)?;
+        let unchanged = guarded_cache
+            && uses_saved_scope
+            && crate::saved_index_scope(&conn)?.as_ref() == Some(&coverage.scope)
+            && conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM info WHERE key='scan')",
+                [],
+                |r| r.get::<_, bool>(0),
+            )?;
         restrict_scope(&mut conn, &coverage)
             .context("apply watch scope before filesystem traversal")?;
+        if unchanged {
+            emit(WatchEvent::Cached).context("emit cached catalog event")?;
+        }
         // Periodic checks cover silently lost notifications, non-journaling
         // volumes, and directories we could not read during a previous pass.
         let timing = Timing {
@@ -103,6 +150,7 @@ mod macos {
             timing,
             progress,
             true,
+            guarded_cache,
             start_stream,
             emit,
         )
@@ -114,6 +162,12 @@ mod macos {
         _stream: S,
         journal: Option<resume::Journal>,
         cursor: u64,
+    }
+
+    struct History {
+        targets: BTreeMap<PathBuf, bool>,
+        cursor: u64,
+        overlap: Option<String>,
     }
 
     impl<S> Subscription<S> {
@@ -179,9 +233,10 @@ mod macos {
             ))
         }
 
-        fn replay(&self) -> Option<(BTreeMap<PathBuf, bool>, u64)> {
+        fn replay(&self) -> Option<History> {
             let deadline = Instant::now() + REPLAY_LIMIT;
             let mut targets = BTreeMap::new();
+            let mut events = BTreeSet::new();
             let mut cursor = self.cursor;
             // Build a bounded set before applying it. Incomplete history,
             // topology changes and queue overflow all require reconciliation.
@@ -192,12 +247,17 @@ mod macos {
                 let timeout = deadline.checked_duration_since(Instant::now())?;
                 match self.receiver.recv_timeout(timeout).ok()? {
                     Event::Change(change) if !change.rearm && !change.uncertain => {
+                        events.insert((change.id, change.path.clone(), change.subtree));
                         add_target(&mut targets, change)
                     }
                     Event::Checkpoint { id, history_done } => {
                         cursor = cursor.max(id);
                         if history_done && !self.sink.lost.load(Ordering::Acquire) {
-                            return Some((targets, cursor));
+                            return Some(History {
+                                targets,
+                                cursor,
+                                overlap: resume::replay_overlap(cursor, &events),
+                            });
                         }
                     }
                     _ => return None,
@@ -221,21 +281,37 @@ mod macos {
         timing: Timing,
         progress: Option<&ScanProgressReporter>,
         persistent: bool,
+        guarded_cache: bool,
         start: impl Fn(&Arc<Sink>, Option<(&resume::Journal, u64)>) -> Result<S>,
         mut emit: impl FnMut(WatchEvent) -> Result<()>,
     ) -> Result<()> {
         let (mut sub, attempt_resume) =
             Subscription::start(conn, &coverage, persistent, true, &start)?;
         let mut resumed = false;
-        if attempt_resume && let Some((targets, cursor)) = sub.replay() {
+        if attempt_resume
+            && let Some(History {
+                targets,
+                cursor,
+                overlap,
+            }) = sub.replay()
+        {
             let mut had_access_errors = false;
-            if !targets.is_empty() {
+            let target_count = targets.len();
+            let mut visited = 0;
+            let repeated = cursor == sub.cursor
+                && overlap
+                    .as_deref()
+                    .map(|overlap| resume::already_replayed(conn, overlap))
+                    .transpose()?
+                    .unwrap_or(false);
+            if !targets.is_empty() && !repeated {
                 let (stats, _) = apply_changes(conn, &coverage, targets)
                     .context("commit historical filesystem changes")?;
                 report_unreadable(&stats);
                 had_access_errors = stats.entries_unreadable != 0;
+                visited = stats.entries_visited;
             }
-            if resume::verify_access(conn, Some(&sub.sink.roots))?
+            if (guarded_cache || resume::verify_access(conn, Some(&sub.sink.roots))?)
                 && !had_access_errors
                 && sub
                     .journal
@@ -244,10 +320,29 @@ mod macos {
                 && !sub.sink.lost.load(Ordering::Acquire)
             {
                 sub.save(conn, cursor)?;
+                resume::remember_replay(conn, overlap)?;
+                if guarded_cache && progress.is_some() {
+                    eprintln!(
+                        "lumen watch: recovered {target_count} history targets, visited {visited} entries"
+                    );
+                }
+                if let Some(progress) = progress {
+                    // No scanner ran to close the preparing phase. Otherwise
+                    // its heartbeat can make a healthy watcher appear busy.
+                    progress.phase(ScanPhase::Done, visited, None);
+                }
                 resumed = true;
             }
         }
         if !resumed {
+            if guarded_cache {
+                let reason = if attempt_resume {
+                    "history incomplete or uncertain"
+                } else {
+                    "no matching journal checkpoint"
+                };
+                eprintln!("lumen watch: {reason}; reconciling the configured scope");
+            }
             if persistent {
                 resume::invalidate(conn)?;
                 if attempt_resume {
@@ -256,7 +351,7 @@ mod macos {
                     (sub, _) = Subscription::start(conn, &coverage, persistent, false, &start)?;
                 }
             }
-            if persistent && coverage.scope.documents {
+            if persistent && coverage.scope.documents && !guarded_cache {
                 resume::verify_access(conn, None)?;
             }
             reconcile_startup(conn, &coverage, &mut sub, progress)?;
@@ -268,7 +363,11 @@ mod macos {
 
         let mut last_reconciled = Instant::now();
         let mut last_emitted = Instant::now();
-        let mut pending_recovery = false;
+        // Restarts cannot defer the repair of a silently missed event forever.
+        // The age bound is separate from the normal in-session periodic check.
+        let mut pending_recovery = persistent
+            && resumed
+            && crate::index::reconciliation_overdue(conn, MAX_PERSISTED_RECONCILIATION_AGE)?;
         let mut pending_update = false;
         loop {
             let interval = if pending_recovery {
@@ -303,11 +402,15 @@ mod macos {
                     Event::Lost => {}
                 }
             }
-            if sub.sink.lost.swap(false, Ordering::AcqRel) && !pending_recovery {
+            if sub.sink.lost.swap(false, Ordering::AcqRel) {
                 if persistent {
                     resume::invalidate(conn)?;
                 }
-                eprintln!("lumen watch: filesystem notifications lost; checking configured roots");
+                if !pending_recovery {
+                    eprintln!(
+                        "lumen watch: filesystem notifications lost; checking configured roots"
+                    );
+                }
                 pending_recovery = true;
             }
             let full = rearm
@@ -462,6 +565,7 @@ mod macos {
     }
 
     struct Change {
+        id: u64,
         path: PathBuf,
         subtree: bool,
         rearm: bool,
@@ -517,6 +621,7 @@ mod macos {
         pub(super) fn native_change(
             &self,
             path: &Path,
+            id: u64,
             subtree: bool,
             rearm: bool,
             uncertain: bool,
@@ -547,6 +652,7 @@ mod macos {
             if scan_roots.iter().any(|root| path.starts_with(root)) && self.coverage.allows(path) {
                 self.change(
                     path,
+                    id,
                     subtree,
                     rearm || above_watch && !below_watch,
                     uncertain,
@@ -556,7 +662,7 @@ mod macos {
                 let mut sent = false;
                 for root in scan_roots {
                     if root.starts_with(path) && self.coverage.allows(root) {
-                        self.change(root, true, true, uncertain);
+                        self.change(root, id, true, true, uncertain);
                         sent = true;
                     }
                 }
@@ -566,8 +672,9 @@ mod macos {
             }
         }
 
-        fn change(&self, path: &Path, subtree: bool, rearm: bool, uncertain: bool) {
+        fn change(&self, path: &Path, id: u64, subtree: bool, rearm: bool, uncertain: bool) {
             self.send(Event::Change(Change {
+                id,
                 path: path.into(),
                 subtree,
                 rearm,
@@ -649,6 +756,7 @@ mod macos {
                 timing,
                 None,
                 false,
+                false,
                 |s, _| {
                     *sink.borrow_mut() = Some(s.clone());
                     Ok(())
@@ -657,10 +765,13 @@ mod macos {
                     let sink = sink.borrow();
                     let sink = sink.as_ref().unwrap();
                     match event {
+                        WatchEvent::Cached => {
+                            unreachable!("synthetic watcher has no startup client")
+                        }
                         WatchEvent::Ready => {
                             fs::write(&target, "this notification is delivered")?;
                             fs::write(&missed, "there is no notification for this path")?;
-                            sink.change(&target, false, false, false);
+                            sink.change(&target, 0, false, false, false);
                         }
                         WatchEvent::Updated => {
                             updates += 1;
@@ -700,4 +811,4 @@ mod macos {
 }
 
 #[cfg(target_os = "macos")]
-pub use macos::watch_with_progress;
+pub use macos::watch_with_launch_progress;

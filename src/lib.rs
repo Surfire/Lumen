@@ -17,6 +17,7 @@ mod semantic;
 mod watch;
 
 pub use content::{ContentBatch, apply_content_scope, index_content};
+pub use diagnose::verify_cached_access;
 pub use diagnose::{Diagnosis, Reason as DiagnoseReason, diagnose, validate_hit};
 pub use external::{VolumeStatus, forget_volume, index_volume, volumes};
 pub use gemma::{GemmaModel, ID as GEMMA_MODEL_ID};
@@ -29,7 +30,7 @@ pub use semantic::{
     EmbedBatch, GemmaCoverage, GemmaSearchSession, embed, embed_batch, embed_with_backend,
     gemma_coverage,
 };
-pub use watch::{WatchEvent, watch, watch_with_progress};
+pub use watch::{WatchEvent, watch, watch_with_launch_progress, watch_with_progress};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -293,6 +294,8 @@ pub struct ScanStats {
     pub items: u64,
     pub skipped: u64,
     pub entries_unreadable: u64,
+    #[serde(default)]
+    pub entries_visited: u64,
     pub bulk_directories: u64,
     pub fallback_directories: u64,
     pub provider_metadata_only: u64,

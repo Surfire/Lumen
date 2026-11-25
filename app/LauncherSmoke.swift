@@ -137,6 +137,32 @@ final class LauncherSmoke {
             try await verifyImageSearch(app)
             return
         }
+        if exists("reopen-scenario") {
+            let timer = ContinuousClock.now
+            try type("existing-reopen-fixture", into: app)
+            try await until("searchable saved catalog on reopen") {
+                model.hits.contains { $0.name == "existing-reopen-fixture.txt" }
+            }
+            let elapsed = timer.duration(to: .now).components
+            let milliseconds = Double(elapsed.seconds) * 1_000 + Double(elapsed.attoseconds) / 1e15
+            let fallback = exists("reopen-fallback")
+            if fallback {
+                try check(model.watchState == .starting, "saved lookup waited for the fallback traversal")
+                try signal("finish-reopen")
+            }
+            try await until("catch-up finished") { model.watchState == .running }
+            try type("new-offline-reopen-fixture", into: app)
+            try await until("name added while the app was stopped") {
+                model.hits.contains { $0.name == "new-offline-reopen-fixture.txt" }
+            }
+            try type("deleted-reopen-fixture", into: app)
+            try await until("deleted name was removed") { !model.searching && model.hits.isEmpty }
+            try await Task.sleep(for: .milliseconds(350))
+            try check(model.watchProgress == nil, "idle watcher kept emitting startup progress")
+            print("Native cached reopen first filename: \(milliseconds) ms, fallback: \(fallback)")
+            return
+        }
+
         if exists("content-scenario") {
             try await verifyContentPipeline(app)
             return

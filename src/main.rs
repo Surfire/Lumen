@@ -167,7 +167,13 @@ enum Action {
     /// Index the readable startup volume by default, or explicit roots. Metadata only unless --documents.
     Index(ScopeArgs),
     /// Reconcile and maintain an index. Emits JSON ready and updated events. Diagnostics go to stderr.
-    Watch(ScopeArgs),
+    Watch {
+        #[command(flatten)]
+        scope: ScopeArgs,
+        /// Allow early cached lookup for a client checking each hit with --check-access.
+        #[arg(long)]
+        cached_start: bool,
+    },
     /// Query a saved index; never implicitly rebuild it.
     Query {
         text: String,
@@ -175,6 +181,9 @@ enum Action {
         mode: SearchMode,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Check live access before returning any cached result.
+        #[arg(long)]
+        check_access: bool,
         #[command(flatten)]
         semantic: SemanticArgs,
     },
@@ -226,6 +235,8 @@ enum Action {
         projector: PathBuf,
         #[arg(long, value_name = "DIR")]
         gemma_home: Option<PathBuf>,
+        #[arg(long)]
+        check_access: bool,
     },
     /// List eligible attached external volumes and saved availability.
     Volumes,
@@ -277,6 +288,8 @@ enum Action {
     SemanticServe {
         #[arg(long, value_name = "DIR")]
         gemma_home: Option<PathBuf>,
+        #[arg(long)]
+        check_access: bool,
     },
     /// Report scan coverage and embedding counts.
     Status {
@@ -285,7 +298,10 @@ enum Action {
         include_scope: bool,
     },
     /// Persistent newline-delimited JSON query transport on stdio for the desktop launcher.
-    Serve,
+    Serve {
+        #[arg(long)]
+        check_access: bool,
+    },
 }
 #[derive(Deserialize)]
 struct Request {
@@ -382,20 +398,30 @@ fn main() -> Result<()> {
             drop(progress);
             println!("{}", serde_json::to_string_pretty(&stats)?);
         }
-        Action::Watch(args) => {
-            let progress = scan_progress(args.progress)?;
-            lumen::watch_with_progress(&db, &args.into(), progress.as_ref(), |event| {
-                let mut out = io::stdout().lock();
-                serde_json::to_writer(&mut out, &event)?;
-                writeln!(out)?;
-                out.flush()?;
-                Ok(())
-            })?;
+        Action::Watch {
+            scope,
+            cached_start,
+        } => {
+            let progress = scan_progress(scope.progress)?;
+            lumen::watch_with_launch_progress(
+                &db,
+                &scope.into(),
+                progress.as_ref(),
+                cached_start,
+                |event| {
+                    let mut out = io::stdout().lock();
+                    serde_json::to_writer(&mut out, &event)?;
+                    writeln!(out)?;
+                    out.flush()?;
+                    Ok(())
+                },
+            )?;
         }
         Action::Query {
             text,
             mode,
             limit,
+            check_access,
             semantic,
         } => {
             let permits_semantic = lumen::query_allows_semantic(&text);
@@ -408,7 +434,7 @@ fn main() -> Result<()> {
                 .then(|| semantic.configure())
                 .transpose()?
                 .flatten();
-            let hits = if model.is_none() && matches!(mode, SearchMode::Semantic) {
+            let mut hits = if model.is_none() && matches!(mode, SearchMode::Semantic) {
                 lumen::GemmaSearchSession::open(
                     &db,
                     &GemmaModel::installed(gemma_home.as_deref())?,
@@ -425,6 +451,9 @@ fn main() -> Result<()> {
                     model.as_ref().map(ConfiguredModel::backend),
                 )?
             };
+            if check_access {
+                lumen::verify_cached_access(&mut hits);
+            }
             println!("{}", serde_json::to_string_pretty(&hits)?);
         }
         Action::ValidateHit {
@@ -529,16 +558,26 @@ fn main() -> Result<()> {
         Action::ImageServe {
             projector,
             gemma_home,
+            check_access,
         } => {
             let model = GemmaModel::installed(gemma_home.as_deref())?;
             let mut session = lumen::ImageSearchSession::open(&db, &model, projector)?;
             serve_gemma(
                 io::stdin().lock(),
                 io::BufWriter::new(io::stdout().lock()),
-                |query, limit| session.search(query, limit),
+                |query, limit| {
+                    let mut hits = session.search(query, limit)?;
+                    if check_access {
+                        lumen::verify_cached_access(&mut hits);
+                    }
+                    Ok(hits)
+                },
             )?;
         }
-        Action::SemanticServe { gemma_home } => {
+        Action::SemanticServe {
+            gemma_home,
+            check_access,
+        } => {
             let mut session = lumen::GemmaSearchSession::open(
                 &db,
                 &GemmaModel::installed(gemma_home.as_deref())?,
@@ -546,7 +585,13 @@ fn main() -> Result<()> {
             serve_gemma(
                 io::stdin().lock(),
                 io::BufWriter::new(io::stdout().lock()),
-                |query, limit| session.search(query, limit),
+                |query, limit| {
+                    let mut hits = session.search(query, limit)?;
+                    if check_access {
+                        lumen::verify_cached_access(&mut hits);
+                    }
+                    Ok(hits)
+                },
             )?;
         }
         Action::ModelStatus {
@@ -588,7 +633,7 @@ fn main() -> Result<()> {
             }
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
-        Action::Serve => {
+        Action::Serve { check_access } => {
             let mut search = lumen::SearchSession::open(&db)
                 .context("no usable index; run lumen index first")?;
             let mut out = io::BufWriter::new(io::stdout().lock());
@@ -596,7 +641,10 @@ fn main() -> Result<()> {
                 let data = line?;
                 match serde_json::from_str::<Request>(&data) {
                     Ok(q) => match search.search(&q.query, q.mode, q.limit.unwrap_or(20)) {
-                        Ok(hits) => {
+                        Ok(mut hits) => {
+                            if check_access {
+                                lumen::verify_cached_access(&mut hits);
+                            }
                             serde_json::to_writer(&mut out, &SearchReply { id: q.id, hits })?
                         }
                         Err(e) => serde_json::to_writer(

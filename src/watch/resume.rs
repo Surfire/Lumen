@@ -20,6 +20,41 @@ use std::{
 
 const DATA: &str = "/System/Volumes/Data";
 const KEY: &str = "watch_checkpoint_v1";
+const REPLAY_KEY: &str = "watch_replay_overlap_v1";
+
+/// FullHistory intentionally returns events from before the saved ID. Only
+/// deduplicate an exact, previously committed overlap at the same watermark.
+pub(super) fn replay_overlap(
+    cursor: u64,
+    events: &std::collections::BTreeSet<(u64, PathBuf, bool)>,
+) -> Option<String> {
+    const MAX_REPLAY_BYTES: usize = 512 * 1024;
+    if events.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&(cursor, events))
+        .ok()
+        .filter(|raw| raw.len() <= MAX_REPLAY_BYTES)
+}
+
+pub(super) fn already_replayed(conn: &Connection, overlap: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM info WHERE key=?1 AND value=?2)",
+        params![REPLAY_KEY, overlap],
+        |r| r.get(0),
+    )?)
+}
+
+pub(super) fn remember_replay(conn: &Connection, overlap: Option<String>) -> Result<()> {
+    if let Some(overlap) = overlap {
+        conn.execute(
+            "INSERT INTO info(key,value) VALUES(?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE value<>excluded.value",
+            params![REPLAY_KEY, overlap],
+        )?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Identity {
@@ -150,7 +185,10 @@ impl Journal {
 }
 
 pub(super) fn invalidate(conn: &Connection) -> Result<()> {
-    conn.execute("DELETE FROM info WHERE key=?1", [KEY])?;
+    conn.execute(
+        "DELETE FROM info WHERE key IN (?1,?2)",
+        params![KEY, REPLAY_KEY],
+    )?;
     Ok(())
 }
 
@@ -169,6 +207,10 @@ pub(super) fn install_invalidation(conn: &Connection) -> Result<()> {
          CREATE TRIGGER IF NOT EXISTS watch_checkpoint_delete AFTER DELETE ON info
          WHEN OLD.key IN('scan','scope') BEGIN
            DELETE FROM info WHERE key='watch_checkpoint_v1';
+         END;
+         CREATE TRIGGER IF NOT EXISTS watch_replay_clear AFTER DELETE ON info
+         WHEN OLD.key='watch_checkpoint_v1' BEGIN
+           DELETE FROM info WHERE key='watch_replay_overlap_v1';
          END;",
     )?;
     Ok(())
@@ -239,6 +281,10 @@ fn other_mount(coverage: &Coverage, roots: &[PathBuf]) -> Option<bool> {
     Some(!readonly_root && roots.iter().any(|root| root == Path::new("/")))
 }
 
+pub(crate) fn can_enumerate(path: &Path) -> bool {
+    open_directory(path).is_ok()
+}
+
 fn open_directory(path: &Path) -> io::Result<()> {
     let file = OpenOptions::new()
         .read(true)
@@ -267,7 +313,7 @@ fn open_directory(path: &Path) -> io::Result<()> {
     }
 }
 
-fn open_document(path: &Path) -> bool {
+pub(crate) fn can_read_document(path: &Path, stamp: Option<&str>) -> bool {
     fs::symlink_metadata(path).is_ok_and(|metadata| {
         metadata.is_file()
             && platform::availability(path, &metadata) == "local"
@@ -280,6 +326,7 @@ fn open_document(path: &Path) -> bool {
                         opened.is_file()
                             && (opened.dev(), opened.ino()) == (metadata.dev(), metadata.ino())
                             && platform::availability(path, &opened) == "local"
+                            && stamp.is_none_or(|expected| crate::index::stamp(&opened) == expected)
                     })
                 })
     })
@@ -312,7 +359,7 @@ pub(super) fn verify_access(conn: &mut Connection, roots: Option<&[PathBuf]>) ->
             let accessible = if directory {
                 open_directory(path).is_ok()
             } else {
-                open_document(path)
+                can_read_document(path, None)
             };
             let previously_blocked: bool = row.get(2)?;
             if !accessible && !previously_blocked {

@@ -8,6 +8,62 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use std::path::{Component, Path, PathBuf};
 
+/// Guard the startup snapshot against out-of-band access changes, including
+/// privacy-policy revocation which may not produce any filesystem event.
+pub fn verify_cached_access(hits: &mut Vec<crate::Hit>) {
+    #[cfg(not(target_os = "macos"))]
+    hits.clear();
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(_io) = crate::platform::NoMaterialization::enter() else {
+            hits.clear();
+            return;
+        };
+        let mut directory_access = std::collections::HashMap::<PathBuf, bool>::new();
+        hits.retain(|hit| {
+            let path = Path::new(&hit.path);
+            if !path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
+                return false;
+            }
+            let directory = hit.kind == "directory";
+            if !directory && hit.kind != "file" {
+                return false;
+            }
+            let Some(parent) = path.parent() else {
+                return false;
+            };
+            for ancestor in parent.ancestors().collect::<Vec<_>>().into_iter().rev() {
+                if !*directory_access
+                    .entry(ancestor.into())
+                    .or_insert_with(|| crate::watch::can_enumerate(ancestor))
+                {
+                    return false;
+                }
+            }
+            let Ok(live) = selected_metadata(path, directory) else {
+                return false;
+            };
+            if live.path != path || live.availability != hit.availability {
+                return false;
+            }
+            if directory
+                && live.availability != "placeholder"
+                && !*directory_access
+                    .entry(path.into())
+                    .or_insert_with(|| crate::watch::can_enumerate(path))
+            {
+                return false;
+            }
+            if hit.snippet.is_some() || hit.document_stamp.is_some() {
+                return hit.document_stamp.is_some()
+                    && hit.document_stamp == live.stamp
+                    && crate::watch::can_read_document(path, hit.document_stamp.as_deref());
+            }
+            true
+        });
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {

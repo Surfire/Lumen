@@ -52,7 +52,7 @@ private struct HitValidation: Decodable {
 }
 
 private struct WatchEvent: Decodable {
-    enum Kind: String, Decodable { case ready, updated }
+    enum Kind: String, Decodable { case cached, ready, updated }
     let event: Kind
 }
 
@@ -133,6 +133,7 @@ final class Launcher: ObservableObject {
     private let defaults: UserDefaults?
     private var watchSupported: Bool?
     private var watchReportsProgress = false
+    private var watchSupportsCachedStart = false
     private var indexReportsProgress = true
     private var scanGeneration: UInt64 = 0
     private var revision: UInt64 = 0
@@ -255,7 +256,7 @@ final class Launcher: ObservableObject {
                 if let report = self.report(from: response) {
                     self.publish(report)
                     self.acceptCoverage(from: report)
-                } else {
+                } else if !self.scopeTrustedForLookup {
                     self.indexPhase = .unreadable
                     self.indexNotice = LauncherNotice(.status, response.diagnostic)
                 }
@@ -267,7 +268,10 @@ final class Launcher: ObservableObject {
         _ = engine.run(["watch", "--help"]) { [weak self] response in
             guard let self, !self.closed else { return }
             self.watchSupported = response.succeeded
-            self.watchReportsProgress = response.succeeded && String(decoding: response.output, as: UTF8.self).contains("--progress")
+            let help = String(decoding: response.output, as: UTF8.self)
+            self.watchReportsProgress = response.succeeded && help.contains("--progress")
+            self.watchSupportsCachedStart = response.succeeded && help.contains("--cached-start")
+            self.engine.checksCachedHitAccess = self.watchSupportsCachedStart
             self.watchState = response.succeeded ? (self.scopePending ? .paused : .needsSetup) : .unavailable
             self.startWatcherIfReady()
         }
@@ -1189,13 +1193,15 @@ final class Launcher: ObservableObject {
     }
 
     private func startWatcherIfReady() {
-        guard watchSupported == true, indexPhase == .ready, !scopePending,
+        let canPrepareCache = watchSupportsCachedStart && indexPhase == .checking && engine.hasDatabase
+        guard watchSupported == true, indexPhase == .ready || canPrepareCache, !scopePending,
               watcher == nil, !closed else { return }
         watchState = .starting
         watchNotice = nil
         watchGeneration &+= 1
         let generation = watchGeneration
         let arguments = ["watch", "--bundled-pdf-helper"] + (watchReportsProgress ? ["--progress"] : [])
+            + (watchSupportsCachedStart ? ["--cached-start"] : [])
         watcher = engine.run(arguments, onLine: { [weak self] line in
             guard let self, self.watchGeneration == generation, !self.closed else { return }
             self.watchEvent(line)
@@ -1226,8 +1232,15 @@ final class Launcher: ObservableObject {
     private func watchEvent(_ line: Data) {
         guard !stoppingWatcher, !scopePending,
               let notice = try? JSONDecoder().decode(WatchEvent.self, from: line) else { return }
+        if notice.event == .cached {
+            scopeTrustedForLookup = true
+            indexPhase = .ready
+            scheduleSearch(keepAction: true)
+            return
+        }
         if notice.event == .ready {
             scopeTrustedForLookup = true
+            indexPhase = .ready
             watchState = .running
         }
         watchProgress = nil

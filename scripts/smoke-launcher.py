@@ -150,41 +150,55 @@ if action == "embed":
     sys.exit(0)
 
 if action == "query" and args[:2] == ["--mode", "semantic"]:
-    assert args[:-1] == ["--mode", "semantic", "--bge", "--language", "en", "--"]
+    assert args[:-1] == ["--mode", "semantic", "--bge", "--language", "en", "--limit", "12", "--"]
     (work / "bge-query-started").touch()
-    if args[-1] == "archive":
-        sys.exit("no paragraph embeddings: run lumen embed first (/Users/synthetic-account/private)")
-    if args[-1] == "no related excerpts":
+    term = args[-1]
+    if term == "outdated semantic request":
+        gate("stale-semantic")
+    elif term == "health examination" and not (work / "finish-semantic-enrichment").exists():
+        gate("semantic-enrichment")
+    if term not in ("health examination", "outdated semantic request"):
         print("[]")
         sys.exit(0)
-    assert args[-1] == "health examination"
-    path = work / "corpus/notes.md"
-    document = indexed_documents()[str(path)]
-    print(json.dumps([{"path": str(path), "name": path.name, "kind": "file", "availability": "local",
-                       "matched_by": "semantic_candidate", "snippet": document["text"],
-                       "document_stamp": document["stamp"]}]))
+    documents = indexed_documents()
+    hits = []
+    for name in ("health examination roster.txt", "notes.md", "notes.md", "related-one.md",
+                 "related-two.md", "related-three.md"):
+        path = work / "corpus" / name
+        document = documents[str(path)]
+        hits.append({"path": str(path), "name": path.name, "kind": "file", "availability": "local",
+                     "matched_by": "semantic_candidate", "snippet": document["text"],
+                     "document_stamp": document["stamp"]})
+    print(json.dumps(hits))
     sys.exit(0)
 
 if action == "query":
-    print(json.dumps(query_hits(args)))
+    hits = query_hits(args)
+    if args[:2] == ["--mode", "name"] and args[-1] == "cloudledger":
+        if (work / "hold-cloud-reveal").exists() and not (work / "finish-cloud-reveal").exists():
+            gate("cloud-reveal")
+    if args[:2] == ["--mode", "text"]:
+        term = args[-1]
+        if term == "archive" and (work / "hold-archive-text").exists() and not (work / "finish-archive-text").exists():
+            gate("archive-text")
+        if term == "privateneedle" and (work / "hold-scope-search").exists():
+            gate("scope-search")
+        if term == "before render original":
+            assert len(hits) == 1 and hits[0].get("document_stamp")
+            gate("before-render")
+        if term == "missing stamp original":
+            assert len(hits) == 1 and hits[0].pop("document_stamp")
+    print(json.dumps(hits))
     sys.exit(0)
 
 if action == "serve":
     for line in sys.stdin:
         req = json.loads(line)
-        if req["query"] == "archive" and req["mode"] == "all" and not (work / "finish-combined").exists():
-            gate("combined")
+        assert req["mode"] == "name"
         if req["query"] == "obsolete" and not (work / "finish-obsolete").exists():
             gate("obsolete")
-        if req["query"] == "privateneedle" and req["mode"] == "all" and (work / "hold-scope-search").exists():
-            gate("scope-search")
         try:
             hits = query_hits(["--mode", req["mode"], "--limit", str(req["limit"]), "--", req["query"]])
-            if req["query"] == "before render original":
-                assert len(hits) == 1 and hits[0].get("document_stamp")
-                gate("before-render")
-            if req["query"] == "missing stamp original":
-                assert len(hits) == 1 and hits[0].pop("document_stamp")
             reply = {"id": req["id"], "hits": hits}
         except subprocess.CalledProcessError as error:
             reply = {"id": req["id"], "error": str(error)}
@@ -202,6 +216,11 @@ def make_corpus(root):
         "archive-one.txt": "Synthetic ledger.",
         "archive-two.txt": "Synthetic backup.",
         "notes.md": "The archive appears only in the body of this document.",
+        "health examination roster.txt": "A direct title hit and duplicate related candidate.",
+        "health examination sample.txt": "Another direct title hit.",
+        "related-one.md": "A related source about preventative care.",
+        "related-two.md": "A related source about clinical care.",
+        "related-three.md": "An extra related source beyond the limit.",
         "content-safety-source.md": "A safety original paragraph for a replacement test.",
         "before-render.md": "A before render original paragraph for a stale reply test.",
         "missing-stamp.md": "A missing stamp original paragraph for a missing stamp test.",
@@ -248,6 +267,12 @@ def main():
                          "Design references.md", "Design accessibility.md", "Design decisions.md",
                          "Design prototype.md", "Design options.md"):
                 (design / name).write_text("Synthetic design fixture.", encoding="utf-8")
+        crowd = root / "corpus/Examples crowded needle fixtures"
+        crowd.mkdir()
+        for index in range(70):
+            (crowd / f"item-{index:02}.txt").write_text("Weak path fixture.", encoding="utf-8")
+        (root / "corpus/crowded needle spec.txt").write_text("Strong filename fixture.", encoding="utf-8")
+        (root / "corpus/body-match.md").write_text("A crowded needle reference in the body.", encoding="utf-8")
         script = root / "fixture-engine"
         script.write_text(FIXTURE_ENGINE, encoding="utf-8")
         script.chmod(0o700)

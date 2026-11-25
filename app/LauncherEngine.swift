@@ -55,6 +55,7 @@ struct IndexReport: Decodable {
     let placeholders: Int?
     let documents: Int?
     let documents_not_read: Int?
+    let embedded_chunks: Int?
 }
 
 struct IndexProgress: Decodable, Equatable {

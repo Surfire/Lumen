@@ -143,11 +143,11 @@ final class LauncherSmoke {
             try await verifyTiming(app)
             try await verifyWatch(app)
             try await verifyModelResources(app)
-            try await verifySemanticInvalidation(app)
             try await verifyStaleBeforeDisplay(app)
             try await verifyReplacedDocument(app)
             try await verifyMissingPath(app)
             try await verifyEmbeddingRun(app)
+            try await verifySemanticInvalidation(app)
             if exists("capture-snapshots") { try await captureSnapshots(app) }
         } else {
             try await until("watch capability checked") { model.watchState != .checking }
@@ -179,10 +179,16 @@ final class LauncherSmoke {
 
         try await verifyCloudAction(app)
         try type("archive", into: app)
-        try await until("two archive rows from the bundled search engine") { model.hits.count == 2 && !model.searching }
+        try await until("strong archive titles precede any body hits") {
+            !model.searching && model.hits.prefix(2).map(\.name) == ["archive-one.txt", "archive-two.txt"]
+        }
         let expected = model.hits[1].path
         try key(kVK_DownArrow, "\u{f701}", in: app)
         try check(model.selection == expected, "down arrow did not select the second row")
+        try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
+        try await until("Command–Return selected a local file in Finder") { self.revealed?.path == expected }
+        try check(opened == nil && model.query == "archive", "Finder shortcut opened the file or changed the query")
+        revealed = nil
         try key(kVK_UpArrow, "\u{f700}", in: app)
         try check(model.selection == model.hits.first?.path, "up arrow did not restore the first row")
         try key(kVK_DownArrow, "\u{f701}", in: app)
@@ -204,6 +210,9 @@ final class LauncherSmoke {
                   "Return intercepted marked text")
         try check(!app.control(app.searchField, textView: fieldEditor, doCommandBy: #selector(NSResponder.cancelOperation(_:))),
                   "Escape intercepted marked text")
+        let revealKey = try event(kVK_Return, "\r", in: app, flags: [.command])
+        _ = app.panel.performKeyEquivalent(with: revealKey)
+        try check(revealed == nil, "Command–Return interrupted IME composition")
         fieldEditor.unmarkText()
         try type("qingshan", into: app)
         try await until("pinyin filename found") { model.hits.first?.matched_by == "pinyin" }
@@ -239,9 +248,8 @@ final class LauncherSmoke {
         }
         let query = language == "zh" ? "屋顶降水如何透入绿地？" : "How can a new recruit learn the job quickly?"
         try type(query, into: app)
-        model.semanticSearch()
-        try await until("real BGE GUI returned the related original excerpt") {
-            model.showingRelatedExcerpts && model.selectedHit?.name == "entry-a.md" &&
+        try await until("real BGE GUI automatically returned the related original excerpt") {
+            model.selectedHit?.name == "entry-a.md" &&
                 model.selectedHit?.isSemanticCandidate == true &&
                 model.selectedHit?.snippet?.contains(language == "zh" ? "种植带" : "experienced teammate") == true
         }
@@ -251,25 +259,57 @@ final class LauncherSmoke {
 
     private func verifyTiming(_ app: AppDelegate) async throws {
         let model = app.model
-        model.changeMode(.all)
-        try await until("combined query intentionally held") { self.exists("combined-started") }
-        try check(model.hits.contains { $0.name == "archive-one.txt" } && model.searching,
-                  "name result was not published before the combined search")
-        try signal("finish-combined")
-        try await until("text results appended") { model.hits.contains { $0.matched_by == "text" } }
-        model.changeMode(.name)
+        let frame = app.panel.frame
+        let chrome = app.panel.contentView
+        var resizeCount = 0
+        let resize = NotificationCenter.default.publisher(for: NSWindow.didResizeNotification, object: app.panel)
+            .sink { _ in resizeCount += 1 }
+        defer { resize.cancel() }
+
+        try signal("hold-archive-text")
+        try type("archive x", into: app)
+        try type("archive", into: app)
+        try await until("body lane intentionally held") { self.exists("archive-text-started") }
+        try await until("fast names published while the body lane was held") {
+            model.selectedHit?.name == "archive-one.txt" && model.searching
+        }
+        try key(kVK_DownArrow, "\u{f701}", in: app)
+        let selected = model.selection
+        try signal("finish-archive-text")
+        try await until("body results merged into the same field") {
+            model.hits.contains { $0.matched_by == "text" } && !model.searching
+        }
+        try check(model.selection == selected, "body results stole selection")
 
         try type("obsolete", into: app)
         try await until("obsolete reply intentionally held") { self.exists("obsolete-started") }
         try type("qingshan", into: app)
-        try check(model.selection == nil, "edited query retained a stale selection")
+        try check(model.selection == selected && !model.hits.isEmpty && model.selectedHit == nil,
+                  "editing cleared the previous rows or kept an obsolete result actionable")
         try key(kVK_Return, "\r", in: app)
-        try check(opened == nil, "Return activated a stale result")
+        try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
+        try check(opened == nil && revealed == nil, "a key action targeted the prior query")
         try signal("finish-obsolete")
         try await until("latest query survived an obsolete reply") {
             model.hits.count == 1 && model.hits.first?.name == "青山月报.md" && !model.searching
         }
 
+        try type("crowded needle", into: app)
+        try await until("body lane survived sixty weak path matches") {
+            model.hits.count == 60 && !model.searching
+        }
+        guard let body = model.hits.firstIndex(where: { $0.name == "body-match.md" && $0.matched_by == "text" }),
+              let weak = model.hits.firstIndex(where: { $0.matched_by == "path" })
+        else { throw Failure("missing distinct body or weak path hit") }
+        try check(model.hits.first?.name == "crowded needle spec.txt" && body < weak &&
+                  model.hits.filter { $0.matched_by == "path" }.count >= 57,
+                  "a weaker path match outranked text or a strong name")
+        model.selection = model.hits[body].path
+        try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
+        try await until("body hit revalidated in its source lane") { self.revealed?.lastPathComponent == "body-match.md" }
+        revealed = nil
+        try check(app.panel.frame == frame && app.panel.contentView === chrome && resizeCount == 0,
+                  "typing or result lane delivery resized or replaced the launcher")
     }
 
     private func captureSnapshots(_ app: AppDelegate) async throws {
@@ -278,7 +318,7 @@ final class LauncherSmoke {
         try capture("lumen-idle-light.png", appearance: .aqua, app: app)
         try type("design", into: app)
         try await until("eight visible result rows are laid out") {
-            app.model.hits.count >= 8 && !app.model.searching && app.panel.frame.height == 470
+            app.model.hits.count >= 8 && !app.model.searching && app.panel.frame.height == 436
         }
         try capture("lumen-results-light.png", appearance: .aqua, app: app)
         try capture("lumen-results-dark.png", appearance: .darkAqua, app: app)
@@ -307,6 +347,11 @@ final class LauncherSmoke {
         let model = app.model
         try type("watchneedle", into: app)
         try await until("watch query starts with no results") { model.hits.isEmpty && !model.searching }
+        let frame = app.panel.frame
+        var resizeCount = 0
+        let resize = NotificationCenter.default.publisher(for: NSWindow.didResizeNotification, object: app.panel)
+            .sink { _ in resizeCount += 1 }
+        defer { resize.cancel() }
         let file = corpus.appendingPathComponent("watchneedle.txt")
         try Data().write(to: file)
         if controlledTiming {
@@ -323,40 +368,74 @@ final class LauncherSmoke {
             try FileManager.default.removeItem(at: file)
             try await until("watch notification removed deleted result") { model.hits.isEmpty && !model.searching }
         }
+        try check(app.panel.frame == frame && resizeCount == 0, "watch events resized the launcher")
     }
 
     private func verifyCloudAction(_ app: AppDelegate) async throws {
         let model = app.model
         try type("cloudledger", into: app)
-        try await until("provider metadata result") { model.selectedHit?.availability == "provider_metadata_only" }
+        try await until("provider metadata result") {
+            model.selectedHit?.availability == "provider_metadata_only" && !model.searching
+        }
         guard let hit = model.selectedHit else { throw Failure("missing cloud result") }
         try key(kVK_Return, "\r", in: app)
         try check(model.searchNotice?.problem == .online && opened == nil && revealed == nil,
                   "Return activated a cloud reference")
-        app.revealInFinder(hit)
-        try await until("explicit Finder action selected the cloud reference") { self.revealed?.path == hit.path }
+        if controlledTiming { try signal("hold-cloud-reveal") }
+        try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
+        if controlledTiming {
+            try await until("Finder action held for a concurrent watch event") { self.exists("cloud-reveal-started") }
+            var refreshed = false
+            let refresh = model.$searching.sink { if $0 { refreshed = true } }
+            defer { refresh.cancel() }
+            try signal("update-watch")
+            try await until("watch refreshed the current query during Finder validation") {
+                refreshed && !model.searching
+            }
+            try signal("finish-cloud-reveal")
+        }
+        try await until("Command–Return revealed the cloud reference") { self.revealed?.path == hit.path }
         try check(opened == nil && model.query == "cloudledger", "Finder action opened the file or closed search")
     }
 
     private func verifySemanticInvalidation(_ app: AppDelegate) async throws {
         let model = app.model
+        let frame = app.panel.frame
         try type("health examination", into: app)
-        model.semanticSearch()
-        try await until("semantic snippet visible before replacement") {
-            model.hits.first?.isSemanticCandidate == true && model.hits.first?.snippet?.contains("archive appears") == true
+        try await until("related excerpts started automatically after direct results") { self.exists("semantic-enrichment-started") }
+        let direct = model.hits.map(\.path)
+        try check(direct.count == 2 && model.hits.allSatisfy { !$0.isSemanticCandidate },
+                  "direct hits were delayed or replaced by the optional lane")
+        try key(kVK_DownArrow, "\u{f701}", in: app)
+        let selected = model.selection
+        try signal("finish-semantic-enrichment")
+        try await until("bounded related excerpts appended") {
+            model.hits.filter(\.isSemanticCandidate).count == 3 && !model.semanticBusy
         }
+        try check(Array(model.hits.prefix(direct.count)).map(\.path) == direct && model.selection == selected &&
+                  Set(model.hits.map(\.path)).count == model.hits.count && app.panel.frame == frame,
+                  "related excerpts duplicated results, changed direct rank, stole selection, or resized the panel")
+        guard let hit = model.hits.first(where: { $0.name == "notes.md" && $0.isSemanticCandidate })
+        else { throw Failure("missing BGE candidate") }
         try check(model.relatedExcerptsLabel == "相关原文", "candidate label did not say related excerpts")
-        guard let hit = model.selectedHit else { throw Failure("missing BGE candidate") }
         var resolved: URL?
         model.resolve(hit, revealInFinder: false) { resolved = $0 }
         try await until("candidate action rechecked the query through BGE") { resolved?.path == hit.path }
         try Data("Replacement body".utf8).write(to: corpus.appendingPathComponent("notes.md"), options: .atomic)
         try signal("update-watch")
-        try await until("same-name replacement cleared the cached semantic result and selection") {
-            model.hits.isEmpty && model.selection == nil && !model.searching && !model.semanticBusy
+        try await until("watch replaced a stale semantic excerpt") {
+            model.hits.contains { $0.name == "notes.md" && $0.snippet == "Replacement body" } && !model.searching
         }
-        try key(kVK_Return, "\r", in: app)
-        try check(opened == nil, "replacement kept the stale semantic hit actionable")
+        try check(model.selection == selected && app.panel.frame == frame,
+                  "watch refresh stole selection or resized the panel")
+
+        try type("outdated semantic request", into: app)
+        try await until("old related query held by fixture") { self.exists("stale-semantic-started") }
+        try type("qingshan", into: app)
+        try signal("finish-stale-semantic")
+        try await until("obsolete related query could not attach to newly typed text") {
+            model.hits.count == 1 && model.selectedHit?.name == "青山月报.md" && !model.semanticBusy
+        }
     }
 
     private func verifyMissingPath(_ app: AppDelegate) async throws {
@@ -371,7 +450,6 @@ final class LauncherSmoke {
 
     private func verifyReplacedDocument(_ app: AppDelegate) async throws {
         let model = app.model
-        model.changeMode(.text)
         try type("safety original paragraph", into: app)
         try await until("preview visible before replacing a same-name file") {
             model.selectedHit?.snippet?.contains("safety original paragraph") == true
@@ -381,12 +459,10 @@ final class LauncherSmoke {
         try key(kVK_Return, "\r", in: app)
         try await until("same-name replacement was refused before the watcher event") { model.searchNotice?.problem == .stale }
         try check(opened == nil && model.selection == nil, "the old preview opened a replacement file")
-        model.changeMode(.name)
     }
 
     private func verifyStaleBeforeDisplay(_ app: AppDelegate) async throws {
         let model = app.model
-        model.changeMode(.text)
         try type("before render original", into: app)
         try await until("old preview and its indexed stamp held before first display") { self.exists("before-render-started") }
         let file = corpus.appendingPathComponent("before-render.md")
@@ -400,7 +476,6 @@ final class LauncherSmoke {
         try type("missing stamp original", into: app)
         try await until("preview without a stamp was rejected") { !model.searching }
         try check(model.hits.isEmpty && model.selection == nil, "an unstamped snippet appeared as an actionable result")
-        model.changeMode(.name)
     }
 
     private func verifyEmbeddingRun(_ app: AppDelegate) async throws {
@@ -478,7 +553,7 @@ final class LauncherSmoke {
         let model = app.model
         try type("archive", into: app)
         try await until("name results visible without model resources") { model.selectedHit?.name == "archive-one.txt" }
-        model.semanticSearch()
+        model.verifyLocalModel()
         try await until("missing local language resources diagnosed") { model.localModelState == .unavailable(.profile) }
         let label = model.modelDiagnostic(.profile)
         try check(label.contains("BGE") && !label.contains("synthetic-account") && !label.contains("/Users/"),
@@ -492,32 +567,21 @@ final class LauncherSmoke {
         try signal("unverified-zh")
         model.verifyLocalModel()
         try await until("present but unverified model rejected") { model.localModelState == .unavailable(.verification) }
-        model.changeMode(.text)
         try type("archive appears", into: app)
         try await until("full-text search still worked with an unverified model") { model.selectedHit?.matched_by == "text" }
 
         model.semanticLanguage = "en"
         try check(model.localModelState == .unchecked, "language change retained an old model verification")
-        model.changeMode(.name)
-        try type("health examination", into: app)
-        model.semanticSearch()
+        model.verifyLocalModel()
         try await until("English BGE verification held by fixture") { self.exists("model-check-started") }
         try type("archive", into: app)
-        try await until("name search continued during model verification") { model.selectedHit?.name == "archive-one.txt" }
+        try await until("name search continued during model verification") {
+            !model.searching && model.hits.prefix(2).map(\.name) == ["archive-one.txt", "archive-two.txt"]
+        }
         try signal("finish-model-check")
         try await until("verified English backend is ready") { model.localModelState == .ready }
-        try check(!exists("bge-query-started") && model.selectedHit?.name == "archive-one.txt",
-                  "verification completed a semantic request for obsolete input")
-        model.semanticSearch()
-        try await until("missing BGE vectors showed a safe hint and restored name search") {
-            model.searchNotice?.problem == .semanticNotIndexed && model.searchNotice?.detail.isEmpty == true &&
-                model.selectedHit?.name == "archive-one.txt"
-        }
-        try type("no related excerpts", into: app)
-        model.semanticSearch()
-        try await until("empty BGE reply kept the related-excerpt context") {
-            model.showingRelatedExcerpts && model.hits.isEmpty && !model.semanticBusy
-        }
+        try check(!exists("bge-query-started") && model.selectedHit?.name == "notes.md",
+                  "verification launched an unrelated semantic request")
     }
 
     private func verifyAppliedScope(_ app: AppDelegate) async throws {
@@ -546,7 +610,6 @@ final class LauncherSmoke {
     private func verifyFailedScopeApply(_ app: AppDelegate) async throws {
         let model = app.model
         try signal("hold-scope-search")
-        model.changeMode(.all)
         try type("privateneedle", into: app)
         try await until("old scope result visible with a follow-up query in flight") {
             model.selectedHit != nil && self.exists("scope-search-started")
@@ -650,8 +713,9 @@ final class LauncherSmoke {
         editor.insertText(text, replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
     }
 
-    private func key(_ code: Int, _ character: String, in app: AppDelegate, throughPanel: Bool = false) throws {
-        let event = try event(code, character, in: app)
+    private func key(_ code: Int, _ character: String, in app: AppDelegate, throughPanel: Bool = false,
+                     flags: NSEvent.ModifierFlags = []) throws {
+        let event = try event(code, character, in: app, flags: flags)
         if throughPanel { app.panel.sendEvent(event) }
         else { try editor(app).keyDown(with: event) }
     }

@@ -29,6 +29,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var buildIndexItem: NSMenuItem?
     private var languageChange: AnyCancellable?
     private var presentationChange: AnyCancellable?
+    private var presentationScheduled = false
     private var settings: NSPanel?
     private var configuredKey: HotKey?
     private(set) var searchPresented = false
@@ -67,6 +68,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
         panel.delegate = self
         panel.onCancel = { [weak self] in self?.dismissSearch() }
+        panel.onReveal = { [weak self] in
+            guard let self, let hit = self.model.selectedHit else { return }
+            self.revealInFinder(hit)
+        }
         let content = SearchBackdrop()
         content.material = .popover
         content.blendingMode = .behindWindow
@@ -151,7 +156,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             DispatchQueue.main.async { [weak self] in self?.updateLanguage() }
         }
         presentationChange = model.objectWillChange.sink { [weak self] _ in
-            DispatchQueue.main.async { [weak self] in self?.updatePresentation() }
+            guard let self, !self.presentationScheduled else { return }
+            self.presentationScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.presentationScheduled = false
+                self.updatePresentation()
+            }
         }
         updateLanguage()
         model.start()
@@ -398,10 +409,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func updatePresentation() {
-        activityItem?.title = model.activityTitle
-        metricsItem?.title = model.activityMetrics ?? ""
-        metricsItem?.isHidden = model.activityMetrics == nil
-        buildIndexItem?.isHidden = !model.canStartIndexFromLauncher
+        let activity = model.activityTitle
+        let metrics = model.activityMetrics
+        let metricsTitle = metrics ?? ""
+        if activityItem?.title != activity { activityItem?.title = activity }
+        if metricsItem?.title != metricsTitle { metricsItem?.title = metricsTitle }
+        if metricsItem?.isHidden != (metrics == nil) { metricsItem?.isHidden = metrics == nil }
+        let hidesBuild = !model.canStartIndexFromLauncher
+        if buildIndexItem?.isHidden != hidesBuild { buildIndexItem?.isHidden = hidesBuild }
         if let button = statusItem?.button {
             let symbol = model.activityBusy ? "arrow.triangle.2.circlepath" : "magnifyingglass"
             if statusSymbol != symbol {
@@ -409,10 +424,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 button.image?.isTemplate = true
                 statusSymbol = symbol
             }
-            button.title = model.activeProgress?.entries.formatted(.number.notation(.compactName)) ?? ""
-            let summary = ["Lumen", model.activityTitle, model.activityMetrics].compactMap { $0 }.joined(separator: " · ")
-            button.toolTip = summary
-            button.setAccessibilityLabel(summary)
+            let count = model.activeProgress?.entries.formatted(.number.notation(.compactName)) ?? ""
+            if button.title != count { button.title = count }
+            let summary = ["Lumen", activity, metrics].compactMap { $0 }.joined(separator: " · ")
+            if button.toolTip != summary {
+                button.toolTip = summary
+                button.setAccessibilityLabel(summary)
+            }
         }
         guard searchPresented else { return }
         var frame = panel.frame
@@ -497,9 +515,24 @@ final class SearchBackdrop: NSVisualEffectView {
 @MainActor
 final class SearchPanel: NSPanel {
     var onCancel: (() -> Void)?
+    var onReveal: (() -> Void)?
     override var canBecomeKey: Bool { true }
 
+    private func handleReveal(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        guard event.type == .keyDown, modifiers == [.command],
+              event.keyCode == kVK_Return || event.keyCode == kVK_ANSI_KeypadEnter,
+              (firstResponder as? NSTextView)?.hasMarkedText() != true else { return false }
+        onReveal?()
+        return true
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        handleReveal(event) || super.performKeyEquivalent(with: event)
+    }
+
     override func sendEvent(_ event: NSEvent) {
+        if handleReveal(event) { return }
         let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
         if event.type == .keyDown, event.keyCode == kVK_Escape, modifiers.isEmpty,
            (firstResponder as? NSTextView)?.hasMarkedText() != true {

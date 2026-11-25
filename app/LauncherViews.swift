@@ -14,10 +14,7 @@ struct SearchWindow: View {
 
     static func height(for model: Launcher) -> CGFloat {
         let shell = headerHeight + footerHeight
-        guard model.canSearch, model.hasQuery else { return shell }
-        let height = model.hits.prefix(maximumVisibleRows).reduce(CGFloat(0)) { $0 + rowHeight($1) }
-        return shell + 34 + min(max(height, 44), CGFloat(maximumVisibleRows * 44)) +
-            (notice(for: model) == nil ? 0 : 28)
+        return model.canSearch && model.hasQuery ? shell + CGFloat(maximumVisibleRows * 44) : shell
     }
 
     private static func rowHeight(_ hit: SearchHit) -> CGFloat { hit.hasPreview ? 60 : 44 }
@@ -25,26 +22,13 @@ struct SearchWindow: View {
     var body: some View {
         VStack(spacing: 0) {
             if model.canSearch && model.hasQuery {
-                modes
-                if let notice = Self.notice(for: model) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "info.circle")
-                        Text(notice).lineLimit(1).help(notice)
-                        Spacer()
-                        if model.searchNotice?.problem == .search || model.searchNotice?.problem == .stale {
-                            Button(model.t("重试", "Retry")) { model.retrySearch() }
-                                .buttonStyle(.borderless)
-                        }
+                results.overlay {
+                    if model.hits.isEmpty {
+                        Text(emptyResultsLabel)
+                            .font(.callout).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                            .padding(16)
                     }
-                    .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 16).frame(height: 28)
-                }
-                if model.hits.isEmpty {
-                    Text(emptyResultsLabel)
-                        .font(.callout).foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-                        .padding(.horizontal, 16)
-                } else {
-                    results
                 }
             }
             footer
@@ -52,38 +36,18 @@ struct SearchWindow: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
     }
 
-    private var modes: some View {
-        HStack(spacing: 12) {
-            Picker(model.t("搜索方式", "Search mode"), selection: Binding(
-                get: { model.mode }, set: { model.changeMode($0) }
-            )) {
-                Text(model.t("名称", "Names")).tag(SearchMode.name)
-                Text(model.t("名称与正文", "Names & Text")).tag(SearchMode.all)
-                Text(model.t("正文", "Text")).tag(SearchMode.text)
-            }
-            .labelsHidden().pickerStyle(.segmented).controlSize(.small).frame(maxWidth: 276)
-            Spacer()
-            Button { model.semanticSearch() } label: {
-                Label(model.relatedExcerptsLabel, systemImage: "text.magnifyingglass")
-            }
-            .buttonStyle(.borderless).font(.caption.weight(.medium))
-            .disabled(model.semanticBusy || model.localModelState == .checking)
-        }
-        .padding(.horizontal, 14)
-        .frame(height: 34)
-    }
-
     private var footer: some View {
         HStack(spacing: 12) {
-            if model.activityBusy || !model.canSearch {
+            if model.canSearch && model.hasQuery {
+                keyHint("↑↓", model.t("选择", "Select"))
+                keyHint("↵", model.t("打开", "Open"))
+                keyHint("⌘↵", model.t("在 Finder 中显示", "Show in Finder"))
+            } else if model.activityBusy || !model.canSearch {
                 Label(model.activityTitle, systemImage: model.activityBusy ? "arrow.triangle.2.circlepath" : "internaldrive")
                     .lineLimit(1)
                 if let metrics = model.activityMetrics { Text(metrics).monospacedDigit().lineLimit(1) }
-            } else if model.hits.isEmpty {
-                Text(model.activityTitle).lineLimit(1)
             } else {
-                keyHint("↑↓", model.t("选择", "Select"))
-                keyHint("↵", model.t("打开", "Open"))
+                Text(model.activityTitle).lineLimit(1)
             }
             Spacer(minLength: 8)
             if model.canStartIndexFromLauncher {
@@ -134,8 +98,8 @@ struct SearchWindow: View {
             }
             .onKeyPress(.upArrow) { model.moveSelection(-1); return .handled }
             .onKeyPress(.downArrow) { model.moveSelection(1); return .handled }
-            .onKeyPress(.return) {
-                guard let hit = model.selectedHit else { return .ignored }
+            .onKeyPress(keys: [.return]) { press in
+                guard press.modifiers.isEmpty, let hit = model.selectedHit else { return .ignored }
                 open(hit)
                 return .handled
             }
@@ -143,22 +107,11 @@ struct SearchWindow: View {
     }
 
     private var emptyResultsLabel: String {
-        if model.semanticBusy { return model.t("正在查找相关原文…", "Finding related excerpts…") }
-        if model.searching { return model.t("正在搜索…", "Searching…") }
-        if model.showingRelatedExcerpts { return model.t("未找到相关原文", "No related excerpts") }
-        return model.t("没有匹配结果", "No matches")
-    }
-
-    private static func notice(for model: Launcher) -> String? {
         if let notice = model.searchNotice { return model.title(for: notice) }
-        if model.localModelState == .checking {
-            return model.t("正在校验本机 BGE 资源…", "Verifying local BGE resources…")
+        if model.searching || model.semanticBusy {
+            return model.t("正在搜索…", "Searching…")
         }
-        if case .unavailable(let issue) = model.localModelState { return model.modelDiagnostic(issue) }
-        if model.showingRelatedExcerpts && !model.hits.isEmpty {
-            return model.t("按语义相似度匹配原文片段", "Source excerpts ranked by semantic similarity")
-        }
-        return nil
+        return model.t("没有匹配结果", "No matches")
     }
 
     private func resultRow(_ hit: SearchHit) -> some View {
@@ -189,8 +142,8 @@ struct SearchWindow: View {
                 Button(model.t("在 Finder 中显示", "Show in Finder")) { revealInFinder(hit) }
                     .buttonStyle(.borderless).font(.caption).fixedSize()
                     .accessibilityIdentifier("reveal-cloud-result")
-            } else if let match = matchLabel(hit) {
-                Text(match).font(.caption).foregroundStyle(.secondary).fixedSize()
+            } else if hit.isSemanticCandidate {
+                Text(model.relatedExcerptsLabel).font(.caption).foregroundStyle(.secondary).fixedSize()
             } else if selected {
                 Image(systemName: "return").font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.secondary).accessibilityHidden(true)
@@ -210,17 +163,9 @@ struct SearchWindow: View {
         .accessibilityElement(children: .contain)
         .accessibilityAddTraits(selected ? .isSelected : [])
         .accessibilityAction(named: Text(model.t("打开", "Open"))) { open(hit) }
+        .accessibilityAction(named: Text(model.t("在 Finder 中显示", "Show in Finder"))) { revealInFinder(hit) }
     }
 
-    private func matchLabel(_ hit: SearchHit) -> String? {
-        switch hit.matched_by {
-        case "semantic_candidate": return model.relatedExcerptsLabel
-        case "pinyin": return model.t("拼音", "Pinyin")
-        case "text": return model.t("正文", "Text")
-        case "path": return model.t("路径", "Path")
-        default: return nil
-        }
-    }
 }
 
 @MainActor

@@ -53,7 +53,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private let extensionModel = LumenExtensionPanelModel()
     #endif
     private(set) var settings: NSPanel?
-    private(set) lazy var settingsSession = SettingsSession(model: model) { [weak self] oldPage, page in
+    private(set) lazy var settingsSession = SettingsSession(model: model, manageLoginItem: smoke == nil) { [weak self] oldPage, page in
         guard let self else { return }
         if oldPage == .translation { self.translation.endSettingsSession() }
         if page == .index {
@@ -102,10 +102,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         panel.onContextActions = { [weak self] in self?.toggleContextActions() }
         panel.onAnswerPage = { [weak self] delta in self?.commands.pageAnswer(delta) ?? false }
         panel.onSettings = { [weak self] in self?.showSearchSettings() }
+        panel.isSearchFieldClick = { [weak self] point in
+            guard let field = self?.searchField else { return false }
+            return field.bounds.contains(field.convert(point, from: nil))
+        }
+        panel.onSpace = { [weak self] in
+            guard let self, self.panel.browsing, self.translation.command == nil, !self.commands.showsCard,
+                  !self.contextActions.isOpen, let hit = self.model.selectedHit else { return false }
+            self.togglePreview(hit, native: true)
+            return true
+        }
         panel.onFileAction = { [weak self] action in
             guard let self, self.translation.command == nil, !self.commands.showsCard,
                   !self.contextActions.isOpen, let hit = self.model.selectedHit else { return }
-            self.perform(action, on: hit)
+            if action == .preview { self.togglePreview(hit) }
+            else { self.perform(action, on: hit) }
         }
         let content = SearchBackdrop()
         content.material = .popover
@@ -148,6 +159,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             showSettings: { [weak self] in self?.showSearchSettings() },
             beginIndex: { [weak self] in self?.startBackgroundIndex() },
             open: { [weak self] in self?.open($0) },
+            browse: { [weak self] in self?.panel.browsing = true },
             fileAction: { [weak self] action, hit in self?.perform(action, on: hit) }
         ))
         results.translatesAutoresizingMaskIntoConstraints = false
@@ -232,7 +244,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
         }
         updateLanguage()
-        model.start()
+        model.start(automaticallyIndex: smoke == nil || smoke?.automaticIndexScenario == true)
         if smoke == nil {
             let workspace = NSWorkspace.shared.notificationCenter
             volumeChanges = workspace.publisher(for: NSWorkspace.didMountNotification)
@@ -350,6 +362,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         guard searchPresented else { return }
         searchPresentationGeneration &+= 1
         searchPresented = false
+        panel.browsing = false
+        localPreview?.close()
         translation.setCommand(nil)
         inlinePreview.close()
         commands.update(.search, raw: "", catalog: catalog)
@@ -371,10 +385,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             return
         }
         model.applyScope(model.settingsScope)
-        if model.isIndexing { dismissSearch() }
     }
 
-    func controlTextDidChange(_ notification: Notification) { searchFieldAction() }
+    func controlTextDidChange(_ notification: Notification) {
+        panel.browsing = false
+        searchFieldAction()
+    }
 
     private var searchText: String {
         (searchField.currentEditor() as? NSTextView)?.string ?? searchField.stringValue
@@ -449,6 +465,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         switch commandSelector {
         case #selector(NSResponder.moveUp(_:)): moveCurrentSelection(-1)
         case #selector(NSResponder.moveDown(_:)): moveCurrentSelection(1)
+        case #selector(NSResponder.moveLeft(_:)), #selector(NSResponder.moveRight(_:)):
+            panel.browsing = false
+            return false
         case #selector(NSResponder.insertNewline(_:)):
             searchFieldAction()
             openSelection()
@@ -463,7 +482,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         guard translation.command == nil, !commands.showsCard,
               !commands.isImageCommand || model.isImageSearch else { return }
         if contextActions.isOpen { contextActions.move(delta) }
-        else { model.moveSelection(delta); refreshInlinePreview() }
+        else {
+            panel.browsing = true
+            model.moveSelection(delta)
+            refreshInlinePreview()
+        }
     }
 
     @discardableResult func closeInlinePreview() -> Bool {
@@ -473,6 +496,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func cancelCurrentPanelAction() {
+        if localPreview != nil { closeLocalPreview(); return }
         if closeInlinePreview() { return }
         if commands.answer == .loading { commands.invalidateAnswer() }
         else if translation.activity == .translating { translation.cancel() }
@@ -616,12 +640,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         let finished: (Bool) -> Void = { [weak self] success in
             guard let self else { return }
             self.actionInFlight = false
+            if success { self.model.noteActionPerformed(action) }
             guard self.searchPresented, self.model.query == query else { return }
             if success { self.dismissSearch() }
             else { self.model.openingFailed() }
         }
         if let smoke { smoke.dispatch(action, completion: finished) }
-        else { LaunchDispatcher.perform(action, completion: finished) }
+        else { LaunchDispatcher.perform(action, chinese: model.zh, completion: finished) }
     }
 
     private func openFile(_ hit: SearchHit) {
@@ -674,6 +699,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         inlinePreview.show(hit)
     }
 
+    private func closeLocalPreview() {
+        guard let localPreview else { return }
+        // A deliberate toggle returns to search, unlike focus leaving either window.
+        localPreview.delegate = nil
+        self.localPreview = nil
+        if searchPresented, localPreview.isKeyWindow { panel.makeKeyAndOrderFront(nil); focusSearch() }
+        localPreview.close()
+    }
+
+    private func togglePreview(_ hit: SearchHit, native: Bool = false) {
+        if localPreview != nil { closeLocalPreview(); return }
+        if closeInlinePreview() { return }
+        previewFile(hit, forceWindow: native)
+    }
+
     private func previewFile(_ hit: SearchHit, forceWindow: Bool = false) {
         if !forceWindow, LauncherInlinePreview.kind(hit) != nil {
             guard searchPresented, !model.scopePending, model.containsCurrentFile(hit),
@@ -705,6 +745,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                     }
                     self.localPreview?.close()
                     self.localPreview = panel
+                    panel.onToggle = { [weak self] in self?.closeLocalPreview() }
                     panel.delegate = self
                     if self.smoke == nil {
                         panel.center()
@@ -1080,6 +1121,9 @@ final class SearchBackdrop: NSVisualEffectView {
 
 @MainActor
 final class SearchPanel: NSPanel {
+    var browsing = false
+    var isSearchFieldClick: ((NSPoint) -> Bool)?
+    var onSpace: (() -> Bool)?
     var onCancel: (() -> Void)?
     var onFileAction: ((FileAction) -> Void)?
     var onContextActions: (() -> Void)?
@@ -1093,7 +1137,7 @@ final class SearchPanel: NSPanel {
         let key = event.charactersIgnoringModifiers?.lowercased()
         if modifiers == [.command], key == "," { onSettings?(); return true }
         if modifiers == [.command] {
-            if key == "y" { onFileAction?(.preview) }
+            if key == "y" { if !event.isARepeat { onFileAction?(.preview) } }
             else if key == "k" { onContextActions?() }
             else if event.keyCode == kVK_Return || event.keyCode == kVK_ANSI_KeypadEnter { onFileAction?(.reveal) }
             else { return false }
@@ -1112,10 +1156,12 @@ final class SearchPanel: NSPanel {
     }
 
     override func sendEvent(_ event: NSEvent) {
+        if event.type == .leftMouseDown, isSearchFieldClick?(event.locationInWindow) == true { browsing = false }
         if handleCommand(event) { return }
         let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
         if event.type == .keyDown, modifiers.isEmpty,
            (firstResponder as? NSTextView)?.hasMarkedText() != true {
+            if event.keyCode == kVK_Space, browsing, event.isARepeat || onSpace?() == true { return }
             if event.keyCode == kVK_Escape { onCancel?(); return }
             if event.keyCode == kVK_PageDown, onAnswerPage?(1) == true { return }
             if event.keyCode == kVK_PageUp, onAnswerPage?(-1) == true { return }

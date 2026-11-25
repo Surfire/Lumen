@@ -22,7 +22,7 @@ done
 /usr/bin/iconutil -c icns -o "$APP/Contents/Resources/Lumen.icns" "$iconset"
 xcrun swiftc -O -swift-version 5 -target "$SWIFT_TARGET" -module-cache-path "$PWD/target/SwiftModuleCache" -parse-as-library -D LUMEN_EXTENSIONS \
     app/LumenApp.swift app/LauncherEngine.swift app/LauncherHotKey.swift app/LauncherModel.swift \
-    app/LauncherViews.swift app/LauncherActions.swift app/LauncherPreview.swift app/LauncherShortcuts.swift app/LauncherCalculation.swift app/LauncherSmoke.swift \
+    app/LauncherViews.swift app/LauncherActions.swift app/LauncherSystemActions.swift app/LauncherFileQuery.swift app/LauncherPreview.swift app/LauncherShortcuts.swift app/LauncherCalculation.swift app/LauncherSmoke.swift \
     app/LumenCommandCatalog.swift app/LumenQuickAnswer.swift app/LauncherCommands.swift app/LauncherImageSearch.swift \
     app/InlinePreview.swift app/MacPreview.swift app/MacInlinePreviewView.swift app/LauncherInlinePreview.swift \
     app/TranslationClient.swift app/TranslationModel.swift app/TranslationPanel.swift app/LauncherExternalVolumes.swift extensions/LumenExtensionPanel.swift -o "$APP/Contents/MacOS/Lumen"
@@ -42,6 +42,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
  <key>CFBundleVersion</key><string>13</string>
  <key>LSMinimumSystemVersion</key><string>14.0</string>
  <key>LSUIElement</key><true/>
+ <key>NSAppleEventsUsageDescription</key><string>Lumen uses macOS automation only when you run a system action such as Empty Trash or Toggle Dark Mode.</string>
  <key>NSAppTransportSecurity</key>
  <dict>
   <key>NSExceptionDomains</key>

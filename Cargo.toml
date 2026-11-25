@@ -1,6 +1,6 @@
 [package]
 name = "lumen"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "Local macOS file and document search"
@@ -9,10 +9,12 @@ description = "Local macOS file and document search"
 anyhow = "1"
 clap = { version = "4.6", features = ["derive"] }
 libc = "0.2"
+quick-xml = "0.42"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 unicode-normalization = "0.1"
+zip = { version = "9.8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [profile.release]
 lto = "thin"

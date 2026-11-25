@@ -301,3 +301,157 @@ pub fn bulk_children(path: &Path) -> Option<Children> {
 pub fn bulk_children(_: &Path) -> Option<Children> {
     None
 }
+
+/// The fallback also opens by descriptor to retain the bulk path's nofollow
+/// policy if a directory is swapped for a symlink between metadata and listing.
+#[cfg(target_os = "macos")]
+pub fn children(path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+    use std::{
+        ffi::OsString,
+        io,
+        os::{
+            fd::IntoRawFd,
+            unix::{ffi::OsStringExt, fs::OpenOptionsExt},
+        },
+    };
+    let fd = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW_ANY)
+        .open(path)?
+        .into_raw_fd();
+    let directory = unsafe { libc::fdopendir(fd) };
+    if directory.is_null() {
+        let error = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(error);
+    }
+    let mut children = Vec::new();
+    let result = loop {
+        // readdir distinguishes EOF and failure through errno.
+        let entry = unsafe {
+            *libc::__error() = 0;
+            libc::readdir(directory)
+        };
+        if entry.is_null() {
+            let errno = unsafe { *libc::__error() };
+            break if errno == 0 {
+                Ok(children)
+            } else {
+                Err(io::Error::from_raw_os_error(errno))
+            };
+        }
+        let entry = unsafe { &*entry };
+        let name = unsafe {
+            std::slice::from_raw_parts(entry.d_name.as_ptr().cast(), entry.d_namlen.into())
+        };
+        if name != b"." && name != b".." {
+            children.push(OsString::from_vec(name.to_vec()));
+        }
+    };
+    unsafe { libc::closedir(directory) };
+    result
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn children(path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+    fs::read_dir(path)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect()
+}
+
+/// APFS can resolve a path whose spelling differs from the spelling FSEvents
+/// delivers. Resolve only through the nearest real, reachable prefix.
+#[cfg(target_os = "macos")]
+pub fn filesystem_spelling(path: &Path) -> std::path::PathBuf {
+    use std::{
+        ffi::{CStr, OsStr},
+        os::{
+            fd::AsRawFd,
+            unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+        },
+    };
+    for prefix in path.ancestors() {
+        let Ok(fd) = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_EVTONLY | libc::O_NOFOLLOW_ANY | libc::O_NONBLOCK)
+            .open(prefix)
+        else {
+            continue;
+        };
+        let mut bytes = [0u8; libc::PATH_MAX as usize];
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETPATH, bytes.as_mut_ptr()) } == 0
+            && let Ok(result) = CStr::from_bytes_until_nul(&bytes)
+        {
+            let canonical = Path::new(OsStr::from_bytes(result.to_bytes()));
+            let suffix = path.strip_prefix(prefix).expect("ancestor prefix");
+            if canonical.is_absolute() {
+                let canonical = canonical.strip_prefix("/System/Volumes/Data").map_or_else(
+                    |_| canonical.to_path_buf(),
+                    |rest| Path::new("/").join(rest),
+                );
+                return if suffix.as_os_str().is_empty() {
+                    canonical
+                } else {
+                    canonical.join(suffix)
+                };
+            }
+        }
+    }
+    path.to_path_buf()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn filesystem_spelling(path: &Path) -> std::path::PathBuf {
+    path.to_path_buf()
+}
+
+/// Be conservative about denies on macOS, including a future case or Unicode
+/// alias of a deny path that does not exist when the scope is configured.
+pub fn denied_by(path: &Path, rule: &Path) -> bool {
+    if path.starts_with(rule) {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut actual = path.components();
+        rule.components().all(|prefix| {
+            actual.next().is_some_and(|part| {
+                let a = part.as_os_str().as_bytes();
+                let b = prefix.as_os_str().as_bytes();
+                a.eq_ignore_ascii_case(b) || (!a.is_ascii() || !b.is_ascii()) && equal_folded(a, b)
+            })
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn equal_folded(a: &[u8], b: &[u8]) -> bool {
+    use std::{ffi::c_void, ptr::null};
+    type Cf = *const c_void;
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringCreateWithBytes(
+            alloc: Cf,
+            bytes: *const u8,
+            count: isize,
+            encoding: u32,
+            external: u8,
+        ) -> Cf;
+        fn CFStringCompare(left: Cf, right: Cf, flags: usize) -> isize;
+        fn CFRelease(object: Cf);
+    }
+    let cf = |bytes: &[u8]| unsafe {
+        CFStringCreateWithBytes(null(), bytes.as_ptr(), bytes.len() as isize, 0x0800_0100, 0)
+    };
+    let (a, b) = (cf(a), cf(b));
+    let same = !a.is_null() && !b.is_null() && unsafe { CFStringCompare(a, b, 1 | 16) } == 0; // case insensitive + nonliteral
+    for pointer in [a, b] {
+        if !pointer.is_null() {
+            unsafe { CFRelease(pointer) };
+        }
+    }
+    same
+}

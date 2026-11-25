@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""Exercise the signed app's native controls using a synthetic corpus without desktop input."""
+import argparse
+from pathlib import Path
+import sqlite3
+import subprocess
+import tempfile
+
+ROOT = Path(__file__).resolve().parents[1]
+BUNDLE = ROOT / "target/Lumen.app/Contents"
+APP = BUNDLE / "MacOS/Lumen"
+
+FIXTURE_ENGINE = """#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+work = Path(__file__).resolve().parent
+engine = str(work / "native-engine")
+db, database, action, *args = sys.argv[1:]
+
+
+def wait_for(marker):
+    end = time.monotonic() + 12
+    while not (work / marker).exists():
+        if time.monotonic() >= end:
+            sys.exit(f"timed out waiting for {marker}")
+        time.sleep(0.02)
+
+
+def gate(name):
+    (work / (name + "-started")).touch()
+    wait_for("finish-" + name)
+
+
+def save_document_stamps():
+    documents = {}
+    for path in (work / "corpus").rglob("*"):
+        if path.suffix not in (".txt", ".md") or not path.is_file():
+            continue
+        stat = path.stat()
+        mtime = divmod(stat.st_mtime_ns, 10**9)
+        ctime = divmod(stat.st_ctime_ns, 10**9)
+        fields = (stat.st_dev % 2**64, stat.st_ino, stat.st_size, *mtime, *ctime)
+        documents[str(path)] = {"stamp": ":".join(map(str, fields)), "text": path.read_text()}
+    temporary = work / "document-stamps.tmp"
+    temporary.write_text(json.dumps(documents))
+    temporary.replace(work / "document-stamps.json")
+
+
+def indexed_documents():
+    return json.loads((work / "document-stamps.json").read_text())
+
+
+def query_hits(args):
+    output = subprocess.check_output([engine, db, database, "query", *args])
+    hits = json.loads(output)
+    documents = indexed_documents()
+    for hit in hits:
+        if hit.get("snippet") is not None and hit["path"] in documents:
+            hit["document_stamp"] = documents[hit["path"]]["stamp"]
+    return hits
+
+
+if action == "index":
+    if "--documents" in args and not (work / "finish-documents").exists():
+        gate("documents")
+    if "--deny" in args and (work / "reject-scope").exists():
+        gate("scope")
+        sys.exit("fixture refused the scope before committing it")
+    output = subprocess.check_output([engine, db, database, action, *args])
+    save_document_stamps()
+    (work / "index-args.json").write_text(json.dumps(args))
+    sys.stdout.buffer.write(output)
+    sys.exit(0)
+
+if action == "watch":
+    if "--help" in args:
+        sys.exit(0)
+    assert not args, "watch resumption must use its saved scope"
+    with (work / "watch-launches").open("a") as handle:
+        handle.write("start\\n")
+    print(json.dumps({"event": "ready"}), flush=True)
+    while True:
+        marker = work / "update-watch"
+        if marker.exists():
+            marker.unlink()
+            scope = json.loads((work / "index-args.json").read_text())
+            subprocess.check_call([engine, db, database, "index", *scope], stdout=subprocess.DEVNULL)
+            save_document_stamps()
+            print(json.dumps({"event": "updated"}), flush=True)
+        time.sleep(0.02)
+
+if action == "model-status":
+    assert args in (["--language", "zh", "--verify"], ["--language", "en", "--verify"])
+    if args[1] == "zh":
+        present = (work / "unverified-zh").exists()
+        diagnostic = None if present else "BGE zh profile is missing model.safetensors: /Users/synthetic-account/private"
+        print(json.dumps({"available": present, "verified": False, "diagnostic": diagnostic}))
+    else:
+        if not (work / "finish-model-check").exists():
+            gate("model-check")
+        print(json.dumps({"available": True, "verified": True, "diagnostic": None}))
+    sys.exit(0)
+
+if action == "embed":
+    assert args == ["--bge", "--language", "en", "--max", "32"]
+    launches = work / "embeddings-started"
+    batch = len(launches.read_text().splitlines()) + 1 if launches.exists() else 1
+    with launches.open("a") as handle:
+        handle.write(f"{batch}\\n")
+    assert batch <= 8, "unexpected extra semantic batch"
+    gate(f"embedding-{batch}")
+    if batch == 6:
+        sys.exit("isolated BGE runtime is missing")
+    indexed = 0 if batch in (2, 5) else 1
+    skipped = 2 if batch == 2 else 0
+    print(json.dumps({"new_embeddings": indexed, "skipped_chunks": skipped, "has_more": batch != 4}))
+    sys.exit(0)
+
+if action == "query" and args[:2] == ["--mode", "semantic"]:
+    assert args[:-1] == ["--mode", "semantic", "--bge", "--language", "en", "--"]
+    (work / "bge-query-started").touch()
+    if args[-1] == "archive":
+        sys.exit("no paragraph embeddings: run lumen embed first (/Users/synthetic-account/private)")
+    if args[-1] == "no related excerpts":
+        print("[]")
+        sys.exit(0)
+    assert args[-1] == "health examination"
+    path = work / "corpus/notes.md"
+    document = indexed_documents()[str(path)]
+    print(json.dumps([{"path": str(path), "name": path.name, "kind": "file", "availability": "local",
+                       "matched_by": "semantic_candidate", "snippet": document["text"],
+                       "document_stamp": document["stamp"]}]))
+    sys.exit(0)
+
+if action == "query":
+    print(json.dumps(query_hits(args)))
+    sys.exit(0)
+
+if action == "serve":
+    for line in sys.stdin:
+        req = json.loads(line)
+        if req["query"] == "archive" and req["mode"] == "all" and not (work / "finish-combined").exists():
+            gate("combined")
+        if req["query"] == "obsolete" and not (work / "finish-obsolete").exists():
+            gate("obsolete")
+        if req["query"] == "privateneedle" and req["mode"] == "all" and (work / "hold-scope-search").exists():
+            gate("scope-search")
+        try:
+            hits = query_hits(["--mode", req["mode"], "--limit", str(req["limit"]), "--", req["query"]])
+            if req["query"] == "before render original":
+                assert len(hits) == 1 and hits[0].get("document_stamp")
+                gate("before-render")
+            if req["query"] == "missing stamp original":
+                assert len(hits) == 1 and hits[0].pop("document_stamp")
+            reply = {"id": req["id"], "hits": hits}
+        except subprocess.CalledProcessError as error:
+            reply = {"id": req["id"], "error": str(error)}
+        print(json.dumps(reply), flush=True)
+    sys.exit(0)
+
+os.execv(engine, [engine, db, database, action, *args])
+"""
+
+
+def make_corpus(root):
+    corpus = root / "corpus"
+    corpus.mkdir()
+    samples = {
+        "archive-one.txt": "Synthetic ledger.",
+        "archive-two.txt": "Synthetic backup.",
+        "notes.md": "The archive appears only in the body of this document.",
+        "content-safety-source.md": "A safety original paragraph for a replacement test.",
+        "before-render.md": "A before render original paragraph for a stale reply test.",
+        "missing-stamp.md": "A missing stamp original paragraph for a missing stamp test.",
+        "obsolete.txt": "Obsolete reply.",
+        "open-safety.txt": "Stale action fixture.",
+        "Excluded/privateneedle.txt": "Synthetic excluded path.",
+        "OneDrive - Synthetic/cloudledger.txt": "Synthetic provider path.",
+        "青山月报.md": "合成测试样本。",
+    }
+    for name, content in samples.items():
+        file = corpus / name
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(content, encoding="utf-8")
+
+
+def run(root, language):
+    subprocess.run([str(APP), "--gui-smoke", str(root), language], check=True, timeout=45)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--watch-engine", type=Path, help="Also test an integrated lumen binary with persisted watch scopes")
+    parser.add_argument("--real-bge", action="store_true", help="Also verify the packaged GUI with installed offline BGE profiles")
+    args = parser.parse_args()
+    if args.watch_engine and not args.watch_engine.is_file():
+        parser.error("--watch-engine must point to a lumen binary")
+    if not APP.is_file():
+        raise SystemExit("Build the app first with scripts/build-app.sh")
+    with tempfile.TemporaryDirectory(prefix="lumen-gui-") as tmp:
+        root = Path(tmp)
+        make_corpus(root)
+        run(root, "en")
+        run(root, "zh")
+    with tempfile.TemporaryDirectory(prefix="lumen-gui-") as tmp:
+        root = Path(tmp)
+        make_corpus(root)
+        script = root / "fixture-engine"
+        script.write_text(FIXTURE_ENGINE, encoding="utf-8")
+        script.chmod(0o700)
+        resources = BUNDLE / "Resources"
+        (root / "native-engine").symlink_to(resources / "lumen")
+        (root / "LumenPdfExtractor").symlink_to(resources / "LumenPdfExtractor")
+        run(root, "zh")
+        run(root, "en")
+    if args.watch_engine:
+        with tempfile.TemporaryDirectory(prefix="lumen-gui-") as tmp:
+            root = Path(tmp)
+            make_corpus(root)
+            (root / "watch-engine").symlink_to(args.watch_engine.resolve())
+            run(root, "en")
+            run(root, "zh")
+        with tempfile.TemporaryDirectory(prefix="lumen-gui-") as tmp:
+            root = Path(tmp).resolve()
+            make_corpus(root)
+            database = root / "index.sqlite"
+            subprocess.run([str(BUNDLE / "Resources/lumen"), "--db", str(database),
+                            "index", "--root", str(root / "corpus")],
+                           check=True, timeout=15, stdout=subprocess.DEVNULL)
+            with sqlite3.connect(database) as connection:
+                connection.execute("DELETE FROM info WHERE key='scope'")
+            (root / "legacy-expected").touch()
+            (root / "watch-engine").symlink_to(args.watch_engine.resolve())
+            run(root, "en")
+
+
+    if args.real_bge:
+        samples = {
+            "zh": ("雨水花园可吸收屋顶径流并通过种植带降低地表积水。", "栽培郁金香应使用排水良好的花土。"),
+            "en": ("An experienced teammate helps new hires practice their routine work and reviews progress regularly.",
+                   "Quantum optics interferometry studies photons and polarization."),
+        }
+        for language, (target, distraction) in samples.items():
+            with tempfile.TemporaryDirectory(prefix="lumen-gui-bge-") as tmp:
+                root = Path(tmp).resolve()
+                corpus = root / "corpus"
+                corpus.mkdir()
+                (corpus / "entry-a.md").write_text(target, encoding="utf-8")
+                (corpus / "entry-b.md").write_text(distraction, encoding="utf-8")
+                (root / "actual-bge").touch()
+                subprocess.run([str(BUNDLE / "Resources/lumen"), "--db", str(root / "index.sqlite"),
+                                "index", "--root", str(corpus), "--documents"], check=True,
+                               timeout=15, stdout=subprocess.DEVNULL)
+                run(root, language)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,931 @@
+{
+  "calibration": {
+    "zh": {
+      "documents": [
+        "用铜箔包裹两块彩色玻璃的边缘，将接缝对齐后用锡焊连接。",
+        "装车零件进库前在金属表面涂薄油，放入带干燥剂的密封袋。",
+        "将小提琴架稳，以标准音为基准微调琴轴，按相邻空弦纯五度核对音高。",
+        "清除脱落涂层，用细砂纸打磨过渡边，涂底漆干透后再涂面漆。",
+        "申请人提交实名材料，管理员核验后下发签名证书，并通知申请人保管私钥。",
+        "灯塔每六秒发出两次短闪。航海人员通过灯光节奏识别位置，再核对海图。",
+        "台锯切割瓷砖时持续给锯片供水，冷却刀具并压住粉尘。",
+        "折扇沾灰用柔软毛刷沿扇骨扫除，全程保持干燥以免纸张软化。",
+        "拆出石英钟电池，用万用表确认输出电压，再检查指针互相卡住的情况。",
+        "营地选在背风坡，风绳呈四十五度斜拉至地钉，定期检查并拉紧松动处。"
+      ],
+      "queries": [
+        {
+          "expected": 0,
+          "kind": "with_answer",
+          "text": "彩绘窗上裂开的彩片怎样重新接起来？"
+        },
+        {
+          "expected": 0,
+          "kind": "with_answer",
+          "text": "做彩色透光拼图时用什么把相邻碎片固定在一起？"
+        },
+        {
+          "expected": 1,
+          "kind": "with_answer",
+          "text": "钢铁配件怎样存放才不长锈？"
+        },
+        {
+          "expected": 1,
+          "kind": "with_answer",
+          "text": "备用钢制部件等待安装时如何隔绝水汽？"
+        },
+        {
+          "expected": 2,
+          "kind": "with_answer",
+          "text": "四根弦怎样逐一校准？"
+        },
+        {
+          "expected": 2,
+          "kind": "with_answer",
+          "text": "弓拉乐器校正音准时要对照哪些音程？"
+        },
+        {
+          "expected": 3,
+          "kind": "with_answer",
+          "text": "桌板掉漆后怎么让补刷处和旧表面接平？"
+        },
+        {
+          "expected": 3,
+          "kind": "with_answer",
+          "text": "油漆起皮时怎样修补平整？"
+        },
+        {
+          "expected": 4,
+          "kind": "with_answer",
+          "text": "如何给员工领取用于签合同的数字凭证？"
+        },
+        {
+          "expected": 4,
+          "kind": "with_answer",
+          "text": "线上电子签名的密钥文件是怎么发放的？"
+        },
+        {
+          "expected": 5,
+          "kind": "with_answer",
+          "text": "夜里海上如何分辨航标属于哪一座？"
+        },
+        {
+          "expected": 5,
+          "kind": "with_answer",
+          "text": "靠岸前能用闪光模式定位吗？"
+        },
+        {
+          "expected": 6,
+          "kind": "with_answer",
+          "text": "铺地用的硬质陶片加工时怎么减少扬尘？"
+        },
+        {
+          "expected": 6,
+          "kind": "with_answer",
+          "text": "锯切地板砖时需要什么冷却措施？"
+        },
+        {
+          "expected": 7,
+          "kind": "with_answer",
+          "text": "给纸扇清洁可以用水吗？"
+        },
+        {
+          "expected": 7,
+          "kind": "with_answer",
+          "text": "旧扇子上落的灰尘怎么处理？"
+        },
+        {
+          "expected": 8,
+          "kind": "with_answer",
+          "text": "墙上的挂钟不走了先排查什么？"
+        },
+        {
+          "expected": 8,
+          "kind": "with_answer",
+          "text": "指针式计时器突然停止该检查哪些部件？"
+        },
+        {
+          "expected": 9,
+          "kind": "with_answer",
+          "text": "户外睡得地方怎样搭才能扛住阵风？"
+        },
+        {
+          "expected": 9,
+          "kind": "with_answer",
+          "text": "野营用的遮蔽物怎么绑得更稳定？"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "彩色玻璃上的铅条需要哪一种颜色的涂层？"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "钢制零件所用防锈油的闪点是多少？"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "小提琴的琴身用什么枫木？"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "电子签名证书换发要交多少钱？"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "这座灯塔是哪一年建成的？"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "帐篷地垫有几种尺码？"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "纸扇的水墨图是由哪位画师题写的？"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "修复油漆时使用的底漆保质期几个月？"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "怎样计算某个多边形的外角和？"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "灌溉沟渠迁走后当地有多少土拨鼠？"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "街舞比赛有哪些组别？"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "怎样在母鸡出壳后辨认羽毛花纹？"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "足球七人制的禁区画多大？"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "山谷中新发掘的墓属于哪个世纪？"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "橡木桶的容积常用什么单位？"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "天象馆冬季什么时候开门？"
+        }
+      ]
+    },
+    "en": {
+      "documents": [
+        "Wrap the edges of two colored pieces of glass with copper foil, align the seam, and solder them together.",
+        "Apply a thin film of oil to steel spare parts and place them in sealed bags with desiccant before storage.",
+        "Set the violin against a reference tone, adjust its pegs, and check the pitch in perfect fifths between adjacent open strings.",
+        "Remove loose paint, smooth the boundary with fine sandpaper, and let the primer dry fully before putting on the top coat.",
+        "The requester submits proof of identity, an administrator verifies it and issues the signing certificate, and the requester protects the private key.",
+        "The beacon emits a pair of short flashes every six seconds. Mariners identify the location by that pattern and verify it against a chart.",
+        "Feed water continuously to the blade of the table saw when cutting ceramic tiles to cool the blade and control dust.",
+        "Brush dust off a folding fan with a soft paintbrush along the ribs and keep the object dry to avoid softening the paper.",
+        "Remove the quartz clock battery and verify its voltage with a multimeter, then check if the hands are binding.",
+        "Pitch on a sheltered slope, run guy lines at about forty-five degrees to their pegs, and retension any that sag."
+      ],
+      "queries": [
+        {
+          "expected": 0,
+          "kind": "with_answer",
+          "text": "How do I rejoin cracked pieces of a stained window?"
+        },
+        {
+          "expected": 0,
+          "kind": "with_answer",
+          "text": "What holds adjacent tinted panes together in a translucent mosaic?"
+        },
+        {
+          "expected": 1,
+          "kind": "with_answer",
+          "text": "How can iron components be stored to avoid rust?"
+        },
+        {
+          "expected": 1,
+          "kind": "with_answer",
+          "text": "How can I keep moisture away from replacement steel pieces awaiting installation?"
+        },
+        {
+          "expected": 2,
+          "kind": "with_answer",
+          "text": "How do I set the pitch of the four strings step by step?"
+        },
+        {
+          "expected": 2,
+          "kind": "with_answer",
+          "text": "What interval should bowed instrument players listen for when tuning?"
+        },
+        {
+          "expected": 3,
+          "kind": "with_answer",
+          "text": "How can I recoat a patch on a wooden desk without a ridge?"
+        },
+        {
+          "expected": 3,
+          "kind": "with_answer",
+          "text": "What is the process for restoring a peeling finish?"
+        },
+        {
+          "expected": 4,
+          "kind": "with_answer",
+          "text": "How does a staff member get a credential to sign contracts electronically?"
+        },
+        {
+          "expected": 4,
+          "kind": "with_answer",
+          "text": "What is the procedure to issue a cryptographic signature credential?"
+        },
+        {
+          "expected": 5,
+          "kind": "with_answer",
+          "text": "How do boat crews identify which coastal light they are seeing at night?"
+        },
+        {
+          "expected": 5,
+          "kind": "with_answer",
+          "text": "Can a sequence of blinks determine a location when approaching shore?"
+        },
+        {
+          "expected": 6,
+          "kind": "with_answer",
+          "text": "How can I keep powder out of the air while shaping floor ceramics?"
+        },
+        {
+          "expected": 6,
+          "kind": "with_answer",
+          "text": "How should a saw be cooled while trimming a piece of flooring tile?"
+        },
+        {
+          "expected": 7,
+          "kind": "with_answer",
+          "text": "Is it safe to use water when cleaning a paper hand fan?"
+        },
+        {
+          "expected": 7,
+          "kind": "with_answer",
+          "text": "How should accumulated dust be removed from an old folding fan?"
+        },
+        {
+          "expected": 8,
+          "kind": "with_answer",
+          "text": "What should I inspect first when a wall clock stops moving?"
+        },
+        {
+          "expected": 8,
+          "kind": "with_answer",
+          "text": "How can I troubleshoot a mechanical-looking timer that has suddenly stopped?"
+        },
+        {
+          "expected": 9,
+          "kind": "with_answer",
+          "text": "How can I put up a place to sleep outdoors that will withstand gusts?"
+        },
+        {
+          "expected": 9,
+          "kind": "with_answer",
+          "text": "How should I secure a camping shelter so it stays steady?"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "What color paint is recommended for the lead in the stained panes?"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "What is the flash point of oil applied to the spare metal pieces?"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "Which variety of maple is the body of the violin made of?"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "How much does it cost to renew an electronic signing certificate?"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "In which year was this lighthouse built?"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "What sizes are offered for the camping footprint?"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "Who painted the decoration on the folding paper fan?"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "How many months is the primer's shelf life?"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "How do I calculate the sum of a polygon's exterior angles?"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "How many marmots moved after a local canal was filled?"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "What competition categories are in the street dance championship?"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "Can I identify feather patterns when chicks hatch?"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "How wide is the penalty area in seven-a-side football?"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "Which century is the newly excavated valley grave from?"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "What unit is normally used to report the capacity of an oak barrel?"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "When does the planetarium open in winter?"
+        }
+      ]
+    }
+  },
+  "fixed": {
+    "zh": {
+      "documents": [
+        "清除传动链上的砂粒，晾干后逐节滴润滑剂，转动曲柄后擦去多余的油。",
+        "自动站每十分钟上传气温、降水、相对湿度和风向，冬季降雪时加热雨量筒。",
+        "用等量面粉和水喂养天然菌种，观察冒泡和体积增长，成熟后留一部分下次继续培养。",
+        "先核发票日期与收款主体，再逐笔和银行流水比对。缺少凭证的交易单列复核。",
+        "用望远镜记录鹤群出现的方向和时间，结合环志颜色估计迁飞路线，不接近筑巢点。",
+        "调光前核对吊装设备的保险绳和供电负载，换灯时先断电，台下留出隔离区。",
+        "将对温度敏感的药物置于符合标示温度的设备中，保存连续温度记录，异常先隔离。",
+        "安排熟悉业务的搭档，让新人先看一遍真实流程再试着独立完成；每周复盘困难。",
+        "将最近备份恢复到隔离环境，再按事务日志回放到误删发生前一点，核查行数和业务一致性。",
+        "将屋顶径流导入低洼种植带，配置耐涝植物和透水土层，超过容量的水经溢流口排出。",
+        "按兴趣选取篇幅较短的故事定时阅读，结束后由孩子用自己的话复述，慢慢延长时间。",
+        "将相片灰尘轻轻拭去，按高分辨率扫描，保存无损原件和浏览副本，以年月编目。",
+        "监控营养液的酸碱度、电导率与液位，高温天补水并检查根部是否缺氧。",
+        "确认只有一台设备开扬声器和话筒，关闭其他终端音频，用耳机复测并检查消回声设置。",
+        "冷库完成收货后记录批次温度，按效期先后出库；超过温控阈值时通知质检。"
+      ],
+      "queries": [
+        {
+          "expected": 0,
+          "kind": "with_answer",
+          "text": "骑车时传动部分摩擦响应该怎样保养？"
+        },
+        {
+          "expected": 0,
+          "kind": "with_answer",
+          "text": "需要在脚踏车的金属链环上加什么减少磨耗？"
+        },
+        {
+          "expected": 1,
+          "kind": "with_answer",
+          "text": "如何在山顶持续采集环境变化？"
+        },
+        {
+          "expected": 1,
+          "kind": "with_answer",
+          "text": "记录户外大气条件需要哪些传感数据？"
+        },
+        {
+          "expected": 2,
+          "kind": "with_answer",
+          "text": "不用商业酵母怎样让面团自然发起来？"
+        },
+        {
+          "expected": 2,
+          "kind": "with_answer",
+          "text": "烤酸种之前如何维持菌群活性？"
+        },
+        {
+          "expected": 3,
+          "kind": "with_answer",
+          "text": "对账遇到无法解释的支出要如何处理？"
+        },
+        {
+          "expected": 3,
+          "kind": "with_answer",
+          "text": "年底怎么检查银行扣款与财务记录吻合？"
+        },
+        {
+          "expected": 4,
+          "kind": "with_answer",
+          "text": "怎么研究冬天鸟群从哪里来？"
+        },
+        {
+          "expected": 4,
+          "kind": "with_answer",
+          "text": "追踪长距离移动的鸟类时怎样避免惊扰？"
+        },
+        {
+          "expected": 5,
+          "kind": "with_answer",
+          "text": "演出布置上方照明如何预防坠物或触电？"
+        },
+        {
+          "expected": 5,
+          "kind": "with_answer",
+          "text": "剧院人员更换高处灯具前应做什么？"
+        },
+        {
+          "expected": 6,
+          "kind": "with_answer",
+          "text": "酷暑中如何保管需要冷链的制剂？"
+        },
+        {
+          "expected": 6,
+          "kind": "with_answer",
+          "text": "发现药库温度超了范围后怎么办？"
+        },
+        {
+          "expected": 7,
+          "kind": "with_answer",
+          "text": "新员工怎样尽快学会日常工作？"
+        },
+        {
+          "expected": 7,
+          "kind": "with_answer",
+          "text": "团队如何让刚入职的人平稳上手？"
+        },
+        {
+          "expected": 8,
+          "kind": "with_answer",
+          "text": "生产表被误删后如何找回原来的数据？"
+        },
+        {
+          "expected": 8,
+          "kind": "with_answer",
+          "text": "怎样利用快照和事务记录做时间点恢复？"
+        },
+        {
+          "expected": 9,
+          "kind": "with_answer",
+          "text": "如何让屋面排水自然渗进绿地？"
+        },
+        {
+          "expected": 9,
+          "kind": "with_answer",
+          "text": "暴雨时小区怎样靠植物和土壤降低地表积水？"
+        },
+        {
+          "expected": 10,
+          "kind": "with_answer",
+          "text": "怎么帮孩子坚持读书而不分心？"
+        },
+        {
+          "expected": 10,
+          "kind": "with_answer",
+          "text": "给小学生做家庭阅读练习可从哪里开始？"
+        },
+        {
+          "expected": 11,
+          "kind": "with_answer",
+          "text": "如何把纸质家庭影像保存到电脑？"
+        },
+        {
+          "expected": 11,
+          "kind": "with_answer",
+          "text": "档案馆扫描老相片后怎样防止画质损失？"
+        },
+        {
+          "expected": 12,
+          "kind": "with_answer",
+          "text": "无土种西红柿该怎样控制肥水？"
+        },
+        {
+          "expected": 12,
+          "kind": "with_answer",
+          "text": "根系浸在溶液里时怎样避免缺氧和浓度失衡？"
+        },
+        {
+          "expected": 13,
+          "kind": "with_answer",
+          "text": "多人开线上会听见自己说话重复怎么办？"
+        },
+        {
+          "expected": 13,
+          "kind": "with_answer",
+          "text": "怎样处理电脑和手机同时入会产生的反馈声？"
+        },
+        {
+          "expected": 14,
+          "kind": "with_answer",
+          "text": "需要冷藏的货入库并发货时怎么核对质量？"
+        },
+        {
+          "expected": 14,
+          "kind": "with_answer",
+          "text": "配送低温产品怎样按到期时间安排出货？"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "火星的两颗卫星分别叫什么？"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "帝王蝶的染色体有几对？"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "日本浮世绘在江户时期如何传播？"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "纯钛在海水中的腐蚀速率是多少？"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "给我写一篇莎士比亚式十四行诗。"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "内蒙古草原上的奶茶需要加盐吗？"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "蒙特卡洛树搜索的探索常数怎么定？"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "明代青花瓷如何鉴别窑口？"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "大西洋海底电缆跨洋如何铺设？"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "立方体有多少个对称操作？"
+        }
+      ]
+    },
+    "en": {
+      "documents": [
+        "Wipe particles off the bicycle chain and apply a drop of lubricant to each link before removing the excess.",
+        "Clean dust from prints, scan at high resolution, and keep a lossless master alongside a smaller viewing copy.",
+        "Feed a living sourdough culture with water and flour until it bubbles and expands, then reserve a little for the next loaf.",
+        "Match each invoice to the corresponding entry on the bank statement; flag charges that lack documentation.",
+        "Pair new hires with an experienced teammate who demonstrates routine tasks, supervises practice, and reviews progress each week.",
+        "Restore the newest snapshot in isolation, replay transaction logs to just before the accidental deletion, and verify consistency.",
+        "Route roof runoff to a planted depression with permeable soil and an overflow drain to reduce pooling during storms.",
+        "Before replacing suspended stage lights, cut the electrical supply, inspect safety cables, and keep people out from underneath.",
+        "Allow only one microphone and speaker in the room; mute other devices and test echo cancellation with headphones.",
+        "A mountain instrument station transmits precipitation, air temperature, humidity, and wind direction every ten minutes."
+      ],
+      "queries": [
+        {
+          "expected": 0,
+          "kind": "with_answer",
+          "text": "How can a rider quiet a dry drivetrain?"
+        },
+        {
+          "expected": 0,
+          "kind": "with_answer",
+          "text": "What prevents wear on the linked metal loop driven by the pedals?"
+        },
+        {
+          "expected": 1,
+          "kind": "with_answer",
+          "text": "What is a good way to preserve old family snapshots on a computer?"
+        },
+        {
+          "expected": 1,
+          "kind": "with_answer",
+          "text": "How should physical images be digitized without throwing away detail?"
+        },
+        {
+          "expected": 2,
+          "kind": "with_answer",
+          "text": "How can bread rise without commercial yeast?"
+        },
+        {
+          "expected": 2,
+          "kind": "with_answer",
+          "text": "How do I keep the natural fermentation culture alive before baking?"
+        },
+        {
+          "expected": 3,
+          "kind": "with_answer",
+          "text": "How should an accountant validate spending at year end?"
+        },
+        {
+          "expected": 3,
+          "kind": "with_answer",
+          "text": "What do I do when a payment cannot be reconciled with a receipt?"
+        },
+        {
+          "expected": 4,
+          "kind": "with_answer",
+          "text": "How can recruits become productive quickly?"
+        },
+        {
+          "expected": 4,
+          "kind": "with_answer",
+          "text": "What helps someone learn a role after joining the team?"
+        },
+        {
+          "expected": 5,
+          "kind": "with_answer",
+          "text": "Can rows from a dropped production table be recovered?"
+        },
+        {
+          "expected": 5,
+          "kind": "with_answer",
+          "text": "How do I return a data store to its earlier state after a destructive mistake?"
+        },
+        {
+          "expected": 6,
+          "kind": "with_answer",
+          "text": "How can landscaping soak up precipitation from a rooftop?"
+        },
+        {
+          "expected": 6,
+          "kind": "with_answer",
+          "text": "What can a neighborhood build so heavy rainfall does not sit on the pavement?"
+        },
+        {
+          "expected": 7,
+          "kind": "with_answer",
+          "text": "How can technicians prevent falling gear and electrical shock during a show setup?"
+        },
+        {
+          "expected": 7,
+          "kind": "with_answer",
+          "text": "What precautions are needed when working on lighting above an audience?"
+        },
+        {
+          "expected": 8,
+          "kind": "with_answer",
+          "text": "What stops hearing your own voice repeated during a remote meeting?"
+        },
+        {
+          "expected": 8,
+          "kind": "with_answer",
+          "text": "How can phones and laptops in a call avoid acoustic feedback?"
+        },
+        {
+          "expected": 9,
+          "kind": "with_answer",
+          "text": "How can changing atmospheric conditions on a summit be observed continually?"
+        },
+        {
+          "expected": 9,
+          "kind": "with_answer",
+          "text": "What measurements should sensors collect at an exposed high elevation?"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "Which moons orbit Neptune?"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "When did Impressionist painting first appear?"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "How fast do ocean trenches move?"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "How can I solve a Rubik's cube blindfolded?"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "What causes the aurora on Jupiter?"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "Write a Shakespearean sonnet about a raven."
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "How is basalt different from granite?"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "What are the dimensions of a cricket pitch?"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "When did the first dinosaurs appear?"
+        },
+        {
+          "expected": null,
+          "kind": "off",
+          "text": "How are the poles of a bar magnet aligned?"
+        }
+      ]
+    }
+  },
+  "near": {
+    "zh": {
+      "documents": [
+        "邮局把破损信封贴上修补条，手写补齐可辨认的邮编，再进行人工分拣。",
+        "竖琴搬运时放松部分琴弦，用护罩保护共鸣箱，避免横放时让琴颈承重。",
+        "陶坯完全阴干后才能入窑，第一阶段慢慢升温，预防残余水分蒸发导致破裂。",
+        "冬季排空喷泉的循环管路，关闭供水阀，并擦干泵体防止结冰膨胀。",
+        "铺马赛克先弹网格定位线，分区刮粘结剂，凝固后填缝并擦掉砖面浮浆。",
+        "绣有图案的丝巾用未漂白棉布隔层夹放，外覆防尘罩，并避免日照。"
+      ],
+      "queries": [
+        {
+          "expected": 0,
+          "kind": "with_answer",
+          "text": "邮寄途中封套弄坏了，分派邮件前会怎样处理？"
+        },
+        {
+          "expected": 1,
+          "kind": "with_answer",
+          "text": "如何运送体积很大的拨弦乐器防止损伤？"
+        },
+        {
+          "expected": 2,
+          "kind": "with_answer",
+          "text": "泥做的器皿要怎样加热才不会炸裂？"
+        },
+        {
+          "expected": 3,
+          "kind": "with_answer",
+          "text": "寒潮前要怎么处理广场上的循环水设备？"
+        },
+        {
+          "expected": 4,
+          "kind": "with_answer",
+          "text": "拼小面积墙砖怎样控制图案整齐？"
+        },
+        {
+          "expected": 5,
+          "kind": "with_answer",
+          "text": "绣花织物收起来时如何减少褪色和磨损？"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "当地邮局昨天处理了几封破损信件？"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "这架竖琴是由哪一家工厂生产的？"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "陶坯开始烧制后第七分钟升到多少度？"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "大喷泉的循环泵由哪个品牌制造？"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "马赛克用的填缝剂价格是多少？"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "那条刺绣丝巾是哪位工匠制作的？"
+        }
+      ]
+    },
+    "en": {
+      "documents": [
+        "A postal worker mends torn envelopes with repair tape, restores legible missing postal code digits, then sorts the items by hand.",
+        "When moving a harp, loosen some strings, cover the soundbox, and avoid putting the weight on the neck while it rests on its side.",
+        "Clay pieces are completely air-dried, then fired slowly at first so any residual moisture evaporates without cracking them.",
+        "Drain the fountain's recirculation pipes, shut off the water supply, and dry the pump so expanding ice does not damage it.",
+        "Snap a grid of guide lines, spread adhesive in sections, and after setting fill the joints and wipe excess grout off the tile faces.",
+        "Store embroidered silk scarves between unbleached cotton layers under a dust cover and away from sunlight."
+      ],
+      "queries": [
+        {
+          "expected": 0,
+          "kind": "with_answer",
+          "text": "What happens to a letter damaged in transit before delivery sorting?"
+        },
+        {
+          "expected": 1,
+          "kind": "with_answer",
+          "text": "How can a bulky plucked instrument be transported safely?"
+        },
+        {
+          "expected": 2,
+          "kind": "with_answer",
+          "text": "What heating steps prevent a handmade clay vessel from shattering?"
+        },
+        {
+          "expected": 3,
+          "kind": "with_answer",
+          "text": "How can the square's water feature be prepared before freezing weather?"
+        },
+        {
+          "expected": 4,
+          "kind": "with_answer",
+          "text": "How do I keep rows straight when assembling a pattern from tiny wall tiles?"
+        },
+        {
+          "expected": 5,
+          "kind": "with_answer",
+          "text": "How do I protect stitched fabrics from rubbing and fading while putting them away?"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "How many damaged letters did the local post office handle yesterday?"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "Which factory manufactured this particular harp?"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "What is the kiln temperature seven minutes after firing begins?"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "What is the brand of pump installed in the grand fountain?"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "How much does the grout used for the mosaic cost?"
+        },
+        {
+          "expected": null,
+          "kind": "near",
+          "text": "Who made that embroidered silk scarf?"
+        }
+      ]
+    }
+  }
+}

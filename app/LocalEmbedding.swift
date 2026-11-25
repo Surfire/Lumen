@@ -8,10 +8,14 @@ guard CommandLine.arguments.count == 2 else {
 }
 let raw = CommandLine.arguments[1]
 let language = raw == "zh" ? NLLanguage.simplifiedChinese : NLLanguage(rawValue: raw)
+guard let model = NLEmbedding.sentenceEmbedding(for: language) else {
+    FileHandle.standardError.write(Data("no installed sentence embedding for this language\n".utf8))
+    exit(1)
+}
 let data = FileHandle.standardInput.readData(ofLength: 16_385)
 guard data.count <= 16_384, let text = String(data: data, encoding: .utf8), !text.isEmpty,
-      let model = NLEmbedding.sentenceEmbedding(for: language), let vector = model.vector(for: text) else {
-    FileHandle.standardError.write(Data("no installed sentence embedding or no embedding for this input\n".utf8))
-    exit(1)
+      let vector = model.vector(for: text) else {
+    FileHandle.standardError.write(Data("this input could not be embedded\n".utf8))
+    exit(3)
 }
 FileHandle.standardOutput.write(try JSONEncoder().encode(vector))

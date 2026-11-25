@@ -31,6 +31,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var presentationChange: AnyCancellable?
     private var presentationScheduled = false
     private(set) var settings: NSPanel?
+    private(set) var translationWindow: NSPanel?
     private(set) lazy var settingsSession = SettingsSession(model: model)
     private var configuredKey: HotKey?
     private var actionInFlight = false
@@ -474,9 +475,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     func windowWillClose(_ notification: Notification) {
         if let localPreview, (notification.object as? NSWindow) === localPreview { self.localPreview = nil }
+        if let translationWindow, (notification.object as? NSWindow) === translationWindow {
+            translationWindow.contentView = nil
+            self.translationWindow = nil
+        }
         if let settings, (notification.object as? NSWindow) === settings {
             settings.makeFirstResponder(nil)
             model.clearFileDiagnosis()
+        }
+    }
+
+    @objc func showTranslation() {
+        if translationWindow == nil {
+            let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 680, height: 590),
+                                 styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            window.hidesOnDeactivate = false
+            window.contentMinSize = NSSize(width: 600, height: 495)
+            window.delegate = self
+            window.contentView = NSHostingView(rootView: TranslationPanel())
+            if smoke == nil { window.center() }
+            else { window.setFrameOrigin(NSPoint(x: -12_000, y: -12_000)) }
+            translationWindow = window
+        }
+        translationWindow?.title = model.t("Lumen 翻译", "Lumen Translation")
+        if searchPresented { dismissSearch() }
+        if smoke == nil {
+            NSApp.activate()
+            translationWindow?.makeKeyAndOrderFront(nil)
         }
     }
 
@@ -556,6 +582,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         activityItem = menu.addItem(withTitle: "", action: nil, keyEquivalent: "")
         metricsItem = menu.addItem(withTitle: "", action: nil, keyEquivalent: "")
         menu.addItem(.separator())
+        menu.addItem(withTitle: model.t("翻译…", "Translate…"), action: #selector(showTranslation), keyEquivalent: "").target = self
         #if LUMEN_EXTENSIONS
         menu.addItem(withTitle: model.t("扩展…", "Extensions…"), action: #selector(showExtensions), keyEquivalent: "").target = self
         #endif

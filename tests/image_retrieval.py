@@ -53,7 +53,7 @@ with tempfile.TemporaryDirectory(dir='/private/tmp',prefix='lumen-vision-fixture
         return j['hits'],(time.perf_counter_ns()-t)/1e6
     def validate(hit):
         form=run('validate-hit','--kind',hit['kind'],'--availability',hit['availability'],
-                 '--document-stamp',hit['document_stamp'],hit['path'])
+                 '--document-stamp',hit['document_stamp'],'--matched-by',hit['matched_by'],hit['path'])
         return form['valid']
     run('index','--root',str(names),'--deny',str(denied).upper().replace('/PRIVATE/TMP/', '/private/tmp/'))
     name_before=run('query','88aa.jpg')

@@ -171,6 +171,7 @@ pub fn validate_hit(
     kind: &str,
     availability: &str,
     stamp: Option<&str>,
+    matched_by: Option<&str>,
 ) -> bool {
     #[cfg(target_os = "macos")]
     let Ok(_io) = crate::platform::NoMaterialization::enter() else {
@@ -183,13 +184,13 @@ pub fn validate_hit(
         let mut visible = [false];
         crate::external::validate_batch(
             database,
-            &[(path, kind, availability, stamp)],
+            &[(path, kind, availability, stamp, matched_by)],
             &mut visible,
             &mut MetadataBatch::default(),
         );
         return visible[0];
     }
-    validate_catalog_hit(database, path, kind, availability, stamp)
+    validate_catalog_hit(database, path, kind, availability, stamp, matched_by)
 }
 
 fn validate_catalog_hit(
@@ -198,6 +199,7 @@ fn validate_catalog_hit(
     kind: &str,
     availability: &str,
     stamp: Option<&str>,
+    matched_by: Option<&str>,
 ) -> bool {
     let result = (|| -> crate::Result<bool> {
         let database = absolute(database)?;
@@ -211,6 +213,7 @@ fn validate_catalog_hit(
                         kind,
                         availability,
                         stamp,
+                        matched_by,
                     )
                 }),
             )
@@ -219,7 +222,7 @@ fn validate_catalog_hit(
     result.unwrap_or(false)
 }
 
-pub(super) type HitInput<'a> = (&'a str, &'a str, &'a str, Option<&'a str>);
+pub(super) type HitInput<'a> = (&'a str, &'a str, &'a str, Option<&'a str>, Option<&'a str>);
 
 /// Validate an ordered batch using the session's existing catalog connection.
 /// The metadata checks never read the selected files' contents.
@@ -236,10 +239,13 @@ pub(super) fn validate_session_hits(
     let mut paths = MetadataBatch::default();
     let _ = read_snapshot(conn, |snapshot| {
         if let Some(validator) = CatalogValidator::new(snapshot, database) {
-            for (&(path, kind, availability, stamp), visible) in hits.iter().zip(&mut visible) {
+            for (&(path, kind, availability, stamp, matched_by), visible) in
+                hits.iter().zip(&mut visible)
+            {
                 let path = Path::new(path);
                 if !crate::external::is_external(path) {
-                    *visible = validator.check(&mut paths, path, kind, availability, stamp);
+                    *visible =
+                        validator.check(&mut paths, path, kind, availability, stamp, matched_by);
                 }
             }
         }
@@ -350,8 +356,9 @@ impl<'a> CatalogValidator<'a> {
         kind: &str,
         availability: &str,
         stamp: Option<&str>,
+        matched_by: Option<&str>,
     ) -> bool {
-        self.check_row(paths, path, kind, availability, stamp)
+        self.check_row(paths, path, kind, availability, stamp, matched_by)
             .unwrap_or(false)
     }
 
@@ -362,6 +369,7 @@ impl<'a> CatalogValidator<'a> {
         kind: &str,
         availability: &str,
         stamp: Option<&str>,
+        matched_by: Option<&str>,
     ) -> crate::Result<bool> {
         let Self {
             conn,
@@ -413,10 +421,20 @@ impl<'a> CatalogValidator<'a> {
         if file.stamp.as_deref() != Some(stamp) {
             return Ok(false);
         }
-        if kind == "file" && crate::image_search::stored_match(conn, id, &path, stamp)? {
-            return Ok(true);
+        if matched_by == Some("image_embedding") {
+            return Ok(kind == "file" && crate::image_search::stored_match(conn, id, &path, stamp)?);
         }
-        if !scope.documents {
+        // OCR and image embeddings share the live stamp. Even if only one
+        // remains, an untyped cached image hit could have come from the other.
+        let image = DocumentKind::for_path(&path) == Some(DocumentKind::Image);
+        if !scope.documents
+            || (image && (!scope.image_ocr || matched_by.is_none()))
+            || scope.content_roots.as_ref().is_some_and(|roots| {
+                !roots
+                    .iter()
+                    .any(|root| &path != root && path.starts_with(root))
+            })
+        {
             return Ok(false);
         }
         let (column, join) = document_stamp_sql(conn)?;
@@ -766,6 +784,7 @@ mod tests {
                 "file",
                 "local",
                 None,
+                None,
             )
         };
         let transaction = reader.unchecked_transaction().unwrap();
@@ -782,7 +801,7 @@ mod tests {
         assert!(!reader.is_autocommit());
         transaction.commit().unwrap();
         assert!(validate_catalog_hit(
-            &database, &path, "file", "local", None
+            &database, &path, "file", "local", None, None
         ));
         drop(reader);
         drop(writer);

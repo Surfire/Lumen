@@ -713,7 +713,9 @@ final class Launcher: ObservableObject {
             case .failure: finish(false)
             case .success(nil):
                 var arguments = ["validate-hit", "--kind", hit.kind, "--availability", hit.availability]
-                if let stamp = hit.document_stamp { arguments += ["--document-stamp", stamp] }
+                if let stamp = hit.document_stamp {
+                    arguments += ["--document-stamp", stamp, "--matched-by", hit.matched_by]
+                }
                 self.actionProcess = self.engine.run(arguments + ["--", hit.path], priority: .userInitiated) { response in
                     finish(response.succeeded && (try? JSONDecoder().decode(HitValidation.self, from: response.output))?.valid == true)
                 }

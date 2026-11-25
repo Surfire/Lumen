@@ -24,7 +24,9 @@ pub use diagnose::verify_cached_access;
 pub use diagnose::{Diagnosis, Reason as DiagnoseReason, diagnose, validate_hit};
 pub use external::{VolumeStatus, forget_volume, index_volume, volumes};
 pub use gemma::{GemmaModel, ID as GEMMA_MODEL_ID};
-pub use image_search::{ImageSearchSession, image_batch, image_scope, image_status};
+pub use image_search::{
+    ImageSearchSession, MODEL_ID as IMAGE_MODEL_ID, image_batch, image_scope, image_status,
+};
 pub use index::{scan, scan_with_progress};
 pub use model::{BgeModel, Model, ModelBackend};
 pub use progress::{ScanPhase, ScanProgress, ScanProgressReporter};
@@ -564,7 +566,7 @@ impl SearchSession {
     }
 
     /// Check previously presented hits in order without reopening the main catalog.
-    pub fn validate(&self, hits: &[(&str, &str, &str, Option<&str>)]) -> Vec<bool> {
+    pub fn validate(&self, hits: &[diagnose::HitInput<'_>]) -> Vec<bool> {
         let Some(database) = self.conn.path().filter(|path| !path.is_empty()) else {
             return vec![false; hits.len()];
         };

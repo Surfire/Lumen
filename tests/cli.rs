@@ -669,10 +669,12 @@ mod live {
         assert!(text["hits"][0]["document_stamp"].is_string());
         let hit = text["hits"][0].clone();
         let invalid = serde_json::json!({"path":path,"kind":"directory","availability":"local"});
+        let mut untyped = hit.clone();
+        untyped.as_object_mut().unwrap().remove("matched_by");
         let valid = request(
             &mut serve,
             serde_json::json!({
-                "id":2,"op":"validate","hits":[hit,invalid,hit]
+                "id":2,"op":"validate","hits":[hit,invalid,untyped]
             }),
         );
         assert_eq!(valid, serde_json::json!({"id":2,"valid":[true,false,true]}));
@@ -3332,7 +3334,7 @@ done
         assert_eq!(stale["semantic"], "stale");
     }
     #[test]
-    fn bundled_vision_ocr_is_opt_in_scoped_and_retired_when_disabled() {
+    fn bundled_vision_ocr_is_opt_in_and_validated_separately_from_image_search() {
         let f = Fixture::new();
         let resources = f.0.join("Fixture.app/Contents/Resources");
         let root = f.0.join("scope");
@@ -3433,10 +3435,92 @@ try rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithP
             run(&["diagnose", image.to_str().unwrap()])["text"],
             "indexed"
         );
+        let text_hit = &hits[0];
+        assert_eq!(text_hit["matched_by"], "text");
+        let path = text_hit["path"].as_str().unwrap();
+        let stamp = metadata_stamp(&image);
+        assert_eq!(text_hit["document_stamp"], stamp);
+
+        run(&["image-scope", selected]);
+        if let Ok(projector) = std::env::var("LUMEN_IMAGE_TEST_PROJECTOR") {
+            // With the pinned Gemma assets installed, exercise actual pixel indexing too.
+            assert_eq!(
+                run(&["image-index", "--projector", &projector])["indexed"],
+                1
+            );
+        } else {
+            // Keep the validation regression runnable without downloading Gemma.
+            // Seed a normalized embedding in the same format image-index persists.
+            let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+            let mut vector = vec![0_u8; 768 * 2];
+            vector[..2].copy_from_slice(&0x3c00_u16.to_le_bytes()); // 1.0 in f16
+            assert_eq!(
+                db.execute(
+                    "INSERT INTO image_embedding SELECT id,?2,?3,?4 FROM item WHERE path=?1",
+                    rusqlite::params![path, lumen::IMAGE_MODEL_ID, stamp, vector],
+                )
+                .unwrap(),
+                1
+            );
+        }
+        assert_eq!(run(&["image-status"])["vectors"], 1);
+        let image_hit = serde_json::json!({
+            "path": path, "kind": "file", "availability": "local",
+            "document_stamp": stamp, "matched_by": "image_embedding"
+        });
+        let mut serve = Serve::new(&f);
+        let mut validate = |text_valid: bool, image_valid: bool| {
+            serve.id += 1;
+            let request = serde_json::json!({
+                "id": serve.id, "op": "validate", "hits": [text_hit, image_hit]
+            });
+            writeln!(serve.input, "{request}").unwrap();
+            assert_eq!(
+                serve.process.json(),
+                serde_json::json!({
+                    "id": serve.id, "valid": [text_valid, image_valid]
+                })
+            );
+            for (matched_by, valid) in [("text", text_valid), ("image_embedding", image_valid)] {
+                assert_eq!(
+                    run(&[
+                        "validate-hit",
+                        "--kind",
+                        "file",
+                        "--availability",
+                        "local",
+                        "--document-stamp",
+                        &stamp,
+                        "--matched-by",
+                        matched_by,
+                        "--",
+                        path
+                    ])["valid"],
+                    valid
+                );
+            }
+        };
+        validate(true, true);
+
         let cleared = run(&["content-scope", "--content-root", selected]);
         assert_eq!(cleared["content"]["total"], 0);
         assert_eq!(query(), serde_json::json!([]));
         assert_eq!(run(&["query", "scan.HEIC"])[0]["name"], "scan.HEIC");
+        validate(false, true);
+
+        run(&["content-scope", "--content-root", selected, "--image-ocr"]);
+        assert_eq!(run(&["content"])["indexed"], 1);
+        assert_eq!(query()[0]["document_stamp"], stamp);
+        validate(true, true);
+        assert_eq!(run(&["image-scope", "--clear"])["vectors"], 0);
+        validate(true, false);
+
+        let mut untyped = image_hit;
+        untyped.as_object_mut().unwrap().remove("matched_by");
+        serve.id += 1;
+        let request = serde_json::json!({"id": serve.id, "op": "validate", "hits": [untyped]});
+        writeln!(serve.input, "{request}").unwrap();
+        assert_eq!(serve.process.json()["valid"], serde_json::json!([false]));
     }
 
     #[test]

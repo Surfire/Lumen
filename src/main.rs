@@ -200,6 +200,9 @@ enum Action {
         availability: String,
         #[arg(long)]
         document_stamp: Option<String>,
+        /// Identify the index that produced a stamped hit (required for images).
+        #[arg(long)]
+        matched_by: Option<String>,
         path: PathBuf,
     },
     /// Apply an explicit document scope without rebuilding the filename catalog.
@@ -345,6 +348,7 @@ struct ValidationHit {
     kind: String,
     availability: String,
     document_stamp: Option<String>,
+    matched_by: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -466,6 +470,7 @@ fn serve(
                                     hit.kind.as_str(),
                                     hit.availability.as_str(),
                                     hit.document_stamp.as_deref(),
+                                    hit.matched_by.as_deref(),
                                 )
                             })
                             .collect();
@@ -594,9 +599,16 @@ fn main() -> Result<()> {
             kind,
             availability,
             document_stamp,
+            matched_by,
         } => {
-            let valid =
-                lumen::validate_hit(&db, &path, &kind, &availability, document_stamp.as_deref());
+            let valid = lumen::validate_hit(
+                &db,
+                &path,
+                &kind,
+                &availability,
+                document_stamp.as_deref(),
+                matched_by.as_deref(),
+            );
             println!("{}", json!({"valid":valid}));
         }
         Action::ContentScope {

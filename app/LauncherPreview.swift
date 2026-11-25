@@ -91,19 +91,20 @@ struct PreviewSnapshot {
 }
 
 enum LocalFile {
-    static func dragURL(for hit: SearchHit) -> URL? {
+    static func dragURL(for hit: SearchHit, resourceValues: (URL, [URLResourceKey]) throws -> [URLResourceKey: Any] = {
+        try ($0 as NSURL).resourceValues(forKeys: $1)
+    }) -> URL? {
         guard hit.isLocal, SearchHit.pathAttributes(at: hit.path, kind: hit.kind) != nil else { return nil }
         let policy = IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES
         let scope = IOPOL_SCOPE_THREAD
         let prior = getiopolicy_np(policy, scope)
         guard prior >= 0, setiopolicy_np(policy, scope, IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0 else { return nil }
         defer { _ = setiopolicy_np(policy, scope, prior) }
-        // Availability already excludes provider_metadata_only; the live stat above
-        // also rejects dataless leaves and ancestors. Check Apple provider/volume metadata
-        // under the no-materialization policy before handing the URL to another app.
+        // The live path check rejects dataless leaves and ancestors. Ubiquity only
+        // signals iCloud membership, not whether the item is locally resident.
         let url = URL(fileURLWithPath: hit.path, isDirectory: hit.kind == "directory")
-        guard let values = try? url.resourceValues(forKeys: [.isUbiquitousItemKey, .volumeIsLocalKey]),
-              values.isUbiquitousItem != true, values.volumeIsLocal == true else { return nil }
+        guard let values = try? resourceValues(url, [.volumeIsLocalKey]),
+              values[.volumeIsLocalKey] as? Bool == true else { return nil }
         return url
     }
 

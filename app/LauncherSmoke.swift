@@ -563,9 +563,15 @@ final class LauncherSmoke {
             SearchHit(path: residentPath, name: similarlyNamed.lastPathComponent, kind: "file",
                       availability: availability, matched_by: "name", snippet: nil, document_stamp: nil, pdf_page: nil)
         }
-        try check(LocalFile.dragURL(for: dragHit(availability: "local"))?.path == residentPath &&
+        let resident = dragHit(availability: "local")
+        try check(LocalFile.dragURL(for: resident)?.path == residentPath &&
                   LocalFile.dragURL(for: dragHit(availability: "provider_metadata_only")) == nil,
                   "drag eligibility followed the spelling of a local path instead of its residency")
+        // Supply provider metadata without relying on a signed-in iCloud account.
+        let ubiquitous = LocalFile.dragURL(for: resident) { _, _ in
+            [.isUbiquitousItemKey: true, .volumeIsLocalKey: true]
+        }
+        try check(ubiquitous?.path == residentPath, "a resident iCloud file did not export a drag URL")
         try type("lumen action", into: app)
         try check(!app.panel.browsing, "editing the search field did not return to typing mode")
         try key(kVK_Space, " ", in: app)
@@ -712,6 +718,15 @@ final class LauncherSmoke {
     }
 
     private func verifyEngineRegressions() async throws {
+        for (raw, expected) in [
+            (#"/Projects path:"/Archive Reports/" /Projects report"#, #"/Projects "/Archive Reports/" /Projects report"#),
+            ("KIND:Directory kind:folder KIND:Doc report", "kind:folder kind:folder kind:doc report"),
+            ("EXT:.TXT ext:txt EXT:.PDF report", "ext:txt ext:txt ext:pdf report"),
+        ] {
+            let query = LauncherFileQuery(raw)
+            try check(query.isFiltered && query.engineQuery == expected,
+                      "repeated qualifiers were not preserved in the engine query: \(query.engineQuery)")
+        }
         let root = directory.appendingPathComponent("engine-regressions", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let executable = root.appendingPathComponent("engine")

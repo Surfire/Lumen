@@ -1,180 +1,84 @@
-import AppKit
 import SwiftUI
 
 @MainActor
-struct TranslationPanel: View {
+struct TranslationResultCard: View {
     @ObservedObject var model: TranslationPanelModel
-    var chinese = Locale.preferredLanguages.first?.hasPrefix("zh") == true
-    var back: () -> Void = {}
-    var openSettings: () -> Void = {}
-    var submit: () -> Void = {}
-    var copyOutput: (String) -> Void = { _ in }
-
-    private var translating: Bool { model.activity == .translating }
+    let command: TranslationCommand
+    let chinese: Bool
+    let activate: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Button(action: back) {
-                    Label(t("返回搜索", "Back to Search"), systemImage: "chevron.left")
-                }
-                .accessibilityIdentifier("translation-back")
-                Text(t("翻译", "Translate"))
-                    .font(.headline)
-                    .accessibilityAddTraits(.isHeader)
-                Spacer()
-                Button(action: openSettings) {
-                    Image(systemName: "gearshape")
-                }
-                .help(t("翻译设置", "Translation Settings"))
-                .accessibilityLabel(t("翻译设置", "Translation Settings"))
-                .accessibilityIdentifier("translation-open-settings")
-            }
-            Divider()
-            HStack(spacing: 12) {
-                Picker(t("提供商", "Provider"), selection: Binding(
-                    get: { model.selected }, set: { model.choose($0) }
-                )) {
-                    ForEach(model.providers) { provider in
-                        Text(verbatim: provider.name).tag(provider.id)
-                    }
-                }
-                Picker(t("源语言", "Source"), selection: $model.source) {
-                    ForEach(TranslationLanguage.allCases) { language in
-                        Text(language.name(chinese: chinese)).tag(language)
-                    }
-                }
-                Picker(t("目标语言", "Target"), selection: $model.target) {
-                    ForEach(TranslationLanguage.allCases.filter { $0 != .automatic }) { language in
-                        Text(language.name(chinese: chinese)).tag(language)
-                    }
-                }
-            }
-            .disabled(model.activity != nil)
-            if let provider = model.provider {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(t("发送至 ", "Sends to ") + provider.endpoint)
-                        .lineLimit(1).truncationMode(.middle)
-                        .accessibilityIdentifier("translation-destination")
-                    Text(provider.model.isEmpty
-                         ? t("请在设置中选择模型。", "Choose a model in Settings.")
-                         : t("模型 ", "Model ") + provider.model)
-                        .lineLimit(1).truncationMode(.middle)
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
-            Text(t("要翻译的文本", "Text to Translate")).font(.callout.weight(.semibold))
-            TranslationTextEditor(model: model, label: t("要翻译的文本", "Text to Translate"))
-                .frame(height: 104)
-                .overlay { RoundedRectangle(cornerRadius: 5).strokeBorder(.quaternary).allowsHitTesting(false) }
-            HStack {
-                Button(t("翻译", "Translate"), action: submit)
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!model.canTranslate)
-                    .accessibilityIdentifier("translation-submit")
-                if translating {
-                    ProgressView(t("正在翻译…", "Translating…")).controlSize(.small)
-                    Button(t("取消", "Cancel"), action: model.cancel)
-                        .accessibilityIdentifier("translation-cancel")
-                } else if let message = statusText {
-                    Text(message)
-                        .font(.caption).foregroundStyle(.secondary)
-                        .accessibilityIdentifier("translation-status")
-                }
-                Spacer()
-                Text("⌘↩ " + t("翻译", "Translate") + "    esc " + t("返回", "Back"))
-                    .font(.caption).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "translate").foregroundStyle(Color.accentColor)
                     .accessibilityHidden(true)
-            }
-            Divider()
-            HStack {
-                Text(t("译文", "Translation")).font(.callout.weight(.semibold))
+                Text(heading)
+                    .font(.system(size: 14, weight: .semibold))
+                    .accessibilityIdentifier("translation-target")
                 Spacer()
-                Button(t("复制译文", "Copy Translation")) { copyOutput(model.output) }
-                    .disabled(model.output.isEmpty)
-                    .accessibilityIdentifier("translation-copy")
+                if model.activity == .translating {
+                    ProgressView().controlSize(.small)
+                    Button(t("取消", "Cancel"), action: model.cancel)
+                } else if !model.output.isEmpty {
+                    Button(t("复制", "Copy"), action: activate)
+                        .accessibilityIdentifier("translation-copy")
+                } else if model.canTranslate {
+                    Button(t("翻译", "Translate"), action: activate)
+                        .accessibilityIdentifier("translation-submit")
+                }
             }
-            ScrollView {
-                Text(verbatim: model.output)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .accessibilityIdentifier("translation-output")
+            if !model.output.isEmpty {
+                ScrollView {
+                    Text(verbatim: model.output)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityIdentifier("translation-output")
+                }
+            } else {
+                Text(message).font(.callout).foregroundStyle(.secondary)
+                    .accessibilityIdentifier("translation-status")
+                Spacer(minLength: 0)
             }
-            .frame(maxHeight: .infinity)
         }
-        .padding(16)
+        .padding(.horizontal, 17)
+        .padding(.vertical, 12)
     }
 
-    private var statusText: String? {
-        if model.source == model.target {
-            return t("请选择不同的源语言和目标语言。", "Choose different source and target languages.")
+    private var heading: String {
+        if command.unsupportedLanguage != nil || command.text.isEmpty {
+            return t("翻译", "Translate")
         }
-        if model.input.utf8.count > 16_384 {
+        let target = command.target.name(chinese: chinese)
+        return t("翻译为\(target)", "Translate to \(target)")
+    }
+
+    private var message: String {
+        if let alias = command.unsupportedLanguage {
+            if alias.isEmpty { return t("请指定目标语言，例如 tr:it 你好。", "Specify a target language, for example tr:it 你好.") }
+            return t("无法识别目标语言「\(alias)」。请修改语言，或去掉 tr: 后的语言标记来自动判断。",
+                     "Unrecognized target “\(alias)”. Edit the language or use tr with your source text for automatic direction.")
+        }
+        if command.text.isEmpty {
+            return t("例如「译 今天下午三点开会」「tr see you tomorrow」或「tr 法 谢谢」。",
+                     "Try “译 今天下午三点开会”, “tr see you tomorrow”, or “tr French 谢谢”.")
+        }
+        if command.text.utf8.count > 16_384 {
             return t("文本超过 16,384 字节。", "Text exceeds 16,384 bytes.")
         }
+        if model.activity == .translating { return t("正在翻译…", "Translating…") }
+        if model.activity != nil { return t("提供商设置操作进行中。", "A provider settings operation is in progress.") }
         switch model.status {
         case .failure(let failure): return failure.message(chinese: chinese)
-        case .canceled: return t("已取消。", "Canceled.")
-        default: return nil
+        case .canceled: return t("已取消。按回车可重试。", "Canceled. Press Return to retry.")
+        default: break
         }
+        guard let provider = model.provider, model.canTranslate else {
+            return t("请在翻译设置中选择提供商和模型。", "Choose a provider and model in Translation Settings.")
+        }
+        return t("按回车发送至 \(provider.name)。", "Press Return to send to \(provider.name).")
     }
 
     private func t(_ cn: String, _ en: String) -> String { chinese ? cn : en }
-}
-
-@MainActor
-final class TranslationTextView: NSTextView {
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        guard let window else { return }
-        window.makeFirstResponder(self)
-    }
-}
-
-@MainActor
-private struct TranslationTextEditor: NSViewRepresentable {
-    let model: TranslationPanelModel
-    let label: String
-
-    func makeNSView(context: Context) -> NSScrollView {
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.drawsBackground = false
-        let editor = TranslationTextView(frame: .zero)
-        editor.isRichText = false
-        editor.isVerticallyResizable = true
-        editor.autoresizingMask = [.width]
-        editor.textContainer?.widthTracksTextView = true
-        editor.textContainerInset = NSSize(width: 6, height: 5)
-        editor.drawsBackground = false
-        editor.font = .systemFont(ofSize: 14)
-        editor.allowsUndo = true
-        editor.delegate = context.coordinator
-        editor.setAccessibilityIdentifier("translation-input")
-        scroll.documentView = editor
-        return scroll
-    }
-
-    func updateNSView(_ view: NSScrollView, context: Context) {
-        guard let editor = view.documentView as? TranslationTextView else { return }
-        editor.setAccessibilityLabel(label)
-        if !editor.hasMarkedText(), editor.string != model.input { editor.string = model.input }
-        editor.isEditable = model.activity != .translating
-    }
-
-    func makeCoordinator() -> Coordinator { Coordinator(model: model) }
-
-    final class Coordinator: NSObject, NSTextViewDelegate {
-        let model: TranslationPanelModel
-
-        init(model: TranslationPanelModel) { self.model = model }
-
-        func textDidChange(_ notification: Notification) {
-            guard let editor = notification.object as? NSTextView, !editor.hasMarkedText() else { return }
-            model.input = editor.string
-        }
-    }
 }
 
 @MainActor

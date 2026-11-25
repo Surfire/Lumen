@@ -450,19 +450,19 @@ final class LauncherSmoke {
         let originalPanel = app.panel
         let backdrop = originalPanel.contentView
         guard let local = mdl.provider, local.name == "oMLX", local.endpoint == "http://127.0.0.1:8000/v1",
-              mdl.activity == nil else { throw Failure("inline translation lost the oMLX preset") }
+              mdl.activity == nil else { throw Failure("missing saved oMLX preset") }
+
         app.showSearch()
+        for term in ["tree", "translate.pdf", "translate notes.pdf", "trailer", "翻译稿"] {
+            try type(term, into: app)
+            try check(mdl.command == nil && app.model.query == term, "a normal file search was treated as translation")
+        }
         try type("翻译", into: app)
-        guard case .action(let action)? = app.model.selectedResult, action.destination == .translation else {
-            throw Failure("translation did not appear in search")
-        }
+        try check(mdl.command?.text == "" && app.panel === originalPanel && app.panel.contentView === backdrop,
+                  "translation guidance moved out of the original launcher")
         try key(kVK_Return, "\r", in: app)
-        try await until("translation editor did not receive keyboard focus") {
-            app.panel.firstResponder is TranslationTextView
-        }
-        try check(app.isTranslatingInSearch && app.searchPresented && app.panel === originalPanel &&
-                  app.panel.contentView === backdrop && app.settings == nil,
-                  "translation replaced the search window or opened a separate panel")
+        try check(app.searchPresented && mdl.activity == nil, "translation guidance submitted without source text")
+
         let windows = Set(NSApp.windows.map(ObjectIdentifier.init))
         try key(kVK_ANSI_Comma, ",", in: app, throughPanel: true, flags: [.command])
         guard let settings = app.settings else { throw Failure("missing shared Settings window") }
@@ -475,95 +475,128 @@ final class LauncherSmoke {
         mdl.editDraft(\.endpoint, value: endpoint + "/translated/v1")
         mdl.editDraft(\.model, value: "sandbox-model")
         mdl.keyInput = "synthetic-smoke-key"
-        try check(mdl.draft.name == "Synthetic Translation Provider", "editing the provider lost its name")
         mdl.saveProvider()
         guard let saved = mdl.provider else { throw Failure("translation provider was not saved") }
-        mdl.source = .simplifiedChinese
-        mdl.target = .english
         let restored = makeTranslationModel()
-        try check(mdl.status == .saved && mdl.keyInput.isEmpty && mdl.activity == nil,
-                  "the configured provider was not saved or made a request (\(String(describing: mdl.status)))")
-        try check(restored.provider == saved, "saved provider was not restored")
-        try check(restored.providers.contains(local), "the original oMLX preset was not retained")
-        try check(restored.source == .simplifiedChinese && restored.target == .english,
-                  "the configured languages did not persist")
+        try check(mdl.status == .saved && mdl.keyInput.isEmpty && restored.provider == saved &&
+                  restored.providers.contains(local), "existing provider or draft state was changed")
         let savedEndpoint = try TranslationEndpoint(saved.endpoint)
         try check(translationSecrets.key(provider: saved.id, endpoint: savedEndpoint) == "synthetic-smoke-key",
-                  "saving from unified Settings changed the endpoint-bound credential")
+                  "saving changed the endpoint-bound credential")
         try check(!exists("translation-request-started"), "configuring translation made a request")
-
         app.showSearch()
         try key(kVK_ANSI_Comma, ",", in: app, throughPanel: true, flags: [.command])
-        try check(app.settings === settings, "ordinary Settings opened another window after deep link")
-        app.settingsSession.page = .quicklinks
-        settings.contentView?.layoutSubtreeIfNeeded()
-        #if LUMEN_EXTENSIONS
-        app.settingsSession.page = .extensions
-        settings.contentView?.layoutSubtreeIfNeeded()
-        #endif
-        app.settingsSession.page = .translation
-        try check(app.settings === settings && mdl.provider == saved && !settings.isVisible,
-                  "Settings navigation replaced the window or provider")
+        try check(app.settings === settings, "ordinary Settings opened another window")
         app.showSearch()
-        try type("Translate", into: app)
-        try key(kVK_Return, "\r", in: app)
-        try await until("English action did not focus inline editor") { app.panel.firstResponder is TranslationTextView }
-        guard let input = app.panel.firstResponder as? TranslationTextView else { throw Failure("missing inline editor") }
-        let text = "这是用于验收的中文输入。我们在同一窗口测试翻译和文件搜索，不为输入内容自动发送请求。这里还包含一段较长的中文文字，确保多行输入、滚动和目标语言提示都能在浅色和深色界面中使用。"
-        input.setMarkedText("zhong", selectedRange: NSRange(location: 5, length: 0),
-                            replacementRange: NSRange(location: NSNotFound, length: 0))
-        try check(input.hasMarkedText(), "could not exercise marked text in native translation input")
-        let submit = try event(kVK_Return, "\r", in: app, flags: [.command])
-        try check(!app.panel.performKeyEquivalent(with: submit) && mdl.activity == nil,
-                  "Command–Return submitted while Chinese text was being composed")
-        input.insertText(text, replacementRange: input.markedRange())
-        input.insertNewline(nil)
-        input.insertText("第二行。", replacementRange: NSRange(location: NSNotFound, length: 0))
-        try check(mdl.input == text + "\n第二行。" && !exists("translation-request-started"),
-                  "native multiline input changed or sent a request")
-        try check(app.panel.performKeyEquivalent(with: submit), "Command–Return did not reach translation")
-        try await until("explicit translation did not return the loopback result") {
-            mdl.output == "A synthetic result.\nSecond line." && mdl.activity == nil
+
+        let aliasCases: [(String, TranslationLanguage, String)] = [
+            ("译 今天下午三点开会", .english, "今天下午三点开会"),
+            ("tr see you tomorrow", .simplifiedChinese, "see you tomorrow"),
+            ("tr it is fine", .simplifiedChinese, "it is fine"),
+            ("tr made up language", .simplifiedChinese, "made up language"),
+            ("tr 法 谢谢", .french, "谢谢"), ("tr 法语 谢谢", .french, "谢谢"),
+            ("tr French 谢谢", .french, "谢谢"), ("tr法 谢谢", .french, "谢谢"),
+            ("tr de 你好", .german, "你好"), ("tr German 你好", .german, "你好"),
+            ("tr ja 早上好", .japanese, "早上好"), ("译日 谢谢", .japanese, "谢谢"),
+            ("tr Russian 谢谢", .russian, "谢谢"), ("tr 韩语 谢谢", .korean, "谢谢"),
+            ("tr es 谢谢", .spanish, "谢谢"), ("tr pt 谢谢", .portuguese, "谢谢"),
+            ("tr 意大利语 谢谢", .italian, "谢谢"), ("tr:it 你好", .italian, "你好"),
+            ("tr en 谢谢", .english, "谢谢"), ("tr 中文 Hello", .simplifiedChinese, "Hello"),
+            ("tr zh-hant Hello", .traditionalChinese, "Hello"),
+        ]
+        let field = try editor(app)
+        for (raw, target, sourceText) in aliasCases {
+            try type(raw, into: app)
+            try check(mdl.command?.target == target && mdl.command?.text == sourceText &&
+                      mdl.command?.raw == field.string && app.model.query.isEmpty &&
+                      app.panel.firstResponder === field && mdl.activity == nil,
+                      "translation alias changed the source, target, or native responder: \(raw)")
         }
-        app.copyTranslation(mdl.output)
-        try check(filePasteboard.string(forType: .string) == mdl.output, "copy did not publish the current result")
+        try type("tr:unknown keep me", into: app)
+        try key(kVK_Return, "\r", in: app)
+        try check(mdl.command?.unsupportedLanguage == "unknown" && mdl.command?.text == "keep me" &&
+                  !exists("translation-request-started"), "unknown explicit target submitted or lost source")
+
+        try type("译 今天下午三点开会", into: app)
+        let originalText = field.string
+        field.setMarkedText("hui", selectedRange: NSRange(location: 3, length: 0),
+                            replacementRange: NSRange(location: originalText.utf16.count - 1, length: 1))
+        try check(field.hasMarkedText() &&
+                  !app.control(app.searchField, textView: field, doCommandBy: #selector(NSResponder.insertNewline(_:))) &&
+                  !exists("translation-request-started"), "Return submitted marked text")
+        field.insertText("会", replacementRange: field.markedRange())
+        field.unmarkText()
+        try check(!field.hasMarkedText() && field.string == originalText, "IME did not restore the committed Chinese input")
+        let originalFrame = app.panel.frame
+        filePasteboard.clearContents()
+        filePasteboard.setString("unchanged clipboard", forType: .string)
+        try key(kVK_Return, "\r", in: app)
+        try await until("Chinese input was not translated in the search result") {
+            mdl.output == "Meeting at three this afternoon." && mdl.activity == nil
+        }
+        try check(filePasteboard.string(forType: .string) == "unchanged clipboard" &&
+                  field.string == originalText && originalPanel.contentView === backdrop &&
+                  app.panel.frame == originalFrame && app.panel.firstResponder === field,
+                  "first Return copied, changed the search text, or disturbed its window")
         if exists("capture-icons") {
             try capture("lumen-translation-light.png", appearance: .aqua, window: originalPanel)
             try capture("lumen-translation-dark.png", appearance: .darkAqua, window: originalPanel)
             originalPanel.appearance = nil
         }
+        try key(kVK_Return, "\r", in: app)
+        try check(mdl.copied && filePasteboard.string(forType: .string) == mdl.output &&
+                  field.string == originalText && app.searchPresented, "second Return did not copy in place")
 
-        input.selectAll(nil)
-        input.insertText("模拟错误", replacementRange: NSRange(location: NSNotFound, length: 0))
-        try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
+        try type("tr it is fine", into: app)
+        try check(mdl.output.isEmpty && !mdl.copied, "edited text kept the old result or copy affordance")
+        try key(kVK_Return, "\r", in: app)
+        try await until("English input lost its leading it or default direction") {
+            mdl.output == "没问题。" && mdl.activity == nil
+        }
+
+        try type("tr:it 你好", into: app)
+        try key(kVK_Return, "\r", in: app)
+        try await until("explicit Italian did not use the selected provider") { mdl.output == "Ciao!" }
+        if exists("capture-icons") {
+            try capture("lumen-translation-italian.png", appearance: .aqua, window: originalPanel)
+            originalPanel.appearance = nil
+        }
+
+        try type("译 模拟错误", into: app)
+        try key(kVK_Return, "\r", in: app)
         try await until("provider errors were lost or left an old result actionable") {
-            mdl.status == .failure(.http(401)) && mdl.output.isEmpty && mdl.activity == nil &&
-                app.isTranslatingInSearch && app.panel.firstResponder === input
+            mdl.status == .failure(.http(401)) && mdl.output.isEmpty && mdl.activity == nil
         }
 
-        input.selectAll(nil)
-        input.insertText("取消翻译", replacementRange: NSRange(location: NSNotFound, length: 0))
-        try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
-        try await until("slow loopback request did not start") {
-            mdl.activity == .translating && self.exists("translation-slow-started")
-        }
+        try type("译 取消翻译", into: app)
+        try key(kVK_Return, "\r", in: app)
+        try await until("slow request did not start") { mdl.activity == .translating && self.exists("slow-escape-started") }
         if exists("capture-icons") {
             try capture("lumen-translation-running.png", appearance: .aqua, window: originalPanel)
             originalPanel.appearance = nil
         }
         try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
-        _ = try editor(app)
-        try check(mdl.activity == nil && mdl.input.isEmpty && mdl.output.isEmpty &&
-                  app.searchPresented && !app.isTranslatingInSearch && app.panel === originalPanel &&
-                  app.model.query.isEmpty && !originalPanel.isVisible && !NSApp.isActive,
-                  "Escape did not cancel and restore the original search responder")
+        try check(mdl.activity == nil && mdl.status == .canceled && app.searchPresented &&
+                  field.string == "译 取消翻译", "Escape did not cancel in place")
+        try await until("fixture did not attempt the canceled reply") { self.exists("slow-escape-replied") }
+        try check(mdl.output.isEmpty, "the canceled reply appeared")
+
+        try type("译 改字前", into: app)
+        try key(kVK_Return, "\r", in: app)
+        try await until("the request to supersede did not start") { self.exists("slow-edit-started") }
+        try type("tr see you tomorrow", into: app)
+        try check(mdl.activity == nil && mdl.output.isEmpty, "editing did not cancel the old work")
+        try key(kVK_Return, "\r", in: app)
+        try await until("new query did not translate") { mdl.output == "明天见。" && mdl.activity == nil }
+        try await until("fixture did not attempt the superseded reply") { self.exists("slow-edit-replied") }
+        try check(mdl.output == "明天见。" && app.panel.firstResponder === field, "late reply replaced the new query")
+
         try type("lumen action probe", into: app)
-        try await until("normal search did not recover after cancel") {
-            app.model.selectedResult?.id != nil && !app.isTranslatingInSearch
+        try await until("normal search did not recover from translation") {
+            app.model.selectedResult?.id != nil && mdl.command == nil && app.panel.firstResponder === field
         }
-        try await until("the fixture did not attempt the late reply") { self.exists("translation-slow-replied") }
-        try check(mdl.output.isEmpty, "a canceled provider reply updated the restored search")
-        print("Inline translation passed: Chinese marked text, same panel, Settings deep link, saved provider, copy, provider error, Escape, and late reply")
+        try check(!NSApp.isActive && !app.panel.isVisible, "translation smoke activated a real window")
+        print("Search-field translation passed: aliases, IME, Return to submit and copy, edit/Escape cancellation, Settings, and late replies")
     }
 
     private func verifyQuicklinks(_ app: AppDelegate) async throws {

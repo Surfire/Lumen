@@ -1,6 +1,82 @@
 import Combine
 import Foundation
 
+struct TranslationCommand: Equatable {
+    let raw: String
+    let text: String
+    let source: TranslationLanguage
+    let target: TranslationLanguage
+    let unsupportedLanguage: String?
+
+    private static let aliases: [(TranslationLanguage, [String])] = [
+        (.simplifiedChinese, ["中", "中文", "汉语", "简中", "简体中文", "chinese", "mandarin", "zh", "zh-cn", "zh-hans", "zho", "chi"]),
+        (.traditionalChinese, ["繁", "繁中", "繁体中文", "traditional-chinese", "zh-tw", "zh-hant"]),
+        (.english, ["英", "英语", "英文", "english", "en", "eng"]),
+        (.french, ["法", "法语", "法文", "french", "français", "fr", "fra"]),
+        (.german, ["德", "德语", "德文", "german", "deutsch", "de", "deu"]),
+        (.japanese, ["日", "日语", "日文", "japanese", "日本語", "ja", "jp", "jpn"]),
+        (.russian, ["俄", "俄语", "俄文", "russian", "русский", "ru", "rus"]),
+        (.korean, ["韩", "韩语", "韩文", "korean", "한국어", "ko", "kr", "kor"]),
+        (.spanish, ["西", "西语", "西班牙语", "西班牙文", "spanish", "español", "es", "spa"]),
+        (.portuguese, ["葡", "葡语", "葡萄牙语", "葡萄牙文", "portuguese", "português", "pt", "por"]),
+        (.italian, ["意", "意语", "意大利语", "意大利文", "italian", "italiano", "it", "ita"]),
+        (.arabic, ["阿", "阿拉伯语", "阿拉伯文", "arabic", "ar", "ara"]),
+    ]
+
+    static func parse(_ raw: String) -> Self? {
+        let input = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let (head, tail) = split(input)
+        let prefix = head.lowercased()
+        var text = tail
+        var requested: TranslationLanguage?
+        var unsupported: String?
+        switch prefix {
+        case "翻译", "translate":
+            guard tail.isEmpty else { return nil }
+        case "译", "tr":
+            let (word, rest) = split(tail)
+            // English "it" is common at the start of source text. Italian remains
+            // available as tr:it, tr Italian, or tr 意.
+            if word.lowercased() != "it", let language = language(for: word) {
+                requested = language
+                text = rest
+            }
+        default:
+            if prefix.hasPrefix("tr:") || prefix.hasPrefix("译:") || prefix.hasPrefix("译：") {
+                let word = String(head.dropFirst(prefix.hasPrefix("tr:") ? 3 : 2))
+                requested = language(for: word)
+                if requested == nil { unsupported = word }
+            } else {
+                let stem = prefix.hasPrefix("tr") ? "tr" : "译"
+                guard prefix.hasPrefix(stem) else { return nil }
+                let attached = String(head.dropFirst(stem.count))
+                // Tight aliases must begin with an ideograph, so "tree" and
+                // "translate.pdf" keep their normal search behavior.
+                guard attached.unicodeScalars.first?.properties.isIdeographic == true,
+                      let language = language(for: attached) else { return nil }
+                requested = language
+            }
+        }
+
+        let hasHan = text.unicodeScalars.contains { $0.properties.isIdeographic }
+        return Self(raw: raw, text: text,
+                    source: requested != nil ? .automatic : (hasHan ? .simplifiedChinese : .english),
+                    target: requested ?? (hasHan ? .english : .simplifiedChinese),
+                    unsupportedLanguage: unsupported)
+    }
+
+    private static func split(_ text: String) -> (String, String) {
+        let boundary = text.firstIndex(where: \.isWhitespace) ?? text.endIndex
+        let rest = text[boundary...].drop(while: \.isWhitespace)
+        return (String(text[..<boundary]), String(rest))
+    }
+
+    private static func language(for word: String) -> TranslationLanguage? {
+        let alias = word.lowercased()
+        return aliases.first { $0.1.contains(alias) }?.0
+    }
+}
+
 @MainActor
 final class TranslationPanelModel: ObservableObject {
     enum Activity: Equatable { case translating, testing, listing }
@@ -15,10 +91,12 @@ final class TranslationPanelModel: ObservableObject {
 
     @Published private(set) var providers: [TranslationProvider]
     @Published private(set) var selected: UUID
-    @Published var source: TranslationLanguage { didSet { store() } }
-    @Published var target: TranslationLanguage { didSet { store() } }
-    @Published var input = ""
+    // Retain the old preference fields for compatibility with existing installs.
+    private let source: TranslationLanguage
+    private let target: TranslationLanguage
+    @Published private(set) var command: TranslationCommand?
     @Published private(set) var output = ""
+    @Published private(set) var copied = false
     @Published private(set) var draft: TranslationProvider
     @Published var keyInput = ""
     @Published private(set) var activity: Activity?
@@ -55,8 +133,8 @@ final class TranslationPanelModel: ObservableObject {
     }
 
     var canTranslate: Bool {
-        guard activity == nil, source != target, target != .automatic, let provider else { return false }
-        return TranslationClient.isValidInput(input) && TranslationClient.isValidModel(provider.model)
+        guard activity == nil, let command, command.unsupportedLanguage == nil, let provider else { return false }
+        return TranslationClient.isValidInput(command.text) && TranslationClient.isValidModel(provider.model)
             && (try? TranslationEndpoint(provider.endpoint)) != nil
     }
 
@@ -150,22 +228,28 @@ final class TranslationPanelModel: ObservableObject {
     }
 
     func translate() {
-        guard canTranslate, let provider else { return }
-        let (text, source, target) = (input, self.source, self.target)
+        guard canTranslate, let command, let provider else { return }
         output = ""
+        copied = false
         start(.translating) { [client] model in
-            let translation = try await client.translate(text, source: source, target: target, provider: provider)
+            let result = try await client.translate(command.text, source: command.source, target: command.target,
+                                                    provider: provider)
             try Task.checkCancellation()
-            model.output = translation
+            guard model.command == command else { return }
+            model.output = result
         }
     }
 
-    func endSession() {
+    func setCommand(_ next: TranslationCommand?) {
+        guard command != next else { return }
         if activity == .translating { cancel() }
-        input = ""
+        command = next
         output = ""
+        copied = false
         if activity == nil { status = nil }
     }
+
+    func noteCopied() { copied = true }
 
     func endSettingsSession() {
         if activity == .testing || activity == .listing { cancel() }

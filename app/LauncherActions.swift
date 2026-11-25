@@ -5,7 +5,7 @@ import ImageIO
 
 struct LaunchAction: Equatable, Identifiable {
     enum Destination: Equatable {
-        case application(URL, stamp: String), settings(URL), translation
+        case application(URL, stamp: String), settings(URL)
     }
 
     let id: String
@@ -184,10 +184,7 @@ enum LaunchCatalog {
                                 destination: .settings(url),
                                 aliases: aliases + [english + " settings", chinese + "设置"] + pinyinAliases(chinese))
         }
-        return settings + [
-            LaunchAction(id: "lumen:translate", english: "Translate", chinese: "翻译", symbol: "translate",
-                         destination: .translation, aliases: ["translation", "中英互译", "fanyi", "fy"])
-        ]
+        return settings
     }
 
     static func applicationRoots(home: URL) -> [URL] {
@@ -340,7 +337,6 @@ enum LaunchDispatcher {
             workspace.openApplication(at: url, configuration: options) { running, error in
                 DispatchQueue.main.async { completion(running != nil && error == nil) }
             }
-        case .translation: completion(false) // Handled by AppDelegate, never a URL.
         case .settings(let url):
             // Require Apple's registered handler for these local System Settings URLs.
             guard let destination = workspace.urlForApplication(toOpen: url),

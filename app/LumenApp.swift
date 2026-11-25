@@ -37,9 +37,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var volumeChanges: AnyCancellable?
     let externalVolumes: ExternalVolumeCatalog
     let translation: TranslationPanelModel
-    private var translationContent: NSHostingView<TranslationPanel>?
-    var isTranslatingInSearch: Bool { translationContent != nil }
-    private var searchSubviews: [NSView] = []
     #if LUMEN_EXTENSIONS
     private let extensionModel = LumenExtensionPanelModel()
     #endif
@@ -87,14 +84,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         panel.delegate = self
         panel.onCancel = { [weak self] in self?.cancelCurrentPanelAction() }
         panel.onContextActions = { [weak self] in self?.toggleContextActions() }
-        panel.onTranslationSubmit = { [weak self] in self?.submitTranslation() }
-        panel.onSettings = { [weak self] in
-            guard let self else { return }
-            if self.isTranslatingInSearch { self.showTranslationSettings() }
-            else { self.showSettings() }
-        }
+        panel.onSettings = { [weak self] in self?.showSearchSettings() }
         panel.onFileAction = { [weak self] action in
-            guard let self, !self.contextActions.isOpen, let hit = self.model.selectedHit else { return }
+            guard let self, self.translation.command == nil,
+                  !self.contextActions.isOpen, let hit = self.model.selectedHit else { return }
             self.perform(action, on: hit)
         }
         let content = SearchBackdrop()
@@ -126,8 +119,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             model: model,
             applicationIcons: applicationIcons,
             contextActions: contextActions,
+            translation: translation,
+            activateTranslation: { [weak self] in self?.activateTranslation() },
             toggleContextActions: { [weak self] in self?.toggleContextActions() },
-            showSettings: { [weak self] in self?.showSettings() },
+            showSettings: { [weak self] in self?.showSearchSettings() },
             beginIndex: { [weak self] in self?.startBackgroundIndex() },
             open: { [weak self] in self?.open($0) },
             fileAction: { [weak self] action, hit in self?.perform(action, on: hit) }
@@ -138,7 +133,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         content.addSubview(searchField)
         content.addSubview(close)
         content.addSubview(results)
-        searchSubviews = [icon, searchField, close, results]
         panel.contentView = content
         panel.initialFirstResponder = searchField
         NSLayoutConstraint.activate([
@@ -288,10 +282,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func focusSearch() {
-        if isTranslatingInSearch {
-            if let editor = panel.firstResponder as? TranslationTextView { panel.makeFirstResponder(editor) }
-            return
-        }
         panel.makeFirstResponder(searchField)
         searchField.refreshTextColor()
     }
@@ -305,7 +295,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     @objc func dismissSearch() {
         guard searchPresented else { return }
         searchPresented = false
-        leaveTranslation(returnToSearch: false)
+        translation.setCommand(nil)
         contextActions.close()
         // Release the field editor first so an earlier composition cannot be restored on reopen.
         panel.makeFirstResponder(nil)
@@ -328,9 +318,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     func controlTextDidChange(_ notification: Notification) { searchFieldAction() }
 
+    private var searchText: String {
+        (searchField.currentEditor() as? NSTextView)?.string ?? searchField.stringValue
+    }
+
     @objc private func searchFieldAction() {
-        if model.query != searchField.stringValue { contextActions.close() }
-        model.setQuery(searchField.stringValue)
+        let text = searchText
+        let command = TranslationCommand.parse(text)
+        let previous = translation.command
+        if command != previous || (command == nil && model.query != text) { contextActions.close() }
+        translation.setCommand(command)
+        if command != nil {
+            if previous == nil { model.clear() }
+        } else {
+            model.setQuery(text)
+        }
+        if (previous == nil) != (command == nil) { updatePresentation() }
     }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
@@ -338,7 +341,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         switch commandSelector {
         case #selector(NSResponder.moveUp(_:)): moveCurrentSelection(-1)
         case #selector(NSResponder.moveDown(_:)): moveCurrentSelection(1)
-        case #selector(NSResponder.insertNewline(_:)): openSelection()
+        case #selector(NSResponder.insertNewline(_:)):
+            searchFieldAction()
+            openSelection()
         case #selector(NSResponder.cancelOperation(_:)): cancelCurrentPanelAction()
         default: return false
         }
@@ -346,17 +351,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func moveCurrentSelection(_ delta: Int) {
+        guard translation.command == nil else { return }
         if contextActions.isOpen { contextActions.move(delta) }
         else { model.moveSelection(delta) }
     }
 
     private func cancelCurrentPanelAction() {
-        if isTranslatingInSearch { leaveTranslation(returnToSearch: true) }
+        if translation.activity == .translating { translation.cancel() }
         else if contextActions.isOpen { contextActions.close() }
         else { dismissSearch() }
     }
 
     private func toggleContextActions() {
+        guard translation.command == nil else { return }
         if contextActions.isOpen { contextActions.close(); return }
         guard let selected = model.selectedResult else { return }
         contextResultID = selected.id
@@ -416,6 +423,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func openSelection() {
+        if translation.command != nil {
+            activateTranslation()
+            return
+        }
         if contextActions.isOpen {
             if model.selectedResult?.id == contextResultID { contextActions.run() }
             else { contextActions.close() }
@@ -425,6 +436,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func open(_ result: LauncherResult) {
+        guard translation.command == nil else { return }
         switch result {
         case .file(let hit): openFile(hit)
         case .action(let action): runAction(action)
@@ -470,7 +482,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
         } ?? model.containsCurrentAction(action)
         guard searchPresented, current, !actionInFlight else { return }
-        if action.destination == .translation { showTranslation(); return }
         actionInFlight = true
         let query = model.query
         let finished: (Bool) -> Void = { [weak self] success in
@@ -587,7 +598,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     @objc func showSettings() { presentSettings(page: nil) }
 
-    func showTranslationSettings() { presentSettings(page: .translation) }
+    private func showSearchSettings() {
+        presentSettings(page: translation.command == nil ? nil : .translation)
+    }
 
     private func presentSettings(page: SettingsPage?) {
         if let page, page != settingsSession.page { settingsSession.page = page }
@@ -684,65 +697,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     @objc func showTranslation() {
-        if !searchPresented { showSearch() }
-        guard translationContent == nil, let backdrop = panel.contentView else { return }
-        contextActions.close()
-        panel.makeFirstResponder(nil)
-        searchField.stringValue = ""
-        model.clear()
-        let content = NSHostingView(rootView: translationView())
-        content.translatesAutoresizingMaskIntoConstraints = false
-        content.sizingOptions = []
-        translationContent = content
-        panel.inTranslation = true
-        searchSubviews.forEach { $0.isHidden = true }
-        updatePresentation()
-        backdrop.addSubview(content)
-        NSLayoutConstraint.activate([
-            content.leadingAnchor.constraint(equalTo: backdrop.leadingAnchor),
-            content.trailingAnchor.constraint(equalTo: backdrop.trailingAnchor),
-            content.topAnchor.constraint(equalTo: backdrop.topAnchor),
-            content.bottomAnchor.constraint(equalTo: backdrop.bottomAnchor)
-        ])
-        backdrop.layoutSubtreeIfNeeded()
+        showSearch()
+        guard let editor = searchField.currentEditor() as? NSTextView, !editor.hasMarkedText() else { return }
+        editor.insertText("tr ", replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
     }
 
-    private func translationView() -> TranslationPanel {
-        TranslationPanel(model: translation, chinese: model.zh, back: { [weak self] in
-            self?.leaveTranslation(returnToSearch: true)
-        }, openSettings: { [weak self] in
-            self?.showTranslationSettings()
-        }, submit: { [weak self] in
-            self?.submitTranslation()
-        }, copyOutput: { [weak self] in
-            self?.copyTranslation($0)
-        })
-    }
-
-    func copyTranslation(_ text: String) {
-        guard isTranslatingInSearch, !text.isEmpty, text == translation.output else { return }
-        let pasteboard = smoke?.filePasteboard ?? .general
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
-    }
-
-    private func submitTranslation() {
-        guard isTranslatingInSearch,
+    private func activateTranslation() {
+        guard searchPresented, let command = translation.command, searchText == command.raw,
               (panel.firstResponder as? NSTextView)?.hasMarkedText() != true else { return }
-        translation.translate()
-    }
-
-    private func leaveTranslation(returnToSearch: Bool) {
-        guard let content = translationContent else { return }
-        panel.makeFirstResponder(nil)
-        content.removeFromSuperview()
-        translationContent = nil
-        panel.inTranslation = false
-        translation.endSession()
-        searchSubviews.forEach { $0.isHidden = false }
-        if returnToSearch {
-            focusSearch()
-            updatePresentation()
+        if translation.output.isEmpty {
+            translation.translate()
+        } else {
+            let pasteboard = smoke?.filePasteboard ?? .general
+            pasteboard.clearContents()
+            if pasteboard.setString(translation.output, forType: .string) { translation.noteCopied() }
         }
     }
 
@@ -788,7 +756,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         updateStatusMenu()
         installEditMenu()
         settings?.title = model.t("Lumen 设置", "Lumen Settings")
-        translationContent?.rootView = translationView()
     }
 
     private func updateSearchField() {
@@ -848,9 +815,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         guard searchPresented else { return }
         if contextActions.isOpen, model.selectedResult?.id != contextResultID { contextActions.close() }
         var frame = panel.frame
-        let height = isTranslatingInSearch
-            ? CGFloat(464)
-            : SearchWindow.height(for: model, contextCount: contextActions.items.count)
+        let height = SearchWindow.height(for: model, contextCount: contextActions.items.count,
+                                         hasTranslation: translation.command != nil)
         guard frame.height != height else { return }
         frame.origin.y += frame.height - height
         frame.size.height = height
@@ -936,8 +902,6 @@ final class SearchPanel: NSPanel {
     var onCancel: (() -> Void)?
     var onFileAction: ((FileAction) -> Void)?
     var onContextActions: (() -> Void)?
-    var onTranslationSubmit: (() -> Void)?
-    var inTranslation = false
     var onSettings: (() -> Void)?
     override var canBecomeKey: Bool { true }
 
@@ -946,11 +910,6 @@ final class SearchPanel: NSPanel {
         guard event.type == .keyDown, (firstResponder as? NSTextView)?.hasMarkedText() != true else { return false }
         let key = event.charactersIgnoringModifiers?.lowercased()
         if modifiers == [.command], key == "," { onSettings?(); return true }
-        if inTranslation {
-            guard modifiers == [.command], event.keyCode == kVK_Return || event.keyCode == kVK_ANSI_KeypadEnter else { return false }
-            onTranslationSubmit?()
-            return true
-        }
         if modifiers == [.command] {
             if key == "y" { onFileAction?(.preview) }
             else if key == "k" { onContextActions?() }

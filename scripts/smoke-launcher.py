@@ -31,12 +31,18 @@ class GuiTranslationFixture(BaseHTTPRequestHandler):
         (root / "translation-request-started").touch()
         assert self.headers["Authorization"] == "Bearer synthetic-smoke-key"
         denied = source == "模拟错误"
-        slow = source == "取消翻译"
+        slow = {"取消翻译": "slow-escape", "改字前": "slow-edit"}.get(source)
         if slow:
-            (root / "translation-slow-started").touch()
+            (root / f"{slow}-started").touch()
             sleep(1.2)
+        replies = {
+            "今天下午三点开会": "Meeting at three this afternoon.",
+            "it is fine": "没问题。",
+            "你好": "Ciao!",
+            "see you tomorrow": "明天见。",
+        }
         body = json.dumps({"choices": [{"message": {
-            "content": "Late reply" if slow else "A synthetic result.\nSecond line."
+            "content": replies.get(source, "Late reply")
         }, "finish_reason": "stop"}]}).encode()
         try:
             self.send_response(401 if denied else 200)
@@ -46,7 +52,7 @@ class GuiTranslationFixture(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
         if slow:
-            (root / "translation-slow-replied").touch()
+            (root / f"{slow}-replied").touch()
 
 
 def verify_gui_translation(root, language):
@@ -58,12 +64,21 @@ def verify_gui_translation(root, language):
         try:
             (root / "translation-endpoint").write_text(f"http://127.0.0.1:{server.server_port}")
             run(root, language)
-            assert len(server.requests) == 3, server.requests
-            for path, request in server.requests:
+            expected = [
+                ("今天下午三点开会", "Simplified Chinese into English"),
+                ("it is fine", "English into Simplified Chinese"),
+                ("你好", "translate into Italian"),
+                ("模拟错误", "Simplified Chinese into English"),
+                ("取消翻译", "Simplified Chinese into English"),
+                ("改字前", "Simplified Chinese into English"),
+                ("see you tomorrow", "English into Simplified Chinese"),
+            ]
+            assert len(server.requests) == len(expected), server.requests
+            for (path, request), (source, direction) in zip(server.requests, expected):
                 assert path == "/translated/v1/chat/completions"
                 assert request["model"] == "sandbox-model"
-                assert "Simplified Chinese into English" in request["messages"][0]["content"]
-            assert server.requests[0][1]["messages"][1]["content"].endswith("\n第二行。")
+                assert direction in request["messages"][0]["content"]
+                assert request["messages"][1]["content"] == source
         finally:
             server.shutdown()
             worker.join()

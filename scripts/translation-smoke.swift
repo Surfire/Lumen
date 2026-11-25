@@ -26,14 +26,13 @@ struct TranslationSmoke {
         let base = CommandLine.arguments[1]
         let secrets = FixtureSecrets()
         let model = TranslationPanelModel(defaults: nil, client: .init(secrets: secrets, timeout: 2))
-        _ = TranslationPanel(model: model)
+        _ = TranslationSettingsView(model: model, chinese: false)
         expect(model.provider?.endpoint == "http://127.0.0.1:8000/v1", "local preset")
         expect(!model.canTranslate && model.activity == nil, "no startup request or automatic fallback")
 
         let fixture = try TranslationEndpoint(base + "/fixture/v1")
-        model.source = .english
-        model.target = .simplifiedChinese
-        model.input = "A synthetic sentence."
+        let command = TranslationCommand.parse("tr A synthetic sentence.")!
+        model.setCommand(command)
         model.editDraft(\.endpoint, value: fixture.url.absoluteString)
         model.editDraft(\.name, value: "Synthetic oMLX")
         model.keyInput = "synthetic-test-key"
@@ -90,7 +89,7 @@ struct TranslationSmoke {
         expect(model.status == .canceled && model.output.isEmpty, "cancellation ignores late replies")
         let impatient = TranslationClient(secrets: secrets, timeout: 0.15)
         do {
-            _ = try await impatient.translate(model.input, source: model.source, target: model.target,
+            _ = try await impatient.translate(command.text, source: command.source, target: command.target,
                                               provider: model.draft)
             fail("timeout should fail")
         } catch let error as TranslationFailure {

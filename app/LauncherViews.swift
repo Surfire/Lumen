@@ -6,6 +6,8 @@ struct SearchWindow: View {
     @ObservedObject var model: Launcher
     @ObservedObject var applicationIcons: ResultIconDisplay
     @ObservedObject var contextActions: ContextActions
+    @ObservedObject var translation: TranslationPanelModel
+    let activateTranslation: () -> Void
     let toggleContextActions: () -> Void
     let showSettings: () -> Void
     let beginIndex: () -> Void
@@ -16,8 +18,9 @@ struct SearchWindow: View {
     static let footerHeight: CGFloat = 28
     static let maximumVisibleRows = 8
 
-    static func height(for model: Launcher, contextCount: Int = 0) -> CGFloat {
+    static func height(for model: Launcher, contextCount: Int = 0, hasTranslation: Bool = false) -> CGFloat {
         let shell = headerHeight + footerHeight
+        if hasTranslation { return shell + 138 }
         if contextCount > 0 { return shell + CGFloat(min(contextCount, maximumVisibleRows) * 44) }
         guard model.showsResults else { return shell }
         let rows = model.hasQuery ? maximumVisibleRows : min(model.visibleResults.count, maximumVisibleRows)
@@ -28,7 +31,10 @@ struct SearchWindow: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if contextActions.isOpen {
+            if let command = translation.command {
+                TranslationResultCard(model: translation, command: command, chinese: model.zh,
+                                      activate: activateTranslation)
+            } else if contextActions.isOpen {
                 contextRows
             } else if model.showsResults {
                 results.overlay {
@@ -47,48 +53,26 @@ struct SearchWindow: View {
 
     private var footer: some View {
         HStack(spacing: 12) {
-            if model.showsResults {
-                keyHint("↑↓", model.t("选择", "Select"))
-                keyHint("↵", model.t("打开", "Open"))
-                if let file = model.selectedHit {
-                    keyHint("⌘↵", model.t("在 Finder 中显示", "Show in Finder"))
-                    if file.isLocal && file.kind == "file" { keyHint("⌘Y", model.t("快速查看", "Quick Look")) }
+            if translation.command != nil {
+                if translation.activity == .translating {
+                    keyHint("esc", model.t("取消", "Cancel"))
+                } else if !translation.output.isEmpty {
+                    keyHint("↵", model.t("复制", "Copy"))
+                    if translation.copied { Text(model.t("已复制", "Copied")).accessibilityIdentifier("translation-copied") }
+                } else if translation.canTranslate {
+                    keyHint("↵", model.t("翻译", "Translate"))
                 }
-            }
-            if let title = model.launcherActivityTitle,
-               !model.showsResults || model.activityBusy || model.watchState == .failed || model.scopePending {
-                if model.activityBusy || !model.canSearch {
-                    Label(title, systemImage: model.activityBusy ? "arrow.triangle.2.circlepath" : "internaldrive")
-                        .lineLimit(1)
-                    if let metrics = model.activityMetrics { Text(metrics).monospacedDigit().lineLimit(1) }
-                } else {
-                    Text(title).lineLimit(1)
-                }
-            }
-            if let notice = model.searchNotice, !model.visibleResults.isEmpty {
-                Text(model.title(for: notice)).lineLimit(1).help(model.title(for: notice))
-                    .accessibilityIdentifier("launcher-notice")
-            }
-            Spacer(minLength: 8)
-            if model.canStartIndexFromLauncher {
-                Button(model.t("在后台建立索引", "Build in Background"), action: beginIndex)
-                    .buttonStyle(.borderless).fontWeight(.semibold)
-                    .accessibilityIdentifier("build-index")
+                Spacer(minLength: 8)
             } else {
-                keyHint("esc", model.t("关闭", "Close"))
-            }
-            if model.selectedResult != nil {
-                Button(action: toggleContextActions) {
-                    keyHint("⌘K", model.t("操作", "Actions"))
-                }
-                .buttonStyle(.borderless)
+                searchFooter
             }
             Button(action: showSettings) {
                 Image(systemName: "gearshape").font(.system(size: 12))
             }
             .buttonStyle(.borderless)
             .accessibilityLabel(model.t("设置", "Settings"))
-            .help(model.t("设置与索引详情", "Settings and index details"))
+            .help(translation.command == nil ? model.t("设置与索引详情", "Settings and index details")
+                  : model.t("翻译设置", "Translation Settings"))
         }
         .font(.system(size: 11, weight: .medium))
         .foregroundStyle(.secondary)
@@ -96,6 +80,45 @@ struct SearchWindow: View {
         .frame(height: Self.footerHeight)
         .background(.primary.opacity(0.035))
         .overlay(alignment: .top) { Divider() }
+    }
+
+    @ViewBuilder private var searchFooter: some View {
+        if model.showsResults {
+            keyHint("↑↓", model.t("选择", "Select"))
+            keyHint("↵", model.t("打开", "Open"))
+            if let file = model.selectedHit {
+                keyHint("⌘↵", model.t("在 Finder 中显示", "Show in Finder"))
+                if file.isLocal && file.kind == "file" { keyHint("⌘Y", model.t("快速查看", "Quick Look")) }
+            }
+        }
+        if let title = model.launcherActivityTitle,
+           !model.showsResults || model.activityBusy || model.watchState == .failed || model.scopePending {
+            if model.activityBusy || !model.canSearch {
+                Label(title, systemImage: model.activityBusy ? "arrow.triangle.2.circlepath" : "internaldrive")
+                    .lineLimit(1)
+                if let metrics = model.activityMetrics { Text(metrics).monospacedDigit().lineLimit(1) }
+            } else {
+                Text(title).lineLimit(1)
+            }
+        }
+        if let notice = model.searchNotice, !model.visibleResults.isEmpty {
+            Text(model.title(for: notice)).lineLimit(1).help(model.title(for: notice))
+                .accessibilityIdentifier("launcher-notice")
+        }
+        Spacer(minLength: 8)
+        if model.canStartIndexFromLauncher {
+            Button(model.t("在后台建立索引", "Build in Background"), action: beginIndex)
+                .buttonStyle(.borderless).fontWeight(.semibold)
+                .accessibilityIdentifier("build-index")
+        } else {
+            keyHint("esc", model.t("关闭", "Close"))
+        }
+        if model.selectedResult != nil {
+            Button(action: toggleContextActions) {
+                keyHint("⌘K", model.t("操作", "Actions"))
+            }
+            .buttonStyle(.borderless)
+        }
     }
 
     private func keyHint(_ key: String, _ action: String) -> some View {
@@ -206,7 +229,6 @@ struct SearchWindow: View {
             let path = (url.path as NSString).abbreviatingWithTildeInPath
             detail = model.t("应用程序 · \(path)", "Application · \(path)")
         case .settings: detail = model.t("系统设置", "System Settings")
-        case .translation: detail = model.t("Lumen 工具", "Lumen Tool")
         }
         let title = action.title(chinese: model.zh)
         return HStack(spacing: 10) {

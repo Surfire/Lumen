@@ -39,6 +39,14 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
  <key>CFBundleVersion</key><string>8</string>
  <key>LSMinimumSystemVersion</key><string>14.0</string>
  <key>LSUIElement</key><true/>
+ <key>NSAppTransportSecurity</key>
+ <dict>
+  <key>NSExceptionDomains</key>
+  <dict>
+   <key>127.0.0.1</key><dict><key>NSExceptionAllowsInsecureHTTPLoads</key><true/></dict>
+   <key>::1</key><dict><key>NSExceptionAllowsInsecureHTTPLoads</key><true/></dict>
+  </dict>
+ </dict>
 </dict>
 </plist>
 PLIST

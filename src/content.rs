@@ -1,6 +1,6 @@
 use crate::index::{
-    Coverage, DocumentKind, document_version, extract_document, remove_document, restrict_scope,
-    save_document,
+    Coverage, DocumentKind, can_open_document, document_version, extract_document, remove_document,
+    restrict_scope, save_document,
 };
 use crate::{MAX_DOCUMENT, PdfHelperPolicy, Scope, absolute, open_read, open_write, platform};
 use anyhow::{Result, ensure};
@@ -118,46 +118,69 @@ fn eligible_kind(coverage: &Coverage, path: &Path) -> Option<DocumentKind> {
     DocumentKind::for_path(path).filter(|kind| *kind != DocumentKind::Pdf || coverage.pdf.is_some())
 }
 
-pub(super) fn observe(
+pub(super) struct Observation {
+    version: Option<String>,
+    verified: bool,
+}
+
+/// Prepare the version and, if there is already a body to publish, verify
+/// read access. Neither operation belongs inside the writer's transaction.
+pub(super) fn prepare(
     conn: &Connection,
     coverage: &Coverage,
-    id: i64,
     path: &Path,
-    availability: &str,
     metadata: Option<&fs::Metadata>,
     kind: DocumentKind,
-) -> Result<bool> {
-    if availability != "local" {
-        let job = conn.execute("DELETE FROM content_job WHERE item_id=?", [id])? != 0;
-        return Ok(remove_document(conn, id)? || job);
-    }
-    let fetched;
-    let metadata = match metadata {
-        Some(meta) => Some(meta),
-        None => {
-            fetched = fs::symlink_metadata(path).ok();
-            fetched.as_ref()
+) -> Result<Option<Observation>> {
+    let version = metadata.map(|meta| document_version(coverage, kind, meta));
+    let mut verified = false;
+    if let Some(meta) = metadata {
+        let has_body: bool = conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM item JOIN document USING(id) WHERE path=?)",
+            )?
+            .query_row([path.to_str().expect("checked UTF-8 path")], |r| r.get(0))?;
+        if has_body {
+            if !can_open_document(path, meta) {
+                return Ok(None);
+            }
+            verified = true;
         }
-    };
-    let version = metadata
-        .filter(|meta| meta.is_file() && platform::availability(path, meta) == "local")
-        .map(|meta| document_version(coverage, kind, meta));
+    }
+    Ok(Some(Observation { version, verified }))
+}
+
+pub(super) fn observe(conn: &Connection, id: i64, observation: &Observation) -> Result<bool> {
+    let version = observation.version.as_deref();
+    // An orphaned body (e.g. a cleared stamp in an older catalog) is stale,
+    // as is any body added since preparation that we did not verify.
+    let verified_version = version.filter(|_| observation.verified);
     let stale: bool = conn
         .prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM document_state WHERE id=?1 AND stamp IS NOT ?2)",
+            "SELECT EXISTS(SELECT 1 FROM document d LEFT JOIN document_state s USING(id)
+             WHERE d.id=?1 AND (?2 IS NULL OR s.stamp IS NOT ?2))",
         )?
-        .query_row(params![id, version], |r| r.get(0))?;
+        .query_row(params![id, verified_version], |r| r.get(0))?;
     if stale {
         remove_document(conn, id)?;
     }
     let changed = conn
         .prepare_cached(
             "INSERT INTO content_job(item_id) VALUES(?1)
-        ON CONFLICT(item_id) DO UPDATE SET stamp=NULL WHERE stamp IS NOT NULL AND stamp IS NOT ?2",
+             ON CONFLICT(item_id) DO UPDATE SET stamp=NULL
+             WHERE stamp IS NOT NULL AND (?3 OR stamp IS NOT ?2)",
         )?
-        .execute(params![id, version])?
+        .execute(params![id, version, stale])?
         != 0;
     Ok(stale || changed)
+}
+
+pub(super) fn retire(conn: &Connection, id: i64) -> Result<bool> {
+    let job = conn
+        .prepare_cached("DELETE FROM content_job WHERE item_id=?")?
+        .execute([id])?
+        != 0;
+    Ok(remove_document(conn, id)? || job)
 }
 
 #[derive(Default, Serialize)]
@@ -208,92 +231,122 @@ pub fn index_content(database: &Path, max: usize) -> Result<ContentBatch> {
     let configured = Coverage::new(database, &scope)?;
     let mut batch = ContentBatch::default();
     let started = std::time::Instant::now();
-    let candidates = conn
-        .prepare(
-            "SELECT i.id,i.path FROM content_job j JOIN item i ON i.id=j.item_id
-        WHERE j.stamp IS NULL AND i.availability='local' ORDER BY j.item_id LIMIT ?1",
-        )?
-        .query_map([max.clamp(1, 32) as i64], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (id, path) in candidates {
-        if started.elapsed() > std::time::Duration::from_secs(2) && batch.processed > 0 {
-            break;
-        }
-        let file = Path::new(&path);
-        if saved_scope(&conn)?.0 != scope_identity {
-            break;
-        }
-        let kind = eligible_kind(&configured, file).filter(|_| configured.permits_content(file));
-        let version = |kind| {
-            local_metadata(file)
-                .map(|meta| meta.map(|meta| document_version(&configured, kind, &meta)))
-        };
-        let before = match kind.map(version).transpose() {
-            Ok(version) => version.flatten(),
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
-            Err(_) => None,
-        };
-        let cached = conn
-            .query_row("SELECT stamp FROM document_state WHERE id=?", [id], |r| {
-                r.get::<_, String>(0)
-            })
-            .optional()?;
-        let unchanged = before.is_some() && before == cached;
-        let extracted = if unchanged {
-            None
-        } else {
-            let result = kind
-                .filter(|_| before.is_some())
-                .map(|kind| extract_document(&configured, file, kind));
-            if result
-                .as_ref()
-                .is_some_and(|result| result.as_ref().is_err_and(transient_extraction_error))
+    let (cursor, upper): (i64, i64) = conn.query_row(
+        "SELECT coalesce((SELECT CAST(value AS INTEGER) FROM info WHERE key='content_cursor'),0),
+                coalesce((SELECT max(item_id) FROM content_job),0)",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let mut attempted = false;
+    // Wrap once, and never try the same pending job twice in this invocation.
+    // Only completed jobs count toward --max; skip fast failures until the
+    // time budget expires, then resume after the last attempt on the next run.
+    'batch: for (mut after, end) in [(cursor, upper), (0, cursor.min(upper))] {
+        loop {
+            if batch.processed >= max.clamp(1, 32)
+                || (attempted && started.elapsed() >= std::time::Duration::from_secs(2))
+                || saved_scope(&conn)?.0 != scope_identity
             {
-                // Leave this job pending: unchanged file metadata does not mean
-                // a temporary access failure or extractor timeout is permanent.
+                break 'batch;
+            }
+            let Some((id, path)) = conn
+                .prepare_cached(
+                    "SELECT i.id,i.path FROM content_job j JOIN item i ON i.id=j.item_id
+                     WHERE j.stamp IS NULL AND i.availability='local'
+                       AND j.item_id>?1 AND j.item_id<=?2 ORDER BY j.item_id LIMIT 1",
+                )?
+                .query_row(params![after, end], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })
+                .optional()?
+            else {
+                break;
+            };
+            conn.prepare_cached(
+                "INSERT INTO info(key,value) VALUES('content_cursor',?1)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            )?
+            .execute([id])?;
+            attempted = true;
+            after = id;
+            let file = Path::new(&path);
+            let kind =
+                eligible_kind(&configured, file).filter(|_| configured.permits_content(file));
+            let stamp = |kind, meta: &fs::Metadata| document_version(&configured, kind, meta);
+            let metadata = match kind.map(|_| local_metadata(file)).transpose() {
+                Ok(metadata) => metadata.flatten(),
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
+                Err(_) => None,
+            };
+            let before = kind
+                .zip(metadata.as_ref())
+                .map(|(kind, meta)| stamp(kind, meta));
+            let cached = conn
+                .query_row("SELECT stamp FROM document_state WHERE id=?", [id], |r| {
+                    r.get::<_, String>(0)
+                })
+                .optional()?;
+            let unchanged = before.is_some()
+                && before == cached
+                && metadata
+                    .as_ref()
+                    .is_some_and(|meta| can_open_document(file, meta));
+            let extracted = if unchanged {
+                None
+            } else {
+                let result = kind
+                    .filter(|_| before.is_some())
+                    .map(|kind| extract_document(&configured, file, kind));
+                if result
+                    .as_ref()
+                    .is_some_and(|result| result.as_ref().is_err_and(transient_extraction_error))
+                {
+                    // Leave this job pending: unchanged file metadata does not mean
+                    // a temporary access failure or extractor timeout is permanent.
+                    continue;
+                }
+                result
+                    .and_then(Result::ok)
+                    .filter(|item| !item.body.trim().is_empty())
+            };
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if saved_scope(&tx)?.0 != scope_identity {
+                break 'batch;
+            }
+            let pending: bool = tx
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM content_job j JOIN item i ON i.id=j.item_id
+            WHERE i.id=?1 AND i.path=?2 AND i.availability='local' AND j.stamp IS NULL)",
+                )?
+                .query_row(params![id, path], |r| r.get(0))?;
+            let after = match kind
+                .map(|kind| local_metadata(file).map(|meta| meta.map(|meta| stamp(kind, &meta))))
+                .transpose()
+            {
+                Ok(version) => version.flatten(),
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
+                Err(_) => None,
+            };
+            if !pending || before != after {
                 continue;
             }
-            result
-                .and_then(Result::ok)
-                .filter(|item| !item.body.trim().is_empty())
-        };
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if saved_scope(&tx)?.0 != scope_identity {
-            break;
-        }
-        let pending: bool = tx
-            .prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM content_job j JOIN item i ON i.id=j.item_id
-            WHERE i.id=?1 AND i.path=?2 AND i.availability='local' AND j.stamp IS NULL)",
-            )?
-            .query_row(params![id, path], |r| r.get(0))?;
-        let after = match kind.map(version).transpose() {
-            Ok(version) => version.flatten(),
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
-            Err(_) => None,
-        };
-        if !pending || before != after {
-            continue;
-        }
-        if kind.is_none() {
-            tx.execute("DELETE FROM content_job WHERE item_id=?", [id])?;
-            remove_document(&tx, id)?;
-        } else {
-            if let (Some(version), Some(extracted)) = (&before, extracted) {
-                save_document(&tx, id, version, &extracted)?;
-                batch.indexed += 1;
-            } else if !unchanged {
-                remove_document(&tx, id)?;
+            if kind.is_none() {
+                retire(&tx, id)?;
+            } else {
+                if let (Some(version), Some(extracted)) = (&before, extracted) {
+                    save_document(&tx, id, version, &extracted)?;
+                    batch.indexed += 1;
+                } else if !unchanged {
+                    remove_document(&tx, id)?;
+                }
+                tx.execute(
+                    "UPDATE content_job SET stamp=?2 WHERE item_id=?1",
+                    params![id, before.as_deref().unwrap_or("unavailable")],
+                )?;
             }
-            tx.execute(
-                "UPDATE content_job SET stamp=?2 WHERE item_id=?1",
-                params![id, before.as_deref().unwrap_or("unavailable")],
-            )?;
+            tx.commit()?;
+            batch.processed += 1;
         }
-        tx.commit()?;
-        batch.processed += 1;
     }
     batch.pending = coverage(&conn)?.pending;
     Ok(batch)

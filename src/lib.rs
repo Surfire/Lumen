@@ -44,8 +44,8 @@ use std::{
 use unicode_normalization::UnicodeNormalization;
 
 pub const MAX_DOCUMENT: u64 = 2 * 1024 * 1024;
-const SCHEMA_VERSION: i64 = 2;
-const LEGACY_SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 3;
+const LEGACY_SCHEMA_VERSIONS: std::ops::RangeInclusive<i64> = 1..=2;
 const DATABASE_APPLICATION_ID: i64 = 0x4c554d4e; // LUMN
 
 pub fn standard_database() -> PathBuf {
@@ -110,10 +110,9 @@ impl Scope {
             || sensitive_path(path)
             || development_noise(path, &self.roots)
             || (system_path(path)
-                && !self
-                    .roots
-                    .iter()
-                    .any(|root| is_temp_path(root) && path.starts_with(root)))
+                && !self.roots.iter().any(|root| {
+                    path.starts_with(root) && (system_path(root) || scope_ancestor(root))
+                }))
             || (path.starts_with("/Volumes")
                 && !self
                     .roots
@@ -122,16 +121,6 @@ impl Scope {
     }
 }
 
-fn is_temp_path(path: &Path) -> bool {
-    [
-        "/tmp",
-        "/private/tmp",
-        "/var/folders",
-        "/private/var/folders",
-    ]
-    .iter()
-    .any(|p| path.starts_with(p))
-}
 fn home_library_tail(path: &Path) -> Option<&Path> {
     static HOME_LIBRARY: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     let library = HOME_LIBRARY.get_or_init(|| {
@@ -301,7 +290,9 @@ fn open_write(path: &Path, exclusive_indexer: bool) -> Result<(Connection, Optio
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     match catalog_schema(&conn)? {
         (DATABASE_APPLICATION_ID, SCHEMA_VERSION) => {}
-        (DATABASE_APPLICATION_ID, LEGACY_SCHEMA_VERSION) => migrate_catalog(&mut conn)?,
+        (DATABASE_APPLICATION_ID, version) if LEGACY_SCHEMA_VERSIONS.contains(&version) => {
+            migrate_catalog(&mut conn)?;
+        }
         (0, 0) if metadata.len() == 0 => {
             conn.pragma_update(None, "journal_mode", "WAL")?;
             migrate_catalog(&mut conn)?;
@@ -324,7 +315,7 @@ fn migrate_catalog(conn: &mut Connection) -> Result<()> {
     // Another writer may have migrated while we were acquiring the lock.
     let uninitialized = match catalog_schema(&tx)? {
         (DATABASE_APPLICATION_ID, SCHEMA_VERSION) => return Ok(()),
-        (DATABASE_APPLICATION_ID, LEGACY_SCHEMA_VERSION) => false,
+        (DATABASE_APPLICATION_ID, version) if LEGACY_SCHEMA_VERSIONS.contains(&version) => false,
         (0, 0) => true,
         _ => bail!("not a supported Lumen index; no changes made"),
     };
@@ -356,6 +347,15 @@ fn migrate_catalog(conn: &mut Connection) -> Result<()> {
     tx.execute_batch(semantic::VERSIONED_SCHEMA)?;
     tx.execute_batch(content::SCHEMA)?;
     name_fast::install_generation(&tx)?;
+    if !uninitialized {
+        // Retain the user's scope settings, but require a policy pass and a
+        // fresh journal seed even if the serialized scope is unchanged.
+        tx.execute(
+            "DELETE FROM info WHERE key IN ('scope_policy_v3','watch_checkpoint_v1',
+             'watch_replay_overlap_v1','watch_reconciled_at','walk_sample')",
+            [],
+        )?;
+    }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
@@ -368,13 +368,10 @@ pub fn open_read(path: &Path) -> Result<Connection> {
     }
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     connection.busy_timeout(Duration::from_secs(3))?;
-    if !matches!(
-        catalog_schema(&connection)?,
-        (
-            DATABASE_APPLICATION_ID,
-            SCHEMA_VERSION | LEGACY_SCHEMA_VERSION
-        )
-    ) {
+    let (application, version) = catalog_schema(&connection)?;
+    if application != DATABASE_APPLICATION_ID
+        || (version != SCHEMA_VERSION && !LEGACY_SCHEMA_VERSIONS.contains(&version))
+    {
         bail!("no supported index was found");
     }
     Ok(connection)

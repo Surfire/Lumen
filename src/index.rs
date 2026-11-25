@@ -385,17 +385,23 @@ pub(super) fn restrict_scope(conn: &mut Connection, coverage: &Coverage) -> Resu
     let prior: Option<String> = tx
         .query_row("SELECT value FROM info WHERE key='scope'", [], |r| r.get(0))
         .optional()?;
-    if prior.as_deref() == Some(&requested) {
+    let policy_reconciled = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM info WHERE key='scope_policy_v3')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )?;
+    if policy_reconciled && prior.as_deref() == Some(&requested) {
         return Ok(());
     }
-    let same_names = prior
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<Scope>(raw).ok())
-        .is_some_and(|scope| {
-            scope.roots == coverage.scope.roots
-                && scope.allow == coverage.scope.allow
-                && scope.deny == coverage.scope.deny
-        });
+    let same_names = policy_reconciled
+        && prior
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Scope>(raw).ok())
+            .is_some_and(|scope| {
+                scope.roots == coverage.scope.roots
+                    && scope.allow == coverage.scope.allow
+                    && scope.deny == coverage.scope.deny
+            });
     if !same_names {
         let mut items = tx.prepare("SELECT id,path FROM item")?;
         let mut rows = items.query([])?;
@@ -417,6 +423,7 @@ pub(super) fn restrict_scope(conn: &mut Connection, coverage: &Coverage) -> Resu
         tx.execute("DELETE FROM info WHERE key='walk_sample'", [])?;
     }
     write_info(&tx, "scope", &coverage.scope)?;
+    write_info(&tx, "scope_policy_v3", &true)?;
     tx.commit()?;
     Ok(())
 }
@@ -595,14 +602,15 @@ pub(super) fn apply_changes(
         let subtree = walk.visit(path, false, *recurse)?;
         if subtree {
             // An explicit nested root may be reachable only by starting at
-            // that root, e.g. a temporary fixture under the system exclusions.
+            // that root. Include the event target: it may itself be opaque.
             for root in &coverage.scope.roots {
                 if root != path
                     && root.starts_with(path)
                     && root
                         .ancestors()
-                        .take_while(|p| *p != path)
-                        .any(|p| !coverage.allows(p))
+                        .skip(1)
+                        .take_while(|p| p.starts_with(path))
+                        .any(|p| opaque_package(p) || !coverage.allows(p))
                 {
                     walk.visit(root, true, true)?;
                 }
@@ -694,8 +702,8 @@ enum Pending {
         path: PathBuf,
         directory: bool,
         availability: &'static str,
-        metadata: Option<fs::Metadata>,
         legacy: Option<Box<LegacyDocument>>,
+        content: Option<crate::content::Observation>,
     },
     Gap(PathBuf),
 }
@@ -840,29 +848,61 @@ impl<'a> Walk<'a> {
                     .is_none_or(|(kind, old)| kind != "directory" || old != availability);
             }
             if path != Path::new("/") && !super::scope_ancestor(&path) {
-                let legacy = if self.coverage.scope.content_roots.is_none()
-                    && !directory
+                let mut legacy = None;
+                let mut content = None;
+                if !directory
                     && self.coverage.permits_content(&path)
                     && let Some(kind) = DocumentKind::for_path(&path)
                     && (kind != DocumentKind::Pdf || self.coverage.pdf.is_some())
                 {
-                    Some(Box::new(self.read_document(
-                        &path,
-                        availability,
-                        metadata.as_ref(),
-                        kind,
-                    )?))
-                } else {
-                    None
-                };
+                    // Bulk enumeration omits document version metadata. Fetch
+                    // it here, before the pending batch can acquire a write lock.
+                    let fetched;
+                    let meta = match (availability, metadata.as_ref()) {
+                        ("local", Some(meta)) => Some(meta),
+                        ("local", None) => match fs::symlink_metadata(&path) {
+                            Ok(meta) => {
+                                fetched = meta;
+                                Some(&fetched)
+                            }
+                            Err(error) if confirmed_absent(&error) => None,
+                            Err(_) => {
+                                self.gap(&path)?;
+                                continue;
+                            }
+                        },
+                        _ => None,
+                    }
+                    .filter(|meta| {
+                        meta.is_file() && platform::availability(&path, meta) == "local"
+                    });
+                    if self.coverage.scope.content_roots.is_none() {
+                        let document = self.read_document(&path, meta, kind)?;
+                        if matches!(document, LegacyDocument::Unreadable) {
+                            self.stats.documents_not_read += 1;
+                            self.gap(&path)?;
+                            continue;
+                        }
+                        legacy = Some(Box::new(document));
+                    } else if availability == "local" {
+                        match crate::content::prepare(self.conn, self.coverage, &path, meta, kind)?
+                        {
+                            Some(observation) => content = Some(observation),
+                            None => {
+                                self.gap(&path)?;
+                                continue;
+                            }
+                        }
+                    }
+                }
                 // Do not accumulate extracted document bodies in a metadata batch.
                 let flush_document = legacy.is_some();
                 self.pending.push(Pending::Item {
                     path: path.clone(),
                     directory,
                     availability,
-                    metadata: metadata.clone(),
                     legacy,
+                    content,
                 });
                 if flush_document || self.pending.len() >= WRITE_BATCH {
                     self.flush()?;
@@ -947,8 +987,8 @@ impl<'a> Walk<'a> {
                     path,
                     directory,
                     availability,
-                    metadata,
                     legacy,
+                    content,
                 } => {
                     let path_text = path.to_str().expect("checked UTF-8 path");
                     let display = path
@@ -968,15 +1008,12 @@ impl<'a> Walk<'a> {
                             self.observe(path_text, display, kind, availability)?;
                         if first {
                             if let Some(document) = legacy {
-                                self.apply_document(id, path, document)?;
-                            } else {
-                                self.refresh_document(
-                                    id,
-                                    path,
-                                    *directory,
-                                    availability,
-                                    metadata.as_ref(),
-                                )?;
+                                self.apply_document(id, document)?;
+                            } else if let Some(observation) = content {
+                                self.changed |=
+                                    crate::content::observe(self.tx(), id, observation)?;
+                            } else if DocumentKind::for_path(path).is_some() {
+                                self.changed |= crate::content::retire(self.tx(), id)?;
                             }
                         }
                     }
@@ -990,22 +1027,19 @@ impl<'a> Walk<'a> {
                 [first_id],
             )?;
         }
+        // Lookups may run between flushes. Publish access gaps atomically
+        // with observations instead of waiting for finalization to hide them.
+        self.changed |= hide_unverified(self.tx())? != 0;
         self.tx.take().expect("writer batch is active").commit()?;
-        // Retain the bounded allocation for the next traversal batch. Gaps
-        // discovered during legacy content extraction stay queued for the next flush.
-        if self.pending.is_empty() {
-            self.pending = pending;
-            self.pending.clear();
-        } else {
-            self.flush()?;
-        }
+        self.pending = pending;
+        self.pending.clear();
         Ok(())
     }
 
     fn gap(&mut self, path: &Path) -> Result<()> {
         self.stats.entries_unreadable += 1;
         self.pending.push(Pending::Gap(path.to_owned()));
-        if self.tx.is_none() && self.pending.len() >= WRITE_BATCH {
+        if self.pending.len() >= WRITE_BATCH {
             self.flush()?;
         }
         Ok(())
@@ -1086,118 +1120,78 @@ impl<'a> Walk<'a> {
         Ok(Some(id))
     }
 
-    fn refresh_document(
-        &mut self,
-        id: i64,
-        path: &Path,
-        directory: bool,
-        availability: &str,
-        metadata: Option<&fs::Metadata>,
-    ) -> Result<()> {
-        let Some(kind) = DocumentKind::for_path(path) else {
-            return Ok(());
-        };
-        let available = kind != DocumentKind::Pdf || self.coverage.pdf.is_some();
-        if !self.coverage.permits_content(path) || directory || !available {
-            // A prior scope may have allowed extraction of this path.
-            return self.clear_document(id);
-        }
-        self.changed |= crate::content::observe(
-            self.tx(),
-            self.coverage,
-            id,
-            path,
-            availability,
-            metadata,
-            kind,
-        )?;
-        Ok(())
-    }
-
     fn read_document(
         &self,
         path: &Path,
-        availability: &str,
         metadata: Option<&fs::Metadata>,
         kind: DocumentKind,
     ) -> Result<LegacyDocument> {
         let version = |meta: &fs::Metadata| document_version(self.coverage, kind, meta);
-        if availability == "local" {
-            let fetched;
-            let metadata = match metadata {
-                Some(m) => Some(m),
-                None => {
-                    fetched = fs::symlink_metadata(path).ok();
-                    fetched.as_ref()
-                }
-            };
-            if let Some(meta) =
-                metadata.filter(|m| m.is_file() && platform::availability(path, m) == "local")
-            {
-                let current = version(meta);
-                let previous: Option<String> = self
+        if let Some(meta) = metadata {
+            let current = version(meta);
+            let previous: Option<String> = self
                     .conn
                     .prepare_cached(
                         "SELECT ds.stamp FROM item i JOIN document_state ds ON i.id=ds.id WHERE i.path=?",
                     )?
                     .query_row([path.to_str().expect("checked UTF-8 path")], |r| r.get(0))
                     .optional()?;
-                if previous.as_deref() == Some(&current) {
-                    return Ok(LegacyDocument::Current);
-                }
-                let extracted = extract_document(self.coverage, path, kind);
-                if kind == DocumentKind::Pdf
-                    && let Some(pdf) = &self.coverage.pdf
+            if previous.as_deref() == Some(&current) {
+                return Ok(if can_open_document(path, meta) {
+                    LegacyDocument::Current
+                } else {
+                    LegacyDocument::Unreadable
+                });
+            }
+            let extracted = extract_document(self.coverage, path, kind);
+            if kind == DocumentKind::Pdf
+                && let Some(pdf) = &self.coverage.pdf
+            {
+                pdf.executable()?;
+            }
+            let body = match extracted {
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied) =>
                 {
-                    pdf.executable()?;
+                    return Ok(LegacyDocument::Unreadable);
                 }
-                let body = match extracted {
-                    Err(error)
-                        if error.downcast_ref::<std::io::Error>().is_some_and(|io| {
-                            io.kind() == std::io::ErrorKind::PermissionDenied
-                        }) =>
-                    {
-                        return Ok(LegacyDocument::Unreadable);
-                    }
-                    other => other,
-                };
-                if let Ok(body) = body
-                    && !body.body.is_empty()
-                    && fs::symlink_metadata(path).is_ok_and(|m| {
-                        m.is_file()
-                            && platform::availability(path, &m) == "local"
-                            && version(&m) == current
-                    })
-                {
-                    // The old stamp identified a binary path, not an extraction
-                    // format. Verify its text once with the current app. Existing
-                    // vectors are valid only if the exact same text was produced.
-                    let legacy = previous.is_none()
-                        || (kind == DocumentKind::Pdf
-                            && previous.as_deref().is_some_and(|prior| {
-                                self.coverage
-                                    .pdf
-                                    .as_ref()
-                                    .is_some_and(|pdf| pdf.can_restamp_legacy(prior, &stamp(meta)))
-                            }));
-                    return Ok(LegacyDocument::Extracted {
-                        stamp: current,
-                        restamp: legacy,
-                        text: body,
-                    });
-                }
+                other => other,
+            };
+            if let Ok(body) = body
+                && !body.body.is_empty()
+                && fs::symlink_metadata(path).is_ok_and(|m| {
+                    m.is_file()
+                        && platform::availability(path, &m) == "local"
+                        && version(&m) == current
+                })
+            {
+                // The old stamp identified a binary path, not an extraction
+                // format. Verify its text once with the current app. Existing
+                // vectors are valid only if the exact same text was produced.
+                let legacy = previous.is_none()
+                    || (kind == DocumentKind::Pdf
+                        && previous.as_deref().is_some_and(|prior| {
+                            self.coverage
+                                .pdf
+                                .as_ref()
+                                .is_some_and(|pdf| pdf.can_restamp_legacy(prior, &stamp(meta)))
+                        }));
+                return Ok(LegacyDocument::Extracted {
+                    stamp: current,
+                    restamp: legacy,
+                    text: body,
+                });
             }
         }
         Ok(LegacyDocument::Empty)
     }
 
-    fn apply_document(&mut self, id: i64, path: &Path, document: &LegacyDocument) -> Result<()> {
+    fn apply_document(&mut self, id: i64, document: &LegacyDocument) -> Result<()> {
         match document {
             LegacyDocument::Current => self.stats.documents += 1,
-            LegacyDocument::Unreadable => {
-                self.gap(path)?;
-                self.stats.documents_not_read += 1;
-            }
+            LegacyDocument::Unreadable => unreachable!("staged as an access gap"),
             LegacyDocument::Empty => {
                 self.clear_document(id)?;
                 self.stats.documents_not_read += 1;
@@ -1229,6 +1223,25 @@ impl<'a> Walk<'a> {
         self.changed |= remove_document(self.tx(), id)?;
         Ok(())
     }
+}
+
+/// Verify access to the same local document version without reading bytes.
+pub(super) fn can_open_document(path: &Path, expected: &fs::Metadata) -> bool {
+    use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(target_os = "macos")]
+    let flags = libc::O_NOFOLLOW_ANY | libc::O_NONBLOCK;
+    #[cfg(not(target_os = "macos"))]
+    let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)
+        .and_then(|file| file.metadata())
+        .is_ok_and(|opened| {
+            opened.is_file()
+                && platform::availability(path, &opened) == "local"
+                && stamp(&opened) == stamp(expected)
+        })
 }
 
 pub(super) fn document_version(

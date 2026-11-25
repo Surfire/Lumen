@@ -742,8 +742,9 @@ mod macos {
             let target = absolute(&root.join("delivered.txt")).unwrap();
             let missed = absolute(&root.join("missed.txt")).unwrap();
             let sink = RefCell::<Option<Arc<Sink>>>::new(None);
+            let periodic = Duration::from_millis(if report_loss { 2500 } else { 500 });
             let policy = MaintenancePolicy {
-                periodic: Duration::from_millis(if report_loss { 2500 } else { 500 }),
+                periodic,
                 recovery_cooldown: Duration::from_millis(80),
                 persistent: false,
                 guarded_cache: false,

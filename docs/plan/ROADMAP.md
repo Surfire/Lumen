@@ -70,29 +70,29 @@ Status legend: `pending` | `in_progress` | `done`
 
 ---
 
-## Milestone 2: P1 Architecture Convergence & Spotlight Parity (`pending`)
+## Milestone 2: P1 Architecture Convergence & Spotlight Parity (`done`)
 
-### `T07` Unified `serve` Protocol & Eliminate Swift Process Storms (`pending`)
+### `T07` Unified `serve` Protocol & Eliminate Swift Process Storms (`done`)
 - **Worktrees**: `m2-engine-serve-soa` (Rust) + `m2-ux-spotlight-parity` (Swift)
 - **Scope**:
   - Rust: Support `mode: "text"` directly in `lumen serve` and add lightweight in-session `validate` / batch-check request. Fix duplicate `deny_rules`/`mounted()` calls in `src/external.rs`.
   - Swift: Route full-text search through persistent `lumen serve`; remove per-keystroke `textProcess` and `nameBypassProcess`; stop permanent `--check-access` once `watch` emits `ready`; remove per-hit `validate-hit` fanout.
 
-### `T08` Compact In-Memory SoA Name Index (`pending`)
+### `T08` Compact In-Memory SoA Name Index (`done`)
 - **Worktree**: `m2-engine-serve-soa`
 - **Scope**:
   - Upgrade `src/name_fast.rs` to compact Structure-of-Arrays (SoA) byte-pool scaling past 1,000,000 entries within <=150 MiB RAM.
   - Serve single-word, multi-word, `ext:`/`.pdf`, `kind:`, path prefix, and pinyin queries directly from RAM.
   - Rank by composite score: match quality + cleanliness (`user_area && !noise`) + recency (`mtime`) + kind priority.
 
-### `T09` Native File UX: Spacebar Quick Look, Drag & Drop, Query Filters (`pending`)
+### `T09` Native File UX: Spacebar Quick Look, Drag & Drop, Query Filters (`done`)
 - **Worktree**: `m2-ux-spotlight-parity`
 - **Scope**:
   - Spacebar Quick Look in browse state (typing state inserts space; `⌘Y` always toggles; never materialize `SF_DATALESS`).
   - Drag & Drop local file URLs from result rows.
   - Query filter hints & support for `kind:` / `ext:` / path prefixes.
 
-### `T10` Out-of-the-Box Readiness, System Actions & Unified Frecency (`pending`)
+### `T10` Out-of-the-Box Readiness, System Actions & Unified Frecency (`done`)
 - **Worktree**: `m2-ux-spotlight-parity`
 - **Scope**:
   - Launch at Login (`SMAppService.mainApp`) in Settings → General.
@@ -100,7 +100,7 @@ Status legend: `pending` | `in_progress` | `done`
   - High-frequency native macOS system actions (Lock Screen, Sleep, Empty Trash with confirm, Toggle Dark Mode, Mute/Unmute, Eject External Volume, Dictionary Lookup via `DCSCopyTextDefinition`).
   - Unified Frecency ranking across apps, actions, and files.
 
-### `T11` End-to-End Benchmarks (`pending`)
+### `T11` End-to-End Benchmarks (`done`)
 - **Worktree**: `m2-engine-serve-soa`
 - **Scope**:
   - Run `scripts/benchmark.py` on 100k and 1M synthetic entries (Chinese + pinyin + multi-word + concurrent updates) and record results in `benchmarks/v0.4-baseline.md`.

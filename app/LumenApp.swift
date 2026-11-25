@@ -660,11 +660,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             if let smoke = self.smoke, smoke.simulatesFileOpen(url) {
                 smoke.opened = url
                 self.dismissSearch()
-            } else if NSWorkspace.shared.open(url) {
-                self.model.noteFileOpened(hit)
-                self.dismissSearch()
-            } else {
+                return
+            }
+            let isSmoke = self.smoke != nil
+            if isSmoke && url.pathExtension.lowercased() != "app"
+                && NSWorkspace.shared.urlForApplication(toOpen: url) == nil
+            {
                 self.model.openingFailed()
+                return
+            }
+            let config = NSWorkspace.OpenConfiguration()
+            config.activates = !isSmoke
+            config.promptsUserIfNeeded = !isSmoke
+            NSWorkspace.shared.open(url, configuration: config) { [weak self] app, error in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if app != nil && error == nil {
+                        self.model.noteFileOpened(hit)
+                        self.dismissSearch()
+                    } else {
+                        self.model.openingFailed()
+                    }
+                }
             }
         }
     }

@@ -130,3 +130,7 @@ Status legend: `pending` | `in_progress` | `done`
 - **Scope**:
   - Support `.heic`, `.heif`, and `.webp` in `image_decode.rs` / `image_search.rs` (keeping `NoMaterialization` / `SF_DATALESS` / 12 MiB / 32MP limits).
   - Add local Apple Vision OCR extraction for indexed local images/screenshots into `content_fts` (opt-in within scope, never touching `SF_DATALESS`).
+
+---
+
+**Next Phase**: See [ROADMAP-v0.5.md](ROADMAP-v0.5.md) (`M4`–`M6`, `T15`–`T20`: highlight/motion polish, local clipboard history, AX window management, lightweight script commands & Apple Shortcuts, static `liblumen.a` convergence, and signed in-app updater / Homebrew Cask).

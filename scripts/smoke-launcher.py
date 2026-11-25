@@ -335,7 +335,7 @@ if action in ("query", "validate-hit"):
 
 
 def validated(hit):
-    assert set(hit) <= {"path", "kind", "availability", "document_stamp"}, hit
+    assert set(hit) <= {"path", "kind", "availability", "document_stamp", "matched_by"}, hit
     path = Path(hit["path"])
     assert path.is_absolute()
     stamp = hit.get("document_stamp")
@@ -353,6 +353,8 @@ def validated(hit):
     args = ["--kind", hit["kind"], "--availability", hit["availability"]]
     if stamp is not None:
         args += ["--document-stamp", stamp]
+        if hit.get("matched_by"):
+            args += ["--matched-by", hit["matched_by"]]
     return json.loads(subprocess.check_output([engine, db, database, "validate-hit", *args, "--", str(path)]))["valid"]
 
 

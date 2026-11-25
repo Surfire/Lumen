@@ -107,19 +107,11 @@ struct LauncherExternalVolumes: View {
                     Text(launcher.t("没有可用的外置卷。", "No external volumes available."))
                         .foregroundStyle(.secondary)
                 }
-                Spacer()
             } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 12) {
-                        ForEach(catalog.volumes) { volume in row(volume) }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.trailing, 4)
-                }
+                ForEach(catalog.volumes) { volume in row(volume) }
             }
         }
-        .padding(20)
-        .frame(minWidth: 480, minHeight: 240)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func row(_ volume: ExternalVolume) -> some View {

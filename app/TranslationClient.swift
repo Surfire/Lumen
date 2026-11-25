@@ -78,7 +78,7 @@ struct TranslationEndpoint: Equatable, Sendable {
 
     init(_ value: String) throws {
         let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard value.utf8.count <= 1_024, !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+        guard value.utf8.count <= 1_024, !TranslationClient.containsControlCharacters(value),
               var parts = URLComponents(string: value), let scheme = parts.scheme?.lowercased(),
               let host = parts.host?.lowercased(), !host.isEmpty,
               parts.user == nil, parts.password == nil, parts.query == nil, parts.fragment == nil,
@@ -224,7 +224,14 @@ struct TranslationClient: Sendable {
 
     static func isValidModel(_ model: String) -> Bool {
         !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && model.utf8.count <= 512
-            && !model.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+            && !containsControlCharacters(model)
+    }
+
+    static func containsControlCharacters(_ value: String) -> Bool {
+        value.unicodeScalars.contains { scalar in
+            let category = scalar.properties.generalCategory
+            return category == .control || category == .format
+        }
     }
 
     static func isValidKey(_ key: String) -> Bool {

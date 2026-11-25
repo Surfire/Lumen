@@ -86,7 +86,7 @@ def main():
             }, metadata)
         sources = ["app/TranslationClient.swift", "app/TranslationModel.swift", "app/TranslationPanel.swift",
                    "scripts/translation-smoke.swift"]
-        subprocess.run(["xcrun", "swiftc", "-swift-version", "5", "-target", "arm64-apple-macosx14.0",
+        subprocess.run(["xcrun", "swiftc", "-O", "-swift-version", "5", "-target", "arm64-apple-macosx14.0",
                         "-parse-as-library", *sources, "-o", str(exe)], cwd=ROOT, check=True, timeout=60)
         with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
             server.paths = []

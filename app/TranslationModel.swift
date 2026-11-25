@@ -19,8 +19,7 @@ final class TranslationPanelModel: ObservableObject {
     @Published var target: TranslationLanguage { didSet { store() } }
     @Published var input = ""
     @Published private(set) var output = ""
-    @Published var showSettings = false
-    @Published var draft: TranslationProvider
+    @Published private(set) var draft: TranslationProvider
     @Published var keyInput = ""
     @Published private(set) var activity: Activity?
     @Published private(set) var status: Status?
@@ -74,17 +73,24 @@ final class TranslationPanelModel: ObservableObject {
         guard activity == nil else { return }
         draft = TranslationProvider()
         resetDraftState()
-        showSettings = true
+    }
+
+    func editDraft(_ field: WritableKeyPath<TranslationProvider, String>, value: String) {
+        guard activity == nil else { return }
+        var next = draft
+        next[keyPath: field] = value
+        draft = next
     }
 
     func saveProvider() {
         guard activity == nil else { return }
         do {
             var proposed = draft
-            proposed.name = proposed.name.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !proposed.name.isEmpty, proposed.name.utf8.count <= 100,
-                  !proposed.name.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
-            else { throw TranslationFailure.invalidProvider }
+            let name = proposed.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard (1...100).contains(name.utf8.count), !TranslationClient.containsControlCharacters(name) else {
+                throw TranslationFailure.invalidProvider
+            }
+            proposed.name = name
             let endpoint = try TranslationEndpoint(proposed.endpoint)
             proposed.endpoint = endpoint.url.absoluteString
             proposed.model = proposed.model.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -152,6 +158,18 @@ final class TranslationPanelModel: ObservableObject {
             try Task.checkCancellation()
             model.output = translation
         }
+    }
+
+    func endSession() {
+        if activity == .translating { cancel() }
+        input = ""
+        output = ""
+        if activity == nil { status = nil }
+    }
+
+    func endSettingsSession() {
+        if activity == .testing || activity == .listing { cancel() }
+        keyInput = ""
     }
 
     func cancel() {

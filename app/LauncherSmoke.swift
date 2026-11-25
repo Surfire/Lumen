@@ -1,6 +1,7 @@
 import AppKit
 import Carbon
 import Combine
+import Foundation
 
 // Runs inside the built app with app-local AppKit and Carbon events and an isolated index.
 @MainActor
@@ -27,6 +28,15 @@ final class LauncherSmoke {
     var chosenQuicklinkFolder: URL?
     var chosenSettingsDirectories: [URL]?
     var chosenDiagnosticFile: URL?
+
+    private lazy var translationSuite = "io.github.surfire.lumen.gui-smoke.\(UUID())"
+    private lazy var translationPreferences = UserDefaults(suiteName: translationSuite)
+    private let translationSecrets = SmokeTranslationSecrets()
+    var shortcutFixturePreferences: UserDefaults? { exists("quicklinks-scenario") ? translationPreferences : nil }
+
+    func makeTranslationModel() -> TranslationPanelModel {
+        TranslationPanelModel(defaults: translationPreferences, client: .init(secrets: translationSecrets, timeout: 3))
+    }
 
     private init(_ directory: URL, language: String, usesOffscreenWindows: Bool) {
         self.directory = directory
@@ -90,7 +100,9 @@ final class LauncherSmoke {
                 NSApp.terminate(nil)
                 return
             }
+            defer { translationPreferences?.removePersistentDomain(forName: translationSuite) }
             try await verify(app)
+            translationPreferences?.removePersistentDomain(forName: translationSuite)
             let engine = controlledTiming ? "controlled timing fixture" : (executable == nil ? "bundled engine" : "live engine")
             print("GUI smoke passed (\(language), \(engine), \(startsWithIndex ? "existing index" : "first run"))")
             NSApp.terminate(nil)
@@ -343,12 +355,7 @@ final class LauncherSmoke {
         try check(dispatchedActions.first == probe.destination && !NSApp.isActive && !wasActivated,
                   "the app action dispatched elsewhere or activated Lumen")
 
-        app.showSearch()
-        try type("翻译", into: app)
-        try check(chosen()?.destination == .translation, "translation did not appear in the search box")
-        try key(kVK_Return, "\r", in: app)
-        try check(app.translationWindow?.contentView != nil && !app.searchPresented, "translation window did not open")
-        app.translationWindow?.close()
+        try await verifyInlineTranslation(app)
 
         for (term, expected) in [
             ("无线局域网", "com.apple.wifi-settings-extension"),
@@ -438,6 +445,127 @@ final class LauncherSmoke {
         print("Unified actions passed: real background app launch, routed Settings URLs, isolated file copies, and native local Quick Look input")
     }
 
+    private func verifyInlineTranslation(_ app: AppDelegate) async throws {
+        let mdl = app.translation
+        let originalPanel = app.panel
+        let backdrop = originalPanel.contentView
+        guard let local = mdl.provider, local.name == "oMLX", local.endpoint == "http://127.0.0.1:8000/v1",
+              mdl.activity == nil else { throw Failure("inline translation lost the oMLX preset") }
+        app.showSearch()
+        try type("翻译", into: app)
+        guard case .action(let action)? = app.model.selectedResult, action.destination == .translation else {
+            throw Failure("translation did not appear in search")
+        }
+        try key(kVK_Return, "\r", in: app)
+        try await until("translation editor did not receive keyboard focus") {
+            app.panel.firstResponder is TranslationTextView
+        }
+        try check(app.isTranslatingInSearch && app.searchPresented && app.panel === originalPanel &&
+                  app.panel.contentView === backdrop && app.settings == nil,
+                  "translation replaced the search window or opened a separate panel")
+        let windows = Set(NSApp.windows.map(ObjectIdentifier.init))
+        try key(kVK_ANSI_Comma, ",", in: app, throughPanel: true, flags: [.command])
+        guard let settings = app.settings else { throw Failure("missing shared Settings window") }
+        try check(app.settingsSession.page == .translation && !app.searchPresented &&
+                  Set(NSApp.windows.map(ObjectIdentifier.init)).subtracting(windows) == [ObjectIdentifier(settings)],
+                  "translation configuration did not open the shared window")
+        let endpoint = try String(contentsOf: directory.appendingPathComponent("translation-endpoint"), encoding: .utf8)
+        mdl.newProvider()
+        mdl.editDraft(\.name, value: "Synthetic Translation Provider")
+        mdl.editDraft(\.endpoint, value: endpoint + "/translated/v1")
+        mdl.editDraft(\.model, value: "sandbox-model")
+        mdl.keyInput = "synthetic-smoke-key"
+        try check(mdl.draft.name == "Synthetic Translation Provider", "editing the provider lost its name")
+        mdl.saveProvider()
+        guard let saved = mdl.provider else { throw Failure("translation provider was not saved") }
+        mdl.source = .simplifiedChinese
+        mdl.target = .english
+        let restored = makeTranslationModel()
+        try check(mdl.status == .saved && mdl.keyInput.isEmpty && mdl.activity == nil,
+                  "the configured provider was not saved or made a request (\(String(describing: mdl.status)))")
+        try check(restored.provider == saved, "saved provider was not restored")
+        try check(restored.providers.contains(local), "the original oMLX preset was not retained")
+        try check(restored.source == .simplifiedChinese && restored.target == .english,
+                  "the configured languages did not persist")
+        let savedEndpoint = try TranslationEndpoint(saved.endpoint)
+        try check(translationSecrets.key(provider: saved.id, endpoint: savedEndpoint) == "synthetic-smoke-key",
+                  "saving from unified Settings changed the endpoint-bound credential")
+        try check(!exists("translation-request-started"), "configuring translation made a request")
+
+        app.showSearch()
+        try key(kVK_ANSI_Comma, ",", in: app, throughPanel: true, flags: [.command])
+        try check(app.settings === settings, "ordinary Settings opened another window after deep link")
+        app.settingsSession.page = .quicklinks
+        settings.contentView?.layoutSubtreeIfNeeded()
+        #if LUMEN_EXTENSIONS
+        app.settingsSession.page = .extensions
+        settings.contentView?.layoutSubtreeIfNeeded()
+        #endif
+        app.settingsSession.page = .translation
+        try check(app.settings === settings && mdl.provider == saved && !settings.isVisible,
+                  "Settings navigation replaced the window or provider")
+        app.showSearch()
+        try type("Translate", into: app)
+        try key(kVK_Return, "\r", in: app)
+        try await until("English action did not focus inline editor") { app.panel.firstResponder is TranslationTextView }
+        guard let input = app.panel.firstResponder as? TranslationTextView else { throw Failure("missing inline editor") }
+        let text = "这是用于验收的中文输入。我们在同一窗口测试翻译和文件搜索，不为输入内容自动发送请求。这里还包含一段较长的中文文字，确保多行输入、滚动和目标语言提示都能在浅色和深色界面中使用。"
+        input.setMarkedText("zhong", selectedRange: NSRange(location: 5, length: 0),
+                            replacementRange: NSRange(location: NSNotFound, length: 0))
+        try check(input.hasMarkedText(), "could not exercise marked text in native translation input")
+        let submit = try event(kVK_Return, "\r", in: app, flags: [.command])
+        try check(!app.panel.performKeyEquivalent(with: submit) && mdl.activity == nil,
+                  "Command–Return submitted while Chinese text was being composed")
+        input.insertText(text, replacementRange: input.markedRange())
+        input.insertNewline(nil)
+        input.insertText("第二行。", replacementRange: NSRange(location: NSNotFound, length: 0))
+        try check(mdl.input == text + "\n第二行。" && !exists("translation-request-started"),
+                  "native multiline input changed or sent a request")
+        try check(app.panel.performKeyEquivalent(with: submit), "Command–Return did not reach translation")
+        try await until("explicit translation did not return the loopback result") {
+            mdl.output == "A synthetic result.\nSecond line." && mdl.activity == nil
+        }
+        app.copyTranslation(mdl.output)
+        try check(filePasteboard.string(forType: .string) == mdl.output, "copy did not publish the current result")
+        if exists("capture-icons") {
+            try capture("lumen-translation-light.png", appearance: .aqua, window: originalPanel)
+            try capture("lumen-translation-dark.png", appearance: .darkAqua, window: originalPanel)
+            originalPanel.appearance = nil
+        }
+
+        input.selectAll(nil)
+        input.insertText("模拟错误", replacementRange: NSRange(location: NSNotFound, length: 0))
+        try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
+        try await until("provider errors were lost or left an old result actionable") {
+            mdl.status == .failure(.http(401)) && mdl.output.isEmpty && mdl.activity == nil &&
+                app.isTranslatingInSearch && app.panel.firstResponder === input
+        }
+
+        input.selectAll(nil)
+        input.insertText("取消翻译", replacementRange: NSRange(location: NSNotFound, length: 0))
+        try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
+        try await until("slow loopback request did not start") {
+            mdl.activity == .translating && self.exists("translation-slow-started")
+        }
+        if exists("capture-icons") {
+            try capture("lumen-translation-running.png", appearance: .aqua, window: originalPanel)
+            originalPanel.appearance = nil
+        }
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        _ = try editor(app)
+        try check(mdl.activity == nil && mdl.input.isEmpty && mdl.output.isEmpty &&
+                  app.searchPresented && !app.isTranslatingInSearch && app.panel === originalPanel &&
+                  app.model.query.isEmpty && !originalPanel.isVisible && !NSApp.isActive,
+                  "Escape did not cancel and restore the original search responder")
+        try type("lumen action probe", into: app)
+        try await until("normal search did not recover after cancel") {
+            app.model.selectedResult?.id != nil && !app.isTranslatingInSearch
+        }
+        try await until("the fixture did not attempt the late reply") { self.exists("translation-slow-replied") }
+        try check(mdl.output.isEmpty, "a canceled provider reply updated the restored search")
+        print("Inline translation passed: Chinese marked text, same panel, Settings deep link, saved provider, copy, provider error, Escape, and late reply")
+    }
+
     private func verifyQuicklinks(_ app: AppDelegate) async throws {
         let model = app.model
         func actionName() -> String? {
@@ -458,7 +586,7 @@ final class LauncherSmoke {
         try type("lap", into: app)
         try await until("the app was ready to pin") { actionName() == "Lumen Action Probe" }
         try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
-        try check(app.contextActions.items.map(\.id) == ["open", "pin-app", "quicklinks"],
+        try check(app.contextActions.items.map(\.id) == ["open", "pin-app"],
                   "Command–K did not expose the selected app's actions")
         try key(kVK_DownArrow, "\u{f701}", in: app)
         try key(kVK_Return, "\r", in: app)
@@ -471,11 +599,16 @@ final class LauncherSmoke {
         try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
         try check(!app.contextActions.isOpen && app.searchPresented, "Escape dismissed search instead of closing its action list")
         try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
-        try key(kVK_DownArrow, "\u{f701}", in: app)
-        try key(kVK_DownArrow, "\u{f701}", in: app)
-        try key(kVK_Return, "\r", in: app)
-        try check(app.quicklinksWindow != nil && app.quicklinksWindow?.isVisible == false,
-                  "the contextual Quicklinks action failed to open the isolated editor")
+        try check(app.contextActions.items.map(\.id) == ["open", "toggle-pin"],
+                  "actions for a pinned shortcut offered unrelated configuration")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try key(kVK_ANSI_Comma, ",", in: app, throughPanel: true, flags: [.command])
+        guard let settings = app.settings else { throw Failure("Settings did not open") }
+        app.settingsSession.page = .quicklinks
+        let reopenedLibrary = ShortcutLibrary(defaults: shortcutFixturePreferences)
+        try check(app.settings === settings && reopenedLibrary.entries.contains(pinned) &&
+                  model.shortcuts.entries == reopenedLibrary.entries && !settings.isVisible,
+                  "Quicklinks settings did not reuse the Settings window and library")
 
         let url = URL(string: "https://example.invalid/work")!
         try check(SavedShortcut.webURL("javascript:alert(1)") == nil &&
@@ -697,11 +830,13 @@ final class LauncherSmoke {
                 model.selectedHit?.matched_by == "text"
         }
         let bodySelection = model.selection
+        let bodyResponder = try editor(app)
         try signal("finish-late-name")
         try await until("late strong names ranked first without moving selection") {
             !model.searching && model.hits.first?.name == "late lexical delivery.md" &&
                 model.selection == bodySelection
         }
+        try check(app.panel.firstResponder === bodyResponder, "late lexical delivery stole the search field focus")
         let latestSelection = model.selection
 
         try type("obsolete", into: app)
@@ -861,7 +996,7 @@ final class LauncherSmoke {
         try check(session.hasChanges && model.savedScope == original && watchLaunches() == initialWatchStarts &&
                   !model.scopePending && model.canSearch,
                   "a draft changed the active index or watcher")
-        session.page = .about
+        session.page = .advanced
         chosenDiagnosticFile = file
         app.chooseDiagnosticFile()
         try await until("the signed CLI diagnosed the explicitly selected synthetic file") {
@@ -878,7 +1013,7 @@ final class LauncherSmoke {
             !model.searching && model.selectedHit?.name == "protected-neighbor.md"
         }
         try check(!exists("metadata-only-body-started"), "metadata-only scope launched a text query")
-        session.page = .about
+        session.page = .advanced
         try check(session.canRebuild, "advanced maintenance did not recognize a saved scope")
         model.rebuildSavedIndex()
         try await until("rebuild used the saved scope and resumed watch") {
@@ -898,7 +1033,7 @@ final class LauncherSmoke {
         }
         try check(model.canSearch && model.hits.isEmpty,
                   "a selected child overrode its excluded parent")
-        session.page = .about
+        session.page = .advanced
         chosenDiagnosticFile = file
         app.chooseDiagnosticFile()
         try await until("file diagnostics reflected the newly saved exclusion") {
@@ -914,7 +1049,7 @@ final class LauncherSmoke {
             model.watchState == .failed &&
                 model.launcherActivityTitle == model.t("文件监听已停止", "File watching stopped")
         }
-        print("Settings smoke passed (four pages, shortcut, draft, exact-scope rebuild, Apply, and file diagnostics)")
+        print("Settings smoke passed (shared window, shortcut, draft, exact-scope rebuild, Apply, and file diagnostics)")
     }
 
     private func captureSettings(_ window: NSPanel, session: SettingsSession) async throws {
@@ -1052,13 +1187,15 @@ final class LauncherSmoke {
                   "direct hits were delayed or replaced by the optional lane")
         try key(kVK_DownArrow, "\u{f701}", in: app)
         let selected = model.selection
+        let responder = try editor(app)
         try signal("finish-semantic-enrichment")
         try await until("bounded related excerpts appended") {
             model.hits.filter(\.isSemanticCandidate).count == 3 && !model.semanticBusy
         }
         try check(Array(model.hits.prefix(direct.count)).map(\.path) == direct && model.selection == selected &&
-                  Set(model.hits.map(\.path)).count == model.hits.count && app.panel.frame == frame,
-                  "related excerpts duplicated results, changed direct rank, stole selection, or resized the panel")
+                  Set(model.hits.map(\.path)).count == model.hits.count && app.panel.frame == frame &&
+                  app.panel.firstResponder === responder,
+                  "related excerpts duplicated results, changed direct rank, focus, selection, or panel size")
         guard let hit = model.hits.first(where: { $0.name == "notes.md" && $0.isSemanticCandidate })
         else { throw Failure("missing Gemma candidate") }
         try check(model.relatedExcerptsLabel == "相关原文", "candidate label did not say related excerpts")
@@ -1227,14 +1364,17 @@ final class LauncherSmoke {
         let model = app.model
         let catalog = app.externalVolumes
         try await until("the synthetic main index is available") { model.canSearch }
-        guard let menu = app.statusMenu?.items.first(where: { $0.action == #selector(AppDelegate.showExternalVolumes) }),
+        guard let menu = app.statusMenu?.items.first(where: { $0.action == #selector(AppDelegate.showSettings) }),
               let action = menu.action
-        else { throw Failure("external volumes menu item is missing") }
-        try check(NSApp.sendAction(action, to: menu.target, from: menu), "external volumes menu did not open")
+        else { throw Failure("settings menu item is missing") }
+        try check(NSApp.sendAction(action, to: menu.target, from: menu), "Settings menu did not open")
+        app.settingsSession.page = .index
+        app.settings?.contentView?.layoutSubtreeIfNeeded()
         try await until("eligible volume was listed") { !catalog.refreshing && catalog.volumes.count == 1 }
         guard let offered = catalog.volumes.first else { throw Failure("eligible volume list was empty") }
         try check(offered.available && !offered.indexed && !offered.needs_refresh, "new volume was not opt-in")
 
+        app.showSearch()
         try type("external-volume-fixture", into: app)
         try await until("unregistered volume remained hidden") { !model.searching }
         try check(model.hits.isEmpty, "unregistered external volume appeared")
@@ -1473,5 +1613,25 @@ final class LauncherSmoke {
     private struct Failure: Error, CustomStringConvertible {
         let description: String
         init(_ description: String) { self.description = description }
+    }
+}
+
+private final class SmokeTranslationSecrets: TranslationSecrets, @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [UUID: (endpoint: TranslationEndpoint, key: String)] = [:]
+
+    func key(provider: UUID, endpoint: TranslationEndpoint) -> String? {
+        lock.withLock {
+            guard let saved = values[provider], saved.endpoint == endpoint else { return nil }
+            return saved.key
+        }
+    }
+
+    func save(_ key: String, provider: UUID, endpoint: TranslationEndpoint) {
+        lock.withLock { values[provider] = (endpoint, key) }
+    }
+
+    func remove(provider: UUID) {
+        lock.withLock { _ = values.removeValue(forKey: provider) }
     }
 }

@@ -269,7 +269,18 @@ final class LumenExtensionPanelModel: ObservableObject {
 
 struct LumenExtensionPanel: View {
     @AppStorage("language") private var language = "system"
-    @StateObject private var model = LumenExtensionPanelModel()
+    @ObservedObject var model: LumenExtensionPanelModel
+    var chinese: (() -> Bool)?
+    var parentWindow: () -> NSWindow? = { nil }
+
+    init() { self.init(model: LumenExtensionPanelModel()) }
+
+    init(model: LumenExtensionPanelModel,
+         chinese: (() -> Bool)? = nil, parentWindow: @escaping () -> NSWindow? = { nil }) {
+        self.model = model
+        self.chinese = chinese
+        self.parentWindow = parentWindow
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -296,16 +307,13 @@ struct LumenExtensionPanel: View {
             }
         }
         .padding(20)
-        .frame(minWidth: 580, minHeight: 360)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text(t("Raycast 扩展", "Raycast Extensions"))
-                    .font(.title2.weight(.semibold))
-                    .accessibilityAddTraits(.isHeader)
-                Spacer()
+                Spacer(minLength: 0)
                 if let package = model.package {
                     Button(t("刷新", "Refresh")) { Task { await model.load(package) } }
                         .disabled(model.choosingPackage || model.busy != nil)
@@ -508,16 +516,18 @@ struct LumenExtensionPanel: View {
         panel.canCreateDirectories = false
         panel.resolvesAliases = false
         panel.canDownloadUbiquitousContents = false
-        panel.begin { response in
+        let finish: (NSApplication.ModalResponse) -> Void = { response in
             model.choosingPackage = false
             guard response == .OK, let package = panel.url else { return }
             Task { await model.load(package) }
         }
+        if let window = parentWindow() { panel.beginSheetModal(for: window, completionHandler: finish) }
+        else { panel.begin(completionHandler: finish) }
     }
 
     private func t(_ cn: String, _ en: String) -> String {
-        let chinese = language == "zh"
-            || (language == "system" && Locale.preferredLanguages.first?.hasPrefix("zh") == true)
-        return chinese ? cn : en
+        let useChinese = chinese?() ?? (language == "zh"
+            || (language == "system" && Locale.preferredLanguages.first?.hasPrefix("zh") == true))
+        return useChinese ? cn : en
     }
 }

@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SearchWindow: View {
     @ObservedObject var model: Launcher
@@ -76,10 +77,12 @@ struct SearchWindow: View {
             } else {
                 keyHint("esc", model.t("关闭", "Close"))
             }
-            Button(action: toggleContextActions) {
-                keyHint("⌘K", model.t("操作", "Actions"))
+            if model.selectedResult != nil {
+                Button(action: toggleContextActions) {
+                    keyHint("⌘K", model.t("操作", "Actions"))
+                }
+                .buttonStyle(.borderless)
             }
-            .buttonStyle(.borderless)
             Button(action: showSettings) {
                 Image(systemName: "gearshape").font(.system(size: 12))
             }
@@ -243,12 +246,7 @@ struct SearchWindow: View {
     private func resultRow(_ hit: SearchHit) -> some View {
         let selected = model.selection == hit.path
         return HStack(spacing: 10) {
-            Image(systemName: hit.kind == "directory" ? "folder" : "doc.text")
-                .font(.system(size: 14, weight: .medium))
-                .foregroundStyle(selected ? Color.accentColor : .secondary)
-                .frame(width: 28, height: 28)
-                .background(.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 6))
-                .accessibilityHidden(true)
+            FileTypeIcon(name: hit.name, directory: hit.kind == "directory")
             VStack(alignment: .leading, spacing: 1) {
                 Text(hit.name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
                 let parent = (hit.path as NSString).deletingLastPathComponent as NSString
@@ -308,6 +306,30 @@ struct SearchWindow: View {
         }
     }
 
+}
+
+// Use type artwork without opening or requesting an icon from the indexed path.
+@MainActor
+private struct FileTypeIcon: View {
+    let name: String
+    let directory: Bool
+    private static var icons: [UTType: NSImage] = [:]
+
+    private var artwork: NSImage {
+        let ext = (name as NSString).pathExtension
+        let type: UTType = directory ? .folder
+            : (ext.isEmpty ? .data : UTType(filenameExtension: ext) ?? .data)
+        if let cached = Self.icons[type] { return cached }
+        let icon = NSWorkspace.shared.icon(for: type)
+        if Self.icons.count < 96 { Self.icons[type] = icon }
+        return icon
+    }
+
+    var body: some View {
+        Image(nsImage: artwork).resizable().scaledToFit()
+            .frame(width: 28, height: 28)
+            .accessibilityHidden(true)
+    }
 }
 
 private struct ActionResultIcon: View {
@@ -391,16 +413,24 @@ extension Launcher {
 }
 
 enum SettingsPage: String, CaseIterable, Identifiable {
-    case general, index, background, about
+    case general, index, quicklinks, translation
+    #if LUMEN_EXTENSIONS
+    case extensions
+    #endif
+    case advanced
 
     var id: Self { self }
 
     @MainActor func title(_ model: Launcher) -> String {
         switch self {
-        case .general: return model.t("常规", "General")
+        case .general: return model.t("通用与快捷键", "General & Shortcuts")
         case .index: return model.t("索引与隐私", "Index & Privacy")
-        case .background: return model.t("后台任务", "Background")
-        case .about: return model.t("关于与诊断", "About & Diagnostics")
+        case .quicklinks: return model.t("快捷链接", "Quicklinks")
+        case .translation: return model.t("翻译", "Translation")
+        #if LUMEN_EXTENSIONS
+        case .extensions: return model.t("扩展", "Extensions")
+        #endif
+        case .advanced: return model.t("高级与诊断", "Advanced & Diagnostics")
         }
     }
 
@@ -408,8 +438,12 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         switch self {
         case .general: return "gearshape"
         case .index: return "folder.badge.gearshape"
-        case .background: return "arrow.triangle.2.circlepath"
-        case .about: return "info.circle"
+        case .quicklinks: return "link"
+        case .translation: return "character.bubble"
+        #if LUMEN_EXTENSIONS
+        case .extensions: return "puzzlepiece.extension"
+        #endif
+        case .advanced: return "waveform.path.ecg"
         }
     }
 }
@@ -437,10 +471,16 @@ enum ScopeFolders {
 @MainActor
 final class SettingsSession: ObservableObject {
     let model: Launcher
-    @Published var page: SettingsPage? = .general
+    private let pageChanged: (SettingsPage?, SettingsPage?) -> Void
+    @Published var page: SettingsPage? = .general {
+        didSet { if page != oldValue { pageChanged(oldValue, page) } }
+    }
     @Published private(set) var draft: IndexScope?
 
-    init(model: Launcher) { self.model = model }
+    init(model: Launcher, pageChanged: @escaping (SettingsPage?, SettingsPage?) -> Void) {
+        self.model = model
+        self.pageChanged = pageChanged
+    }
 
     private var baseline: IndexScope {
         var scope = model.settingsScope
@@ -494,6 +534,10 @@ final class SettingsSession: ObservableObject {
 struct LauncherSettings: View {
     @ObservedObject var model: Launcher
     @ObservedObject var session: SettingsSession
+    let translation: TranslationPanelModel
+    let volumes: ExternalVolumeCatalog
+    let extensionContent: AnyView?
+    let chooseQuicklinkFolder: (@escaping (URL) -> Void) -> Void
     let recordShortcut: (NSEvent) -> Void
     let disableShortcut: () -> Void
     let chooseDirectories: (ScopeFolders) -> Void
@@ -507,31 +551,53 @@ struct LauncherSettings: View {
         HStack(spacing: 0) {
             sidebar
             VStack(spacing: 0) {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 19) {
-                        Text(page.title(model))
-                            .font(.system(size: 26, weight: .semibold))
-                            .accessibilityAddTraits(.isHeader)
-                        switch page {
-                        case .general: general
-                        case .index: indexAndPrivacy
-                        case .background: background
-                        case .about: about
+                switch page {
+                case .quicklinks:
+                    pageHeading.padding(.horizontal, 28).padding(.top, 26)
+                    QuicklinksView(model: model, library: model.shortcuts, chooseFolder: chooseQuicklinkFolder)
+                #if LUMEN_EXTENSIONS
+                case .extensions:
+                    pageHeading.padding(.horizontal, 28).padding(.top, 26)
+                    extensionContent
+                #endif
+                default:
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 19) {
+                            pageHeading
+                            switch page {
+                            case .general: general
+                            case .index: indexAndPrivacy
+                            case .translation:
+                                group(model.t("模型与提供商", "Model & Providers")) {
+                                    TranslationSettingsView(model: translation, chinese: model.zh)
+                                }
+                            case .advanced:
+                                background
+                                about
+                            default: EmptyView()
+                            }
                         }
+                        .frame(maxWidth: 640, alignment: .leading)
+                        .padding(.horizontal, 28)
+                        .padding(.vertical, 26)
+                        .frame(maxWidth: .infinity)
                     }
-                    .frame(maxWidth: 640, alignment: .leading)
-                    .padding(.horizontal, 28)
-                    .padding(.vertical, 26)
-                    .frame(maxWidth: .infinity)
                     .id(page)
+                    if page == .index { applyBar }
                 }
-                if page == .index { applyBar }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(nsColor: .windowBackgroundColor))
         }
         .frame(minWidth: 700, minHeight: 488)
         .labeledContentStyle(SettingsValueStyle())
+    }
+
+    private var pageHeading: some View {
+        Text(page.title(model))
+            .font(.system(size: 26, weight: .semibold))
+            .accessibilityAddTraits(.isHeader)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var sidebar: some View {
@@ -548,8 +614,8 @@ struct LauncherSettings: View {
                                 .frame(width: 20)
                             Text(item.title(model))
                                 .font(.system(size: 13, weight: selected ? .semibold : .medium))
-                                .lineLimit(1)
-                                .minimumScaleFactor(0.9)
+                                .lineLimit(2)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                         .foregroundStyle(.primary)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -662,6 +728,10 @@ struct LauncherSettings: View {
             folderRows(.exclude, empty: model.t("没有手动排除的目录。", "No folders excluded manually."))
         }
         .disabled(!session.canEditScope)
+        group(model.t("外置卷", "External Volumes")) {
+            LauncherExternalVolumes(launcher: model, catalog: volumes, changed: model.externalVolumesChanged)
+                .accessibilityIdentifier("settings.external-volumes")
+        }
         if let notice = model.indexNotice {
             NoticeView(model: model, notice: notice)
         }

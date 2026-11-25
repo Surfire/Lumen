@@ -212,7 +212,8 @@ struct QuicklinksView: View {
                         }
                     }
                 case .web:
-                    TextField("https://example.com", text: $destination)
+                    TextField(model.t("网页地址", "Website URL"), text: $destination,
+                              prompt: Text(verbatim: "https://example.com"))
                 }
                 Toggle(model.t("固定在空搜索页", "Pin to Empty Search"), isOn: $pinned)
                 HStack {
@@ -226,7 +227,6 @@ struct QuicklinksView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(minWidth: 530, minHeight: 440)
     }
 
     private func kindOf(_ shortcut: SavedShortcut) -> Kind {

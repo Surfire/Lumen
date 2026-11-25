@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the signed app's native controls using a synthetic corpus without desktop input."""
 import argparse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import plistlib
@@ -9,12 +10,64 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+from threading import Thread
+from time import sleep
 import struct
 import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 BUNDLE = ROOT / "target/Lumen.app/Contents"
 APP = BUNDLE / "MacOS/Lumen"
+
+class GuiTranslationFixture(BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+
+    def do_POST(self):
+        request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        source = request["messages"][1]["content"]
+        self.server.requests.append((self.path, request))
+        root = self.server.root
+        (root / "translation-request-started").touch()
+        assert self.headers["Authorization"] == "Bearer synthetic-smoke-key"
+        denied = source == "模拟错误"
+        slow = source == "取消翻译"
+        if slow:
+            (root / "translation-slow-started").touch()
+            sleep(1.2)
+        body = json.dumps({"choices": [{"message": {
+            "content": "Late reply" if slow else "A synthetic result.\nSecond line."
+        }, "finish_reason": "stop"}]}).encode()
+        try:
+            self.send_response(401 if denied else 200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        if slow:
+            (root / "translation-slow-replied").touch()
+
+
+def verify_gui_translation(root, language):
+    with ThreadingHTTPServer(("127.0.0.1", 0), GuiTranslationFixture) as server:
+        server.root = root
+        server.requests = []
+        worker = Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            (root / "translation-endpoint").write_text(f"http://127.0.0.1:{server.server_port}")
+            run(root, language)
+            assert len(server.requests) == 3, server.requests
+            for path, request in server.requests:
+                assert path == "/translated/v1/chat/completions"
+                assert request["model"] == "sandbox-model"
+                assert "Simplified Chinese into English" in request["messages"][0]["content"]
+            assert server.requests[0][1]["messages"][1]["content"].endswith("\n第二行。")
+        finally:
+            server.shutdown()
+            worker.join()
+
 
 FIXTURE_ENGINE = """#!/usr/bin/env python3
 import json
@@ -503,11 +556,11 @@ def main():
 
         if args.snapshots:
             (root / "capture-icons").touch()
-        run(root, "zh")
+        verify_gui_translation(root, "zh")
         if args.snapshots:
             args.snapshots.mkdir(parents=True, exist_ok=True)
-            for name in ("lumen-app-icon.png", "lumen-setting-icon.png"):
-                shutil.copyfile(root / name, args.snapshots / name)
+            for image in root.glob("lumen-*.png"):
+                shutil.copyfile(image, args.snapshots / image.name)
     with tempfile.TemporaryDirectory(prefix="lumen-gui-") as tmp:
         root = Path(tmp)
         make_corpus(root)

@@ -34,8 +34,8 @@ struct TranslationSmoke {
         model.source = .english
         model.target = .simplifiedChinese
         model.input = "A synthetic sentence."
-        model.draft.endpoint = fixture.url.absoluteString
-        model.draft.name = "Synthetic oMLX"
+        model.editDraft(\.endpoint, value: fixture.url.absoluteString)
+        model.editDraft(\.name, value: "Synthetic oMLX")
         model.keyInput = "synthetic-test-key"
         model.checkProvider(listModels: false)
         try await idle(model)
@@ -45,7 +45,7 @@ struct TranslationSmoke {
         model.checkProvider(listModels: true)
         try await idle(model)
         expect(model.availableModels == ["fixture-chat"], "model discovery")
-        model.draft.model = "fixture-chat"
+        model.editDraft(\.model, value: "fixture-chat")
         model.saveProvider()
         let first = model.selected
         expect(model.status == .saved && model.keyInput.isEmpty, "save and clear the editor secret")
@@ -53,7 +53,7 @@ struct TranslationSmoke {
         try await idle(model)
         expect(model.output == "一句合成示例。", "translation result")
 
-        model.draft.endpoint = base + "/changed/v1"
+        model.editDraft(\.endpoint, value: base + "/changed/v1")
         expect(!model.canRemoveKey && model.availableModels.isEmpty, "scope credentials and discovery to the endpoint")
         model.saveProvider()
         model.translate()
@@ -61,9 +61,9 @@ struct TranslationSmoke {
         expect(model.output == "未发送旧密钥。", "endpoint change never forwards the old key")
 
         model.newProvider()
-        model.draft.name = "Another Provider"
-        model.draft.endpoint = base + "/other/v1"
-        model.draft.model = "other-chat"
+        model.editDraft(\.name, value: "Another Provider")
+        model.editDraft(\.endpoint, value: base + "/other/v1")
+        model.editDraft(\.model, value: "other-chat")
         model.saveProvider()
         expect(model.providers.count == 2 && model.selected != first, "independent named profiles")
         model.translate()
@@ -72,16 +72,16 @@ struct TranslationSmoke {
         model.choose(first)
         expect(model.provider?.model == "fixture-chat", "switching preserves each provider model")
 
-        model.draft.endpoint = base + "/redirect/v1"
+        model.editDraft(\.endpoint, value: base + "/redirect/v1")
         model.checkProvider(listModels: true)
         try await idle(model)
         expect(model.status == .failure(.redirected), "reject server redirects")
-        model.draft.endpoint = base + "/denied/v1"
+        model.editDraft(\.endpoint, value: base + "/denied/v1")
         model.checkProvider(listModels: true)
         try await idle(model)
         expect(model.status == .failure(.http(401)), "sanitized unauthorized error")
 
-        model.draft.endpoint = base + "/slow/v1"
+        model.editDraft(\.endpoint, value: base + "/slow/v1")
         model.saveProvider()
         model.translate()
         try await Task.sleep(nanoseconds: 120_000_000)

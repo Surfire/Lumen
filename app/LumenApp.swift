@@ -22,7 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     let applicationIcons = ResultIconDisplay()
     let contextActions = ContextActions()
     private var contextUpdates: AnyCancellable?
-    private(set) var quicklinksWindow: NSPanel?
+    private var contextResultID: String?
     private let defaults: UserDefaults?
     private(set) lazy var globalHotKey = GlobalHotKey { [weak self] in self?.showSearch() }
     private var statusItem: NSStatusItem?
@@ -35,19 +35,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var presentationChange: AnyCancellable?
     private var presentationScheduled = false
     private var volumeChanges: AnyCancellable?
-    private var externalVolumesWindow: NSPanel?
     let externalVolumes: ExternalVolumeCatalog
+    let translation: TranslationPanelModel
+    private var translationContent: NSHostingView<TranslationPanel>?
+    var isTranslatingInSearch: Bool { translationContent != nil }
+    private var searchSubviews: [NSView] = []
+    #if LUMEN_EXTENSIONS
+    private let extensionModel = LumenExtensionPanelModel()
+    #endif
     private(set) var settings: NSPanel?
-    private(set) var translationWindow: NSPanel?
-    private(set) lazy var settingsSession = SettingsSession(model: model)
+    private(set) lazy var settingsSession = SettingsSession(model: model) { [weak self] oldPage, page in
+        guard let self else { return }
+        if oldPage == .translation { self.translation.endSettingsSession() }
+        if page == .index { self.externalVolumes.reload() }
+    }
     private var configuredKey: HotKey?
     private var actionInFlight = false
     private var previewPreparing = false
     private(set) var localPreview: LocalPreviewPanel?
     private(set) var searchPresented = false
-    #if LUMEN_EXTENSIONS
-    private var extensions: NSPanel?
-    #endif
 
     lazy var searchField: SearchField = {
         let field = SearchField()
@@ -81,7 +87,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         panel.delegate = self
         panel.onCancel = { [weak self] in self?.cancelCurrentPanelAction() }
         panel.onContextActions = { [weak self] in self?.toggleContextActions() }
-        panel.onSettings = { [weak self] in self?.showSettings() }
+        panel.onTranslationSubmit = { [weak self] in self?.submitTranslation() }
+        panel.onSettings = { [weak self] in
+            guard let self else { return }
+            if self.isTranslatingInSearch { self.showTranslationSettings() }
+            else { self.showSettings() }
+        }
         panel.onFileAction = { [weak self] action in
             guard let self, !self.contextActions.isOpen, let hit = self.model.selectedHit else { return }
             self.perform(action, on: hit)
@@ -127,6 +138,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         content.addSubview(searchField)
         content.addSubview(close)
         content.addSubview(results)
+        searchSubviews = [icon, searchField, close, results]
         panel.contentView = content
         panel.initialFirstResponder = searchField
         NSLayoutConstraint.activate([
@@ -154,7 +166,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     init(smoke: LauncherSmoke?) {
         self.smoke = smoke
-        defaults = smoke == nil ? .standard : nil
+        defaults = smoke != nil ? smoke?.shortcutFixturePreferences : .standard
         let resources = Bundle.main.resourceURL ?? Bundle.main.bundleURL.appendingPathComponent("Contents/Resources")
         let executable = smoke?.executable ?? resources.appendingPathComponent("lumen")
         let database = smoke?.database ?? FileManager.default.homeDirectoryForCurrentUser
@@ -163,6 +175,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                                     syntheticRoot: smoke?.corpus, gemmaHome: smoke?.gemmaHome)
         model = Launcher(engine: engine, defaults: defaults, locale: smoke?.language)
         externalVolumes = ExternalVolumeCatalog(engine: engine)
+        translation = smoke?.makeTranslationModel() ?? TranslationPanelModel()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -237,6 +250,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     func applicationWillTerminate(_ notification: Notification) {
         localPreview?.close()
+        translation.cancel()
         externalVolumes.stop()
         globalHotKey.close()
         model.close()
@@ -274,6 +288,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func focusSearch() {
+        if isTranslatingInSearch {
+            if let editor = panel.firstResponder as? TranslationTextView { panel.makeFirstResponder(editor) }
+            return
+        }
         panel.makeFirstResponder(searchField)
         searchField.refreshTextColor()
     }
@@ -287,6 +305,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     @objc func dismissSearch() {
         guard searchPresented else { return }
         searchPresented = false
+        leaveTranslation(returnToSearch: false)
         contextActions.close()
         // Release the field editor first so an earlier composition cannot be restored on reopen.
         panel.makeFirstResponder(nil)
@@ -300,8 +319,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     @objc func startBackgroundIndex() {
         if model.indexPhase == .ready, model.watchState == .needsSetup, model.savedScope == nil, !model.scopePending {
-            settingsSession.page = .index
-            showSettings()
+            presentSettings(page: .index)
             return
         }
         model.applyScope(model.settingsScope)
@@ -333,56 +351,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func cancelCurrentPanelAction() {
-        if contextActions.isOpen { contextActions.close() }
+        if isTranslatingInSearch { leaveTranslation(returnToSearch: true) }
+        else if contextActions.isOpen { contextActions.close() }
         else { dismissSearch() }
     }
 
     private func toggleContextActions() {
         if contextActions.isOpen { contextActions.close(); return }
+        guard let selected = model.selectedResult else { return }
+        contextResultID = selected.id
         var items: [ContextActions.Item] = []
         func item(_ id: String, _ zh: String, _ en: String, _ symbol: String, _ callback: @escaping () -> Void) {
-            items.append(.init(id: id, title: model.t(zh, en), symbol: symbol, perform: callback))
+            items.append(.init(id: id, title: model.t(zh, en), symbol: symbol) { [weak self] in
+                guard self?.model.selectedResult?.id == selected.id else { return }
+                callback()
+            })
         }
-        if let selected = model.selectedResult {
-            if case .calculation = selected {
-                item("copy", "复制结果", "Copy Result", "doc.on.doc") { [weak self] in self?.open(selected) }
-            } else if case .file(let hit) = selected, !hit.isLocal {
-                item("reveal", "在 Finder 中显示", "Show in Finder", "folder") { [weak self] in self?.revealInFinder(hit) }
-            } else {
-                item("open", "打开", "Open", "return") { [weak self] in self?.open(selected) }
-            }
+        if case .calculation = selected {
+            item("copy", "复制结果", "Copy Result", "doc.on.doc") { [weak self] in self?.open(selected) }
+        } else if case .file(let hit) = selected, !hit.isLocal {
+            item("reveal", "在 Finder 中显示", "Show in Finder", "folder") { [weak self] in self?.revealInFinder(hit) }
+        } else {
+            item("open", "打开", "Open", "return") { [weak self] in self?.open(selected) }
+        }
 
-            switch selected {
-            case .file(let hit):
-                if hit.isLocal { item("reveal", "在 Finder 中显示", "Show in Finder", "folder") { [weak self] in self?.revealInFinder(hit) } }
-                if hit.isLocal && hit.kind == "file" {
-                    item("preview", "快速查看", "Quick Look", "eye") { [weak self] in self?.previewFile(hit) }
-                }
-                item("copy-name", "复制名称", "Copy Name", "doc.on.doc") { [weak self] in self?.perform(.copyName, on: hit) }
-                item("copy-path", "复制路径", "Copy Path", "link") { [weak self] in self?.perform(.copyPath, on: hit) }
-                if hit.isLocal && hit.kind == "directory" {
-                    item("pin-folder", "固定项目文件夹", "Pin Project Folder", "pin") { [weak self] in
-                        guard let self else { return }
-                        self.model.resolve(hit, action: .open) { [weak self] url in
-                            self?.pin(title: hit.name, target: .folder(url.path))
-                        }
-                    }
-                }
-            case .action(let action):
-                if case .application = action.destination {
-                    item("pin-app", "固定应用", "Pin Application", "pin") { [weak self] in
-                        guard let self, self.model.containsCurrentAction(action) else { return }
-                        self.pin(title: action.title(chinese: self.model.zh), target: .application(action.id))
-                    }
-                }
-            case .shortcut(let shortcut):
-                item("toggle-pin", shortcut.pinned ? "取消固定" : "固定", shortcut.pinned ? "Unpin" : "Pin", "pin") { [weak self] in
-                    self?.model.shortcuts.togglePin(shortcut)
-                }
-            case .calculation: break
+        switch selected {
+        case .file(let hit):
+            if hit.isLocal { item("reveal", "在 Finder 中显示", "Show in Finder", "folder") { [weak self] in self?.revealInFinder(hit) } }
+            if hit.isLocal && hit.kind == "file" {
+                item("preview", "快速查看", "Quick Look", "eye") { [weak self] in self?.previewFile(hit) }
             }
+            item("copy-name", "复制名称", "Copy Name", "doc.on.doc") { [weak self] in self?.perform(.copyName, on: hit) }
+            item("copy-path", "复制路径", "Copy Path", "link") { [weak self] in self?.perform(.copyPath, on: hit) }
+            if hit.isLocal && hit.kind == "directory" {
+                item("pin-folder", "固定项目文件夹", "Pin Project Folder", "pin") { [weak self] in
+                    guard let self else { return }
+                    self.model.resolve(hit, action: .open) { [weak self] url in
+                        self?.pin(title: hit.name, target: .folder(url.path))
+                    }
+                }
+            }
+        case .action(let action):
+            if case .application = action.destination {
+                item("pin-app", "固定应用", "Pin Application", "pin") { [weak self] in
+                    guard let self, self.model.containsCurrentAction(action) else { return }
+                    self.pin(title: action.title(chinese: self.model.zh), target: .application(action.id))
+                }
+            }
+        case .shortcut(let shortcut):
+            item("toggle-pin", shortcut.pinned ? "取消固定" : "固定", shortcut.pinned ? "Unpin" : "Pin", "pin") { [weak self] in
+                self?.model.shortcuts.togglePin(shortcut)
+            }
+        case .calculation: break
         }
-        item("quicklinks", "管理快捷链接…", "Manage Quicklinks…", "link") { [weak self] in self?.showQuicklinks() }
         contextActions.show(items)
     }
 
@@ -395,7 +416,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func openSelection() {
-        if contextActions.isOpen { contextActions.run(); return }
+        if contextActions.isOpen {
+            if model.selectedResult?.id == contextResultID { contextActions.run() }
+            else { contextActions.close() }
+            return
+        }
         if let selected = model.selectedResult { open(selected) }
     }
 
@@ -539,68 +564,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
     }
 
-    @objc func showQuicklinks() {
-        loadApplicationCatalog()
-        if quicklinksWindow == nil {
-            let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 620, height: 520),
-                                 styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-            window.isReleasedWhenClosed = false
-            let view = QuicklinksView(model: model, library: model.shortcuts) { [weak self, weak window] complete in
-                guard let self, let window else { return }
-                if let smoke = self.smoke {
-                    if let folder = smoke.chosenQuicklinkFolder { complete(folder) }
-                    return
-                }
-                let picker = NSOpenPanel()
-                picker.canChooseDirectories = true
-                picker.canChooseFiles = false
-                picker.allowsMultipleSelection = false
-                picker.resolvesAliases = false
-                picker.beginSheetModal(for: window) { response in
-                    if response == .OK, let url = picker.url { complete(url) }
-                }
-            }
-            window.contentView = NSHostingView(rootView: view)
-            if smoke == nil { window.center() }
-            else { window.setFrameOrigin(NSPoint(x: -12_000, y: -12_000)) }
-            quicklinksWindow = window
+    private func chooseQuicklinkFolder(_ complete: @escaping (URL) -> Void) {
+        guard let settings else { return }
+        if let smoke {
+            if let folder = smoke.chosenQuicklinkFolder { complete(folder) }
+            return
         }
-        quicklinksWindow?.title = model.t("快捷链接", "Quicklinks")
-        if smoke == nil {
-            NSApp.activate()
-            quicklinksWindow?.makeKeyAndOrderFront(nil)
+        let picker = NSOpenPanel()
+        picker.canChooseDirectories = true
+        picker.canChooseFiles = false
+        picker.allowsMultipleSelection = false
+        picker.resolvesAliases = false
+        picker.beginSheetModal(for: settings) { response in
+            if response == .OK, let url = picker.url { complete(url) }
         }
-        if searchPresented { dismissSearch() }
     }
 
     func externalVolumeStateChanged() {
         model.externalVolumesChanged()
-        if externalVolumesWindow?.isVisible == true { externalVolumes.reload() }
+        if settings?.isVisible == true, settingsSession.page == .index { externalVolumes.reload() }
     }
 
-    @objc func showExternalVolumes() {
-        externalVolumes.reload()
-        if externalVolumesWindow == nil {
-            let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 540, height: 330),
-                                 styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-            window.isReleasedWhenClosed = false
-            window.hidesOnDeactivate = false
-            window.contentMinSize = NSSize(width: 480, height: 240)
-            window.contentView = NSHostingView(rootView: LauncherExternalVolumes(
-                launcher: model, catalog: externalVolumes,
-                changed: { [weak self] in self?.model.externalVolumesChanged() }
-            ))
-            if smoke == nil { window.center() }
-            externalVolumesWindow = window
-        }
-        externalVolumesWindow?.title = model.t("外置卷", "External Volumes")
-        if smoke == nil {
-            NSApp.activate()
-            externalVolumesWindow?.makeKeyAndOrderFront(nil)
-        }
-    }
+    @objc func showSettings() { presentSettings(page: nil) }
 
-    @objc func showSettings() {
+    func showTranslationSettings() { presentSettings(page: .translation) }
+
+    private func presentSettings(page: SettingsPage?) {
+        if let page, page != settingsSession.page { settingsSession.page = page }
+        else if settingsSession.page == .index, settings?.isVisible != true { externalVolumes.reload() }
         if smoke == nil { NSApp.activate() }
         if settings == nil {
             let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 770, height: 568),
@@ -609,9 +600,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             window.hidesOnDeactivate = false
             window.contentMinSize = NSSize(width: 700, height: 488)
             window.delegate = self
+            let extensionContent: AnyView?
+            #if LUMEN_EXTENSIONS
+            extensionContent = AnyView(LumenExtensionPanel(
+                model: extensionModel, chinese: { [weak self] in self?.model.zh ?? false },
+                parentWindow: { [weak window] in window }
+            ))
+            #else
+            extensionContent = nil
+            #endif
             window.contentView = NSHostingView(rootView: LauncherSettings(
                 model: model,
                 session: settingsSession,
+                translation: translation,
+                volumes: externalVolumes,
+                extensionContent: extensionContent,
+                chooseQuicklinkFolder: { [weak self] in self?.chooseQuicklinkFolder($0) },
                 recordShortcut: { [weak self] in self?.recordShortcut($0) },
                 disableShortcut: { [weak self] in self?.disableShortcut() },
                 chooseDirectories: { [weak self] in self?.chooseSettingsDirectories($0) },
@@ -672,53 +676,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     func windowWillClose(_ notification: Notification) {
         if let localPreview, (notification.object as? NSWindow) === localPreview { self.localPreview = nil }
-        if let translationWindow, (notification.object as? NSWindow) === translationWindow {
-            translationWindow.contentView = nil
-            self.translationWindow = nil
-        }
         if let settings, (notification.object as? NSWindow) === settings {
             settings.makeFirstResponder(nil)
+            translation.endSettingsSession()
             model.clearFileDiagnosis()
         }
     }
 
     @objc func showTranslation() {
-        if translationWindow == nil {
-            let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 680, height: 590),
-                                 styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-            window.isReleasedWhenClosed = false
-            window.hidesOnDeactivate = false
-            window.contentMinSize = NSSize(width: 600, height: 495)
-            window.delegate = self
-            window.contentView = NSHostingView(rootView: TranslationPanel())
-            if smoke == nil { window.center() }
-            else { window.setFrameOrigin(NSPoint(x: -12_000, y: -12_000)) }
-            translationWindow = window
-        }
-        translationWindow?.title = model.t("Lumen 翻译", "Lumen Translation")
-        if searchPresented { dismissSearch() }
-        if smoke == nil {
-            NSApp.activate()
-            translationWindow?.makeKeyAndOrderFront(nil)
-        }
+        if !searchPresented { showSearch() }
+        guard translationContent == nil, let backdrop = panel.contentView else { return }
+        contextActions.close()
+        panel.makeFirstResponder(nil)
+        searchField.stringValue = ""
+        model.clear()
+        let content = NSHostingView(rootView: translationView())
+        content.translatesAutoresizingMaskIntoConstraints = false
+        content.sizingOptions = []
+        translationContent = content
+        panel.inTranslation = true
+        searchSubviews.forEach { $0.isHidden = true }
+        updatePresentation()
+        backdrop.addSubview(content)
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: backdrop.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: backdrop.trailingAnchor),
+            content.topAnchor.constraint(equalTo: backdrop.topAnchor),
+            content.bottomAnchor.constraint(equalTo: backdrop.bottomAnchor)
+        ])
+        backdrop.layoutSubtreeIfNeeded()
     }
 
-    #if LUMEN_EXTENSIONS
-    @objc private func showExtensions() {
-        if extensions == nil {
-            let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 640, height: 500),
-                                 styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-            window.isReleasedWhenClosed = false
-            window.hidesOnDeactivate = false
-            window.contentView = NSHostingView(rootView: LumenExtensionPanel())
-            window.center()
-            extensions = window
-        }
-        extensions?.title = model.t("Lumen 扩展", "Lumen Extensions")
-        NSApp.activate()
-        extensions?.makeKeyAndOrderFront(nil)
+    private func translationView() -> TranslationPanel {
+        TranslationPanel(model: translation, chinese: model.zh, back: { [weak self] in
+            self?.leaveTranslation(returnToSearch: true)
+        }, openSettings: { [weak self] in
+            self?.showTranslationSettings()
+        }, submit: { [weak self] in
+            self?.submitTranslation()
+        }, copyOutput: { [weak self] in
+            self?.copyTranslation($0)
+        })
     }
-    #endif
+
+    func copyTranslation(_ text: String) {
+        guard isTranslatingInSearch, !text.isEmpty, text == translation.output else { return }
+        let pasteboard = smoke?.filePasteboard ?? .general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+    }
+
+    private func submitTranslation() {
+        guard isTranslatingInSearch,
+              (panel.firstResponder as? NSTextView)?.hasMarkedText() != true else { return }
+        translation.translate()
+    }
+
+    private func leaveTranslation(returnToSearch: Bool) {
+        guard let content = translationContent else { return }
+        panel.makeFirstResponder(nil)
+        content.removeFromSuperview()
+        translationContent = nil
+        panel.inTranslation = false
+        translation.endSession()
+        searchSubviews.forEach { $0.isHidden = false }
+        if returnToSearch {
+            focusSearch()
+            updatePresentation()
+        }
+    }
 
     func recordShortcut(_ event: NSEvent) {
         do {
@@ -762,7 +788,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         updateStatusMenu()
         installEditMenu()
         settings?.title = model.t("Lumen 设置", "Lumen Settings")
-        externalVolumesWindow?.title = model.t("外置卷", "External Volumes")
+        translationContent?.rootView = translationView()
     }
 
     private func updateSearchField() {
@@ -781,12 +807,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         metricsItem = menu.addItem(withTitle: "", action: nil, keyEquivalent: "")
         menu.addItem(.separator())
         menu.addItem(withTitle: model.t("翻译…", "Translate…"), action: #selector(showTranslation), keyEquivalent: "").target = self
-        #if LUMEN_EXTENSIONS
-        menu.addItem(withTitle: model.t("扩展…", "Extensions…"), action: #selector(showExtensions), keyEquivalent: "").target = self
-        #endif
-        menu.addItem(withTitle: model.t("快捷链接…", "Quicklinks…"), action: #selector(showQuicklinks), keyEquivalent: "").target = self
-        menu.addItem(withTitle: model.t("外置卷…", "External Volumes…"),
-                     action: #selector(showExternalVolumes), keyEquivalent: "").target = self
         menu.addItem(withTitle: model.t("设置…", "Settings…"), action: #selector(showSettings), keyEquivalent: "").target = self
         menu.addItem(.separator())
         menu.addItem(withTitle: model.t("退出 Lumen", "Quit Lumen"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "").target = NSApp
@@ -826,8 +846,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
         }
         guard searchPresented else { return }
+        if contextActions.isOpen, model.selectedResult?.id != contextResultID { contextActions.close() }
         var frame = panel.frame
-        let height = SearchWindow.height(for: model, contextCount: contextActions.items.count)
+        let height = isTranslatingInSearch
+            ? CGFloat(464)
+            : SearchWindow.height(for: model, contextCount: contextActions.items.count)
         guard frame.height != height else { return }
         frame.origin.y += frame.height - height
         frame.size.height = height
@@ -913,6 +936,8 @@ final class SearchPanel: NSPanel {
     var onCancel: (() -> Void)?
     var onFileAction: ((FileAction) -> Void)?
     var onContextActions: (() -> Void)?
+    var onTranslationSubmit: (() -> Void)?
+    var inTranslation = false
     var onSettings: (() -> Void)?
     override var canBecomeKey: Bool { true }
 
@@ -920,9 +945,14 @@ final class SearchPanel: NSPanel {
         let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
         guard event.type == .keyDown, (firstResponder as? NSTextView)?.hasMarkedText() != true else { return false }
         let key = event.charactersIgnoringModifiers?.lowercased()
+        if modifiers == [.command], key == "," { onSettings?(); return true }
+        if inTranslation {
+            guard modifiers == [.command], event.keyCode == kVK_Return || event.keyCode == kVK_ANSI_KeypadEnter else { return false }
+            onTranslationSubmit?()
+            return true
+        }
         if modifiers == [.command] {
-            if key == "," { onSettings?() }
-            else if key == "y" { onFileAction?(.preview) }
+            if key == "y" { onFileAction?(.preview) }
             else if key == "k" { onContextActions?() }
             else if event.keyCode == kVK_Return || event.keyCode == kVK_ANSI_KeypadEnter { onFileAction?(.reveal) }
             else { return false }

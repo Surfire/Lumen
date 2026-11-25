@@ -139,7 +139,8 @@ final class ShortcutLibrary: ObservableObject {
         }
         if shortcut.queryParameter != nil {
             guard let link = shortcut.queryLink else { return .invalid }
-            if LumenCommandCatalog.isBuiltInAlias(link.keyword, includeOptionalLinks: includeOptionalLinks)
+            let keepsAlias = entries.first(where: { $0.id == shortcut.id })?.alias.lowercased() == link.keyword
+            if (!keepsAlias && LumenCommandCatalog.isBuiltInAlias(link.keyword, includeOptionalLinks: includeOptionalLinks))
                 || entries.contains(where: { $0.id != shortcut.id && $0.queryLink?.keyword == link.keyword }) {
                 return .aliasInUse(link.keyword)
             }

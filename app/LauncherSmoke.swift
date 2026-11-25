@@ -1453,17 +1453,22 @@ final class LauncherSmoke {
         try type("map 示例", into: app)
         try check(app.commands.resolution == .search, "disabling built-ins did not restore normal search")
 
-        let internalWiki = internalLink(" WiKi ")
+        var internalWiki = internalLink(" WiKi ")
         try check(model.shortcuts.saveResult(internalWiki) == .saved,
                   "could not save a custom alias while its built-in was disabled")
         model.shortcuts.includeOptionalLinks = true
+        internalWiki.title = "Internal Wiki Search"
+        try check(model.shortcuts.saveResult(internalWiki) == .saved,
+                  "could not edit the existing wiki shortcut after enabling its built-in")
+        let savedWiki = ShortcutLibrary(defaults: shortcutFixturePreferences).entries.first { $0.id == internalWiki.id }
+        try check(savedWiki?.title == internalWiki.title, "the updated wiki title was not persisted")
         try type("wiki 示例", into: app)
         guard case .web(let wikiID, let wikiTitle, let wikiURL) = app.commands.resolution else {
-            throw Failure("existing wiki shortcut disappeared when built-ins were enabled")
+            throw Failure("the edited wiki shortcut disappeared when built-ins were enabled")
         }
         try check(wikiID == internalWiki.rowID && wikiTitle == internalWiki.title &&
                   wikiURL.absoluteString == "https://example.invalid/work?term=%E7%A4%BA%E4%BE%8B",
-                  "enabling built-ins redirected the existing wiki shortcut")
+                  "the edited wiki shortcut did not retain its title and destination")
         try type("?", into: app)
         try check(app.commands.entries.filter { $0.keyword == "wiki" }.map(\.commandID) == [internalWiki.rowID],
                   "discovery did not preserve the custom wiki shortcut as the only wiki alias")

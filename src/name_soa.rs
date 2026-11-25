@@ -5,6 +5,7 @@ use crate::{
     query::{Kind, Terms},
 };
 use std::{
+    borrow::Cow,
     cmp::{Ordering, Reverse},
     collections::{BinaryHeap, HashMap},
     mem::size_of,
@@ -106,12 +107,22 @@ impl PostingList {
     }
 }
 
+// NFKC and lowercase leave Greek final sigma distinct; FTS5 folds it to σ.
+// Fold the postings without changing the stored spellings used for ranking.
+fn fold_sigma(text: &str) -> Cow<'_, str> {
+    if text.contains('ς') {
+        Cow::Owned(text.replace('ς', "σ"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
 #[derive(Default)]
 struct Postings(HashMap<[u8; 3], PostingList>);
 
 impl Postings {
     fn add(&mut self, text: &str, id: usize, budget: &mut usize) {
-        for gram in text.as_bytes().windows(3) {
+        for gram in fold_sigma(text).as_bytes().windows(3) {
             let list = self.0.entry(gram.try_into().unwrap()).or_default();
             if list.count == 0 {
                 // Approximate hash table bucket and allocator slack.
@@ -123,7 +134,7 @@ impl Postings {
 
     fn rarest(&self, query: &str) -> Option<&PostingList> {
         let mut shortest: Option<&PostingList> = None;
-        for gram in query.as_bytes().windows(3) {
+        for gram in fold_sigma(query).as_bytes().windows(3) {
             let list = self.0.get(<&[u8; 3]>::try_from(gram).unwrap())?;
             if shortest.is_none_or(|prior| list.count < prior.count) {
                 shortest = Some(list);
@@ -165,6 +176,23 @@ pub(super) struct NameIndex {
 struct Word<'a> {
     text: &'a str,
     legacy: Option<pinyin::LegacyReading>,
+    fts_text: Option<Cow<'a, str>>,
+}
+
+impl Word<'_> {
+    fn matches_fts(&self, value: &str) -> bool {
+        self.fts_text
+            .as_deref()
+            .is_some_and(|text| fold_sigma(value).contains(text))
+    }
+
+    fn matches_path(&self, parent: &str, name: &str) -> bool {
+        contains_path(parent, name, self.text)
+            || self
+                .fts_text
+                .as_deref()
+                .is_some_and(|text| contains_path(&fold_sigma(parent), &fold_sigma(name), text))
+    }
 }
 
 struct Seed<'a> {
@@ -385,7 +413,9 @@ impl NameIndex {
         {
             return Some(3);
         }
-        None
+        // The cold FTS query ranks fold-only hits in the same tier as paths.
+        (word.matches_fts(name) || word.matches_fts(full) || word.matches_fts(initials))
+            .then_some(4)
     }
 
     fn seed<'a>(&'a self, words: &[Word<'_>]) -> Option<Seed<'a>> {
@@ -411,7 +441,7 @@ impl NameIndex {
             if let Some(list) = self.paths.rarest(word.text) {
                 for id in list.ids() {
                     let parent = &self.parents[id];
-                    if parent.folded().contains(word.text) {
+                    if parent.folded().contains(word.text) || word.matches_fts(parent.folded()) {
                         parents.push(id);
                         count += parent.rows.count as usize;
                     }
@@ -446,6 +476,11 @@ impl NameIndex {
             .map(|text| Word {
                 text,
                 legacy: pinyin::legacy(text),
+                // Only an unstructured trigram query accepts fold-only hits.
+                fts_text: (terms.is_none()
+                    && text.contains(['σ', 'ς'])
+                    && text.chars().count() >= 3)
+                    .then(|| fold_sigma(text)),
             })
             .collect();
         let mut heap = BinaryHeap::<Ranked<'_>>::with_capacity(limit);
@@ -477,7 +512,7 @@ impl NameIndex {
                     tier
                 } else if let Some(tier) = self.name_tier(id, word) {
                     tier
-                } else if contains_path(parent.folded(), name, word.text) {
+                } else if word.matches_path(parent.folded(), name) {
                     4
                 } else {
                     return;

@@ -484,6 +484,80 @@ mod tests {
     }
 
     #[test]
+    fn ready_soa_matches_disk_for_greek_final_sigma() -> Result<()> {
+        let catalog = Catalog::new("final-sigma")?;
+        let db = catalog.db();
+        let (writer, _) = crate::open_write(&db, false)?;
+        for (path, name) in [
+            ("/scope/κόσμος", "κόσμος"),
+            ("/scope/κόσμοσ", "κόσμοσ"),
+            ("/scope/κόσμος-archive/notes", "notes"),
+            ("/scope/κοσμος", "κοσμος"),
+        ] {
+            writer.execute(
+                "INSERT INTO item VALUES(NULL,?1,?2,'file','local',?3,'','',?4,0)",
+                params![path, name, crate::norm(name), crate::norm(path)],
+            )?;
+        }
+        writer.execute_batch(
+            "INSERT INTO name_fts(rowid,name,full,initials,searchable_path)
+             SELECT id,name,full,initials,searchable_path FROM item;",
+        )?;
+        let reader = open_read(&db)?;
+        let mut fast = NameFast::new(&db, &reader);
+        let matches = |hits: Vec<Hit>| {
+            hits.into_iter()
+                .map(|hit| (hit.path, hit.matched_by))
+                .collect::<Vec<_>>()
+        };
+        for (query, expected) in [
+            (
+                "ΚΌΣΜΟΣ",
+                [
+                    ("/scope/κόσμοσ", "name"),
+                    ("/scope/κόσμος-archive/notes", "path"),
+                    ("/scope/κόσμος", "path"),
+                ],
+            ),
+            (
+                "κόσμος",
+                [
+                    ("/scope/κόσμος", "name"),
+                    ("/scope/κόσμος-archive/notes", "path"),
+                    ("/scope/κόσμοσ", "path"),
+                ],
+            ),
+        ] {
+            let cold = matches(crate::search_with_names(
+                &reader,
+                query,
+                crate::Mode::Name,
+                20,
+                None,
+                None,
+            )?);
+            assert_eq!(
+                cold,
+                expected.map(|(path, by)| (path.to_owned(), by.to_owned()))
+            );
+            if fast.build.is_some() {
+                finish_build(&fast);
+            }
+            let ready = matches(crate::search_with_names(
+                &reader,
+                query,
+                crate::Mode::Name,
+                20,
+                None,
+                Some(&mut fast),
+            )?);
+            assert!(fast.index.is_some(), "the test must use the RAM snapshot");
+            assert_eq!(ready, cold, "cold and ready results for {query}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn over_budget_catalog_backs_off_across_generations() -> Result<()> {
         let catalog = Catalog::new("over-budget")?;
         let db = catalog.db();

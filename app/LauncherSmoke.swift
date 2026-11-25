@@ -738,6 +738,10 @@ final class LauncherSmoke {
         db, command, *args = sys.argv[2:]
         def mark(name):
             (root / name).touch()
+        def stamp(path):
+            stat = path.stat()
+            return ':'.join(map(str, (stat.st_dev % 2**64, stat.st_ino, stat.st_size,
+                                     *divmod(stat.st_mtime_ns, 10**9), *divmod(stat.st_ctime_ns, 10**9))))
         def hold(name):
             def stopped(*_):
                 mark(name + '-terminated')
@@ -769,6 +773,17 @@ final class LauncherSmoke {
             for line in sys.stdin.buffer:
                 assert len(line) <= 12 * 1024, len(line)
                 request = json.loads(line)
+                if Path(db).name == 'legacy':
+                    reply = dict(id=request['id'], hits=[])
+                    if request.get('op') == 'validate':
+                        reply = dict(id=request['id'], error='missing field `query`')
+                    elif request['query'] == 'legacy probe' and request['mode'] == 'text':
+                        paths = [root.resolve() / name for name in ('legacy.txt', 'legacy.PNG')]
+                        reply['hits'] = [dict(path=str(path), name=path.name, kind='file', availability='local',
+                                              matched_by='text', snippet='legacy probe', document_stamp=stamp(path))
+                                         for path in paths]
+                    print(json.dumps(reply), flush=True)
+                    continue
                 if request.get('op') == 'validate':
                     assert set(request) == {'id', 'op', 'hits'}
                     hits = request['hits']
@@ -845,6 +860,16 @@ final class LauncherSmoke {
                 hits = [dict(path=str(root / name), name=name, kind='file', availability='local',
                              matched_by='image_embedding', document_stamp='fixture') for name in names]
                 print(json.dumps(dict(id=request['id'], hits=hits)), flush=True)
+        elif command == 'validate-hit' and Path(db).name == 'legacy':
+            path = Path(args[-1])
+            expected = ['--kind', 'file', '--availability', 'local', '--document-stamp', stamp(path)]
+            if '--matched-by' in args:
+                assert args == expected + ['--matched-by', 'text', '--', str(path)], args
+                mark(path.name + '-typed-rejected')
+                sys.exit(2)
+            assert args == expected + ['--', str(path)], args
+            # Untyped validation accepts either current stamp, even for the OCR hit.
+            print('{"valid":true}')
         elif command in ('query', 'validate-hit'):
             mark('unexpected-standalone-query')
             sys.exit(1)
@@ -975,6 +1000,34 @@ final class LauncherSmoke {
         try await until("image hit validation did not restart") { marked("hold-close-started") }
         model.close()
         try await until("closing the launcher leaked image hit validation") { marked("hold-close-terminated") }
+
+        let legacy = Launcher(engine: try testEngine("legacy"), defaults: nil)
+        defer { legacy.close() }
+        let legacyRoot = URL(fileURLWithPath: IndexScope.folderPath(root), isDirectory: true)
+        let textFile = legacyRoot.appendingPathComponent("legacy.txt")
+        let imageFile = legacyRoot.appendingPathComponent("legacy.PNG")
+        for file in [textFile, imageFile] { try Data("legacy probe".utf8).write(to: file) }
+        legacy.start()
+        try await until("the legacy engine did not become searchable") { legacy.canSearch && legacy.watchState == .running }
+        legacy.setQuery("legacy probe")
+        try await until("the legacy engine did not publish both stamped text and OCR hits") {
+            !legacy.searching && Set(legacy.hits.map(\.path)) == Set([textFile.path, imageFile.path])
+        }
+        guard let textHit = legacy.hits.first(where: { $0.path == textFile.path }),
+              let imageHit = legacy.hits.first(where: { $0.path == imageFile.path }) else {
+            throw Failure("missing legacy validation fixtures")
+        }
+        var resolved: URL?
+        legacy.resolve(textHit, action: .open) { resolved = $0 }
+        try await until("legacy text validation did not finish") { resolved != nil || legacy.searchNotice?.problem == .stale }
+        try check(resolved == textFile, "legacy validate-hit rejected an unchanged stamped .txt hit")
+
+        resolved = nil
+        legacy.resolve(imageHit, action: .open) { resolved = $0 }
+        try await until("legacy image validation did not finish") { resolved != nil || legacy.searchNotice?.problem == .stale }
+        try check(marked("legacy.PNG-typed-rejected") && resolved == nil && !legacy.hits.contains(imageHit),
+                  "a stamped OCR image did not fail safely when legacy validate-hit rejected --matched-by")
+        legacy.close()
 
         // libdispatch reads this setting at process startup. One cooperative worker is
         // enough to expose starvation without racing to saturate a machine-sized pool.

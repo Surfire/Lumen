@@ -319,7 +319,7 @@ final class Launcher: ObservableObject {
                                    "Local semantic indexing failed. Saved chunks are kept for the next run.")
         case .embeddingNoProgress: return t("本批没有新增或跳过片段，已停止生成。已完成的进度已保存。",
                                            "Indexing stopped after a batch made no progress. Completed work is saved.")
-        case .preview: return t("无法快速查看此文件。可预览的本机文件上限为 128 MB。", "Could not preview the file. The limit for local previews is 128 MB.")
+        case .preview: return t("无法快速查看此文件。", "Could not preview the file.")
         case .copiedName: return t("已复制名称", "Name copied")
         case .copiedPath: return t("已复制路径", "Path copied")
         case .opening: return t("macOS 无法打开这个项目。", "macOS could not open this item.")

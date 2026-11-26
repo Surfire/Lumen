@@ -9,8 +9,8 @@ enum FileAction: Equatable {
 
     var allowsCloudReference: Bool {
         switch self {
-        case .reveal, .copyName, .copyPath: return true
-        case .open, .preview: return false
+        case .preview, .reveal, .copyName, .copyPath: return true
+        case .open: return false
         }
     }
 }

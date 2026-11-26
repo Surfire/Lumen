@@ -17,6 +17,8 @@ public enum PreviewKind: Sendable, Equatable {
     /// nil means no match page is known. It must not be labelled a hit.
     case pdf(matchPage: Int?)
     case excerpt
+    /// Use the inline area for hydration progress, then hand off to Quick Look.
+    case quickLook
 }
 
 public struct PreviewSelection: Sendable, Equatable {

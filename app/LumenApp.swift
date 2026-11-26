@@ -231,6 +231,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        inlinePreview.onQuickLookReady = { [weak self] in self?.updatePresentation() }
         if smoke == nil {
             statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
             statusItem?.button?.imagePosition = .imageLeading
@@ -932,6 +933,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         let selected = commands.selectedResult(in: model)
         if case .file(let hit) = selected, model.containsCurrentFile(hit) {
             inlinePreview.retainPreview(for: hit)
+            if case .ready(let item, _) = inlinePreview.state, item.kind == .quickLook {
+                inlinePreview.close()
+                do { try showLocalPreview(hit, at: item.url) }
+                catch { model.previewFailed() }
+            }
         } else if !(selected == nil && previewed.isCloudReference && model.searching &&
                     model.selection == previewed.id && model.hits.contains(previewed)) {
             inlinePreview.close()
@@ -956,33 +962,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func previewFile(_ hit: SearchHit, forceWindow: Bool = false, allowCloudDownload: Bool = false) {
-        if !forceWindow, LauncherInlinePreview.kind(hit) != nil {
-            guard searchPresented, !model.scopePending, model.containsCurrentFile(hit),
-                  hit.isLocal || hit.isCloudReference else { return }
+        guard searchPresented, !model.scopePending else { return }
+        if !forceWindow, let kind = LauncherInlinePreview.kind(hit) {
+            guard model.containsCurrentFile(hit), hit.isLocal || hit.isCloudReference else { return }
             commands.choose(.file(hit), in: model)
             if inlinePreview.hit == hit { inlinePreview.close() }
-            else { inlinePreview.show(hit, allowCloudDownload: allowCloudDownload) }
+            else { inlinePreview.show(hit, kind: kind, allowCloudDownload: allowCloudDownload) }
             updatePresentation()
             return
         }
         model.resolve(hit, action: .preview) { [weak self] url in
-            guard let self, self.searchPresented, self.model.containsCurrentFile(hit) else { return }
-            guard let panel = try? LocalFile.withResidentFile(url, expectedStamp: hit.document_stamp, {
-                LocalPreviewPanel(url: url, title: hit.name, page: hit.pdf_page)
-            }) else {
-                self.model.openingFailed()
-                return
+            guard let self, self.searchPresented, !self.model.scopePending, self.model.containsCurrentFile(hit),
+                  self.commands.selectedResult(in: self.model)?.id == hit.id else { return }
+            do {
+                try self.showLocalPreview(hit, at: url)
+            } catch is LocalFile.Placeholder where allowCloudDownload {
+                self.inlinePreview.show(hit, kind: .quickLook, allowCloudDownload: true)
+                self.updatePresentation()
+            } catch {
+                self.model.previewFailed()
             }
-            self.localPreview?.close()
-            self.localPreview = panel
-            panel.onToggle = { [weak self] in self?.closeLocalPreview() }
-            panel.delegate = self
-            if self.smoke == nil {
-                panel.center()
-                self.makeLocalPreviewKey()
-            } else {
-                panel.setFrameOrigin(NSPoint(x: -12_000, y: -12_000))
-            }
+        }
+    }
+
+    private func showLocalPreview(_ hit: SearchHit, at url: URL) throws {
+        guard let preview = try inlinePreview.withResidentFile(url, expectedStamp: hit.document_stamp, {
+            LocalPreviewPanel(url: url, title: hit.name, page: hit.pdf_page)
+        }) else { throw PreviewFailure.invalidContent }
+        localPreview?.close()
+        localPreview = preview
+        preview.onToggle = { [weak self] in self?.closeLocalPreview() }
+        preview.delegate = self
+        if smoke == nil {
+            preview.center()
+            makeLocalPreviewKey()
+        } else {
+            preview.setFrameOrigin(NSPoint(x: -12_000, y: -12_000))
         }
     }
 

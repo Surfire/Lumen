@@ -15,6 +15,7 @@ final class LauncherInlinePreview: ObservableObject {
     @Published private(set) var state: InlinePreviewState = .closed
     @Published private(set) var hit: SearchHit?
     private(set) var image: NSImage?
+    var onQuickLookReady: (() -> Void)?
     private let downloads: DownloadProvider
 
     init(downloads: DownloadProvider = .system) { self.downloads = downloads }
@@ -34,6 +35,9 @@ final class LauncherInlinePreview: ObservableObject {
                 }
             }
             self.state = state
+            if case .ready(let selection, _) = state, selection.kind == .quickLook {
+                self.onQuickLookReady?()
+            }
         }
         return coordinator
     }()
@@ -49,8 +53,7 @@ final class LauncherInlinePreview: ObservableObject {
         return nil
     }
 
-    func show(_ hit: SearchHit, allowCloudDownload: Bool) {
-        guard let kind = Self.kind(hit) else { close(); return }
+    func show(_ hit: SearchHit, kind: PreviewKind, allowCloudDownload: Bool) {
         guard self.hit != hit else { return }
         self.hit = hit
         let evidence = hit.snippet.map {
@@ -77,6 +80,10 @@ final class LauncherInlinePreview: ObservableObject {
         guard hit != nil else { return false }
         hit = nil
         return coordinator.close()
+    }
+
+    func withResidentFile<T>(_ url: URL, expectedStamp: String?, _ work: () throws -> T) throws -> T {
+        try LocalFile.withResidentFile(url, expectedStamp: expectedStamp, isPending: downloads.isPending, work)
     }
 
     nonisolated private static func render(_ item: PreviewSelection, downloads: DownloadProvider,
@@ -117,8 +124,10 @@ final class LauncherInlinePreview: ObservableObject {
                                                       report: @escaping InlinePreviewCoordinator.DownloadProgress) async throws {
         let read = CloudRead()
         let updates = Task {
-            while !Task.isCancelled {
-                let fraction: Double? = try? LocalFile.withMaterializationDisabled {
+            while !Task.isCancelled && !read.request.isCancelled {
+                let coordinated = read.request.fractionCompleted
+                // Some providers publish iCloud metadata instead of child Progress.
+                let fraction: Double? = coordinated > 0 ? coordinated : try? LocalFile.withMaterializationDisabled {
                     let fresh = URL(fileURLWithPath: url.path)
                     let values = try fresh.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey,
                                                                    .ubiquitousItemIsDownloadingKey])
@@ -140,12 +149,13 @@ final class LauncherInlinePreview: ObservableObject {
             try await withCheckedThrowingContinuation { (completion: CheckedContinuation<Void, Error>) in
                 DispatchQueue.global(qos: .utility).async {
                     guard !read.request.isCancelled else { completion.resume(throwing: CancellationError()); return }
-                    // The ubiquity API may reject other providers; coordination still applies.
-                    try? FileManager.default.startDownloadingUbiquitousItem(at: url)
-                    guard !read.request.isCancelled else { completion.resume(throwing: CancellationError()); return }
                     var error: NSError?
+                    // Let the coordinated read request hydration and collect any child progress it emits.
+                    read.request.becomeCurrent(withPendingUnitCount: 1)
                     read.coordinator.coordinate(readingItemAt: url, options: [], error: &error) { _ in }
-                    if let error { completion.resume(throwing: error) }
+                    read.request.resignCurrent()
+                    if read.request.isCancelled { completion.resume(throwing: CancellationError()) }
+                    else if let error { completion.resume(throwing: error) }
                     else { completion.resume() }
                 }
             }

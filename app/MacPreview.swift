@@ -14,6 +14,9 @@ public struct MacPreviewRenderer: Sendable {
         return try LocalFile.withResidentFile(item.url, expectedStamp: item.revision.isEmpty ? nil : item.revision,
                                               isPending: isPending) {
             switch item.kind {
+            case .quickLook:
+                // The launcher opens Quick Look only after the resident-file check succeeds.
+                return PreviewDocument()
             case .excerpt:
                 guard let evidence = item.evidence, !evidence.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     throw PreviewFailure.noExcerpt

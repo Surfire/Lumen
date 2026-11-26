@@ -4,6 +4,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct SearchWindow: View {
+    @Environment(\.colorScheme) private var colorScheme
     @ObservedObject var model: Launcher
     @ObservedObject var applicationIcons: ResultIconDisplay
     @ObservedObject var contextActions: ContextActions
@@ -11,6 +12,8 @@ struct SearchWindow: View {
     @ObservedObject var commands: LauncherCommands
     @ObservedObject var inlinePreview: LauncherInlinePreview
     @ObservedObject var imageSearch: LauncherImageSearch
+    let clipboard: ClipboardManager
+    let selectClipboard: (Int64) -> Void
     let activateCommand: () -> Void
     let searchCommandAsFiles: () -> Void
     let closeInlinePreview: () -> Void
@@ -58,6 +61,12 @@ struct SearchWindow: View {
                 }
                 .padding(.horizontal, 16).padding(.vertical, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)
+            } else if commands.isClipboardCommand {
+                if contextActions.isOpen { contextRows }
+                else {
+                    ClipboardHistoryView(commands: commands, clipboard: clipboard, chinese: model.zh,
+                                         select: selectClipboard, copy: activateCommand, openSettings: showSettings)
+                }
             } else if commands.showsCard {
                 LauncherCommandCard(commands: commands, provider: translation, chinese: model.zh,
                                     activate: activateCommand, openSettings: showSettings)
@@ -137,6 +146,16 @@ struct SearchWindow: View {
         case .discovery:
             keyHint("↑↓", model.t("选择", "Select"))
             keyHint("↵", model.t("填入命令", "Fill Command"))
+        case .clipboard:
+            if contextActions.isOpen {
+                keyHint("↑↓", model.t("选择操作", "Select Action"))
+                keyHint("↵", model.t("执行", "Run"))
+            } else if commands.selectedClipboardItem != nil {
+                keyHint("↑↓", model.t("选择", "Select"))
+                keyHint("↵", model.t("复制", "Copy"))
+                Button(action: toggleContextActions) { keyHint("⇧↵", model.t("操作", "Actions")) }
+                    .buttonStyle(.borderless)
+            }
         case .question:
             switch commands.answer {
             case .loading: keyHint("esc", model.t("取消", "Cancel"))
@@ -216,19 +235,20 @@ struct SearchWindow: View {
     }
 
     private var results: some View {
-        ScrollViewReader { proxy in
+        let highlight = LauncherHighlight(model.query)
+        return ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 0) {
                     ForEach(model.visibleResults) { result in
                         switch result {
-                        case .file(let hit): resultRow(hit).id(result.id)
-                        case .action(let action): actionRow(action).id(result.id)
+                        case .file(let hit): resultRow(hit, highlight: highlight).id(result.id)
+                        case .action(let action): actionRow(action, highlight: highlight).id(result.id)
                         case .shortcut(let shortcut):
-                            utilityRow(result, title: shortcut.title, detail: shortcut.detail, symbol: shortcut.symbol)
-                                .id(result.id)
+                            utilityRow(result, title: shortcut.title, detail: shortcut.detail, symbol: shortcut.symbol,
+                                       highlight: highlight).id(result.id)
                         case .calculation(let calculation):
                             utilityRow(result, title: calculation.display, detail: model.t("回车复制", "Return to Copy"),
-                                       symbol: "plus.forwardslash.minus").id(result.id)
+                                       symbol: "plus.forwardslash.minus", highlight: nil).id(result.id)
                         }
                     }
                 }
@@ -256,8 +276,7 @@ struct SearchWindow: View {
                     } label: {
                         Label(item.title, systemImage: item.symbol)
                             .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 10)
-                            .frame(height: 44).background { selectionBackground(contextActions.selected == index) }
-                            .contentShape(Rectangle())
+                            .frame(height: 44).modifier(ResultRowChrome(selected: contextActions.selected == index))
                     }
                     .buttonStyle(.plain)
                     .accessibilityAddTraits(contextActions.selected == index ? .isSelected : [])
@@ -266,7 +285,8 @@ struct SearchWindow: View {
         }
     }
 
-    private func utilityRow(_ result: LauncherResult, title: String, detail: String, symbol: String) -> some View {
+    private func utilityRow(_ result: LauncherResult, title: String, detail: String, symbol: String,
+                            highlight: LauncherHighlight?) -> some View {
         let selected = model.selection == result.id
         return HStack(spacing: 10) {
             if case .shortcut(let shortcut) = result, let action = model.application(for: shortcut) {
@@ -278,17 +298,18 @@ struct SearchWindow: View {
                     .background(.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 6))
                     .accessibilityHidden(true)
             }
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
-                Text(detail).font(.system(size: 11)).foregroundStyle(.secondary)
-                    .lineLimit(1).truncationMode(.middle)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(highlight?.text(title, size: 13, colorScheme: colorScheme, mode: .action) ?? AttributedString(title))
+                    .font(.system(size: 13, weight: .medium)).lineLimit(1)
+                Text(highlight?.text(detail, size: 11, colorScheme: colorScheme) ?? AttributedString(detail))
+                    .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             }
-            Spacer()
+            Spacer(minLength: 2)
+            if case .shortcut = result { ResultCategory(title: model.t("快捷链接", "Quicklink"), symbol: "bolt") }
         }
         .padding(.horizontal, 8)
         .frame(height: 44)
-        .background { selectionBackground(selected) }
-        .contentShape(Rectangle())
+        .modifier(ResultRowChrome(selected: selected))
         .onTapGesture { clickRow(result) }
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(selected ? .isSelected : [])
@@ -317,38 +338,41 @@ struct SearchWindow: View {
             : model.t("没有匹配结果", "No matches")
     }
 
-    private func actionRow(_ action: LaunchAction) -> some View {
+    private func actionRow(_ action: LaunchAction, highlight: LauncherHighlight) -> some View {
         let selected = model.selection == action.id
-        let detail: String
+        let category: ResultCategory
+        let detail: String?
         switch action.destination {
         case .application(let url, _):
-            let path = (url.path as NSString).abbreviatingWithTildeInPath
-            detail = model.t("应用程序 · \(path)", "Application · \(path)")
-        case .settings: detail = model.t("系统设置", "System Settings")
+            category = ResultCategory(title: model.t("应用", "App"), symbol: "app")
+            detail = (url.path as NSString).abbreviatingWithTildeInPath
+        case .settings:
+            category = ResultCategory(title: model.t("系统设置", "System Settings"), symbol: "gearshape")
+            detail = nil
         case .system(let operation):
+            category = ResultCategory(title: model.t("系统操作", "System Action"), symbol: "bolt")
             if case .define(let word) = operation { detail = word }
-            else { detail = model.t("系统操作", "System Action") }
+            else { detail = nil }
         }
         let title = action.title(chinese: model.zh)
         return HStack(spacing: 10) {
             ActionResultIcon(action: action, image: ApplicationIcons.Key(action).flatMap { applicationIcons.images[$0] },
                              selected: selected)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
-                Text(detail).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
-                    .truncationMode(.middle).help(detail)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(highlight.text(title, size: 13, colorScheme: colorScheme, mode: .action))
+                    .font(.system(size: 13, weight: .medium)).lineLimit(1)
+                if let detail {
+                    Text(highlight.text(detail, size: 11, colorScheme: colorScheme))
+                        .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                        .truncationMode(.middle).help(detail)
+                }
             }
-            Spacer()
-            if selected {
-                Image(systemName: "return")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary).accessibilityHidden(true)
-            }
+            Spacer(minLength: 2)
+            category
         }
         .padding(.horizontal, 8)
         .frame(height: 44)
-        .background { selectionBackground(selected) }
-        .contentShape(Rectangle())
+        .modifier(ResultRowChrome(selected: selected))
         .overlay { ActionRowClickView { clickRow(.action(action), count: $0) }.accessibilityHidden(true) }
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(selected ? .isSelected : [])
@@ -356,39 +380,40 @@ struct SearchWindow: View {
         .accessibilityIdentifier(action.id)
     }
 
-    @ViewBuilder private func selectionBackground(_ selected: Bool) -> some View {
-        if selected {
-            RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.15))
-            RoundedRectangle(cornerRadius: 8).strokeBorder(Color.accentColor.opacity(0.28), lineWidth: 1)
-        }
-    }
-
-    @ViewBuilder private func resultRow(_ hit: SearchHit) -> some View {
+    @ViewBuilder private func resultRow(_ hit: SearchHit, highlight: LauncherHighlight) -> some View {
         if hit.isLocal && model.containsCurrentFile(hit) {
-            fileRow(hit).onDrag {
+            fileRow(hit, highlight: highlight).onDrag {
                 guard model.containsCurrentFile(hit), let url = LocalFile.dragURL(for: hit) else { return NSItemProvider() }
                 return NSItemProvider(object: url as NSURL)
             }
-        } else { fileRow(hit) }
+        } else { fileRow(hit, highlight: highlight) }
     }
 
-    private func fileRow(_ hit: SearchHit) -> some View {
+    private func fileRow(_ hit: SearchHit, highlight: LauncherHighlight) -> some View {
         let selected = model.selection == hit.path
+        let folder = hit.kind == "directory"
         return HStack(spacing: 10) {
-            FileTypeIcon(name: hit.name, directory: hit.kind == "directory")
-            VStack(alignment: .leading, spacing: 1) {
-                Text(hit.name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+            FileTypeIcon(name: hit.name, directory: folder)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 8) {
+                    Text(highlight.text(hit.name, size: 13, colorScheme: colorScheme, mode: .name))
+                        .font(.system(size: 13, weight: .medium)).lineLimit(1)
+                    if !hit.isCloudReference {
+                        Spacer(minLength: 2)
+                        fileCategory(hit, folder: folder)
+                    }
+                }
                 let parent = (hit.path as NSString).deletingLastPathComponent as NSString
-                Text(parent.abbreviatingWithTildeInPath).font(.system(size: 11)).foregroundStyle(.secondary)
-                    .lineLimit(1).truncationMode(.middle)
+                Text(highlight.text(parent.abbreviatingWithTildeInPath, size: 11, colorScheme: colorScheme))
+                    .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                     .help(hit.path)
                 if hit.hasPreview, let snippet = hit.snippet {
                     HStack(spacing: 6) {
                         if let page = hit.pdf_page {
-                            Text(model.t("第 \(page) 页", "Page \(page)")).font(.system(size: 11, weight: .medium))
+                            Text(model.t("第 \(page) 页", "Page \(page)")).fontWeight(.medium).fixedSize()
                         }
-                        Text(snippet).font(.system(size: 11)).lineLimit(1)
-                    }.foregroundStyle(.secondary)
+                        Text(highlight.text(snippet, size: 11, colorScheme: colorScheme)).lineLimit(1)
+                    }.font(.system(size: 11)).foregroundStyle(.secondary)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -400,17 +425,11 @@ struct SearchWindow: View {
                 Button(model.t("在 Finder 中显示", "Show in Finder")) { fileAction(.reveal, hit) }
                     .buttonStyle(.borderless).font(.caption).fixedSize()
                     .accessibilityIdentifier("reveal-cloud-result")
-            } else if hit.isSemanticCandidate {
-                Text(model.relatedExcerptsLabel).font(.caption).foregroundStyle(.secondary).fixedSize()
-            } else if selected {
-                Image(systemName: "return").font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary).accessibilityHidden(true)
             }
         }
         .padding(.horizontal, 8)
         .frame(height: Self.rowHeight(hit))
-        .background { selectionBackground(selected) }
-        .contentShape(Rectangle())
+        .modifier(ResultRowChrome(selected: selected))
         .onTapGesture { clickRow(.file(hit)) }
         .accessibilityElement(children: .contain)
         .accessibilityAddTraits(selected ? .isSelected : [])
@@ -434,6 +453,55 @@ struct SearchWindow: View {
         }
     }
 
+    private func fileCategory(_ hit: SearchHit, folder: Bool) -> ResultCategory {
+        if hit.isSemanticCandidate {
+            return ResultCategory(title: model.relatedExcerptsLabel, symbol: "text.quote", emphasized: true)
+        }
+        if hit.isImageMatch { return ResultCategory(title: model.t("图像内容", "Image Content"), symbol: "photo") }
+        return folder ? ResultCategory(title: model.t("文件夹", "Folder"), symbol: "folder")
+            : ResultCategory(title: model.t("文件", "File"), symbol: "doc")
+    }
+}
+
+private struct ResultCategory: View {
+    let title: String
+    let symbol: String
+    var emphasized = false
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: symbol).accessibilityHidden(true)
+            Text(title)
+        }
+        .font(.system(size: 10, weight: .medium))
+        .foregroundStyle(emphasized ? .primary : .secondary)
+        .padding(.horizontal, 6).padding(.vertical, 2)
+        .background(emphasized ? Color.accentColor.opacity(0.13) : Color.primary.opacity(0.055), in: Capsule())
+        .fixedSize()
+    }
+}
+
+private struct ResultRowChrome: ViewModifier {
+    let selected: Bool
+    @State private var hovered = false
+
+    func body(content: Content) -> some View {
+        content
+            .background {
+                let shape = RoundedRectangle(cornerRadius: 8)
+                ZStack {
+                    if selected {
+                        shape.fill(Color.accentColor.opacity(0.14))
+                        shape.strokeBorder(Color.accentColor.opacity(0.29), lineWidth: 1)
+                    } else if hovered {
+                        shape.fill(.primary.opacity(0.065))
+                    }
+                }
+                .padding(.vertical, 1)
+            }
+            .contentShape(Rectangle())
+            .onHover { hovered = $0 }
+    }
 }
 
 @MainActor
@@ -698,6 +766,7 @@ struct LauncherSettings: View {
     let translation: TranslationPanelModel
     let volumes: ExternalVolumeCatalog
     let images: LauncherImageSearch
+    let clipboard: ClipboardManager
     let chooseImageFolder: () -> Void
     let chooseImageProjector: () -> Void
     let chooseQuicklinkFolder: (@escaping (URL) -> Void) -> Void
@@ -867,6 +936,10 @@ struct LauncherSettings: View {
             }
             note(model.t("菜单栏中的「打开搜索」始终可用。", "Open Search is always available in the menu bar."))
         }
+        group(model.t("剪贴板历史", "Clipboard History")) {
+            ClipboardSettingsView(clipboard: clipboard, chinese: model.zh)
+        }
+        .onAppear { clipboard.loadHistory() }
     }
 
     @ViewBuilder private var indexAndPrivacy: some View {

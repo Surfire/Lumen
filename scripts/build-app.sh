@@ -2,10 +2,11 @@
 set -eu
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:$PATH"
-# Compile the bundled SQLite C object for the same minimum as the app.
-export MACOSX_DEPLOYMENT_TARGET=14.0
-cargo build --locked --release "$@"
-SWIFT_TARGET="$(uname -m)-apple-macosx$MACOSX_DEPLOYMENT_TARGET"
+SWIFT_TARGET="$(uname -m)-apple-macosx14.0"
+# Match the bundled SQLite C object to the app without changing Rust host proc-macro builds.
+RUST_TARGET="$(rustc --print host-tuple)"
+C_FLAGS="$(printenv "CFLAGS_$RUST_TARGET" || printenv "CFLAGS_$(printf '%s' "$RUST_TARGET" | tr '-' '_')" || :)"
+env "CFLAGS_$RUST_TARGET=$C_FLAGS -mmacosx-version-min=14.0" cargo build --locked --release "$@"
 APP="$PWD/target/Lumen.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/lumen "$APP/Contents/Resources/lumen"

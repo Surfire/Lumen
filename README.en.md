@@ -6,7 +6,7 @@
 
 [Quick start](#quick-start) · [Features and limits](#features-and-limits) · [Development](#development) · [简体中文](README.md)
 
-**v0.4** · **Apple Silicon** · **macOS 14+** · **Rust + native macOS UI**
+**v0.5** · **Apple Silicon** · **macOS 14+** · **Rust + native macOS UI**
 
 | Try typing | What happens |
 | :--- | :--- |
@@ -28,6 +28,12 @@ This creates an ad hoc signed development build. For daily use, build with an ex
 Open Lumen from the menu bar or press **Control–Shift–Space**. Record or disable the shortcut in **Settings → General & Shortcuts**. Apps and System Settings are searchable immediately. The first eligible name scan starts quietly in the background. Adjust the folder scope in **Index & Privacy**, or start a scan from the menu bar, which shows the current phase, scanned item count, and elapsed time.
 
 When you reopen Lumen, eligible results from the saved index can appear while the watcher catches up with changes made since you closed it.
+
+### Signed releases and Homebrew
+
+For a release-signed copy in a writable Applications folder, open **Settings → Advanced & Diagnostics → Check for Updates**. Checks are manual. Lumen verifies the signed GitHub release manifest, ZIP checksum, and app signature before replacing the app. Quit and reopen after installation; Lumen shows where it saved the previous app. Ad hoc builds cannot use the updater. If the release signing certificate changes, install the first build with the new certificate manually.
+
+If you installed from a Homebrew tap, use `brew upgrade --cask lumen` instead. Normal uninstall keeps your data; `--zap` also removes Lumen’s preferences and Application Support, including scripts and clipboard history.
 
 ### Use the same launcher field
 
@@ -54,6 +60,13 @@ Q&A and translation share the provider and model selected under **Settings → T
 - **Cloud files are indexed by visible metadata.** For recognized iCloud, OneDrive, and other File Provider locations, Lumen records names and paths the system exposes. Indexing and previewing do not download cloud placeholders. Search indexes and offline inference stay on the Mac. Model weights are provisioned separately.
 - **Check progress and diagnose missing files.** **Advanced & Diagnostics** shows file watching and semantic indexing separately. Use **File Diagnostics → Choose File** to check name, document, and semantic coverage for a file. This check neither reads document content nor downloads a placeholder.
 - **Pin frequently used items.** Pinned items appear with an empty query. Save apps, project folders, or web pages as quicklinks or aliases.
+
+## What’s new in v0.5
+
+- Sharper visual hierarchy and match highlighting, plus opt-in private local clipboard history.
+- Native Accessibility window management, opt-in local script commands, and Apple Shortcuts.
+- A static, in-process core for hot search, with heavy extractors still isolated.
+- Signed in-app updates and a Homebrew Cask.
 
 ## What’s new in v0.4
 
@@ -90,6 +103,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo test --locked --manifest-path extensions/Cargo.toml
 scripts/build-app.sh
+python3 scripts/smoke-updater.py
 python3 scripts/smoke-app.py
 python3 scripts/smoke-launcher.py
 python3 scripts/smoke-relaunch.py target/Lumen.app
@@ -99,5 +113,7 @@ python3 scripts/smoke-translation.py
 Use synthetic fixtures. Tests for AppKit and FSEvents depend on native macOS services. Simulated or skipped tests do not establish coverage on physical external drives or live third-party services.
 
 </details>
+
+**Packaging a release:** Set `LUMEN_SIGN_IDENTITY` to the named Keychain identity and `LUMEN_MANIFEST_KEY` to a protected PEM of the same private key, kept outside the repository. Set `LUMEN_NOTARY_PROFILE` to a `notarytool` profile for public Developer ID releases. Run `scripts/package-release.sh OUTPUT_DIR RELEASE_NOTES.txt` and upload the ZIP and `lumen-update.json.cms` to the GitHub release tagged `v<version>`. Increment the bundle build number for every release. Use `version` and `sha256` from the emitted `lumen-update.json` to fill the [Cask template](packaging/homebrew/Casks/lumen.rb) before publishing it in a tap.
 
 Original source is released under the [MIT License](LICENSE). Lumen is independently implemented, with product inspiration from Tinycast, Oil Find, DigUp, and Luminator Index.

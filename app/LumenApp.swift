@@ -7,6 +7,7 @@ import SwiftUI
 @main
 struct LumenApp {
     @MainActor static func main() {
+        LauncherSmoke.runUpdaterIfRequested()
         let application = NSApplication.shared
         let smoke = LauncherSmoke.configuration()
         let launcher = AppDelegate(smoke: smoke)
@@ -59,6 +60,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     let externalVolumes: ExternalVolumeCatalog
     let translation: TranslationPanelModel
     private(set) var settings: NSPanel?
+    private lazy var updateSettings = UpdateSettings()
     private(set) lazy var settingsSession = SettingsSession(model: model, manageLoginItem: smoke == nil) { [weak self] oldPage, page in
         guard let self else { return }
         if oldPage == .translation { self.translation.endSettingsSession() }
@@ -1073,6 +1075,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 clipboard: clipboard,
                 windowManagement: windowManagement,
                 scriptCatalog: scriptCatalog,
+                updates: smoke == nil ? updateSettings : nil,
                 chooseScriptsFolder: { [weak self] in self?.chooseScriptsFolder() },
                 chooseImageFolder: { [weak self] in self?.chooseImageResource(folder: true) },
                 chooseImageProjector: { [weak self] in self?.chooseImageResource(folder: false) },

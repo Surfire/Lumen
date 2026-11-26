@@ -89,6 +89,42 @@ final class LauncherSmoke {
         self.usesOffscreenWindows = usesOffscreenWindows
     }
 
+    static func runUpdaterIfRequested() {
+        let args = Array(CommandLine.arguments.dropFirst())
+        guard args.first == "--updater-smoke" else { return }
+        let bundle = Bundle.main.bundleURL.resolvingSymlinksInPath()
+        let temp = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().path
+        guard (2...3).contains(args.count), args.count == 2 || args[2] == "fail-after-swap",
+              bundle.path.hasPrefix(temp + "/"), bundle.lastPathComponent == "Lumen.app",
+              bundle.deletingLastPathComponent().lastPathComponent == "Applications",
+              let feed = URL(string: args[1]) else {
+            fputs("Updater smoke requires an isolated temporary Applications/Lumen.app and loopback feed.\n", stderr)
+            exit(2)
+        }
+        Task {
+            do {
+                let production = UpdateTransport(loopbackOnly: false)
+                let smoke = UpdateTransport(loopbackOnly: true)
+                guard production.allows(URL(string: "https://github.com/")!),
+                      !production.allows(URL(string: "http://github.com/")!),
+                      !production.allows(URL(string: "http://127.0.0.1/")!),
+                      smoke.allows(feed), !smoke.allows(URL(string: "https://github.com/")!) else {
+                    throw Failure("Incorrect updater URL policy")
+                }
+                let updater = LauncherUpdater(smokeFeed: feed)
+                if let release = try await updater.check() {
+                    let backup = try await updater.install(release, smokeFailAfterSwap: args.count == 3)
+                    print("Installed \(release.version) (build \(release.build)); backup: \(backup.path)")
+                } else { print("No newer release") }
+                exit(0)
+            } catch {
+                fputs("\(error.localizedDescription)\n", stderr)
+                exit(1)
+            }
+        }
+        dispatchMain()
+    }
+
     static func configuration() -> LauncherSmoke? {
         let arguments = CommandLine.arguments
         guard let mode = arguments.dropFirst().first, ["--gui-smoke", "--verify-resident-startup"].contains(mode) else { return nil }

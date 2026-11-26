@@ -727,21 +727,41 @@ final class LauncherSmoke {
             try check(p95 < .milliseconds(15), "500-item clipboard search (\(label)) exceeded 15 ms (p95: \(p95))")
             print("500-item clipboard search (\(label)): p95 \(p95)")
         }
-        func periodicItems(afterID: String = "", suffix: String = "") -> [ClipboardItem] {
+        func nearCapItems(afterID: String = "", repeating pattern: String = "a", suffix: String = "") -> [ClipboardItem] {
             (0..<500).map { id in
                 let prefix = "\(id)\(afterID)"
-                let padding = String(repeating: "a", count: ClipboardStore.maximumTextBytes - prefix.utf8.count - suffix.utf8.count)
+                let budget = ClipboardStore.maximumTextBytes - prefix.utf8.count - suffix.utf8.count
+                let width = pattern.utf8.count // These fixtures are ASCII, so characters and bytes coincide.
+                let padding = String(repeating: pattern, count: (budget + width - 1) / width).prefix(budget)
                 return ClipboardItem(id: Int64(id), text: prefix + padding + suffix, capturedAt: .now,
                                      sourceBundleID: nil, sourceAppName: nil, pinned: false)
             }
+        }
+        func verifyFuzzyLatency(_ items: [ClipboardItem], query: String, label: String) throws {
+            // A literal appended after the fixture must outrank every fuzzy match.
+            let literal = ClipboardItem(id: -1, text: query, capturedAt: .now, sourceBundleID: nil,
+                                        sourceAppName: nil, pinned: false)
+            try check(ClipboardItem.filtered(items + [literal], for: query).map(\.id) == [literal.id] + items.map(\.id),
+                      "500-item clipboard search (\(label)) did not return only fuzzy matches in order")
+            try verifyLatency(items, query: query, label: label, expectedCount: 500)
         }
 
         let periodicQuery = String(repeating: "a", count: 31) + "z"
         try verifyLatency(items, query: periodicQuery, label: "absent character", expectedCount: 0)
         // All bytes are present, but the first 't' is near the end with no 'a' after it.
         try verifyLatency(items, query: "t" + String(repeating: "a", count: 32), label: "all bytes present", expectedCount: 0)
-        try verifyLatency(periodicItems(afterID: "z"), query: periodicQuery, label: "reverse late mismatch", expectedCount: 0)
-        try verifyLatency(periodicItems(suffix: "xz"), query: periodicQuery, label: "fuzzy hit without substring", expectedCount: 500)
+        try verifyLatency(nearCapItems(afterID: "z"), query: periodicQuery, label: "reverse late mismatch", expectedCount: 0)
+        try verifyLatency(nearCapItems(suffix: "xz"), query: periodicQuery, label: "fuzzy hit without substring", expectedCount: 500)
+        try verifyFuzzyLatency(nearCapItems(repeating: "az"), query: periodicQuery, label: "Astra dense anchor")
+
+        let ys = String(repeating: "y", count: 14)
+        let xs = String(repeating: "x", count: 14)
+        let collisionQuery = "aa" + ys + "a" + ys + "z"
+        let collisionBlock = "aa" + xs + "a" + xs + "z"
+        // Every block passes the four probes but fails the full comparison. The suffix supplies
+        // the ordered y runs for fuzzy matching, with x preventing a literal across the boundary.
+        let collisionItems = nearCapItems(afterID: ys + ys, repeating: collisionBlock, suffix: "x" + ys + "a" + ys + "z")
+        try verifyFuzzyLatency(collisionItems, query: collisionQuery, label: "four-point collision (KMP fallback)")
     }
 
     private func verifyClipboardStorageLinks() throws {

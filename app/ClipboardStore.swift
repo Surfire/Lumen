@@ -39,8 +39,35 @@ struct ClipboardItem: Identifiable, Equatable {
             return (low, high, nonAscii)
         }
 
+        @inline(__always)
+        private static func load16(_ ptr: UnsafePointer<UInt8>) -> SIMD16<UInt8> {
+            var v = SIMD16<UInt8>()
+            _ = withUnsafeMutableBytes(of: &v) { memcpy($0.baseAddress!, ptr, 16) }
+            return v
+        }
+
+        @inline(__always)
+        private static func kmpPure(_ hBase: UnsafePointer<UInt8>, _ n: Int, _ nBase: UnsafePointer<UInt8>,
+                                    _ m: Int, _ lps: [Int], start: Int) -> Bool {
+            lps.withUnsafeBufferPointer { table in
+                let lBase = table.baseAddress!
+                var i = start
+                var j = 0
+                while i < n {
+                    let b = hBase[i]
+                    while j > 0 && nBase[j] != b { j = lBase[j &- 1] }
+                    if nBase[j] == b {
+                        j &+= 1
+                        if j == m { return true }
+                    }
+                    i &+= 1
+                }
+                return false
+            }
+        }
+
         private static func containsSubstring(haystack: UnsafeBufferPointer<UInt8>, needle: UnsafeBufferPointer<UInt8>,
-                                              anchorIndex: Int, allIdenticalBytes: Bool, lps: [Int], startOffset: Int) -> Bool {
+                                              allIdenticalBytes: Bool, lps: [Int], startOffset: Int) -> Bool {
             let n = haystack.count
             let m = needle.count
             let lastStart = n - m
@@ -68,38 +95,47 @@ struct ClipboardItem: Identifiable, Equatable {
                 return false
             }
 
-            let anchorByte = Int32(nBase[anchorIndex])
-            let anchorEnd = n - (m - 1 - anchorIndex)
-            var nextAnchor = startOffset + anchorIndex
-            for _ in 0..<32 {
-                guard nextAnchor < anchorEnd, let hit = memchr(hBase + nextAnchor, anchorByte, anchorEnd - nextAnchor) else { return false }
-                let anchor = UnsafeRawPointer(hBase).distance(to: UnsafeRawPointer(hit))
-                if memcmp(hBase + anchor - anchorIndex, nBase, m) == 0 { return true }
-                nextAnchor = anchor + 1
+            let off1 = 1
+            let off2 = m >> 1
+            let off3 = m - 1
+            let v0 = SIMD16<UInt8>(repeating: nBase[0])
+            let v1 = SIMD16<UInt8>(repeating: nBase[off1])
+            let v2 = SIMD16<UInt8>(repeating: nBase[off2])
+            let v3 = SIMD16<UInt8>(repeating: nBase[off3])
+            var pos = startOffset
+            var verifications = 0
+            // Every lane is a valid start, so even the last-byte load stays in bounds.
+            while pos <= lastStart - 15 {
+                var mask = (load16(hBase + pos) .== v0) .& (load16(hBase + pos + off3) .== v3)
+                if any(mask) {
+                    mask = mask .& (load16(hBase + pos + off1) .== v1) .& (load16(hBase + pos + off2) .== v2)
+                    if any(mask) {
+                        for lane in 0..<16 where mask[lane] {
+                            let candidate = pos + lane
+                            if m <= 4 || memcmp(hBase + candidate, nBase, m) == 0 { return true }
+                            verifications &+= 1
+                            if verifications >= 32 {
+                                // Earlier starts have already been ruled out, including this candidate.
+                                return kmpPure(hBase, n, nBase, m, lps, start: candidate + 1)
+                            }
+                        }
+                    }
+                }
+                pos &+= 16
             }
-
-            // Bound the cost of full comparisons. All starts before the next candidate were ruled out.
-            var offset = nextAnchor - anchorIndex
-            var matched = 0
-            while offset < n {
-                if matched == 0 {
-                    guard offset <= lastStart, let hit = memchr(hBase + offset, Int32(nBase[0]), lastStart - offset + 1) else { return false }
-                    offset = UnsafeRawPointer(hBase).distance(to: UnsafeRawPointer(hit)) + 1
-                    matched = 1
-                    continue
+            while pos <= lastStart {
+                if hBase[pos] == nBase[0] && hBase[pos + off3] == nBase[off3] &&
+                    hBase[pos + off1] == nBase[off1] && hBase[pos + off2] == nBase[off2] {
+                    if m <= 4 || memcmp(hBase + pos, nBase, m) == 0 { return true }
+                    verifications &+= 1
+                    if verifications >= 32 { return kmpPure(hBase, n, nBase, m, lps, start: pos + 1) }
                 }
-                let byte = hBase[offset]
-                while matched > 0 && nBase[matched] != byte { matched = lps[matched - 1] }
-                if nBase[matched] == byte {
-                    matched += 1
-                    if matched == m { return true }
-                }
-                offset += 1
+                pos &+= 1
             }
             return false
         }
 
-        func match(needle: UnsafeBufferPointer<UInt8>, scalarRanges: [Range<Int>], anchorIndex: Int,
+        func match(needle: UnsafeBufferPointer<UInt8>, scalarRanges: [Range<Int>],
                    allIdenticalBytes: Bool, lps: [Int], checkFuzzy: Bool) -> SearchMatch? {
             bytes.withUnsafeBufferPointer { field in
                 guard field.count >= needle.count, let base = field.baseAddress, let query = needle.baseAddress else { return nil }
@@ -123,8 +159,8 @@ struct ClipboardItem: Identifiable, Equatable {
                     if offset - firstMatchOffset == needle.count { return .substring }
                 }
 
-                if Self.containsSubstring(haystack: field, needle: needle, anchorIndex: anchorIndex,
-                                          allIdenticalBytes: allIdenticalBytes, lps: lps, startOffset: firstMatchOffset) {
+                if Self.containsSubstring(haystack: field, needle: needle, allIdenticalBytes: allIdenticalBytes,
+                                          lps: lps, startOffset: firstMatchOffset) {
                     return .substring
                 }
                 return checkFuzzy ? .fuzzy : nil
@@ -165,13 +201,8 @@ struct ClipboardItem: Identifiable, Equatable {
             offset = end
         }
 
-        var frequencies = [Int](repeating: 0, count: 256)
-        for byte in needleBytes { frequencies[Int(byte)] += 1 }
-        var anchorIndex = needleBytes.count - 1
-        for index in needleBytes.indices.reversed() where frequencies[Int(needleBytes[index])] < frequencies[Int(needleBytes[anchorIndex])] {
-            anchorIndex = index
-        }
-        let allIdenticalBytes = frequencies[Int(needleBytes[anchorIndex])] == needleBytes.count
+        let firstByte = needleBytes[0]
+        let allIdenticalBytes = needleBytes.allSatisfy { $0 == firstByte }
 
         var kmpLPS = [Int](repeating: 0, count: needleBytes.count)
         var prefix = 0
@@ -190,8 +221,8 @@ struct ClipboardItem: Identifiable, Equatable {
                     if (field.lowMask & needLow) != needLow || (field.highMask & needHigh) != needHigh ||
                         (field.nonAsciiMask & needNonAscii) != needNonAscii { continue }
                     // After a fuzzy hit, later fields can still promote the item to a substring hit.
-                    if let match = field.match(needle: needle, scalarRanges: scalarRanges, anchorIndex: anchorIndex,
-                                               allIdenticalBytes: allIdenticalBytes, lps: kmpLPS, checkFuzzy: bestMatch == nil) {
+                    if let match = field.match(needle: needle, scalarRanges: scalarRanges, allIdenticalBytes: allIdenticalBytes,
+                                               lps: kmpLPS, checkFuzzy: bestMatch == nil) {
                         bestMatch = match
                         if match == .substring { break }
                     }

@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import Darwin
 
 enum IndexPhase: Equatable {
     case checking, needsIndex, ready, unreadable
@@ -319,7 +320,7 @@ final class Launcher: ObservableObject {
                                    "Local semantic indexing failed. Saved chunks are kept for the next run.")
         case .embeddingNoProgress: return t("本批没有新增或跳过片段，已停止生成。已完成的进度已保存。",
                                            "Indexing stopped after a batch made no progress. Completed work is saved.")
-        case .preview: return t("无法快速查看此文件。可预览的本机文件上限为 128 MB。", "Could not preview the file. The limit for local previews is 128 MB.")
+        case .preview: return t("无法快速查看此文件。", "Could not preview the file.")
         case .copiedName: return t("已复制名称", "Name copied")
         case .copiedPath: return t("已复制路径", "Path copied")
         case .opening: return t("macOS 无法打开这个项目。", "macOS could not open this item.")
@@ -934,6 +935,7 @@ final class Launcher: ObservableObject {
         embeddingState = .idle
         embeddingBatch = nil
         embeddingNotice = nil
+        automaticBuildAttempted = false
         let shouldStageDocuments = indexPhase != .ready && requested.documents
         var first = requested
         if shouldStageDocuments { first.documents = false; if first.content_roots != nil { first.content_roots = [] } }
@@ -1004,9 +1006,13 @@ final class Launcher: ObservableObject {
         }
     }
 
+    private var contentNeedsBatch: Bool {
+        !contentPaused && !contentFailed && (contentCoverage?.pending ?? 0) > 0
+    }
+
     private func startContentIfReady() {
-        guard canSearch, !scopePending, !closed, indexWork == nil, contentWriter == nil,
-              !contentPaused, !contentFailed, contentCoverage?.pending ?? 0 > 0 else { return }
+        guard canSearch, !scopePending, !closed, indexWork == nil, !contentRunning,
+              embeddingState != .verifying, contentNeedsBatch else { return }
         contentRunning = true
         contentWriter = engine.run(["content", "--max", "8"], priority: .background) { [weak self] response in
             guard let self, !self.closed else { return }
@@ -1014,11 +1020,10 @@ final class Launcher: ObservableObject {
             self.contentRunning = false
             guard response.succeeded, let batch = try? JSONDecoder().decode(ContentBatch.self, from: response.output) else {
                 self.contentFailed = true
+                self.refreshCoverage()
                 return
             }
             if batch.indexed > 0 {
-                self.automaticBuildAttempted = false
-                if self.embeddingState == .finished { self.embeddingState = .idle }
                 self.scheduleSearch(keepAction: true)
             }
             if batch.processed == 0 && batch.pending > 0 { self.contentFailed = true }
@@ -1045,6 +1050,7 @@ final class Launcher: ObservableObject {
                 guard let self, self.embeddingState == .verifying else { return }
                 self.embeddingState = .idle
                 if verified, self.canBuildEmbeddings { self.startEmbeddings() }
+                else { self.startContentIfReady() }
             }
         }
     }
@@ -1056,6 +1062,7 @@ final class Launcher: ObservableObject {
             cancelModelCheck()
             localModelState = .available
             embeddingState = .paused
+            refreshCoverage()
         case .running:
             embeddingState = .pausing
         case .idle, .pausing, .paused, .finished:
@@ -1071,7 +1078,7 @@ final class Launcher: ObservableObject {
 
     private func embedNextBatch() {
         let arguments = ["embed", "--gemma", "--max", "32"] + engine.gemmaOptions
-        writer = engine.run(arguments) { [weak self] response in
+        writer = engine.run(arguments, priority: .background) { [weak self] response in
             guard let self, !self.closed else { return }
             self.writer = nil
             guard response.succeeded, let batch = try? JSONDecoder().decode(EmbeddingBatch.self, from: response.output) else {
@@ -1087,12 +1094,21 @@ final class Launcher: ObservableObject {
                 self.embeddingNotice = LauncherNotice(.embeddingNoProgress)
                 self.finishEmbeddings(.paused)
             } else if self.embeddingState == .running {
-                if self.gemmaCoverage?.hasResults != true { self.refreshCoverage() }
-                self.embedNextBatch()
+                if self.contentNeedsBatch {
+                    // Yield one writer turn, then recheck both queues from fresh coverage.
+                    self.automaticBuildAttempted = false
+                    self.finishEmbeddings(.idle)
+                    self.startContentIfReady()
+                } else {
+                    if self.gemmaCoverage?.hasResults != true { self.refreshCoverage() }
+                    self.embedNextBatch()
+                }
             } else {
                 self.finishEmbeddings(.paused)
             }
         }
+        // The engine's QoS controls pipe draining; lower the child itself too.
+        if let writer { _ = setpriority(PRIO_PROCESS, UInt32(writer.processIdentifier), 10) }
     }
 
     private func finishEmbeddings(_ state: EmbeddingState) {
@@ -1106,7 +1122,6 @@ final class Launcher: ObservableObject {
         if savedScope != report.scope { savedScope = report.scope }
         if indexReport != report { indexReport = report }
         if contentCoverage != report.content { contentCoverage = report.content }
-        startContentIfReady()
         let previous = gemmaCoverage
         if previous != report.gemma {
             gemmaCoverage = report.gemma
@@ -1118,15 +1133,19 @@ final class Launcher: ObservableObject {
                 queueRelatedExcerpts()
             }
         }
+        if embeddingState == .finished, report.gemma?.pending == true {
+            embeddingState = .idle
+            automaticBuildAttempted = false
+        }
         // Existing BGE vectors are evidence an older user explicitly started semantic indexing.
         // The saved scope in the database decides whether documents are eligible.
         if !automaticBuildAttempted, embeddingState == .idle, canBuildEmbeddings,
-           contentCoverage?.pending ?? 0 == 0 || contentPaused || contentFailed,
            defaults?.bool(forKey: "gemmaIndexingPaused") != true,
            (report.embedded_chunks ?? 0) > 0 || defaults?.bool(forKey: "gemmaIndexingEnabled") == true {
             automaticBuildAttempted = true
             prepareEmbeddings()
         }
+        startContentIfReady()
     }
 
     private func refreshCoverage(after delay: Duration = .zero) {

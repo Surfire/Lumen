@@ -80,11 +80,7 @@ impl ImageOcrExtractor {
         path: &Path,
         meta: &fs::Metadata,
     ) -> Result<crate::content::Extracted> {
-        let bytes = platform::read_local_checked(
-            path,
-            crate::image_decode::MAX_FILE_BYTES,
-            Some(&stamp(meta)),
-        )?;
+        let bytes = read_resident_document(path, meta, crate::image_decode::MAX_FILE_BYTES)?;
         ensure!(
             self.binary_stamp == Self::binary_stamp(&self.executable)?,
             "bundled image OCR extractor changed while running; restart from the current app"
@@ -202,6 +198,18 @@ fn visible_entry_path(path: &Path) -> bool {
     path != Path::new("/") && !super::scope_ancestor(path)
 }
 
+pub(super) fn in_explicit_content_root(scope: &Scope, path: &Path) -> bool {
+    scope.content_roots.as_ref().is_some_and(|roots| {
+        roots
+            .iter()
+            .any(|root| path != root && path.starts_with(root))
+    })
+}
+
+pub(super) fn resident_content_availability(availability: &str, explicit_scope: bool) -> bool {
+    availability == "local" || (explicit_scope && availability == "provider_metadata_only")
+}
+
 pub(super) struct Coverage {
     pub scope: Scope,
     database: PathBuf,
@@ -299,11 +307,7 @@ impl Coverage {
     pub(super) fn permits_content(&self, path: &Path) -> bool {
         self.scope.documents
             && self.contains(path)
-            && self.scope.content_roots.as_ref().is_none_or(|roots| {
-                roots
-                    .iter()
-                    .any(|root| path != root && path.starts_with(root))
-            })
+            && (self.scope.content_roots.is_none() || in_explicit_content_root(&self.scope, path))
     }
 
     pub fn allows(&self, path: &Path) -> bool {
@@ -463,21 +467,22 @@ pub(super) fn restrict_scope(conn: &mut Connection, coverage: &Coverage) -> Resu
     let prior: Option<String> = tx
         .query_row("SELECT value FROM info WHERE key='scope'", [], |r| r.get(0))
         .optional()?;
-    // Recheck unchanged scopes from catalogs written before traversal-only
-    // paths were excluded here as well as in the walk.
-    const POLICY_KEY: &str = "scope_policy_v4";
-    let policy_reconciled = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM info WHERE key=?)",
-        [POLICY_KEY],
-        |r| r.get::<_, bool>(0),
+    // Seed newly eligible resident provider rows even when reopening an
+    // unchanged scope saved by an older engine.
+    const NAME_POLICY: &str = "scope_policy_v4";
+    const CONTENT_POLICY: &str = "cloud_content_policy_v1";
+    let (names_reconciled, content_reconciled) = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM info WHERE key=?1), EXISTS(SELECT 1 FROM info WHERE key=?2)",
+        [NAME_POLICY, CONTENT_POLICY],
+        |r| Ok((r.get::<_, bool>(0)?, r.get::<_, bool>(1)?)),
     )?;
-    if policy_reconciled && prior.as_deref() == Some(&requested) {
+    if names_reconciled && content_reconciled && prior.as_deref() == Some(&requested) {
         return Ok(());
     }
     let prior = prior
         .as_deref()
         .and_then(|raw| serde_json::from_str::<Scope>(raw).ok());
-    let same_names = policy_reconciled
+    let same_names = names_reconciled
         && prior.as_ref().is_some_and(|scope| {
             scope.roots == coverage.scope.roots
                 && scope.allow == coverage.scope.allow
@@ -497,14 +502,19 @@ pub(super) fn restrict_scope(conn: &mut Connection, coverage: &Coverage) -> Resu
     purge(&tx)?;
     if !coverage.scope.documents {
         tx.execute_batch("DELETE FROM content_fts; DELETE FROM document; DELETE FROM document_state; DELETE FROM embedding; DELETE FROM content_job;")?;
-    } else if coverage.scope.content_roots.is_some() || prior.is_some_and(|scope| scope.image_ocr) {
+    } else if coverage.scope.content_roots.is_some()
+        || prior.is_some_and(|scope| scope.content_roots.is_some() || scope.image_ocr)
+    {
         crate::content::restrict_and_seed(&tx, coverage)?;
     }
     if !same_names {
         tx.execute("DELETE FROM info WHERE key='walk_sample'", [])?;
+        write_info(&tx, NAME_POLICY, &true)?;
     }
     write_info(&tx, "scope", &coverage.scope)?;
-    write_info(&tx, POLICY_KEY, &true)?;
+    if !content_reconciled {
+        write_info(&tx, CONTENT_POLICY, &true)?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -935,17 +945,19 @@ impl<'a> Walk<'a> {
             if visible_entry_path(&path) {
                 let mut legacy = None;
                 let mut content = None;
+                let explicit = self.coverage.scope.content_roots.is_some();
+                let resident = resident_content_availability(availability, explicit);
                 if !directory
                     && self.coverage.permits_content(&path)
                     && let Some(kind) = crate::content::eligible_kind(self.coverage, &path)
-                    && kind.accepts_availability(availability)
+                    && (resident || !explicit)
                 {
                     // Bulk enumeration omits document version metadata. Fetch
                     // it here, before the pending batch can acquire a write lock.
                     let fetched;
-                    let meta = match (availability, metadata.as_ref()) {
-                        ("local", Some(meta)) => Some(meta),
-                        ("local", None) => match fs::symlink_metadata(&path) {
+                    let meta = match (resident, metadata.as_ref()) {
+                        (true, Some(meta)) => Some(meta),
+                        (true, None) => match fs::symlink_metadata(&path) {
                             Ok(meta) => {
                                 fetched = meta;
                                 Some(&fetched)
@@ -959,9 +971,13 @@ impl<'a> Walk<'a> {
                         _ => None,
                     }
                     .filter(|meta| {
-                        meta.is_file() && platform::availability(&path, meta) == "local"
+                        meta.is_file()
+                            && resident_content_availability(
+                                platform::availability(&path, meta),
+                                explicit,
+                            )
                     });
-                    if self.coverage.scope.content_roots.is_none() {
+                    if !explicit {
                         let document = self.read_document(&path, meta, kind)?;
                         if matches!(document, LegacyDocument::Unreadable) {
                             self.stats.documents_not_read += 1;
@@ -969,7 +985,7 @@ impl<'a> Walk<'a> {
                             continue;
                         }
                         legacy = Some(Box::new(document));
-                    } else if availability == "local" {
+                    } else if meta.is_some() {
                         match crate::content::prepare(self.conn, self.coverage, &path, meta, kind)?
                         {
                             Some(observation) => content = Some(observation),
@@ -1237,7 +1253,7 @@ impl<'a> Walk<'a> {
                     LegacyDocument::Unreadable
                 });
             }
-            let extracted = extract_document(self.coverage, path, kind);
+            let extracted = extract_document(self.coverage, path, kind, meta);
             if kind == DocumentKind::Pdf
                 && let Some(pdf) = &self.coverage.pdf
             {
@@ -1257,7 +1273,7 @@ impl<'a> Walk<'a> {
                 && !body.body.is_empty()
                 && fs::symlink_metadata(path).is_ok_and(|m| {
                     m.is_file()
-                        && platform::availability(path, &m) == "local"
+                        && resident_content_availability(platform::availability(path, &m), false)
                         && version(&m) == current
                 })
             {
@@ -1319,25 +1335,52 @@ impl<'a> Walk<'a> {
     }
 }
 
-/// Verify access to the same local document version without reading bytes.
+/// Verify access to the same resident document version without reading bytes.
 pub(super) fn can_open_document(path: &Path, expected: &fs::Metadata) -> bool {
     check_document_access(path, expected).unwrap_or(false)
 }
 
 pub(super) fn check_document_access(path: &Path, expected: &fs::Metadata) -> std::io::Result<bool> {
+    Ok(open_resident_document(path, expected)?.is_some())
+}
+
+// The caller has authorized this path for content and disabled materialization
+// on this thread. Check both the observed entry and the descriptor before access.
+fn open_resident_document(
+    path: &Path,
+    expected: &fs::Metadata,
+) -> std::io::Result<Option<fs::File>> {
     use std::os::unix::fs::OpenOptionsExt;
+    let resident =
+        |m: &fs::Metadata| m.is_file() && platform::availability(path, m) != "placeholder";
+    if !resident(expected) {
+        return Ok(None);
+    }
     #[cfg(target_os = "macos")]
     let flags = libc::O_NOFOLLOW_ANY | libc::O_NONBLOCK;
     #[cfg(not(target_os = "macos"))]
     let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
-    let opened = fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(flags)
-        .open(path)?
-        .metadata()?;
-    Ok(opened.is_file()
-        && platform::availability(path, &opened) == "local"
-        && stamp(&opened) == stamp(expected))
+        .open(path)?;
+    let opened = file.metadata()?;
+    Ok((resident(&opened) && stamp(&opened) == stamp(expected)).then_some(file))
+}
+
+fn read_resident_document(path: &Path, expected: &fs::Metadata, limit: u64) -> Result<Vec<u8>> {
+    ensure!(expected.len() <= limit, "file exceeded size limit");
+    let file =
+        open_resident_document(path, expected)?.context("file changed or is not resident")?;
+    let mut data = Vec::new();
+    Read::take(&file, limit + 1).read_to_end(&mut data)?;
+    ensure!(data.len() as u64 <= limit, "file exceeded size limit");
+    let after = file.metadata()?;
+    ensure!(
+        platform::availability(path, &after) != "placeholder" && stamp(&after) == stamp(expected),
+        "file changed while reading"
+    );
+    Ok(data)
 }
 
 pub(super) fn document_version(
@@ -1358,11 +1401,12 @@ pub(super) fn extract_document(
     coverage: &Coverage,
     path: &Path,
     kind: DocumentKind,
+    meta: &fs::Metadata,
 ) -> Result<crate::content::Extracted> {
     let pdf = (kind == DocumentKind::Pdf)
         .then_some(coverage.pdf.as_ref())
         .flatten();
-    let result = kind.extract(path, pdf);
+    let result = kind.extract(path, meta, pdf);
     if let Some(pdf) = pdf {
         pdf.executable()?;
     }
@@ -1457,15 +1501,22 @@ impl DocumentKind {
         }
     }
 
-    pub(super) fn accepts_availability(self, availability: &str) -> bool {
-        self != Self::Image || availability == "local"
-    }
-
-    fn extract(self, path: &Path, pdf: Option<&PdfExtractor>) -> Result<crate::content::Extracted> {
+    fn extract(
+        self,
+        path: &Path,
+        meta: &fs::Metadata,
+        pdf: Option<&PdfExtractor>,
+    ) -> Result<crate::content::Extracted> {
+        let read = |limit| match platform::availability(path, meta) {
+            "local" => platform::read_local(path, limit),
+            _ => read_resident_document(path, meta, limit),
+        };
         let body = match self {
-            Self::Text => String::from_utf8(platform::read_local(path, MAX_DOCUMENT)?)?,
-            Self::Docx => docx::text(&platform::read_local(path, docx::MAX_ARCHIVE)?)?,
-            Self::Pdf => return extract_pdf(path, pdf.context("missing PDF helper")?),
+            Self::Text => String::from_utf8(read(MAX_DOCUMENT)?)?,
+            Self::Docx => docx::text(&read(docx::MAX_ARCHIVE)?)?,
+            Self::Pdf => {
+                return extract_pdf(read(24 * 1024 * 1024)?, pdf.context("missing PDF helper")?);
+            }
             Self::Image => unreachable!("image OCR uses the observed file stamp"),
         };
         Ok(crate::content::Extracted {
@@ -1475,8 +1526,7 @@ impl DocumentKind {
     }
 }
 
-fn extract_pdf(path: &Path, helper: &PdfExtractor) -> Result<crate::content::Extracted> {
-    let bytes = platform::read_local(path, 24 * 1024 * 1024)?;
+fn extract_pdf(bytes: Vec<u8>, helper: &PdfExtractor) -> Result<crate::content::Extracted> {
     let mut command = Command::new(helper.executable()?);
     let pages = helper.bundled_binary.is_some();
     if pages {
@@ -1588,11 +1638,15 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn dataless_bulk_metadata_cannot_queue_image_ocr() {
-        let path = Path::new("/private/tmp/local.heic");
-        let image = DocumentKind::for_path(path).unwrap();
+        let path = Path::new("/private/tmp/OneDrive-Fixture/image.heic");
+        assert!(DocumentKind::for_path(path) == Some(DocumentKind::Image));
         let availability = |flags| platform::classify(path, platform::dataless_flags(flags));
-        assert!(image.accepts_availability(availability(0)));
-        assert!(!image.accepts_availability(availability(0x4000_0000))); // Darwin SF_DATALESS
+        assert!(resident_content_availability(availability(0), true));
+        assert!(!resident_content_availability(availability(0), false));
+        assert!(!resident_content_availability(
+            availability(0x4000_0000),
+            true
+        )); // Darwin SF_DATALESS
     }
 
     #[test]

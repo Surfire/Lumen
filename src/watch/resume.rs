@@ -1,5 +1,9 @@
 use super::fsevents;
-use crate::{Result, Scope, index::Coverage, platform};
+use crate::{
+    Result, Scope,
+    index::{Coverage, in_explicit_content_root, resident_content_availability},
+    platform, saved_index_scope,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -314,9 +318,13 @@ fn open_directory(path: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn can_read_document(path: &Path, stamp: Option<&str>) -> bool {
+    can_read_resident_document(path, stamp, false)
+}
+
+fn can_read_resident_document(path: &Path, stamp: Option<&str>, explicit: bool) -> bool {
     fs::symlink_metadata(path).is_ok_and(|metadata| {
         metadata.is_file()
-            && platform::availability(path, &metadata) == "local"
+            && resident_content_availability(platform::availability(path, &metadata), explicit)
             && stamp.is_none_or(|expected| crate::index::stamp(&metadata) == expected)
             && crate::index::can_open_document(path, &metadata)
     })
@@ -326,6 +334,8 @@ pub(super) fn verify_access(conn: &mut Connection, roots: Option<&[PathBuf]>) ->
     // Directory enumeration controls name visibility in the normal walker.
     // Also verify access to each cached document without reading its bytes.
     // The watcher's no-materialization I/O policy covers both operations.
+    // The watcher has already restricted the catalog to this saved scope.
+    let scope = saved_index_scope(conn)?;
     let mut blocked = Vec::new();
     let mut opened_previously_blocked = false;
     for path in roots.into_iter().flatten() {
@@ -349,7 +359,10 @@ pub(super) fn verify_access(conn: &mut Connection, roots: Option<&[PathBuf]>) ->
             let accessible = if directory {
                 open_directory(path).is_ok()
             } else {
-                can_read_document(path, None)
+                let explicit = scope
+                    .as_ref()
+                    .is_some_and(|scope| scope.documents && in_explicit_content_root(scope, path));
+                can_read_resident_document(path, None, explicit)
             };
             let previously_blocked: bool = row.get(2)?;
             if !accessible && !previously_blocked {

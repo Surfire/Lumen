@@ -1,6 +1,7 @@
 use crate::index::{
     Coverage, DocumentKind, ImageOcrExtractor, can_open_document, check_document_access,
-    document_version, extract_document, remove_document, restrict_scope, save_document,
+    document_version, extract_document, remove_document, resident_content_availability,
+    restrict_scope, save_document,
 };
 use crate::{MAX_DOCUMENT, PdfHelperPolicy, Scope, absolute, open_read, open_write, platform};
 use anyhow::{Context, Result, ensure};
@@ -84,7 +85,16 @@ pub(super) fn restrict_and_seed(conn: &Connection, coverage: &Coverage) -> Resul
         while let Some(row) = rows.next()? {
             let path: String = row.get(1)?;
             let path = Path::new(&path);
-            if !coverage.permits_content(path) || eligible_kind(coverage, path).is_none() {
+            let availability: String = row.get(2)?;
+            // Keep access gaps for watch to revalidate. They are not runnable jobs.
+            if !coverage.permits_content(path)
+                || eligible_kind(coverage, path).is_none()
+                || (availability != "unverified"
+                    && !resident_content_availability(
+                        &availability,
+                        coverage.scope.content_roots.is_some(),
+                    ))
+            {
                 ids.push(row.get(0)?);
             }
         }
@@ -93,20 +103,20 @@ pub(super) fn restrict_and_seed(conn: &Connection, coverage: &Coverage) -> Resul
     for id in retired(
         conn,
         coverage,
-        "SELECT i.id,i.path FROM document d JOIN item i USING(id)",
+        "SELECT i.id,i.path,i.availability FROM document d JOIN item i USING(id)",
     )? {
         remove_document(conn, id)?;
     }
     for id in retired(
         conn,
         coverage,
-        "SELECT i.id,i.path FROM content_job j JOIN item i ON i.id=j.item_id",
+        "SELECT i.id,i.path,i.availability FROM content_job j JOIN item i ON i.id=j.item_id",
     )? {
         conn.prepare_cached("DELETE FROM content_job WHERE item_id=?")?
             .execute([id])?;
     }
     if let Some(roots) = &coverage.scope.content_roots {
-        let mut select = conn.prepare("SELECT id,path FROM item WHERE path>=?1 AND path<?2 AND kind='file' AND availability='local'")?;
+        let mut select = conn.prepare("SELECT id,path FROM item WHERE path>=?1 AND path<?2 AND kind='file' AND availability IN ('local','provider_metadata_only')")?;
         let mut add = conn.prepare("INSERT OR IGNORE INTO content_job(item_id) VALUES(?)")?;
         for root in roots {
             let Some(root) = root.to_str() else {
@@ -217,9 +227,10 @@ pub(super) fn coverage(conn: &Connection) -> Result<ContentCoverage> {
     if !has_table(conn, "content_job")? {
         return Ok(ContentCoverage::default());
     }
+    // Scope reconciliation and the watcher keep jobs inside explicit roots.
     Ok(conn.query_row(
         "SELECT count(*)-count(j.stamp),count(j.stamp),count(*)
-        FROM content_job j JOIN item i ON i.id=j.item_id WHERE i.availability='local'",
+        FROM content_job j JOIN item i ON i.id=j.item_id WHERE i.availability IN ('local','provider_metadata_only')",
         [],
         |r| {
             Ok(ContentCoverage {
@@ -272,7 +283,7 @@ pub fn index_content(database: &Path, max: usize) -> Result<ContentBatch> {
             let Some((id, path)) = conn
                 .prepare_cached(
                     "SELECT i.id,i.path FROM content_job j JOIN item i ON i.id=j.item_id
-                     WHERE j.stamp IS NULL AND i.availability='local'
+                     WHERE j.stamp IS NULL AND i.availability IN ('local','provider_metadata_only')
                        AND j.item_id>?1 AND j.item_id<=?2 ORDER BY j.item_id LIMIT 1",
                 )?
                 .query_row(params![after, end], |r| {
@@ -307,7 +318,7 @@ pub fn index_content(database: &Path, max: usize) -> Result<ContentBatch> {
             let pending: bool = tx
                 .prepare_cached(
                     "SELECT EXISTS(SELECT 1 FROM content_job j JOIN item i ON i.id=j.item_id
-            WHERE i.id=?1 AND i.path=?2 AND i.availability='local' AND j.stamp IS NULL)",
+            WHERE i.id=?1 AND i.path=?2 AND i.availability IN ('local','provider_metadata_only') AND j.stamp IS NULL)",
                 )?
                 .query_row(params![id, path], |r| r.get(0))?;
             if !pending {
@@ -370,7 +381,7 @@ fn prepare_update(
     else {
         return Ok(Some(Update::Retire));
     };
-    let metadata = || match local_metadata(path) {
+    let metadata = || match resident_metadata(path, coverage.scope.content_roots.is_some()) {
         Err(error) if error.kind() != ErrorKind::PermissionDenied => Ok(None),
         result => result,
     };
@@ -394,7 +405,7 @@ fn prepare_update(
     let extracted = if let Some(meta) = before.as_ref().filter(|_| !unchanged) {
         let extracted = match kind {
             DocumentKind::Image => ocr.context("image OCR is not enabled")?.extract(path, meta),
-            _ => extract_document(coverage, path, kind),
+            _ => extract_document(coverage, path, kind, meta),
         };
         match extracted {
             Ok(extracted) => Some(extracted).filter(|item| !item.body.trim().is_empty()),
@@ -423,7 +434,7 @@ fn has_io_error(error: &anyhow::Error, kind: ErrorKind) -> bool {
     })
 }
 
-fn local_metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {
+fn resident_metadata(path: &Path, explicit: bool) -> io::Result<Option<fs::Metadata>> {
     // Check ancestors in root order before examining any child. Opening document
     // bytes repeats the engine's no-follow and no-materialization protections.
     let parents: Vec<_> = path.ancestors().skip(1).collect();
@@ -434,7 +445,9 @@ fn local_metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {
         }
     }
     let meta = fs::symlink_metadata(path)?;
-    Ok((meta.is_file() && platform::availability(path, &meta) == "local").then_some(meta))
+    Ok((meta.is_file()
+        && resident_content_availability(platform::availability(path, &meta), explicit))
+    .then_some(meta))
 }
 
 pub(super) struct Extracted {

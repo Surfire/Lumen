@@ -2,7 +2,7 @@ use crate::{
     Hit, Model, ModelBackend, PdfHelperPolicy, Scope, absolute,
     diagnose::read_snapshot,
     document_stamp_sql, gemma,
-    index::DocumentKind,
+    index::{DocumentKind, in_explicit_content_root},
     model::{Role, Unencodable},
     open_write, read_document_stamp, row_hit, saved_index_scope,
     vector::{Matrix, MatrixCache, adaptive_floor, pack},
@@ -139,9 +139,11 @@ fn read_gemma_coverage(conn: &Connection) -> Result<GemmaCoverage> {
     if !coverage.documents_enabled {
         return Ok(coverage);
     }
+    // Provider documents are created only within explicit content roots and
+    // pruned on scope changes, just like the rest of the document store.
     if !has_gemma_store(conn)? {
         coverage.pending = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM document JOIN item USING(id) WHERE availability='local')",
+            "SELECT EXISTS(SELECT 1 FROM document JOIN item USING(id) WHERE availability IN ('local','provider_metadata_only'))",
             [],
             |row| row.get(0),
         )?;
@@ -184,7 +186,7 @@ const GEMMA_VECTOR_BYTES: i64 = (gemma::DIMENSIONS * size_of::<f32>()) as i64;
 
 const GEMMA_LIVE: &str = "FROM semantic_vector v JOIN semantic_chunk c ON c.id=v.chunk_id
     JOIN item i ON i.id=c.document_id JOIN document_state ds ON ds.id=c.document_id
-    WHERE v.model=?1 AND i.availability='local'";
+    WHERE v.model=?1 AND i.availability IN ('local','provider_metadata_only')";
 const GEMMA_VECTOR: &str = "typeof(v.vector)='blob' AND length(v.vector) IN (?2/2,?2)";
 const GEMMA_MIN_COSINE: f32 = f32::MIN_POSITIVE;
 const GEMMA_Z_THRESHOLD: f64 = 1.0;
@@ -203,7 +205,7 @@ fn documents_enabled(conn: &Connection) -> Result<bool> {
 }
 
 const GEMMA_QUEUE: &str = "FROM semantic_chunk c JOIN item i ON i.id=c.document_id
-    JOIN document_state ds ON ds.id=c.document_id WHERE i.availability='local' AND NOT EXISTS
+    JOIN document_state ds ON ds.id=c.document_id WHERE i.availability IN ('local','provider_metadata_only') AND NOT EXISTS
        (SELECT 1 FROM semantic_vector v INDEXED BY semantic_vector_chunk WHERE v.model=?1 AND v.chunk_id=c.id)";
 
 fn gemma_pending(conn: &Connection) -> Result<bool> {
@@ -212,7 +214,7 @@ fn gemma_pending(conn: &Connection) -> Result<bool> {
             "SELECT EXISTS(SELECT 1 {GEMMA_QUEUE}) OR EXISTS(
             SELECT 1 FROM semantic_document p JOIN item i ON i.id=p.document_id
             JOIN document_state ds ON ds.id=p.document_id
-            WHERE p.prepared=0 AND i.availability='local')"
+            WHERE p.prepared=0 AND i.availability IN ('local','provider_metadata_only'))"
         ))?
         .query_row([gemma::ID], |row| row.get(0))?)
 }
@@ -307,7 +309,7 @@ fn embed_gemma(conn: &mut Connection, model: &crate::GemmaModel, max: usize) -> 
         let saved = tx.execute(
             "INSERT OR IGNORE INTO semantic_vector(model,chunk_id,vector)
              SELECT ?1,c.id,?3 FROM semantic_chunk c JOIN item i ON i.id=c.document_id
-             JOIN document_state ds ON ds.id=c.document_id WHERE c.id=?2 AND i.availability='local'",
+             JOIN document_state ds ON ds.id=c.document_id WHERE c.id=?2 AND i.availability IN ('local','provider_metadata_only')",
             params![gemma::ID, id, vector],
         )?;
         tx.commit()?;
@@ -443,7 +445,7 @@ pub(super) fn add_status(conn: &Connection, status: &mut serde_json::Value) -> R
             "SELECT count(DISTINCT c.document_id), count(c.document_id),
                 (SELECT dimensions FROM semantic_state WHERE singleton=1)
              FROM semantic_chunk c JOIN item i ON c.document_id=i.id
-             WHERE i.availability<>'unverified' AND c.vector IS NOT NULL",
+             WHERE i.availability IN ('local','provider_metadata_only') AND c.vector IS NOT NULL",
             [],
             |r| {
                 let documents = r.get::<_, i64>(0)?;
@@ -542,7 +544,7 @@ pub fn embed_batch(database: &Path, model: ModelBackend<'_>, max: usize) -> Resu
         report.has_more = next_chunk(&conn, reuse, &signature)?.is_some()
             || conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM semantic_document p JOIN item i ON i.id=p.document_id
-                   WHERE p.prepared=0 AND i.availability<>'unverified')",
+                   WHERE p.prepared=0 AND i.availability IN ('local','provider_metadata_only'))",
                 [],
                 |row| row.get(0),
             )?;
@@ -554,7 +556,7 @@ fn next_chunk(conn: &Connection, reuse: bool, signature: &str) -> Result<Option<
     const SELECT: &str = "SELECT c.id,
                CAST(substr(CAST(d.body AS BLOB), c.start_byte+1, c.end_byte-c.start_byte) AS TEXT)
          FROM semantic_chunk c JOIN document d ON d.id=c.document_id JOIN item i ON i.id=d.id
-         WHERE i.availability<>'unverified'
+         WHERE i.availability IN ('local','provider_metadata_only')
            AND NOT EXISTS(SELECT 1 FROM semantic_skip s WHERE s.chunk_id=c.id AND s.model=?1)";
     let vector = if reuse { " AND c.vector IS NULL" } else { "" };
     let sql = format!("{SELECT}{vector} ORDER BY c.id LIMIT 1");
@@ -576,7 +578,7 @@ fn save_skip(
     let new = tx.execute(
         "INSERT INTO semantic_skip (chunk_id, model)
          SELECT c.id,?2 FROM semantic_chunk c JOIN item i ON i.id=c.document_id
-         WHERE c.id=?1 AND i.availability<>'unverified' AND (c.vector IS NULL OR NOT ?3)
+         WHERE c.id=?1 AND i.availability IN ('local','provider_metadata_only') AND (c.vector IS NULL OR NOT ?3)
          ON CONFLICT(chunk_id) DO UPDATE SET model=excluded.model
          WHERE model<>excluded.model",
         params![id, signature, state.model.as_deref() == Some(signature)],
@@ -590,7 +592,7 @@ fn prepare_next_document(conn: &mut Connection, require_stamp: bool) -> Result<b
         .prepare_cached(
             "SELECT d.id,d.body FROM semantic_document p
              JOIN document d ON d.id=p.document_id JOIN item i ON i.id=d.id
-             WHERE p.prepared=0 AND i.availability='local'
+             WHERE p.prepared=0 AND i.availability IN ('local','provider_metadata_only')
              AND (NOT ?1 OR EXISTS(SELECT 1 FROM document_state ds WHERE ds.id=p.document_id))
              ORDER BY p.document_id LIMIT 1",
         )?
@@ -604,7 +606,7 @@ fn prepare_next_document(conn: &mut Connection, require_stamp: bool) -> Result<b
         .prepare_cached(
             "UPDATE semantic_document SET prepared=1 WHERE document_id=?1 AND prepared=0
          AND EXISTS(SELECT 1 FROM document d JOIN item i USING(id)
-                    WHERE d.id=?1 AND d.body=?2 AND i.availability='local'
+                    WHERE d.id=?1 AND d.body=?2 AND i.availability IN ('local','provider_metadata_only')
                     AND (NOT ?3 OR EXISTS(SELECT 1 FROM document_state ds WHERE ds.id=d.id)))",
         )?
         .execute(params![id, body, require_stamp])?;
@@ -648,7 +650,7 @@ fn save_vector(
     let candidate: bool = tx
         .prepare_cached(
             "SELECT EXISTS(SELECT 1 FROM semantic_chunk c JOIN item i ON i.id=c.document_id
-          WHERE c.id=? AND i.availability<>'unverified')",
+          WHERE c.id=? AND i.availability IN ('local','provider_metadata_only'))",
         )?
         .query_row([id], |r| r.get(0))?;
     if !candidate {
@@ -766,7 +768,7 @@ fn search_gemma(
 }
 
 const LEGACY: &str = "SELECT c.document_id, c.id, i.path, c.vector FROM semantic_chunk c
-    JOIN item i ON i.id=c.document_id WHERE i.availability<>'unverified' AND c.vector IS NOT NULL";
+    JOIN item i ON i.id=c.document_id WHERE i.availability IN ('local','provider_metadata_only') AND c.vector IS NOT NULL";
 
 struct Paragraph {
     document: i64,
@@ -806,11 +808,7 @@ fn paragraph_path_allowed(scope: &Scope, path: &Path) -> bool {
     !crate::external::is_external(path)
         && scope.roots.iter().any(|root| path.starts_with(root))
         && scope.allows(path)
-        && scope.content_roots.as_ref().is_none_or(|roots| {
-            roots
-                .iter()
-                .any(|root| path != root && path.starts_with(root))
-        })
+        && (scope.content_roots.is_none() || in_explicit_content_root(scope, path))
         && DocumentKind::for_path(path).is_some_and(|kind| match kind {
             DocumentKind::Image => scope.image_ocr,
             DocumentKind::Pdf => {
@@ -888,7 +886,7 @@ fn rank(
                CAST(substr(CAST(d.body AS BLOB), c.start_byte+1, c.end_byte-c.start_byte) AS TEXT),
                {stamp} AS document_stamp,{page}
              FROM semantic_chunk c JOIN document d ON d.id=c.document_id JOIN item i ON i.id=d.id
-             {state_join} WHERE c.id=?1 AND i.id=?2 AND i.path=?3 AND i.availability<>'unverified'"
+             {state_join} WHERE c.id=?1 AND i.id=?2 AND i.path=?3 AND i.availability IN ('local','provider_metadata_only')"
         );
         let mut hit = snapshot.prepare_cached(&sql)?;
         for (score, meta) in ranked {

@@ -43,6 +43,49 @@ final class LauncherSmoke {
     var chosenDiagnosticFile: URL?
     var chosenImageFolder: URL?
     var chosenImageProjector: URL?
+    private var previewDownloadRelease: AsyncStream<Void>.Continuation?
+    private var previewDownloadsStarted = 0
+    private var previewDownloadsCancelled = 0
+    nonisolated private static func previewHydrated(_ url: URL, in directory: URL) -> URL {
+        directory.appendingPathComponent("preview-hydrated-" + url.lastPathComponent)
+    }
+
+    var previewDownloads: LauncherInlinePreview.DownloadProvider? {
+        guard exists("content-scenario") else { return nil }
+        let directory = directory
+        return .init(isPending: { url in
+            ["cloud-preview-placeholder.png", "cloud-quick-look-placeholder.txt"].contains(url.lastPathComponent) &&
+            !FileManager.default.fileExists(atPath: Self.previewHydrated(url, in: directory).path)
+        }, download: { [weak self] url, report in
+            guard let self else { throw CancellationError() }
+            try await self.hydratePreviewFixture(url, report: report)
+        })
+    }
+
+    private func hydratePreviewFixture(_ url: URL, report: InlinePreviewCoordinator.DownloadProgress) async throws {
+        let (stream, release) = AsyncStream<Void>.makeStream()
+        previewDownloadRelease = release
+        previewDownloadsStarted += 1
+        defer {
+            previewDownloadRelease = nil
+            if Task.isCancelled { previewDownloadsCancelled += 1 }
+        }
+        report(0.4)
+        for await _ in stream {
+            try Task.checkCancellation()
+            let bytes: Data
+            if url.pathExtension == "png" {
+                bytes = try Data(contentsOf: corpus.appendingPathComponent("Dropbox/cloud-preview-known.png"))
+            } else {
+                bytes = Data("Hydrated Quick Look text fixture.".utf8)
+            }
+            try bytes.write(to: url)
+            try Data().write(to: Self.previewHydrated(url, in: directory))
+            return
+        }
+        throw CancellationError()
+    }
+
     private var frontmostWindowPID: pid_t? = 42_001
     private let windowAdapter = SmokeWindowAccess()
     private var openedAccessibilitySettings: [URL] = []
@@ -967,6 +1010,7 @@ final class LauncherSmoke {
         try verifyHighlights()
         try await verifyCatalogRegressions()
         try await verifyEngineRegressions()
+        try await verifyBackgroundEmbeddingInterleavesContent()
         try check(model.indexPhase == .needsIndex && !model.canSearch, "action smoke unexpectedly had a file index")
         func chosen() -> LaunchAction? {
             if case .action(let action)? = model.selectedResult { return action }
@@ -1130,16 +1174,14 @@ final class LauncherSmoke {
         try verifyInternalCopy(app, "Copy File Path")
         try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
         try await until("Command–Y assigned a local item to the native Quick Look view") { app.localPreview?.previewURL != nil }
-        guard let preview = app.localPreview, let snapshot = preview.previewURL else { throw Failure("Quick Look had no item") }
-        let snapshotContents = try String(contentsOf: snapshot, encoding: .utf8)
-        try check(snapshot.path != expected.path && snapshot.lastPathComponent == expected.name &&
-                  snapshotContents == "Synthetic unified search fixture." && !preview.isVisible && !NSApp.isActive,
-                  "Quick Look received the original path, bad contents or a visible window")
-        let mode = try FileManager.default.attributesOfItem(atPath: snapshot.path)[.posixPermissions] as? NSNumber
-        try check(mode?.intValue == 0o600, "Quick Look snapshot had broad file permissions")
+        guard let preview = app.localPreview, let url = preview.previewURL else { throw Failure("Quick Look had no item") }
+        let previewContents = try String(contentsOf: url, encoding: .utf8)
+        try check(url.path == expected.path && previewContents == "Synthetic unified search fixture." &&
+                  !preview.isVisible && !NSApp.isActive, "Quick Look did not use the original file offscreen")
         try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
-        try check(app.localPreview == nil && app.searchPresented && !FileManager.default.fileExists(atPath: snapshot.path),
-                  "Command–Y did not toggle the snapshot away while leaving the search open")
+        try check(app.localPreview == nil && preview.previewURL == nil && app.searchPresented &&
+                  FileManager.default.fileExists(atPath: expected.path),
+                  "Command–Y did not release the Quick Look item while leaving search and the original intact")
         try key(kVK_Space, " ", in: app, throughPanel: true)
         try await until("Space in browse mode toggles real Quick Look") { app.localPreview?.previewURL != nil }
         try key(kVK_Space, " ", in: app, throughPanel: true)
@@ -3062,6 +3104,17 @@ final class LauncherSmoke {
         let selected = corpus.appendingPathComponent("Chosen", isDirectory: true)
         let path = IndexScope.folderPath(selected)
         try await until("existing names verified") { model.canSearch && model.watchState == .running }
+        try writeSparsePreviewPDF(to: corpus.appendingPathComponent("large-preview-fixture.pdf"))
+        let provider = URL(fileURLWithPath: IndexScope.folderPath(corpus), isDirectory: true)
+            .appendingPathComponent("Library/CloudStorage/OneDrive", isDirectory: true)
+        try FileManager.default.createDirectory(at: provider, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: corpus.appendingPathComponent("Dropbox/cloud-preview-known.png"),
+                                        to: provider.appendingPathComponent("cloud-preview-resident.png"))
+        try Data().write(to: provider.appendingPathComponent("cloud-preview-placeholder.png"))
+        try Data("Resident Quick Look text fixture.".utf8).write(to: provider.appendingPathComponent("cloud-quick-look-resident.txt"))
+        try Data().write(to: provider.appendingPathComponent("cloud-quick-look-placeholder.txt"))
+        model.rebuildSavedIndex()
+        try await until("preview fixtures were indexed") { !model.scopePending && model.canSearch && model.watchState == .running }
         app.showSettings()
         app.settingsSession.page = .index
         model.setContentPaused(true)
@@ -3214,7 +3267,9 @@ final class LauncherSmoke {
         try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
         try key(kVK_DownArrow, "\u{f701}", in: app)
         guard let selectedImage = model.selectedHit?.path else { throw Failure("image navigation lost selection") }
-        try await until("rapid selection did not show the new image") {
+        try check(!app.inlinePreview.isOpen, "rapid selection did not close the previous image preview")
+        try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
+        try await until("explicit preview did not show the newly selected image") {
             if case .ready(let selection, let preview) = app.inlinePreview.state,
                case .image? = preview.visual { return selection.id == selectedImage }
             return false
@@ -3224,14 +3279,8 @@ final class LauncherSmoke {
             app.panel.appearance = nil
         }
 
-        try type("cloud-preview-known", into: app)
-        try await until("cloud fixture was not metadata only") { model.selectedHit?.isCloudReference == true }
-        try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
-        try check({
-            if case .unavailable(_, .notLocal) = app.inlinePreview.state { return true }
-            return false
-        }() && app.localPreview == nil, "cloud preview did not decline before reading")
-        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try await verifyUnlimitedAndCloudPreview(app, provider: provider)
+        try await verifyCloudQuickLook(app, provider: provider)
         try type("outsideexclusivebody", into: app)
         try await until("body remained outside the chosen scope") { !model.searching }
         try check(model.hits.isEmpty, "unselected text appeared as a hit")
@@ -3248,6 +3297,195 @@ final class LauncherSmoke {
         try check(model.hits.isEmpty, "narrowed scope retained the page result")
         try type("report.pdf", into: app)
         try await until("removed document still searchable by name") { model.hits.contains { $0.name == "report.pdf" && $0.pdf_page == nil } }
+    }
+
+    private func verifyUnlimitedAndCloudPreview(_ app: AppDelegate, provider: URL) async throws {
+        let model = app.model
+        let large = URL(fileURLWithPath: IndexScope.folderPath(corpus), isDirectory: true)
+            .appendingPathComponent("large-preview-fixture.pdf")
+        try type("large-preview-fixture", into: app)
+        try await until("large PDF was not selected") { model.selectedHit?.path == large.path }
+        try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
+        try await until("large PDF did not render a bounded first-page preview") {
+            if case .ready(_, let document) = app.inlinePreview.state, case .pdf(let png, 1, false)? = document.visual,
+               let bitmap = NSBitmapImageRep(data: png) {
+                return max(bitmap.pixelsWide, bitmap.pixelsHigh) == 960
+            }
+            return false
+        }
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        app.panel.browsing = true
+        try key(kVK_Space, " ", in: app, throughPanel: true)
+        try await until("Space Quick Look did not use the original large PDF") { app.localPreview?.previewURL?.path == large.path }
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try check(app.searchPresented && app.localPreview == nil && FileManager.default.fileExists(atPath: large.path),
+                  "Escape did not close only the native preview")
+
+        let resident = provider.appendingPathComponent("cloud-preview-resident.png")
+        let placeholder = provider.appendingPathComponent("cloud-preview-placeholder.png")
+        try type("cloud-preview-", into: app)
+        try await until("provider fixtures were not indexed metadata-only") {
+            [resident, placeholder].allSatisfy { file in
+                model.hits.contains { $0.path == file.path && $0.isCloudReference }
+            }
+        }
+        guard let residentHit = model.hits.first(where: { $0.path == resident.path }),
+              let placeholderHit = model.hits.first(where: { $0.path == placeholder.path }) else {
+            throw Failure("provider fixtures lost before preview")
+        }
+        app.commands.choose(.file(residentHit), in: model)
+        try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
+        func readyImage(at url: URL) -> Bool {
+            if case .ready(let selection, let preview) = app.inlinePreview.state, case .image? = preview.visual {
+                return selection.url == url && app.inlinePreview.image != nil
+            }
+            return false
+        }
+        try await until("resident OneDrive image did not preview") { readyImage(at: resident) }
+        try check(previewDownloadsStarted == 0, "resident provider file requested a download")
+
+        guard let residentIndex = model.visibleResults.firstIndex(where: { $0.id == residentHit.id }),
+              let placeholderIndex = model.visibleResults.firstIndex(where: { $0.id == placeholderHit.id }) else {
+            throw Failure("provider rows were not visible")
+        }
+        func moveOffPlaceholder() throws {
+            if model.visibleResults.last?.id == placeholderHit.id {
+                try key(kVK_UpArrow, "\u{f700}", in: app)
+            } else {
+                try key(kVK_DownArrow, "\u{f701}", in: app)
+            }
+            try check(model.selectedHit?.path != placeholder.path, "arrow key did not move off the placeholder")
+        }
+        let step = placeholderIndex > residentIndex ? (kVK_DownArrow, "\u{f701}") : (kVK_UpArrow, "\u{f700}")
+        for _ in 0..<abs(placeholderIndex - residentIndex) { try key(step.0, step.1, in: app) }
+        try check(model.selectedHit?.path == placeholder.path && app.inlinePreview.state == .closed && previewDownloadsStarted == 0,
+                  "selection change opened a preview or requested a download")
+        var sawIndeterminate = false
+        let observation = app.inlinePreview.$state.sink { state in
+            if case .downloading(let item, nil) = state, item.url == placeholder { sawIndeterminate = true }
+        }
+        defer { observation.cancel() }
+        func startDownload() async throws {
+            app.commands.choose(.file(placeholderHit), in: model)
+            try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
+            try await until("Cmd+Y did not deliver 40% sync progress for the selected placeholder") {
+                if case .downloading(let item, 0.4) = app.inlinePreview.state { return item.url == placeholder }
+                return false
+            }
+        }
+        try await startDownload()
+        try check(sawIndeterminate && app.localPreview == nil && app.inlinePreview.image == nil,
+                  "preview did not show indeterminate progress before the percentage")
+        try moveOffPlaceholder()
+        try await until("selection change did not cancel cloud sync") { self.previewDownloadsCancelled == 1 }
+        try check(app.inlinePreview.state == .closed && previewDownloadsStarted == 1,
+                  "selection change started another preview or download")
+        try await startDownload()
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try await until("Escape did not cancel cloud sync") { self.previewDownloadsCancelled == 2 }
+        try check(app.inlinePreview.state == .closed && app.searchPresented &&
+                  !FileManager.default.fileExists(atPath: Self.previewHydrated(placeholder, in: directory).path),
+                  "Escape left a preview open, hydrated the file, or dismissed search")
+        try await startDownload()
+        previewDownloadRelease?.yield(())
+        try await until("resident placeholder did not transition from progress to its real bitmap") { readyImage(at: placeholder) }
+        try check(previewDownloadsStarted == 3 && previewDownloadsCancelled == 2,
+                  "cloud preview ran more than once per explicit request")
+    }
+
+    private func verifyCloudQuickLook(_ app: AppDelegate, provider: URL) async throws {
+        let model = app.model
+        let resident = provider.appendingPathComponent("cloud-quick-look-resident.txt")
+        let placeholder = provider.appendingPathComponent("cloud-quick-look-placeholder.txt")
+        let started = previewDownloadsStarted
+        let cancelled = previewDownloadsCancelled
+        try type("cloud-quick-look-", into: app)
+        try await until("name-only provider text files were not indexed") {
+            [resident, placeholder].allSatisfy { url in
+                model.hits.contains { $0.path == url.path && $0.isCloudReference && $0.snippet == nil }
+            }
+        }
+        func select(_ url: URL) throws {
+            guard let hit = model.hits.first(where: { $0.path == url.path }) else {
+                throw Failure("missing provider text result: \(url.lastPathComponent)")
+            }
+            app.commands.choose(.file(hit), in: model)
+        }
+        func cmdY() throws { try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command]) }
+        func escape() throws { try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true) }
+
+        try select(resident)
+        try cmdY()
+        try await until("Cmd+Y did not open Quick Look for the resident cloud text file") {
+            app.localPreview?.previewURL == resident
+        }
+        try check(app.inlinePreview.state == .closed && previewDownloadsStarted == started,
+                  "resident text opened inline preview or requested a download")
+        try escape()
+        app.panel.browsing = true
+        try key(kVK_Space, " ", in: app, throughPanel: true)
+        try await until("Space did not open Quick Look for the resident cloud text file") {
+            app.localPreview?.previewURL == resident
+        }
+        try escape()
+
+        try select(placeholder)
+        try check(app.inlinePreview.state == .closed && app.localPreview == nil && previewDownloadsStarted == started,
+                  "selecting a cloud text file requested a preview without a shortcut")
+        func startDownload() async throws {
+            try cmdY()
+            try await until("Cmd+Y did not show the 40% download ring for the cloud text file") {
+                if case .downloading(let item, 0.4) = app.inlinePreview.state {
+                    return item.url == placeholder && app.inlinePreview.isOpen && app.localPreview == nil
+                }
+                return false
+            }
+        }
+        try await startDownload()
+        try escape()
+        try await until("Escape did not cancel the Quick Look download") { self.previewDownloadsCancelled == cancelled + 1 }
+        try check(app.inlinePreview.state == .closed && app.localPreview == nil && app.searchPresented &&
+                  !FileManager.default.fileExists(atPath: Self.previewHydrated(placeholder, in: directory).path),
+                  "Escape hydrated the text placeholder, left a preview open, or dismissed search")
+        try await startDownload()
+        previewDownloadRelease?.yield(())
+        try await until("hydrated cloud text did not replace the download ring with Quick Look") {
+            app.localPreview?.previewURL == placeholder && app.inlinePreview.state == .closed
+        }
+        try check(previewDownloadsStarted == started + 2 && previewDownloadsCancelled == cancelled + 1,
+                  "Quick Look started extra downloads or did not cancel exactly once")
+        try escape()
+        print("Cloud text Quick Look passed (resident, progress, Escape, hydrated handoff)")
+    }
+
+    private func writeSparsePreviewPDF(to url: URL) throws {
+        try Data().write(to: url)
+        let file = try FileHandle(forWritingTo: url)
+        defer { try? file.close() }
+        func write(_ text: String) throws { try file.write(contentsOf: Data(text.utf8)) }
+        try write("%PDF-1.4\n")
+        let drawing = "0 0 1 rg 20 20 50 50 f\n"
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 600] /Contents 4 0 R >>",
+            "<< /Length \(drawing.utf8.count) >>\nstream\n\(drawing)endstream"
+        ]
+        var offsets: [UInt64] = []
+        for (index, object) in objects.enumerated() {
+            offsets.append(try file.offset())
+            try write("\(index + 1) 0 obj\n\(object)\nendobj\n")
+        }
+        // An unused stream makes a valid PDF larger than both old limits without writing 130 MiB.
+        let padding: UInt64 = 130 * 1024 * 1024
+        offsets.append(try file.offset())
+        try write("5 0 obj\n<< /Length \(padding) >>\nstream\n")
+        try file.seek(toOffset: try file.offset() + padding)
+        try write("\nendstream\nendobj\n")
+        let xref = try file.offset()
+        try write("xref\n0 6\n0000000000 65535 f \n")
+        for offset in offsets { try write(String(format: "%010llu 00000 n \n", offset)) }
+        try write("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n\(xref)\n%%EOF\n")
     }
 
     private func verifySettings(_ app: AppDelegate) async throws {
@@ -3467,8 +3705,8 @@ final class LauncherSmoke {
         try check(model.searchNotice?.problem == .online && opened == nil && revealed == nil,
                   "Return activated a cloud reference")
         try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
-        try check(app.localPreview == nil && model.searchNotice?.problem == .online,
-                  "Quick Look accepted online-only metadata")
+        try await until("Quick Look did not open the resident provider file") { app.localPreview?.previewURL?.path == hit.path }
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
         if controlledTiming { try signal("hold-cloud-reveal") }
         try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
         if controlledTiming {
@@ -3609,6 +3847,87 @@ final class LauncherSmoke {
         try type("missing stamp original", into: app)
         try await until("preview without a stamp was rejected") { !model.searching }
         try check(model.hits.isEmpty && model.selection == nil, "an unstamped snippet appeared as an actionable result")
+    }
+
+    private func verifyBackgroundEmbeddingInterleavesContent() async throws {
+        let root = directory.appendingPathComponent("background-embedding", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let executable = root.appendingPathComponent("engine")
+        let database = root.appendingPathComponent("index.sqlite")
+        let journal = root.appendingPathComponent("batches")
+        let source = #"""
+        #!/usr/bin/python3
+        import json, signal, sys, time
+        from pathlib import Path
+        root = Path(__file__).parent
+        journal = root / 'batches'
+        recovered = root / 'recover-document'
+        batches = journal.read_text().splitlines() if journal.exists() else []
+        checked, embedded = batches.count('content'), batches.count('embed')
+        visible = checked + int(recovered.exists())
+        command, *args = sys.argv[3:]
+        def record(batch):
+            with journal.open('a') as out:
+                print(batch, file=out)
+        if command == 'status':
+            print(json.dumps(dict(items=4, documents=visible,
+                content=dict(pending=3-checked, checked=checked, total=3),
+                gemma=dict(documents_enabled=True, pending=visible>embedded,
+                    limited=False, embedded_chunks=embedded, skipped_chunks=0, chunk_limit=100))))
+        elif command == 'watch':
+            if '--help' not in args:
+                print('{"event":"ready"}', flush=True)
+                while not recovered.exists():
+                    time.sleep(0.02)
+                print('{"event":"updated"}', flush=True)
+                signal.pause()
+        elif command == 'content':
+            assert args == ['--max', '8'] and checked < 3
+            record('content')
+            print(json.dumps(dict(processed=1, indexed=1, pending=2-checked)))
+        elif command == 'model-status':
+            print(json.dumps(dict(available=True, verified='--verify' in args)))
+        elif command == 'embed':
+            assert args == ['--gemma', '--max', '32'] and visible > embedded
+            record('embed')
+            print(json.dumps(dict(new_embeddings=1, skipped_chunks=0, has_more=False)))
+        else:
+            sys.exit(1)
+        """#
+        try Data(source.utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        try Data().write(to: database)
+        let suite = "lumen-background-embedding-\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else { throw Failure("missing isolated embedding defaults") }
+        defaults.set(true, forKey: "gemmaIndexingEnabled")
+        defaults.set(false, forKey: "gemmaIndexingPaused")
+        let model = Launcher(engine: LauncherEngine(executable: executable, database: database), defaults: defaults)
+        defer {
+            model.close()
+            defaults.removePersistentDomain(forName: suite)
+        }
+        model.start(automaticallyIndex: false)
+        try await until("background embeddings resumed after successive content batches") {
+            model.contentCoverage?.pending == 0 && model.gemmaCoverage?.embedded_chunks == 3 &&
+                model.gemmaCoverage?.complete == true && model.embeddingState == .finished && model.watchState == .running
+        }
+        let batches = try String(contentsOf: journal, encoding: .utf8).split(separator: "\n")
+        try check(batches == ["content", "embed", "content", "embed", "content", "embed"],
+                  "semantic indexing waited for content to drain: \(batches)")
+        var resumedFromIdle = false
+        let stateUpdates = model.$embeddingState.sink { if $0 == .idle { resumedFromIdle = true } }
+        defer { stateUpdates.cancel() }
+        try Data().write(to: root.appendingPathComponent("recover-document"))
+        try await until("watch recovery automatically embedded newly visible text") {
+            model.gemmaCoverage?.embedded_chunks == 4 && model.gemmaCoverage?.complete == true &&
+                model.embeddingState == .finished
+        }
+        let recoveredBatches = try String(contentsOf: journal, encoding: .utf8).split(separator: "\n")
+        try check(resumedFromIdle && recoveredBatches == batches + ["embed"],
+                  "finished embeddings did not return to idle and resume without a content batch: \(recoveredBatches)")
+        try check(defaults.bool(forKey: "gemmaIndexingEnabled") && !defaults.bool(forKey: "gemmaIndexingPaused") &&
+                  defaults.object(forKey: "contentIndexingPaused") == nil && model.embeddingNotice == nil,
+                  "silent background embedding changed pause preferences or raised a notice")
     }
 
     private func verifyEmbeddingRun(_ app: AppDelegate) async throws {

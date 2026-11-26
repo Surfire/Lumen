@@ -17,8 +17,11 @@ struct ClipboardHistoryView: View {
             HStack {
                 Label(t("剪贴板历史", "Clipboard History"), systemImage: "clipboard").font(.headline)
                 Spacer()
-                if !clipboard.enabled {
-                    Button(t("启用记录…", "Enable Capture…"), action: openSettings).buttonStyle(.borderless)
+                if !clipboard.enabled && !commands.clipboardRows.isEmpty {
+                    Button(t("开启剪贴板历史", "Enable Clipboard History")) {
+                        clipboard.setEnabled(true)
+                    }
+                    .buttonStyle(.borderless)
                 }
                 ClipboardClearButton(clipboard: clipboard, chinese: chinese, short: true)
             }
@@ -28,7 +31,22 @@ struct ClipboardHistoryView: View {
                     .font(.callout).foregroundStyle(.secondary).padding(.horizontal, 16)
             }
             if commands.clipboardRows.isEmpty {
-                Text(emptyMessage).font(.callout).foregroundStyle(.secondary).padding(16)
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(emptyMessage).font(.callout).foregroundStyle(.secondary)
+                    if !clipboard.enabled {
+                        HStack(spacing: 10) {
+                            Button(t("开启剪贴板历史", "Enable Clipboard History")) {
+                                clipboard.setEnabled(true)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            Button(t("剪贴板设置…", "Clipboard Settings…"), action: openSettings)
+                                .buttonStyle(.borderless)
+                                .controlSize(.small)
+                        }
+                    }
+                }
+                .padding(16)
                 Spacer(minLength: 0)
             } else {
                 Divider()
@@ -58,22 +76,26 @@ struct ClipboardHistoryView: View {
                 LazyVStack(spacing: 2) {
                     ForEach(commands.clipboardRows) { item in
                         let selected = item.id == commands.clipboardSelection
-                        Button { select(item.id) } label: {
-                            HStack(spacing: 9) {
-                                Image(systemName: item.text == nil ? "photo" : "text.alignleft")
-                                    .frame(width: 20).foregroundStyle(.secondary).accessibilityHidden(true)
-                                Text(verbatim: item.text.map { String($0.drop(while: \.isWhitespace).prefix(120)) } ?? t("图片", "Image"))
-                                    .lineLimit(1)
-                                Spacer(minLength: 0)
-                                if item.pinned { Image(systemName: "pin.fill").foregroundStyle(.secondary) }
-                            }
-                            .padding(.horizontal, 8).frame(height: 34)
-                            .background(selected ? Color.accentColor.opacity(0.17) : .clear,
-                                        in: RoundedRectangle(cornerRadius: 6))
-                            .contentShape(Rectangle())
+                        HStack(spacing: 9) {
+                            Image(systemName: item.text == nil ? "photo" : "text.alignleft")
+                                .frame(width: 20).foregroundStyle(.secondary).accessibilityHidden(true)
+                            Text(verbatim: item.text.map { String($0.drop(while: \.isWhitespace).prefix(120)) } ?? t("图片", "Image"))
+                                .lineLimit(1)
+                            Spacer(minLength: 0)
+                            if item.pinned { Image(systemName: "pin.fill").foregroundStyle(.secondary) }
                         }
-                        .buttonStyle(.plain)
+                        .padding(.horizontal, 8).frame(height: 34)
+                        .background(selected ? Color.accentColor.opacity(0.17) : .clear,
+                                    in: RoundedRectangle(cornerRadius: 6))
+                        .contentShape(Rectangle())
+                        .onTapGesture { clickRow(item.id) }
+                        .accessibilityElement(children: .combine)
                         .accessibilityAddTraits(selected ? .isSelected : [])
+                        .accessibilityAction { select(item.id) }
+                        .accessibilityAction(named: Text(t("复制", "Copy"))) {
+                            select(item.id)
+                            copy()
+                        }
                         .id(item.id)
                     }
                 }
@@ -83,6 +105,13 @@ struct ClipboardHistoryView: View {
                 if let id { proxy.scrollTo(id) }
             }
         }
+    }
+
+    private func clickRow(_ id: Int64) {
+        select(id)
+        // Select on mouseUp without waiting to see if it becomes a double click.
+        let event = NSApp.currentEvent
+        if event?.type == .leftMouseUp, event?.clickCount == 2 { copy() }
     }
 
     private func t(_ zh: String, _ en: String) -> String { chinese ? zh : en }
@@ -95,6 +124,7 @@ private struct ClipboardItemPreview: View {
     let chinese: Bool
     let copy: () -> Void
     @State private var thumbnail: NSImage?
+    @State private var loadingThumbnail = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -116,12 +146,15 @@ private struct ClipboardItemPreview: View {
                     if let thumbnail {
                         Image(nsImage: thumbnail).resizable().scaledToFit()
                             .accessibilityLabel(t("图片预览", "Image Preview"))
-                    } else {
+                    } else if !loadingThumbnail {
                         Text(t("无法预览", "Preview unavailable")).foregroundStyle(.secondary)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .task { thumbnail = clipboard.thumbnail(id: item.id) }
+                .task {
+                    thumbnail = await clipboard.loadThumbnail(id: item.id)
+                    loadingThumbnail = false
+                }
             }
             HStack {
                 Button(t("复制", "Copy"), action: copy)

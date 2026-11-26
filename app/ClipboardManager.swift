@@ -12,12 +12,32 @@ final class ClipboardManager: ObservableObject {
     ]
     private static let enabledKey = "clipboard.enabled"
     private static let limitKey = "clipboard.retentionCount"
+    private static let thumbnailCacheLimit = 32
+
+    private enum CaptureOutcome: Sendable {
+        case cancelled
+        case unchanged
+        case reloaded([ClipboardItem])
+        case upserted(ClipboardStore.UpsertResult)
+    }
+
+    private enum PinOutcome: Sendable {
+        case unchanged
+        case reloaded([ClipboardItem])
+        case toggled(id: Int64, pinned: Bool, evictedIDs: Set<Int64>)
+    }
+
+    private enum LimitOutcome: Sendable {
+        case reloaded([ClipboardItem])
+        case pruned(Set<Int64>)
+    }
 
     @Published private(set) var enabled: Bool
     @Published private(set) var limit: Int
     @Published private(set) var items: [ClipboardItem] = []
     @Published private(set) var failed = false
     let store: ClipboardStore
+    private let storeQueue = DispatchQueue(label: "io.github.surfire.lumen.clipboard.store", qos: .userInitiated)
     private let defaults: UserDefaults
     private let pasteboard: NSPasteboard
     private let automaticPolling: Bool
@@ -29,6 +49,10 @@ final class ClipboardManager: ObservableObject {
     private var lastChangeCount: Int?
     private var imageWork: Task<Void, Never>?
     private var loaded = false
+    private var loadingHistory = false
+    private var clearGeneration: UInt64 = 0
+    private var thumbnailCache: [Int64: NSImage] = [:]
+    private var thumbnailOrder: [Int64] = []
 
     init(defaults: UserDefaults, pasteboard: NSPasteboard, directory: URL = ClipboardStore.defaultDirectory,
          automaticPolling: Bool = true, sessionCenter: NotificationCenter = NSWorkspace.shared.notificationCenter,
@@ -79,27 +103,165 @@ final class ClipboardManager: ObservableObject {
 
     func setLimit(_ value: Int) {
         let next = ClipboardStore.boundedLimit(value)
-        change {
-            try store.setLimit(next)
-            defaults.set(next, forKey: Self.limitKey)
-            limit = next
+        let store = self.store
+        let expectedGeneration = self.clearGeneration
+        let needsFullLoad = !self.loaded || self.failed
+        performStoreWork({ () throws -> LimitOutcome in
+            let evicted = try store.setLimitReturningEvicted(next)
+            return needsFullLoad ? .reloaded(try store.items()) : .pruned(evicted)
+        }) { manager, result in
+            switch result {
+            case .success(let outcome):
+                manager.defaults.set(next, forKey: Self.limitKey)
+                manager.limit = next
+                guard manager.clearGeneration == expectedGeneration else { return }
+                switch outcome {
+                case .reloaded(let records):
+                    if manager.items != records { manager.items = records }
+                case .pruned(let evictedIDs):
+                    if !evictedIDs.isEmpty {
+                        manager.items.removeAll { evictedIDs.contains($0.id) }
+                        manager.evictThumbnails(ids: evictedIDs)
+                    }
+                }
+                if manager.failed { manager.failed = false }
+                manager.loaded = true
+            case .failure:
+                manager.failed = true
+            }
         }
     }
 
     func loadHistory() {
-        if !loaded || failed { change {} }
+        guard (!loaded || failed), !loadingHistory else { return }
+        loadingHistory = true
+        let store = self.store
+        let expectedGeneration = self.clearGeneration
+        performStoreWork({ try store.items() }) { manager, result in
+            manager.loadingHistory = false
+            guard manager.clearGeneration == expectedGeneration else { return }
+            switch result {
+            case .success(let records):
+                if manager.items != records { manager.items = records }
+                if manager.failed { manager.failed = false }
+                manager.loaded = true
+            case .failure:
+                manager.failed = true
+            }
+        }
     }
 
-    func togglePin(id: Int64) { change { try store.togglePin(id: id) } }
-    func remove(id: Int64) { change { try store.remove(id: id) } }
+    func togglePin(id: Int64) {
+        let store = self.store
+        let expectedGeneration = self.clearGeneration
+        let needsFullLoad = !self.loaded || self.failed
+        performStoreWork({ () throws -> PinOutcome in
+            let toggled = try store.togglePinReturningEvicted(id: id)
+            if needsFullLoad { return .reloaded(try store.items()) }
+            guard let toggled else { return .unchanged }
+            return .toggled(id: id, pinned: toggled.pinned, evictedIDs: toggled.evictedIDs)
+        }) { manager, result in
+            guard manager.clearGeneration == expectedGeneration else { return }
+            switch result {
+            case .success(.unchanged):
+                if manager.failed { manager.failed = false }
+                manager.loaded = true
+            case .success(.reloaded(let records)):
+                if manager.items != records { manager.items = records }
+                if manager.failed { manager.failed = false }
+                manager.loaded = true
+            case .success(.toggled(let id, let pinned, let evictedIDs)):
+                var next = manager.items
+                if let index = next.firstIndex(where: { $0.id == id }) {
+                    next[index] = next[index].withPinned(pinned)
+                }
+                if !evictedIDs.isEmpty {
+                    next.removeAll { evictedIDs.contains($0.id) }
+                    manager.evictThumbnails(ids: evictedIDs)
+                }
+                if next != manager.items { manager.items = next }
+                if manager.failed { manager.failed = false }
+                manager.loaded = true
+            case .failure:
+                manager.failed = true
+            }
+        }
+    }
+
+    func remove(id: Int64) {
+        let store = self.store
+        let expectedGeneration = self.clearGeneration
+        let needsFullLoad = !self.loaded || self.failed
+        performStoreWork({ () throws -> [ClipboardItem]? in
+            try store.remove(id: id)
+            return needsFullLoad ? try store.items() : nil
+        }) { manager, result in
+            guard manager.clearGeneration == expectedGeneration else { return }
+            switch result {
+            case .success(let records?):
+                if manager.items != records { manager.items = records }
+                manager.evictThumbnails(ids: [id])
+                if manager.failed { manager.failed = false }
+                manager.loaded = true
+            case .success(nil):
+                if manager.items.contains(where: { $0.id == id }) {
+                    manager.items.removeAll { $0.id == id }
+                }
+                manager.evictThumbnails(ids: [id])
+                if manager.failed { manager.failed = false }
+                manager.loaded = true
+            case .failure:
+                manager.failed = true
+            }
+        }
+    }
+
     func clearAll() {
         imageWork?.cancel()
+        imageWork = nil
+        clearGeneration &+= 1
         if lastChangeCount != nil { lastChangeCount = pasteboard.changeCount }
-        change { try store.clearAll() }
+        let store = self.store
+        performStoreWork({ try store.clearAll() }) { manager, result in
+            switch result {
+            case .success:
+                if !manager.items.isEmpty { manager.items = [] }
+                manager.clearThumbnailCache()
+                if manager.failed { manager.failed = false }
+                manager.loaded = true
+            case .failure:
+                manager.failed = true
+            }
+        }
     }
 
     func thumbnail(id: Int64) -> NSImage? {
-        (try? store.thumbnail(id: id)).flatMap(NSImage.init(data:))
+        if let cached = thumbnailCache[id] {
+            touchThumbnailOrder(id: id)
+            return cached
+        }
+        guard let image = (try? store.thumbnail(id: id)).flatMap(NSImage.init(data:)) else { return nil }
+        if items.contains(where: { $0.id == id }) { cacheThumbnail(image, for: id) }
+        return image
+    }
+
+    func loadThumbnail(id: Int64) async -> NSImage? {
+        if let cached = thumbnailCache[id] {
+            touchThumbnailOrder(id: id)
+            return cached
+        }
+        let store = self.store
+        let decoded: CGImage? = await Task.detached(priority: .utility) {
+            guard !Task.isCancelled, let data = try? store.thumbnail(id: id),
+                  let source = ClipboardStore.imageSource(data) else { return nil }
+            return CGImageSourceCreateImageAtIndex(source, 0, [
+                kCGImageSourceShouldCacheImmediately: true
+            ] as CFDictionary)
+        }.value
+        guard !Task.isCancelled, let cgImage = decoded else { return nil }
+        let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+        if items.contains(where: { $0.id == id }) { cacheThumbnail(image, for: id) }
+        return image
     }
 
     @discardableResult static func writeInternalString(_ text: String, to pasteboard: NSPasteboard = .general) -> Bool {
@@ -119,12 +281,24 @@ final class ClipboardManager: ObservableObject {
             let wrote: Bool
             if let text = entry.text {
                 wrote = Self.writeInternalString(text, to: pasteboard)
-            } else if let data = try store.image(id: id) {
+            } else if let data = try storeQueue.sync(execute: { try store.image(id: id) }) {
                 let item = NSPasteboardItem()
                 wrote = item.setData(data, forType: .png) && Self.writeInternalItem(item, to: pasteboard)
             } else { return false }
             guard wrote else { failed = true; return false }
-            change { try store.noteUsed(id: id) }
+            moveItemToFront(id: id)
+            let store = self.store
+            let expectedGeneration = self.clearGeneration
+            performStoreWork({ try store.noteUsed(id: id) }) { manager, result in
+                guard manager.clearGeneration == expectedGeneration else { return }
+                switch result {
+                case .success:
+                    manager.moveItemToFront(id: id)
+                    if manager.failed { manager.failed = false }
+                case .failure:
+                    manager.failed = true
+                }
+            }
             return true
         } catch {
             failed = true
@@ -183,46 +357,126 @@ final class ClipboardManager: ObservableObject {
         let imageType: NSPasteboard.PasteboardType? = types.contains(.png) ? .png : (types.contains(.tiff) ? .tiff : nil)
         if let imageType, let bytes = pasteboard.data(forType: imageType) {
             guard pasteboard.changeCount == count else { return nil }
+            let store = self.store
+            let queue = self.storeQueue
+            let expectedGeneration = self.clearGeneration
+            let needsFullLoad = !self.loaded || self.failed
             let work = Task.detached(priority: .utility) { [weak self] in
                 guard let image = Self.encodeImage(bytes), !Task.isCancelled else { return }
-                await self?.saveImage(image, capturedAt: capturedAt, bundleID: bundleID, appName: appName)
+                let result: Result<CaptureOutcome, Error> = await withCheckedContinuation { continuation in
+                    queue.async {
+                        guard !Task.isCancelled else {
+                            continuation.resume(returning: .success(.cancelled))
+                            return
+                        }
+                        let outcome = Result<CaptureOutcome, Error> {
+                            guard let upserted = try store.upsertImage(image.png, thumbnail: image.thumbnail,
+                                                                       capturedAt: capturedAt, bundleID: bundleID, appName: appName) else {
+                                return .unchanged
+                            }
+                            return needsFullLoad ? .reloaded(try store.items()) : .upserted(upserted)
+                        }
+                        continuation.resume(returning: outcome)
+                    }
+                }
+                guard !Task.isCancelled else { return }
+                await MainActor.run { [weak self] in
+                    guard let self, self.clearGeneration == expectedGeneration, !Task.isCancelled else { return }
+                    self.applyCaptureResult(result)
+                }
             }
             imageWork = work
             return work
         }
         if types.contains(.string), let text = pasteboard.string(forType: .string), pasteboard.changeCount == count {
-            capture {
-                try store.addText(text, capturedAt: capturedAt, bundleID: bundleID, appName: appName)
+            let store = self.store
+            let expectedGeneration = self.clearGeneration
+            let needsFullLoad = !self.loaded || self.failed
+            performStoreWork({ () throws -> CaptureOutcome in
+                guard let upserted = try store.upsertText(text, capturedAt: capturedAt, bundleID: bundleID, appName: appName) else {
+                    return .unchanged
+                }
+                return needsFullLoad ? .reloaded(try store.items()) : .upserted(upserted)
+            }) { manager, result in
+                guard manager.clearGeneration == expectedGeneration else { return }
+                manager.applyCaptureResult(result)
             }
         }
         return nil
     }
 
-    private func saveImage(_ image: (png: Data, thumbnail: Data), capturedAt: Date, bundleID: String?, appName: String?) {
-        guard !Task.isCancelled else { return }
-        capture {
-            try store.addImage(image.png, thumbnail: image.thumbnail, capturedAt: capturedAt, bundleID: bundleID, appName: appName)
+    private func performStoreWork<T: Sendable>(
+        _ work: @escaping @Sendable () throws -> T,
+        apply: @escaping @MainActor (ClipboardManager, Result<T, Error>) -> Void
+    ) {
+        if automaticPolling {
+            storeQueue.async { [weak self] in
+                let result = Result(catching: work)
+                DispatchQueue.main.async { [weak self] in
+                    MainActor.assumeIsolated {
+                        guard let self else { return }
+                        apply(self, result)
+                    }
+                }
+            }
+        } else {
+            let result = storeQueue.sync { Result(catching: work) }
+            apply(self, result)
         }
     }
 
-    private func capture(_ body: () throws -> Bool) {
-        do {
-            if try body() { try reload() }
-        } catch { failed = true }
+    private func applyCaptureResult(_ result: Result<CaptureOutcome, Error>) {
+        switch result {
+        case .success(.cancelled), .success(.unchanged):
+            break
+        case .success(.reloaded(let records)):
+            if items != records { items = records }
+            if failed { failed = false }
+            loaded = true
+        case .success(.upserted(let upserted)):
+            var next = items
+            next.removeAll { $0.id == upserted.item.id || upserted.evictedIDs.contains($0.id) }
+            next.insert(upserted.item, at: 0)
+            items = next
+            evictThumbnails(ids: upserted.evictedIDs)
+            if failed { failed = false }
+            loaded = true
+        case .failure:
+            failed = true
+        }
     }
 
-    private func change(_ body: () throws -> Void) {
-        do {
-            try body()
-            try reload()
-        } catch { failed = true }
+    private func moveItemToFront(id: Int64) {
+        guard let index = items.firstIndex(where: { $0.id == id }), index > 0 else { return }
+        var next = items
+        let entry = next.remove(at: index)
+        next.insert(entry, at: 0)
+        items = next
     }
 
-    private func reload() throws {
-        let records = try store.items()
-        if records != items { items = records }
-        if failed { failed = false }
-        loaded = true
+    private func cacheThumbnail(_ image: NSImage, for id: Int64) {
+        thumbnailCache[id] = image
+        touchThumbnailOrder(id: id)
+        while thumbnailOrder.count > Self.thumbnailCacheLimit {
+            let oldest = thumbnailOrder.removeFirst()
+            thumbnailCache.removeValue(forKey: oldest)
+        }
+    }
+
+    private func touchThumbnailOrder(id: Int64) {
+        if let index = thumbnailOrder.firstIndex(of: id) { thumbnailOrder.remove(at: index) }
+        thumbnailOrder.append(id)
+    }
+
+    private func evictThumbnails(ids: Set<Int64>) {
+        guard !ids.isEmpty else { return }
+        for id in ids { thumbnailCache.removeValue(forKey: id) }
+        thumbnailOrder.removeAll { ids.contains($0) }
+    }
+
+    private func clearThumbnailCache() {
+        thumbnailCache.removeAll()
+        thumbnailOrder.removeAll()
     }
 
     nonisolated private static func encodeImage(_ bytes: Data) -> (png: Data, thumbnail: Data)? {

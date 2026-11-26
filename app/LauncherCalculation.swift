@@ -18,12 +18,34 @@ struct CalculationResult: Equatable {
         var parser = Parser(input: Array(explicit ? expression.dropFirst() : expression[...]))
         guard let value = parser.sum(), parser.finished, explicit || parser.calculated,
               let answer = format(value) else { return nil }
-        return Self(display: answer, copyValue: answer)
+        return Self(display: answer.display, copyValue: answer.copy)
     }
 
-    private static func format(_ value: Double) -> String? {
+    private static func format(_ value: Double) -> (display: String, copy: String)? {
         guard value.isFinite else { return nil }
-        return String(format: "%.12g", locale: Locale(identifier: "en_US_POSIX"), value == 0 ? 0 : value)
+        let plain = String(format: "%.12g", locale: Locale(identifier: "en_US_POSIX"), value == 0 ? 0 : value)
+        return (groupThousands(plain), plain)
+    }
+
+    private static func groupThousands(_ plain: String) -> String {
+        guard !plain.contains("e"), !plain.contains("E") else { return plain }
+        let negative = plain.hasPrefix("-")
+        let unsigned = negative ? plain.dropFirst() : plain[...]
+        let parts = unsigned.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
+        let integer = parts[0]
+        guard integer.count > 3 else { return plain }
+        var grouped = ""
+        grouped.reserveCapacity(plain.count + (integer.count - 1) / 3)
+        if negative { grouped.append("-") }
+        for (index, ch) in integer.enumerated() {
+            if index > 0 && (integer.count - index) % 3 == 0 { grouped.append(",") }
+            grouped.append(ch)
+        }
+        if parts.count == 2 {
+            grouped.append(".")
+            grouped.append(contentsOf: parts[1])
+        }
+        return grouped
     }
 
     private struct Unit {
@@ -69,17 +91,21 @@ struct CalculationResult: Equatable {
         })
     }()
 
+    private static let conversionRegex = try! NSRegularExpression(
+        pattern: #"^([+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|[+-]?\.\d+)\s*([\p{L}°]+)\s*(?:\b(?:to|in)\b|到|转成|转换为)\s*([\p{L}°]+)$"#,
+        options: [.caseInsensitive]
+    )
+
     private static func convert(_ value: String) -> Self? {
-        let pattern = #"^([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*([\p{L}°]+)\s*(?:\b(?:to|in)\b|到|转成|转换为)\s*([\p{L}°]+)$"#
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
-              let match = regex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) else { return nil }
+        guard let match = conversionRegex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) else { return nil }
         let fields = (1...3).compactMap { Range(match.range(at: $0), in: value).map { String(value[$0]).lowercased() } }
-        guard fields.count == 3, let amount = Double(fields[0]), let from = units[fields[1]], let to = units[fields[2]],
+        guard fields.count == 3,
+              let amount = Double(fields[0].replacingOccurrences(of: ",", with: "")),
+              let from = units[fields[1]], let to = units[fields[2]],
               from.dimension == to.dimension else { return nil }
         let converted = (amount * from.factor + from.offset - to.offset) / to.factor
         guard let result = format(from.dimension == "temperature" && abs(converted) < 1e-10 ? 0 : converted) else { return nil }
-        let formatted = "\(result) \(to.symbol)"
-        return Self(display: formatted, copyValue: formatted)
+        return Self(display: "\(result.display) \(to.symbol)", copyValue: "\(result.copy) \(to.symbol)")
     }
 
     private struct Parser {
@@ -105,19 +131,39 @@ struct CalculationResult: Equatable {
         }
 
         mutating func product() -> Double? {
-            guard var left = factor() else { return nil }
+            guard var left = unary() else { return nil }
             while let op = peek(), op == "*" || op == "/" {
                 offset += 1
-                guard let right = factor(), op != "/" || right != 0 else { return nil }
+                guard let right = unary(), op != "/" || right != 0 else { return nil }
                 calculated = true
                 left = op == "*" ? left * right : left / right
             }
             return left
         }
 
-        mutating func factor() -> Double? {
-            let sign = peek()
-            if sign == "+" || sign == "-" { offset += 1 }
+        mutating func unary() -> Double? {
+            if let sign = peek(), sign == "+" || sign == "-" {
+                offset += 1
+                guard let value = unary() else { return nil }
+                return sign == "-" ? -value : value
+            }
+            return power()
+        }
+
+        mutating func power() -> Double? {
+            guard let base = primary() else { return nil }
+            if peek() == "^" {
+                offset += 1
+                guard let exponent = unary() else { return nil }
+                calculated = true
+                let result = pow(base, exponent)
+                guard result.isFinite else { return nil }
+                return result
+            }
+            return base
+        }
+
+        mutating func primary() -> Double? {
             var number: Double
             if peek() == "(" {
                 offset += 1
@@ -125,11 +171,7 @@ struct CalculationResult: Equatable {
                 offset += 1
                 number = result
             } else {
-                let start = offset
-                while offset < input.count, ("0"..."9").contains(input[offset]) || input[offset] == "." {
-                    offset += 1
-                }
-                guard start < offset, let result = Double(String(input[start..<offset])), result.isFinite else { return nil }
+                guard let result = parseNumber() else { return nil }
                 number = result
             }
             if peek() == "%" {
@@ -137,7 +179,49 @@ struct CalculationResult: Equatable {
                 calculated = true
                 number /= 100
             }
-            return sign == "-" ? -number : number
+            return number
+        }
+
+        mutating func parseNumber() -> Double? {
+            let start = offset
+            var digits = ""
+            var groupLength = 0
+            while offset < input.count, ("0"..."9").contains(input[offset]) {
+                digits.append(input[offset])
+                groupLength += 1
+                offset += 1
+            }
+            let hasIntegerDigits = groupLength > 0
+
+            if offset < input.count && input[offset] == "," {
+                guard hasIntegerDigits, (1...3).contains(groupLength) else { return nil }
+                while offset < input.count && input[offset] == "," {
+                    offset += 1
+                    var count = 0
+                    while offset < input.count, ("0"..."9").contains(input[offset]) {
+                        digits.append(input[offset])
+                        count += 1
+                        offset += 1
+                    }
+                    guard count == 3 else { return nil }
+                }
+            }
+
+            if offset < input.count && input[offset] == "." {
+                digits.append(".")
+                offset += 1
+                var fracCount = 0
+                while offset < input.count, ("0"..."9").contains(input[offset]) {
+                    digits.append(input[offset])
+                    fracCount += 1
+                    offset += 1
+                }
+                if offset < input.count && (input[offset] == "," || input[offset] == ".") { return nil }
+                if !hasIntegerDigits && fracCount == 0 { return nil }
+            }
+
+            guard start < offset, let result = Double(digits), result.isFinite else { return nil }
+            return result
         }
     }
 }

@@ -73,24 +73,31 @@ public struct LumenCommandCatalog: Sendable {
     private static let defaultLinks = builtInLinks([
         ("google", "g", "Search Google", "https://www.google.com/search", "q")
     ])
-    private static let optionalLinks = builtInLinks([
-        ("github", "gh", "Search GitHub", "https://github.com/search", "q"),
-        ("wikipedia", "wiki", "Search Wikipedia", "https://zh.wikipedia.org/w/index.php", "search"),
-        ("maps", "map", "Search Maps", "https://www.google.com/maps/search/", "query")
-    ])
+    private static let optionalLinksZH = optionalBuiltInLinks(chinese: true)
+    private static let optionalLinksEN = optionalBuiltInLinks(chinese: false)
     private let links: [String: LumenHTTPSQueryLink]
+
+    private static func optionalBuiltInLinks(chinese: Bool) -> [LumenHTTPSQueryLink] {
+        builtInLinks([
+            ("github", "gh", "Search GitHub", "https://github.com/search", "q"),
+            ("wikipedia", "wiki", "Search Wikipedia",
+             chinese ? "https://zh.wikipedia.org/w/index.php" : "https://en.wikipedia.org/w/index.php", "search"),
+            ("maps", "map", "Search Maps", "https://www.google.com/maps/search/", "query")
+        ])
+    }
 
     static func isBuiltInAlias(_ alias: String, includeOptionalLinks: Bool) -> Bool {
         reservedVerbs.contains(alias) || defaultLinks.contains { $0.keyword == alias }
-            || (includeOptionalLinks && optionalLinks.contains { $0.keyword == alias })
+            || (includeOptionalLinks && optionalLinksZH.contains { $0.keyword == alias })
     }
 
     /// Built-in verbs and Google stay reserved. Saved links take precedence over
     /// opt-in built-ins so enabling those searches cannot redirect an existing alias.
-    public init(includeOptionalLinks: Bool = false, additionalLinks: [LumenHTTPSQueryLink] = []) {
+    public init(includeOptionalLinks: Bool = false, additionalLinks: [LumenHTTPSQueryLink] = [], chinese: Bool = true) {
         var table: [String: LumenHTTPSQueryLink] = [:]
         var usedIDs = Set(["qa", "translate", "discover", "img", "clipboard"])
-        for link in Self.defaultLinks + additionalLinks + (includeOptionalLinks ? Self.optionalLinks : []) {
+        let optionals = includeOptionalLinks ? (chinese ? Self.optionalLinksZH : Self.optionalLinksEN) : []
+        for link in Self.defaultLinks + additionalLinks + optionals {
             guard !Self.reservedVerbs.contains(link.keyword), table[link.keyword] == nil,
                   usedIDs.insert(link.commandID).inserted else { continue }
             table[link.keyword] = link
@@ -117,7 +124,7 @@ public struct LumenCommandCatalog: Sendable {
         // starts at the first character and requires a space/tab. Newlines are payload only.
         let delimiter = input.firstIndex(where: { $0 == " " || $0 == "\t" })
         let token = input[..<(delimiter ?? input.endIndex)]
-        guard !token.isEmpty, delimiter != nil || token.utf8.count <= 4,
+        guard !token.isEmpty, token.utf8.count <= (delimiter == nil ? 4 : 24),
               token.utf8.allSatisfy({ $0 < 128 }) else { return .search }
         let keyword = token.lowercased()
         let isClipboard = keyword == "cb" || keyword == "clip"

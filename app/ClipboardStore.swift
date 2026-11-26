@@ -5,7 +5,7 @@ import ImageIO
 import SQLite3
 import UniformTypeIdentifiers
 
-struct ClipboardItem: Identifiable, Equatable {
+struct ClipboardItem: Identifiable, Equatable, Sendable {
     let id: Int64
     let text: String?    // nil for images; image bytes are read only when needed
     let capturedAt: Date
@@ -13,7 +13,7 @@ struct ClipboardItem: Identifiable, Equatable {
     let sourceAppName: String?
     let pinned: Bool
 
-    private struct SearchField: Equatable {
+    private struct SearchField: Equatable, Sendable {
         let bytes: [UInt8]
         let lowMask: UInt64
         let highMask: UInt64
@@ -181,6 +181,22 @@ struct ClipboardItem: Identifiable, Equatable {
         searchableFields = [text, sourceAppName, sourceBundleID].compactMap { $0.map(SearchField.init) }
     }
 
+    private init(id: Int64, text: String?, capturedAt: Date, sourceBundleID: String?, sourceAppName: String?,
+                 pinned: Bool, searchableFields: [SearchField]) {
+        self.id = id
+        self.text = text
+        self.capturedAt = capturedAt
+        self.sourceBundleID = sourceBundleID
+        self.sourceAppName = sourceAppName
+        self.pinned = pinned
+        self.searchableFields = searchableFields
+    }
+
+    func withPinned(_ pinned: Bool) -> ClipboardItem {
+        ClipboardItem(id: id, text: text, capturedAt: capturedAt, sourceBundleID: sourceBundleID,
+                      sourceAppName: sourceAppName, pinned: pinned, searchableFields: searchableFields)
+    }
+
     private static func fold(_ value: String) -> String {
         value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
             .precomposedStringWithCanonicalMapping
@@ -238,18 +254,22 @@ struct ClipboardItem: Identifiable, Equatable {
     }
 }
 
-@MainActor
-final class ClipboardStore {
-    nonisolated static let maximumTextBytes = 32 * 1024
-    nonisolated static let maximumImageBytes = 2 * 1024 * 1024
-    nonisolated static let defaultLimit = 200
-    private nonisolated static let maximumLimit = 500
-    nonisolated static let defaultDirectory = canonicalStorageAnchor(FileManager.default.homeDirectoryForCurrentUser)
+final class ClipboardStore: @unchecked Sendable {
+    struct UpsertResult: Sendable {
+        let item: ClipboardItem
+        let evictedIDs: Set<Int64>
+    }
+
+    static let maximumTextBytes = 32 * 1024
+    static let maximumImageBytes = 2 * 1024 * 1024
+    static let defaultLimit = 200
+    private static let maximumLimit = 500
+    static let defaultDirectory = canonicalStorageAnchor(FileManager.default.homeDirectoryForCurrentUser)
         .appendingPathComponent("Library/Application Support/Lumen/Clipboard", isDirectory: true)
 
     // Resolve only the trusted starting point, never the private path below it.
     // Foundation may abbreviate /private/var to the system symlink /var.
-    nonisolated static func canonicalStorageAnchor(_ url: URL) -> URL {
+    static func canonicalStorageAnchor(_ url: URL) -> URL {
         guard let path = realpath(url.path, nil) else { return url }
         defer { free(path) }
         return URL(fileURLWithPath: String(cString: path), isDirectory: true)
@@ -257,6 +277,7 @@ final class ClipboardStore {
     private static let databaseName = ".history.sqlite"
 
     let directory: URL
+    private let lock = NSLock()
     private var connection: OpaquePointer?
     private var limit: Int
 
@@ -265,9 +286,14 @@ final class ClipboardStore {
         self.limit = Self.boundedLimit(limit)
     }
 
-    deinit { sqlite3_close(connection) }
+    deinit {
+        lock.withLock {
+            sqlite3_close(connection)
+            connection = nil
+        }
+    }
 
-    nonisolated static func boundedLimit(_ limit: Int) -> Int { min(max(1, limit), maximumLimit) }
+    static func boundedLimit(_ limit: Int) -> Int { min(max(1, limit), maximumLimit) }
 
     func contains(_ url: URL) -> Bool {
         let root = directory.path
@@ -276,101 +302,124 @@ final class ClipboardStore {
     }
 
     func items() throws -> [ClipboardItem] {
-        guard let db = try database() else { return [] }
-        return try statement(db, """
-            SELECT id, text, captured, bundle_id, app_name, pinned FROM clips ORDER BY recency DESC
-            """) { row in
-            var items: [ClipboardItem] = []
-            while try next(row) {
-                items.append(ClipboardItem(id: sqlite3_column_int64(row, 0), text: text(row, 1),
-                                           capturedAt: Date(timeIntervalSince1970: sqlite3_column_double(row, 2)),
-                                           sourceBundleID: text(row, 3), sourceAppName: text(row, 4),
-                                           pinned: sqlite3_column_int(row, 5) != 0))
+        typealias RawRow = (id: Int64, text: String?, capturedAt: Date, bundleID: String?, appName: String?, pinned: Bool)
+        let rows: [RawRow] = try lock.withLock {
+            guard let db = try databaseLocked() else { return [] }
+            return try statement(db, """
+                SELECT id, text, captured, bundle_id, app_name, pinned FROM clips ORDER BY recency DESC
+                """) { row in
+                var records: [RawRow] = []
+                while try next(row) {
+                    records.append((sqlite3_column_int64(row, 0), text(row, 1),
+                                    Date(timeIntervalSince1970: sqlite3_column_double(row, 2)),
+                                    text(row, 3), text(row, 4), sqlite3_column_int(row, 5) != 0))
+                }
+                return records
             }
-            return items
+        }
+        return rows.map {
+            ClipboardItem(id: $0.id, text: $0.text, capturedAt: $0.capturedAt,
+                          sourceBundleID: $0.bundleID, sourceAppName: $0.appName, pinned: $0.pinned)
         }
     }
 
     func addText(_ value: String, capturedAt: Date, bundleID: String?, appName: String?) throws -> Bool {
+        try upsertText(value, capturedAt: capturedAt, bundleID: bundleID, appName: appName) != nil
+    }
+
+    func upsertText(_ value: String, capturedAt: Date, bundleID: String?, appName: String?) throws -> UpsertResult? {
         let utf8 = value.utf8
         var end = utf8.index(utf8.startIndex, offsetBy: Self.maximumTextBytes, limitedBy: utf8.endIndex) ?? utf8.endIndex
         // Back up at most three bytes to avoid truncating a UTF-8 scalar.
         while end != utf8.endIndex, utf8[end] & 0xc0 == 0x80 { utf8.formIndex(before: &end) }
         let bounded = String(decoding: utf8[..<end], as: UTF8.self)
-        guard !bounded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
-        return try insert(text: bounded, image: nil, thumbnail: nil, bytes: Data(bounded.utf8),
-                   capturedAt: capturedAt, bundleID: bundleID, appName: appName)
+        guard !bounded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return try upsert(text: bounded, image: nil, thumbnail: nil, bytes: Data(bounded.utf8),
+                          capturedAt: capturedAt, bundleID: bundleID, appName: appName)
     }
 
     func addImage(_ png: Data, thumbnail: Data, capturedAt: Date, bundleID: String?, appName: String?) throws -> Bool {
-        guard !png.isEmpty, png.count <= Self.maximumImageBytes,
-              !thumbnail.isEmpty, thumbnail.count <= Self.maximumImageBytes else { return false }
-        return try insert(text: nil, image: png, thumbnail: thumbnail, bytes: png,
-                   capturedAt: capturedAt, bundleID: bundleID, appName: appName)
+        try upsertImage(png, thumbnail: thumbnail, capturedAt: capturedAt, bundleID: bundleID, appName: appName) != nil
     }
 
-    private func insert(text: String?, image: Data?, thumbnail: Data?, bytes: Data,
-                        capturedAt: Date, bundleID: String?, appName: String?) throws -> Bool {
-        guard let db = try database(create: true) else { throw StoreError.unavailable }
+    func upsertImage(_ png: Data, thumbnail: Data, capturedAt: Date, bundleID: String?, appName: String?) throws -> UpsertResult? {
+        guard !png.isEmpty, png.count <= Self.maximumImageBytes,
+              !thumbnail.isEmpty, thumbnail.count <= Self.maximumImageBytes else { return nil }
+        return try upsert(text: nil, image: png, thumbnail: thumbnail, bytes: png,
+                          capturedAt: capturedAt, bundleID: bundleID, appName: appName)
+    }
+
+    private func upsert(text: String?, image: Data?, thumbnail: Data?, bytes: Data,
+                        capturedAt: Date, bundleID: String?, appName: String?) throws -> UpsertResult? {
         // Distinguish text and images even if their bytes match. At capacity with only
         // pins, don't write a new entry that would immediately be evicted.
+        let persistedTimestamp = capturedAt.timeIntervalSince1970
+        let storedCapturedAt = Date(timeIntervalSince1970: persistedTimestamp)
         var digest = Data([image == nil ? 0 : 1])
         digest.append(contentsOf: SHA256.hash(data: bytes))
-        return try transaction(db) {
-            let existing = try statement(db, """
-                SELECT id, recency = (SELECT MAX(recency) FROM clips)
-                FROM clips WHERE digest = ? ORDER BY recency DESC LIMIT 1
-                """) { row -> (id: Int64, newest: Bool)? in
-                try bind(digest, to: row, at: 1)
-                guard try next(row) else { return nil }
-                return (sqlite3_column_int64(row, 0), sqlite3_column_int(row, 1) != 0)
-            }
-            if let existing {
-                guard !existing.newest else { return false }
+        let committed: (id: Int64, pinned: Bool, evicted: Set<Int64>)? = try lock.withLock {
+            guard let db = try databaseLocked(create: true) else { throw StoreError.unavailable }
+            return try transaction(db) {
+                let existing = try statement(db, """
+                    SELECT id, pinned, recency = (SELECT MAX(recency) FROM clips)
+                    FROM clips WHERE digest = ? ORDER BY recency DESC LIMIT 1
+                    """) { row -> (id: Int64, pinned: Bool, newest: Bool)? in
+                    try bind(digest, to: row, at: 1)
+                    guard try next(row) else { return nil }
+                    return (sqlite3_column_int64(row, 0), sqlite3_column_int(row, 1) != 0, sqlite3_column_int(row, 2) != 0)
+                }
+                if let existing {
+                    guard !existing.newest else { return nil }
+                    try statement(db, """
+                        UPDATE clips SET captured = ?1, bundle_id = ?2, app_name = ?3,
+                            recency = (SELECT MAX(recency) + 1 FROM clips) WHERE id = ?4
+                        """) { row in
+                        try requireOK(sqlite3_bind_double(row, 1, persistedTimestamp))
+                        try bind(bundleID, to: row, at: 2)
+                        try bind(appName, to: row, at: 3)
+                        try requireOK(sqlite3_bind_int64(row, 4, existing.id))
+                        _ = try next(row)
+                    }
+                    return (existing.id, existing.pinned, [])
+                }
                 try statement(db, """
-                    UPDATE clips SET captured = ?1, bundle_id = ?2, app_name = ?3,
-                        recency = (SELECT MAX(recency) + 1 FROM clips) WHERE id = ?4
+                    INSERT INTO clips (text, image, thumbnail, captured, bundle_id, app_name, digest, recency)
+                    SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(MAX(recency), 0) + 1 FROM clips
+                    HAVING (SELECT COUNT(*) FROM clips WHERE pinned = 1) < ?8
                     """) { row in
-                    try requireOK(sqlite3_bind_double(row, 1, capturedAt.timeIntervalSince1970))
-                    try bind(bundleID, to: row, at: 2)
-                    try bind(appName, to: row, at: 3)
-                    try requireOK(sqlite3_bind_int64(row, 4, existing.id))
+                    try bind(text, to: row, at: 1)
+                    try bind(image, to: row, at: 2)
+                    try bind(thumbnail, to: row, at: 3)
+                    try requireOK(sqlite3_bind_double(row, 4, persistedTimestamp))
+                    try bind(bundleID, to: row, at: 5)
+                    try bind(appName, to: row, at: 6)
+                    try bind(digest, to: row, at: 7)
+                    try requireOK(sqlite3_bind_int64(row, 8, Int64(limit)))
                     _ = try next(row)
                 }
-                return true
+                guard sqlite3_changes(db) != 0 else { return nil }
+                let id = sqlite3_last_insert_rowid(db)
+                let evicted = try pruneLocked(db, limit: limit)
+                return (id, false, evicted)
             }
-            try statement(db, """
-                INSERT INTO clips (text, image, thumbnail, captured, bundle_id, app_name, digest, recency)
-                SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(MAX(recency), 0) + 1 FROM clips
-                HAVING (SELECT COUNT(*) FROM clips WHERE pinned = 1) < ?8
-                """) { row in
-                try bind(text, to: row, at: 1)
-                try bind(image, to: row, at: 2)
-                try bind(thumbnail, to: row, at: 3)
-                try requireOK(sqlite3_bind_double(row, 4, capturedAt.timeIntervalSince1970))
-                try bind(bundleID, to: row, at: 5)
-                try bind(appName, to: row, at: 6)
-                try bind(digest, to: row, at: 7)
-                try requireOK(sqlite3_bind_int64(row, 8, Int64(limit)))
-                _ = try next(row)
-            }
-            guard sqlite3_changes(db) != 0 else { return false }
-            try prune(db, limit: limit)
-            return true
         }
+        guard let committed else { return nil }
+        let item = ClipboardItem(id: committed.id, text: text, capturedAt: storedCapturedAt,
+                                 sourceBundleID: bundleID, sourceAppName: appName, pinned: committed.pinned)
+        return UpsertResult(item: item, evictedIDs: committed.evicted)
     }
 
     func image(id: Int64) throws -> Data? { try validatedPNG("image", id: id) }
     func thumbnail(id: Int64) throws -> Data? { try validatedPNG("thumbnail", id: id) }
 
     private func validatedPNG(_ column: String, id: Int64) throws -> Data? {
-        guard let bytes = try imageBytes(column, id: id),
+        guard let bytes = try lock.withLock({ try imageBytesLocked(column, id: id) }),
               let source = Self.imageSource(bytes), Self.isDecodablePNG(source) else { return nil }
         return bytes
     }
 
-    private func imageBytes(_ column: String, id: Int64) throws -> Data? {
-        guard let db = try database() else { return nil }
+    private func imageBytesLocked(_ column: String, id: Int64) throws -> Data? {
+        guard let db = try databaseLocked() else { return nil }
         return try statement(db, "SELECT \(column) FROM clips WHERE id = ?1 AND typeof(\(column)) = 'blob' AND length(\(column)) BETWEEN 1 AND ?2") { row in
             try requireOK(sqlite3_bind_int64(row, 1, id))
             try requireOK(sqlite3_bind_int(row, 2, Int32(Self.maximumImageBytes)))
@@ -379,11 +428,11 @@ final class ClipboardStore {
         }
     }
 
-    nonisolated static func imageSource(_ bytes: Data) -> CGImageSource? {
+    static func imageSource(_ bytes: Data) -> CGImageSource? {
         CGImageSourceCreateWithData(bytes as CFData, [kCGImageSourceShouldCache: false] as CFDictionary)
     }
 
-    nonisolated static func isDecodablePNG(_ source: CGImageSource) -> Bool {
+    static func isDecodablePNG(_ source: CGImageSource) -> Bool {
         guard CGImageSourceGetType(source) == UTType.png.identifier as CFString,
               CGImageSourceGetCount(source) >= 1,
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
@@ -401,41 +450,73 @@ final class ClipboardStore {
     }
 
     func noteUsed(id: Int64) throws {
-        try update(id, "UPDATE clips SET recency = (SELECT MAX(recency) + 1 FROM clips) WHERE id = ?")
-    }
-
-    func togglePin(id: Int64) throws {
-        guard let db = try database() else { return }
-        try transaction(db) {
-            try update(id, "UPDATE clips SET pinned = 1 - pinned WHERE id = ?")
-            try prune(db, limit: limit)
+        try lock.withLock {
+            try updateLocked(id, "UPDATE clips SET recency = (SELECT MAX(recency) + 1 FROM clips) WHERE id = ?")
         }
     }
 
-    func remove(id: Int64) throws { try update(id, "DELETE FROM clips WHERE id = ?") }
-    func clearUnpinned() throws { if let db = try database() { try execute(db, "DELETE FROM clips WHERE pinned = 0") } }
-    func clearAll() throws { if let db = try database() { try execute(db, "DELETE FROM clips") } }
-
-    func setLimit(_ value: Int) throws {
-        let value = Self.boundedLimit(value)
-        if let db = try database() { try prune(db, limit: value) }
-        limit = value
+    func togglePin(id: Int64) throws {
+        _ = try togglePinReturningEvicted(id: id)
     }
 
-    private func prune(_ db: OpaquePointer, limit: Int) throws {
+    func togglePinReturningEvicted(id: Int64) throws -> (pinned: Bool, evictedIDs: Set<Int64>)? {
+        try lock.withLock {
+            guard let db = try databaseLocked() else { return nil }
+            return try transaction(db) {
+                let pinned = try statement(db, "UPDATE clips SET pinned = 1 - pinned WHERE id = ? RETURNING pinned") { row -> Bool? in
+                    try requireOK(sqlite3_bind_int64(row, 1, id))
+                    var value: Bool?
+                    while try next(row) { value = sqlite3_column_int(row, 0) != 0 }
+                    return value
+                }
+                guard let pinned else { return nil }
+                let evicted = try pruneLocked(db, limit: limit)
+                return (pinned, evicted)
+            }
+        }
+    }
+
+    func remove(id: Int64) throws {
+        try lock.withLock { try updateLocked(id, "DELETE FROM clips WHERE id = ?") }
+    }
+
+    func clearUnpinned() throws {
+        try lock.withLock { if let db = try databaseLocked() { try execute(db, "DELETE FROM clips WHERE pinned = 0") } }
+    }
+
+    func clearAll() throws {
+        try lock.withLock { if let db = try databaseLocked() { try execute(db, "DELETE FROM clips") } }
+    }
+
+    func setLimit(_ value: Int) throws {
+        _ = try setLimitReturningEvicted(value)
+    }
+
+    func setLimitReturningEvicted(_ value: Int) throws -> Set<Int64> {
+        try lock.withLock {
+            let value = Self.boundedLimit(value)
+            let evicted = if let db = try databaseLocked() { try pruneLocked(db, limit: value) } else { Set<Int64>() }
+            limit = value
+            return evicted
+        }
+    }
+
+    private func pruneLocked(_ db: OpaquePointer, limit: Int) throws -> Set<Int64> {
         try statement(db, """
             DELETE FROM clips WHERE id IN (
                 SELECT id FROM clips WHERE pinned = 0 ORDER BY recency DESC LIMIT -1
                 OFFSET MAX(0, ? - (SELECT COUNT(*) FROM clips WHERE pinned = 1))
-            )
+            ) RETURNING id
             """) { row in
             try requireOK(sqlite3_bind_int64(row, 1, Int64(limit)))
-            _ = try next(row)
+            var evicted: Set<Int64> = []
+            while try next(row) { evicted.insert(sqlite3_column_int64(row, 0)) }
+            return evicted
         }
     }
 
-    private func update(_ id: Int64, _ sql: String) throws {
-        guard let db = try database() else { return }
+    private func updateLocked(_ id: Int64, _ sql: String) throws {
+        guard let db = try databaseLocked() else { return }
         try statement(db, sql) { row in
             try requireOK(sqlite3_bind_int64(row, 1, id))
             _ = try next(row)
@@ -474,7 +555,7 @@ final class ClipboardStore {
         return false
     }
 
-    private func database(create: Bool = false) throws -> OpaquePointer? {
+    private func databaseLocked(create: Bool = false) throws -> OpaquePointer? {
         guard let directoryFD = try openDirectory(directory, create: create) else { return nil }
         defer { close(directoryFD) }
         // All payloads are SQLite BLOBs, not separate files. Reject links on the
@@ -498,6 +579,7 @@ final class ClipboardStore {
             let path = directory.appendingPathComponent(name).path
             try requireOK(sqlite3_open_v2(path, &handle, SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOFOLLOW, nil))
             guard let db = handle else { throw StoreError.unavailable }
+            sqlite3_busy_timeout(db, 1000)
             // DELETE journals inherit the database mode. Don't leave freed payloads in
             // SQLite pages or send any part of this store to the index engine or diagnostics.
             try execute(db, """

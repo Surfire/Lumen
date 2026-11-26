@@ -76,7 +76,7 @@ pub(super) const SKIP_SCHEMA: &str = "
     END;
 ";
 
-// Additive to the legacy BGE/helper slot. The versioned store allows upgrades
+// Additive to the legacy helper slot. The versioned store allows upgrades
 // without changing the legacy vectors or stranding them on rollback.
 pub(super) const VERSIONED_SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS semantic_vector(

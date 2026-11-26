@@ -72,7 +72,7 @@ Q&A and translation share the provider and model selected under **Settings → T
 
 - **M1 — Reliability.** The search panel stays out of the way of other apps, follows the pointer’s display, and respects IME composition. App lookup adds fuzzy matching; ranking learns from successful opens. Indexing skips common development caches and treats app bundles as packages by default.
 - **M2 — Spotlight-style interactions and one search process.** Drag local files from results, filter with `kind:`, `ext:`, and path prefixes, and use Space for Quick Look while browsing. Settings offers Launch at Login; the launcher supports actions such as Lock Screen, Sleep, and Mute. A persistent `lumen serve` session handles name search, full-text search, and batch result validation without launching a process for each query or hit.
-- **M3 — Streaming and simpler settings.** `tr` and `qa` stream in the launcher, and the optional web commands are off by default. The main app no longer ships an Extensions settings page or helper; the standalone Rust crate remains.
+- **M3 — Streaming and simpler settings.** `tr` and `qa` stream in the launcher, and the optional web commands are off by default. The main app no longer ships an Extensions settings page or helper.
 - **M3 — Separate semantic and multimodal work for the integrated release.** T13 covers compact f16 vector storage for new/rebuilt embeddings while retaining f32 reads. T14 covers HEIC/HEIF and WebP image search and opt-in, on-device Apple Vision OCR for local images and screenshots. These are not part of the launcher cleanup worktree; cloud-only placeholders must not be downloaded for indexing.
 
 ### Million-file name-index benchmark
@@ -101,7 +101,6 @@ Rust handles scanning, indexing, and retrieval. AppKit and SwiftUI provide the n
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-cargo test --locked --manifest-path extensions/Cargo.toml
 scripts/build-app.sh
 python3 scripts/smoke-updater.py
 python3 scripts/smoke-app.py

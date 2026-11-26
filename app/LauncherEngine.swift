@@ -110,7 +110,6 @@ struct IndexReport: Decodable, Equatable {
     let placeholders: Int?
     let documents: Int?
     let documents_not_read: Int?
-    let embedded_chunks: Int?
     let gemma: GemmaCoverage?
     let scope: IndexScope?
     let content: ContentCoverage?
@@ -263,7 +262,6 @@ final class LauncherEngine {
     private let requestTimeout: Duration
     private var nextID: UInt64 = 0
     private(set) var checksCachedHitAccess = false
-    private var legacyValidation = false
 
     func setCachedHitAccess(_ enabled: Bool) {
         guard checksCachedHitAccess != enabled else { return }
@@ -451,7 +449,6 @@ final class LauncherEngine {
             }
             return
         }
-        guard !legacyValidation else { complete(.success(nil)); return }
         do {
             let batches = try validationBatches(hits)
             let server = try connect(\.connection, command: ["serve"])
@@ -509,12 +506,7 @@ final class LauncherEngine {
                 guard let self, let responder = self.connection else { return }
                 self.validate(remaining, on: responder, explicit: explicit, valid: valid + flags, complete: complete)
             case .failure(let error):
-                let detail = error.detail.lowercased()
-                if (detail.contains("missing field") && detail.contains("query")) ||
-                    detail.contains("unsupported op") || detail.contains("unknown op") {
-                    self?.legacyValidation = true
-                    complete(.success(nil))
-                } else { complete(.failure(error)) }
+                complete(.failure(error))
             }
         }
     }

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use lumen::{BgeModel, GemmaModel, Mode, Model, ModelBackend, PdfHelperPolicy, Scope};
+use lumen::{GemmaModel, Mode, Model, ModelBackend, PdfHelperPolicy, Scope};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -118,34 +118,21 @@ impl From<ScopeArgs> for Scope {
 #[derive(Args)]
 struct SemanticArgs {
     /// Select EmbeddingGemma 2 explicitly, including a partially built index for a diagnostic query.
-    #[arg(long, conflicts_with_all = ["helper", "bge", "language"])]
+    #[arg(long, conflicts_with_all = ["helper", "language"])]
     gemma: bool,
     /// Override the isolated EmbeddingGemma 2 resource directory.
-    #[arg(long, conflicts_with_all = ["helper", "bge", "language"], value_name = "DIR")]
+    #[arg(long, conflicts_with_all = ["helper", "language"], value_name = "DIR")]
     gemma_home: Option<PathBuf>,
-    /// Existing local model executable, or the BGE worker script with --bge-model.
+    /// Existing local model executable.
     #[arg(long)]
     helper: Option<PathBuf>,
-    /// Use the installed experimental BGE candidate backend.
-    #[arg(long, conflicts_with = "helper")]
-    bge: bool,
-    /// Override the isolated installed BGE resource directory.
-    #[arg(long, requires = "bge", value_name = "DIR")]
-    bge_home: Option<PathBuf>,
-    /// Language profile (defaults to en for a legacy helper and zh for BGE).
-    #[arg(long)]
+    /// Language profile (defaults to en for a helper).
+    #[arg(long, requires = "helper")]
     language: Option<String>,
-    /// Verified local BGE snapshot for experimental semantic candidate retrieval.
-    #[arg(long, requires_all = ["helper", "bge_python"], value_name = "DIR")]
-    bge_model: Option<PathBuf>,
-    /// Isolated Python executable with local BGE dependencies already available.
-    #[arg(long, requires = "bge_model", value_name = "PATH")]
-    bge_python: Option<PathBuf>,
 }
 
 enum ConfiguredModel {
     Helper(Model),
-    Bge(BgeModel),
     Gemma(GemmaModel),
 }
 
@@ -156,31 +143,12 @@ impl SemanticArgs {
                 self.gemma_home.as_deref(),
             )?)));
         }
-        if self.bge {
-            let model = BgeModel::installed(
-                self.bge_home.as_deref(),
-                self.language.as_deref().unwrap_or("zh"),
-            )?;
-            model.check_installed_files()?;
-            return Ok(Some(ConfiguredModel::Bge(model)));
-        }
-        let model = match (self.helper, self.bge_model, self.bge_python) {
-            (Some(helper), Some(directory), Some(python)) => ConfiguredModel::Bge(BgeModel {
-                directory,
-                python,
-                helper,
-                language: self.language.unwrap_or_else(|| "zh".into()),
-            }),
-            (Some(executable), None, None) => ConfiguredModel::Helper(Model {
+        Ok(self.helper.map(|executable| {
+            ConfiguredModel::Helper(Model {
                 executable,
                 language: self.language.unwrap_or_else(|| "en".into()),
-            }),
-            (None, None, None) => return Ok(None),
-            _ => anyhow::bail!(
-                "the optional BGE backend requires --helper, --bge-model and --bge-python"
-            ),
-        };
-        Ok(Some(model))
+            })
+        }))
     }
 }
 
@@ -188,7 +156,6 @@ impl ConfiguredModel {
     fn backend(&self) -> ModelBackend<'_> {
         match self {
             Self::Helper(model) => ModelBackend::Helper(model),
-            Self::Bge(model) => ModelBackend::Bge(model),
             Self::Gemma(model) => ModelBackend::Gemma(model),
         }
     }
@@ -308,14 +275,12 @@ enum Action {
     },
     /// Check installed local semantic resources without modifying the index.
     ModelStatus {
-        #[arg(long, conflicts_with = "bge_home")]
+        #[arg(long)]
         gemma: bool,
-        #[arg(long, requires = "gemma", value_name = "DIR")]
+        #[arg(long, value_name = "DIR")]
         gemma_home: Option<PathBuf>,
         #[arg(long, default_value = "zh")]
         language: String,
-        #[arg(long, value_name = "DIR")]
-        bge_home: Option<PathBuf>,
         /// Launch the worker and check pinned hashes, runtime and model format.
         #[arg(long)]
         verify: bool,
@@ -711,10 +676,10 @@ fn main() -> Result<()> {
             }
         }
         Action::ModelStatus {
-            gemma: true,
+            gemma: _,
             gemma_home,
+            language: _,
             verify,
-            ..
         } => {
             let inspection = GemmaModel::installed(gemma_home.as_deref())
                 .and_then(|model| model.inspect(verify));
@@ -806,31 +771,6 @@ fn main() -> Result<()> {
                     })
                 },
             )?;
-        }
-        Action::ModelStatus {
-            language,
-            gemma: false,
-            gemma_home: _,
-            bge_home,
-            verify,
-        } => {
-            let model = BgeModel::installed(bge_home.as_deref(), &language)?;
-            let inspection = if verify {
-                model.verify()
-            } else {
-                model.check_installed_files()
-            };
-            let available = inspection.is_ok();
-            println!(
-                "{}",
-                json!({
-                    "backend": "bge_candidate",
-                    "language": model.language,
-                    "available": available,
-                    "verified": verify && available,
-                    "diagnostic": inspection.err().map(|error| format!("{error:#}")),
-                })
-            );
         }
         Action::Status { include_scope } => {
             let conn = lumen::open_read(&db)?;
@@ -964,5 +904,14 @@ mod tests {
             assert_eq!(input.position(), bytes_read as u64);
             assert!(output.is_empty());
         }
+    }
+
+    #[test]
+    fn model_status_accepts_gemma_and_rejects_removed_bge_flags() {
+        assert!(Cli::try_parse_from(["lumen", "model-status", "--gemma"]).is_ok());
+        assert!(Cli::try_parse_from(["lumen", "model-status"]).is_ok());
+        assert!(Cli::try_parse_from(["lumen", "model-status", "--language", "zh"]).is_ok());
+        assert!(Cli::try_parse_from(["lumen", "embed", "--bge"]).is_err());
+        assert!(Cli::try_parse_from(["lumen", "model-status", "--bge-home", "/tmp"]).is_err());
     }
 }

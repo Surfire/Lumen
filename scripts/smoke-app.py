@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Headless smoke of the signed .app resources using an isolated synthetic corpus."""
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -33,6 +34,8 @@ def make_pdf(path):
 
 def main():
     subprocess.run(["codesign", "--verify", "--deep", "--strict", str(APP)], check=True)
+    for retired in ("LumenLocalEmbedding", "local-bge.py", "lumen-extensions"):
+        assert not os.path.lexists(RES / retired), f"retired resource still bundled: {retired}"
     with tempfile.TemporaryDirectory(prefix="lumen-app-smoke-", dir="/tmp") as d:
         corpus = Path(d) / "corpus"
         corpus.mkdir()
@@ -49,19 +52,17 @@ def main():
         scan = run("index", "--root", str(corpus), "--documents", "--pdf-helper", str(RES / "LumenPdfExtractor"))
         assert scan["documents"] == 3 and scan["documents_not_read"] == 0, scan
         assert run("query", "PDF extraction", "--mode", "text")[0]["name"] == "example.pdf"
-        helper = str(RES / "LumenLocalEmbedding")
-        model = ["--helper", helper, "--language", "en"]
-        assert run("embed", *model, "--max", "1")["new_embeddings"] == 1
-        assert run("embed", *model, "--max", "3")["new_embeddings"] == 2
-        hits = run("query", "A doctor scheduled another health check", "--mode", "semantic", *model)
-        assert hits[0]["name"] == "closer.md" and hits[0]["matched_by"] == "semantic", hits
         protocol = subprocess.check_output(argv + ["serve"], input=b'{"id":42,"query":"PDF extraction","mode":"all"}\n', timeout=10)
         assert json.loads(protocol)["hits"][0]["name"] == "example.pdf"
-        chinese = json.loads(subprocess.check_output([helper, "zh"], input="医院进行慢病随访。".encode(), timeout=10))
-        assert len(chinese) > 8
-        print(json.dumps({"headless_app_resources":"PASS","documents":scan["documents"],
-            "semantic_top":"closer.md","semantic_score":hits[0]["score"],
-            "zh_vector_dimensions":len(chinese),"GUI_launched":False}, indent=2))
+        status = run("status", "--include-scope")
+        assert status["documents"] == 3 and status["scope"]["documents"] is True, status
+        assert len(status["scope"]["roots"]) == 1, status
+        print(json.dumps({
+            "headless_app_resources": "PASS",
+            "documents": scan["documents"],
+            "status_items": status["items"],
+            "GUI_launched": False,
+        }, indent=2))
 
 
 if __name__ == "__main__":

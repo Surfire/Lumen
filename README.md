@@ -29,6 +29,12 @@ open target/Lumen.app
 
 重新打开 Lumen 时，符合条件的已保存索引可先用于查找。监听器在后台补查关闭期间的变动。
 
+### 签名发布与 Homebrew
+
+对于安装在可写「应用程序」文件夹且使用发布签名的副本，请打开「设置 → 高级与诊断 → 检查更新」。检查只在手动触发时进行。Lumen 会验证 GitHub 发布清单的签名、ZIP 校验值和应用签名，再原位替换应用。安装后请退出并重新打开 Lumen；界面会显示旧版本的备份路径。临时签名构建不支持应用内更新。若发布证书更换，请手动安装首个使用新证书的版本。
+
+通过 Homebrew tap 安装时，请用 `brew upgrade --cask lumen` 升级。普通卸载保留数据；`--zap` 还会移除偏好和 Application Support，包括脚本和剪贴板历史。
+
 ### 在同一个搜索框里操作
 
 | 输入或按键 | 动作 |
@@ -54,6 +60,13 @@ open target/Lumen.app
 - **网盘只记录可见元数据。** 已识别的 iCloud、OneDrive 和 File Provider 范围记录系统可见的名称与路径。索引和预览不会主动下载云端占位文件。搜索索引和离线推理留在本机，应用不捆绑或自动下载权重。
 - **进度和缺失原因可以检查。** 「高级与诊断」分别显示文件监听和语义索引状态。使用「文件诊断 → 选取文件」检查名称、正文和语义覆盖，诊断不会读取原文或唤醒云端项目。
 - **常用项目可以固定。** 空搜索可显示手动固定的项目，也可为应用、项目目录和网页创建快捷链接或别名。
+
+## v0.5 整合亮点（待发布）
+
+- 优化视觉层次和命中高亮，新增需主动启用的本地私密剪贴板历史。
+- 使用 macOS 辅助功能管理窗口，支持本地脚本命令和 Apple 快捷指令。
+- 热查询使用进程内静态核心，较重的提取器仍单独运行。
+- 支持签名应用内更新和 Homebrew Cask。
 
 ## v0.4 更新要点
 
@@ -90,6 +103,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo test --locked --manifest-path extensions/Cargo.toml
 scripts/build-app.sh
+python3 scripts/smoke-updater.py
 python3 scripts/smoke-app.py
 python3 scripts/smoke-launcher.py
 python3 scripts/smoke-relaunch.py target/Lumen.app

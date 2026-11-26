@@ -11,6 +11,8 @@ struct SearchWindow: View {
     @ObservedObject var commands: LauncherCommands
     @ObservedObject var inlinePreview: LauncherInlinePreview
     @ObservedObject var imageSearch: LauncherImageSearch
+    let clipboard: ClipboardManager
+    let selectClipboard: (Int64) -> Void
     let activateCommand: () -> Void
     let searchCommandAsFiles: () -> Void
     let closeInlinePreview: () -> Void
@@ -58,6 +60,12 @@ struct SearchWindow: View {
                 }
                 .padding(.horizontal, 16).padding(.vertical, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)
+            } else if commands.isClipboardCommand {
+                if contextActions.isOpen { contextRows }
+                else {
+                    ClipboardHistoryView(commands: commands, clipboard: clipboard, chinese: model.zh,
+                                         select: selectClipboard, copy: activateCommand, openSettings: showSettings)
+                }
             } else if commands.showsCard {
                 LauncherCommandCard(commands: commands, provider: translation, chinese: model.zh,
                                     activate: activateCommand, openSettings: showSettings)
@@ -137,6 +145,16 @@ struct SearchWindow: View {
         case .discovery:
             keyHint("↑↓", model.t("选择", "Select"))
             keyHint("↵", model.t("填入命令", "Fill Command"))
+        case .clipboard:
+            if contextActions.isOpen {
+                keyHint("↑↓", model.t("选择操作", "Select Action"))
+                keyHint("↵", model.t("执行", "Run"))
+            } else if commands.selectedClipboardItem != nil {
+                keyHint("↑↓", model.t("选择", "Select"))
+                keyHint("↵", model.t("复制", "Copy"))
+                Button(action: toggleContextActions) { keyHint("⇧↵", model.t("操作", "Actions")) }
+                    .buttonStyle(.borderless)
+            }
         case .question:
             switch commands.answer {
             case .loading: keyHint("esc", model.t("取消", "Cancel"))
@@ -698,6 +716,7 @@ struct LauncherSettings: View {
     let translation: TranslationPanelModel
     let volumes: ExternalVolumeCatalog
     let images: LauncherImageSearch
+    let clipboard: ClipboardManager
     let chooseImageFolder: () -> Void
     let chooseImageProjector: () -> Void
     let chooseQuicklinkFolder: (@escaping (URL) -> Void) -> Void
@@ -867,6 +886,10 @@ struct LauncherSettings: View {
             }
             note(model.t("菜单栏中的「打开搜索」始终可用。", "Open Search is always available in the menu bar."))
         }
+        group(model.t("剪贴板历史", "Clipboard History")) {
+            ClipboardSettingsView(clipboard: clipboard, chinese: model.zh)
+        }
+        .onAppear { clipboard.loadHistory() }
     }
 
     @ViewBuilder private var indexAndPrivacy: some View {

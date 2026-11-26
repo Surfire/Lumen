@@ -9,6 +9,7 @@ public enum LumenCommandResolution: Equatable, Sendable {
     case argumentTooLong(commandID: String, maximumUTF8Bytes: Int)
     case question(String)
     case image(String)
+    case clipboard(String)
     case web(commandID: String, title: String, url: URL)
 }
 
@@ -68,7 +69,7 @@ public struct LumenCommandCatalog: Sendable {
 
     public static let maximumURLArgumentBytes = 2_048
     public static let maximumQuestionBytes = 16_384
-    private static let reservedVerbs: Set<String> = ["qa", "tr", "translate", "img"]
+    private static let reservedVerbs: Set<String> = ["qa", "tr", "translate", "img", "cb", "clip"]
     private static let defaultLinks = builtInLinks([
         ("google", "g", "Search Google", "https://www.google.com/search", "q")
     ])
@@ -88,7 +89,7 @@ public struct LumenCommandCatalog: Sendable {
     /// opt-in built-ins so enabling those searches cannot redirect an existing alias.
     public init(includeOptionalLinks: Bool = false, additionalLinks: [LumenHTTPSQueryLink] = []) {
         var table: [String: LumenHTTPSQueryLink] = [:]
-        var usedIDs = Set(["qa", "translate", "discover", "img"])
+        var usedIDs = Set(["qa", "translate", "discover", "img", "clipboard"])
         for link in Self.defaultLinks + additionalLinks + (includeOptionalLinks ? Self.optionalLinks : []) {
             guard !Self.reservedVerbs.contains(link.keyword), table[link.keyword] == nil,
                   usedIDs.insert(link.commandID).inserted else { continue }
@@ -101,7 +102,8 @@ public struct LumenCommandCatalog: Sendable {
         [.init(keyword: "?", title: "Browse Commands", commandID: "discover", destinationHost: nil),
          .init(keyword: "qa", title: "Ask Model", commandID: "qa", destinationHost: nil),
          .init(keyword: "tr", title: "Translate", commandID: "translate", destinationHost: nil),
-         .init(keyword: "img", title: "Search Images", commandID: "img", destinationHost: nil)]
+         .init(keyword: "img", title: "Search Images", commandID: "img", destinationHost: nil),
+         .init(keyword: "cb", title: "Clipboard History", commandID: "clipboard", destinationHost: nil)]
         + links.values.sorted { $0.keyword < $1.keyword }.map {
             Entry(keyword: $0.keyword, title: $0.title, commandID: $0.commandID, destinationHost: $0.destinationHost)
         }
@@ -111,14 +113,17 @@ public struct LumenCommandCatalog: Sendable {
         // Pass raw input to the active 0.3.2 translator; no clone of its multilingual parsing.
         if isExistingTranslation(input) { return .translation }
         if input == "?" { return .discovery }
-        // Bare qa/g are still searchable filenames. A command starts at the first
-        // character and is reserved only with a space/tab. Newlines are payload only.
-        guard let delimiter = input.firstIndex(where: { $0 == " " || $0 == "\t" }),
-              delimiter != input.startIndex else { return .search }
-        let token = input[..<delimiter]
-        guard token.utf8.allSatisfy({ $0 < 128 }) else { return .search }
+        // Bare qa/g are still searchable filenames. Except for cb/clip, a command
+        // starts at the first character and requires a space/tab. Newlines are payload only.
+        let delimiter = input.firstIndex(where: { $0 == " " || $0 == "\t" })
+        let token = input[..<(delimiter ?? input.endIndex)]
+        guard !token.isEmpty, delimiter != nil || token.utf8.count <= 4,
+              token.utf8.allSatisfy({ $0 < 128 }) else { return .search }
         let keyword = token.lowercased()
+        let isClipboard = keyword == "cb" || keyword == "clip"
+        guard let delimiter else { return isClipboard ? .clipboard("") : .search }
         let payload = input[input.index(after: delimiter)...].trimmingCharacters(in: .whitespacesAndNewlines)
+        if isClipboard { return .clipboard(payload) }
         if keyword == "img" {
             if payload.isEmpty { return .missingArgument(commandID: "img") }
             if payload.utf8.count > 8192 { return .argumentTooLong(commandID: "img", maximumUTF8Bytes: 8192) }

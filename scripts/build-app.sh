@@ -23,7 +23,7 @@ done
 xcrun swiftc -O -swift-version 5 -target "$SWIFT_TARGET" -module-cache-path "$PWD/target/SwiftModuleCache" -parse-as-library \
     app/LumenApp.swift app/LauncherEngine.swift app/LauncherHotKey.swift app/LauncherModel.swift \
     app/LauncherViews.swift app/LauncherHighlight.swift app/LauncherActions.swift app/LauncherSystemActions.swift app/LauncherFileQuery.swift app/LauncherPreview.swift app/LauncherShortcuts.swift app/LauncherCalculation.swift app/LauncherSmoke.swift \
-    app/LumenCommandCatalog.swift app/LumenQuickAnswer.swift app/LauncherCommands.swift app/LauncherImageSearch.swift \
+    app/LumenCommandCatalog.swift app/LumenQuickAnswer.swift app/LauncherCommands.swift app/LauncherScripts.swift app/LauncherImageSearch.swift \
     app/ClipboardStore.swift app/ClipboardManager.swift app/ClipboardViews.swift \
     app/InlinePreview.swift app/MacPreview.swift app/MacInlinePreviewView.swift app/LauncherInlinePreview.swift \
     app/TranslationClient.swift app/TranslationModel.swift app/TranslationPanel.swift app/LauncherExternalVolumes.swift -o "$APP/Contents/MacOS/Lumen"

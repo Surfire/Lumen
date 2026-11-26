@@ -13,6 +13,15 @@ final class LauncherCommands: ObservableObject {
     @Published private(set) var copied = false
     @Published private(set) var webFailed = false
     @Published private(set) var answerPage = 0
+    @Published private(set) var executableMatches: [ActionMatch] = []
+    @Published private var selectedExecutableID: String?
+    @Published private var manuallySelected = false
+    @Published private(set) var execution: CommandExecution?
+    @Published var executionArgument = ""
+    @Published private(set) var outputCopied = false
+    @Published private(set) var outputPage = 0
+    private var executionTask: Task<Void, Never>?
+    private var feedbackTask: Task<Void, Never>?
     private(set) var raw = ""
     private lazy var request: LumenQuickAnswer = {
         let request = LumenQuickAnswer()
@@ -41,6 +50,128 @@ final class LauncherCommands: ObservableObject {
         if selection != 0 { selection = 0 }
         if webFailed { webFailed = false }
         if resolution != next { resolution = next }
+    }
+
+    func matchExecutables(_ actions: [LaunchAction], resetSelection: Bool = false) {
+        let matches = resolution == .search && !actions.isEmpty && !LauncherFileQuery(raw).isFiltered
+            ? LaunchCatalog.matches(raw, actions: actions, includeDictionary: false) : []
+        if matches != executableMatches { executableMatches = matches }
+        if resetSelection || !matches.contains(where: { $0.action.id == selectedExecutableID }) {
+            if selectedExecutableID != nil { selectedExecutableID = nil }
+            if resetSelection && manuallySelected { manuallySelected = false }
+        }
+    }
+
+    // Merge opt-in commands here without adding I/O or catalog state to file search.
+    func results(in model: Launcher) -> [LauncherResult] {
+        var rows = model.visibleResults
+        guard !executableMatches.isEmpty else { return rows }
+        let native = Dictionary(uniqueKeysWithValues: model.launchMatches.map { ($0.action.id, $0.score) })
+        let links = Dictionary(uniqueKeysWithValues: model.shortcuts.matches(model.query).map { ($0.record.rowID, $0.score) })
+        func score(_ row: LauncherResult) -> Int {
+            switch row {
+            case .file: return 79
+            case .calculation: return .max
+            case .shortcut: return links[row.id] ?? 0
+            case .action: return native[row.id] ?? .max // Already inserted opt-in command.
+            }
+        }
+        for match in executableMatches {
+            let insertion = rows.firstIndex { score($0) < match.score } ?? rows.firstIndex {
+                // Keep partial commands accessible without interleaving file matches.
+                if case .file = $0 { return match.score >= 55 }
+                return false
+            } ?? rows.endIndex
+            rows.insert(.action(match.action), at: insertion)
+        }
+        return rows
+    }
+
+    func selection(in model: Launcher) -> String? {
+        if let selectedExecutableID { return selectedExecutableID }
+        guard !manuallySelected, executableMatches.first?.primary == true,
+              let first = results(in: model).first, first.id == executableMatches.first?.action.id else { return model.selection }
+        return first.id
+    }
+
+    func selectedResult(in model: Launcher) -> LauncherResult? {
+        let id = selection(in: model)
+        return executableMatches.first { $0.action.id == id }.map { .action($0.action) } ?? model.selectedResult
+    }
+
+    func choose(_ row: LauncherResult, in model: Launcher) {
+        if !manuallySelected { manuallySelected = true }
+        if case .action(let action) = row, case .executable = action.destination {
+            selectedExecutableID = row.id
+        } else {
+            selectedExecutableID = nil
+            model.selection = row.id
+        }
+    }
+
+    func moveResults(_ delta: Int, in model: Launcher) {
+        guard !executableMatches.isEmpty else { model.moveSelection(delta); return }
+        let rows = results(in: model)
+        guard let first = rows.first, let last = rows.last else { return }
+        let id = selection(in: model)
+        if let index = rows.firstIndex(where: { $0.id == id }) {
+            choose(rows[min(max(0, index + delta), rows.count - 1)], in: model)
+        } else {
+            choose(delta > 0 ? first : last, in: model)
+        }
+    }
+
+    var visibleExecution: CommandExecution? {
+        guard let execution else { return nil }
+        if case .argument = execution.phase { return execution }
+        return execution.command.mode == .silent ? nil : execution
+    }
+
+    func prompt(_ command: LauncherExecutable, placeholder: String, required: Bool) {
+        guard executionTask == nil else { return }
+        feedbackTask?.cancel()
+        executionArgument = ""
+        outputCopied = false
+        outputPage = 0
+        execution = .init(command: command, phase: .argument(placeholder, required: required))
+    }
+
+    func run(_ command: LauncherExecutable, argument: String?, catalog: LauncherScriptCatalog) {
+        guard executionTask == nil, catalog.contains(command) else { return }
+        feedbackTask?.cancel()
+        executionArgument = ""
+        outputCopied = false
+        outputPage = 0
+        execution = .init(command: command, phase: .running)
+        let shortcuts = catalog.shortcutsExecutable
+        executionTask = Task { [weak self] in
+            let result = await LauncherProcess.execute(command, argument: argument, shortcuts: shortcuts)
+            guard let self else { return }
+            self.executionTask = nil
+            guard !Task.isCancelled else { return }
+            self.execution = .init(command: command, phase: .finished(result))
+            if command.mode == .silent {
+                self.feedbackTask = Task { [weak self] in
+                    try? await Task.sleep(for: .seconds(4))
+                    if !Task.isCancelled { self?.execution = nil }
+                }
+            }
+        }
+    }
+
+    var canStartExecutable: Bool { executionTask == nil }
+
+    @discardableResult func cancelExecution() -> Task<Void, Never>? {
+        executionTask?.cancel()
+        feedbackTask?.cancel()
+        execution = nil
+        executionArgument = ""
+        return executionTask
+    }
+
+    func copyOutput(to pasteboard: NSPasteboard) {
+        guard let output = visibleExecution?.output, !output.isEmpty else { return }
+        outputCopied = ClipboardManager.writeInternalString(output, to: pasteboard)
     }
 
     func updateClipboard(_ items: [ClipboardItem], resetSelection: Bool = false) {
@@ -79,6 +210,10 @@ final class LauncherCommands: ObservableObject {
     }
 
     func pageAnswer(_ delta: Int) -> Bool {
+        if let execution = visibleExecution, execution.command.mode == .fullOutput, execution.hasOutput {
+            outputPage += delta
+            return true
+        }
         guard !answerText.isEmpty else { return false }
         answerPage += delta
         return true
@@ -91,6 +226,97 @@ final class LauncherCommands: ObservableObject {
     }
     func noteCopied() { copied = true }
     func recordWebFailure() { webFailed = true }
+}
+
+struct CommandExecution {
+    enum Phase { case argument(String, required: Bool), running, finished(LauncherProcess.Result) }
+    let command: LauncherExecutable
+    let phase: Phase
+
+    var output: String {
+        if case .finished(let result) = phase { return result.output }
+        return ""
+    }
+
+    var hasOutput: Bool {
+        if case .finished(let result) = phase { return !result.stdout.bytes.isEmpty || !result.stderr.bytes.isEmpty }
+        return false
+    }
+
+    var running: Bool { if case .running = phase { return true }; return false }
+
+    func status(chinese: Bool) -> String {
+        switch phase {
+        case .argument: return chinese ? "准备运行" : "Ready to Run"
+        case .running: return chinese ? "正在运行…" : "Running…"
+        case .finished(let result):
+            switch result.status {
+            case .exited(0): return chinese ? "已完成" : "Completed"
+            case .exited(let code): return chinese ? "退出码：\(code)" : "Exit code: \(code)"
+            case .timedOut: return chinese ? "已超时（15 秒）" : "Timed out (15 seconds)"
+            case .cancelled: return chinese ? "已取消" : "Cancelled"
+            case .unavailable:
+                return chinese ? "无法运行。请检查文件或重新载入命令。" : "Could not run. Check the file or reload commands."
+            }
+        }
+    }
+}
+
+@MainActor
+struct LauncherCommandOutputCard: View {
+    @ObservedObject var commands: LauncherCommands
+    let execution: CommandExecution
+    let chinese: Bool
+    let run: () -> Void
+    let copy: () -> Void
+    let cancel: () -> Void
+    @FocusState private var argumentFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label(execution.command.title, systemImage: execution.command.action.symbol)
+                    .font(.headline).lineLimit(1)
+                Spacer(minLength: 8)
+                if execution.running {
+                    ProgressView().controlSize(.small)
+                    Button(t("取消", "Cancel"), action: cancel)
+                } else if execution.hasOutput {
+                    Button(commands.outputCopied ? t("已复制", "Copied") : t("复制输出", "Copy Output"), action: copy)
+                        .accessibilityIdentifier("command-copy-output")
+                }
+            }
+            if case .argument(let placeholder, let required) = execution.phase {
+                HStack {
+                    TextField(placeholder, text: $commands.executionArgument)
+                        .accessibilityIdentifier("command-argument").focused($argumentFocused)
+                        .onAppear { argumentFocused = true }
+                        .onSubmit(run)
+                    Button(t("运行", "Run"), action: run)
+                        .disabled(required && commands.executionArgument.isEmpty)
+                        .accessibilityIdentifier("command-run")
+                }
+                if !required { Text(t("留空则不传入参数。", "Leave empty to run without an argument.")).foregroundStyle(.secondary) }
+            } else {
+                Text(execution.status(chinese: chinese)).font(.callout).foregroundStyle(.secondary)
+                    .lineLimit(1).accessibilityIdentifier("command-output-status")
+                if execution.hasOutput {
+                    if execution.command.mode == .fullOutput {
+                        LauncherScrollableText(text: execution.output, label: t("命令输出", "Command Output"),
+                                               identifier: "command-output-scroll", page: commands.outputPage)
+                    } else {
+                        Text(execution.output.prefix(300).split(whereSeparator: \.isNewline).first.map(String.init) ?? "")
+                            .font(.callout.monospaced()).lineLimit(1).truncationMode(.tail)
+                    }
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 16).padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func t(_ zh: String, _ en: String) -> String { chinese ? zh : en }
 }
 
 @MainActor

@@ -4,7 +4,7 @@ import Darwin
 
 struct LaunchAction: Equatable, Identifiable {
     enum Destination: Equatable {
-        case application(URL, stamp: String), settings(URL), system(LauncherSystemActions.Operation)
+        case application(URL, stamp: String), settings(URL), system(LauncherSystemActions.Operation), executable(LauncherExecutable)
     }
 
     let id: String
@@ -249,8 +249,9 @@ enum LaunchCatalog {
         return actions
     }
 
-    static func matches(_ query: String, actions: [LaunchAction], boost: (String) -> Int = { _ in 0 }) -> [ActionMatch] {
-        if let dictionary = dictionaryAction(query) {
+    static func matches(_ query: String, actions: [LaunchAction], includeDictionary: Bool = true,
+                        boost: (String) -> Int = { _ in 0 }) -> [ActionMatch] {
+        if includeDictionary, let dictionary = dictionaryAction(query) {
             return [ActionMatch(action: dictionary, score: 110 + boost(dictionary.id))]
         }
         let term = normalized(query)
@@ -305,7 +306,7 @@ enum LaunchCatalog {
     }
 }
 
-private func withNoDatalessMaterialization<T>(_ body: () -> T?) -> T? {
+func withNoDatalessMaterialization<T>(_ body: () -> T?) -> T? {
     let policy = IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES
     let scope = IOPOL_SCOPE_THREAD
     let previous = getiopolicy_np(policy, scope)
@@ -378,6 +379,9 @@ enum LaunchDispatcher {
             completion(workspace.open(url))
         case .system(let operation):
             LauncherSystemActions.perform(operation, chinese: chinese, completion: completion)
+        case .executable:
+            // Only the command card owns consent, arguments and cancellation for these rows.
+            completion(false)
         }
     }
 }

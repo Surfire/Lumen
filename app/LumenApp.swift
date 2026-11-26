@@ -23,6 +23,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     let applicationIcons = ResultIconDisplay()
     let contextActions = ContextActions()
     let commands = LauncherCommands()
+    let scriptCatalog: LauncherScriptCatalog
+    private var executableActions: [LaunchAction] = []
+    private var executableUpdates: AnyCancellable?
+    private var executionUpdates: AnyCancellable?
     let inlinePreview = LauncherInlinePreview()
     let imageSearch: LauncherImageSearch
     let clipboard: ClipboardManager
@@ -113,13 +117,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
         panel.onSpace = { [weak self] in
             guard let self, self.panel.browsing, self.translation.command == nil, !self.commands.showsCard,
-                  !self.contextActions.isOpen, let hit = self.model.selectedHit else { return false }
+                  self.commands.visibleExecution == nil, !self.contextActions.isOpen,
+                  case .file(let hit) = self.commands.selectedResult(in: self.model) else { return false }
             self.togglePreview(hit, native: true)
             return true
         }
         panel.onFileAction = { [weak self] action in
             guard let self, self.translation.command == nil, !self.commands.showsCard,
-                  !self.contextActions.isOpen, let hit = self.model.selectedHit else { return }
+                  self.commands.visibleExecution == nil, !self.contextActions.isOpen,
+                  case .file(let hit) = self.commands.selectedResult(in: self.model) else { return }
             if action == .preview { self.togglePreview(hit) }
             else { self.perform(action, on: hit) }
         }
@@ -162,6 +168,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 self?.focusSearch()
             },
             activateCommand: { [weak self] in self?.activateCommand() },
+            activateExecution: { [weak self] in self?.activateExecution() },
+            copyOutput: { [weak self] in self?.copyCommandOutput() },
+            cancelExecution: { [weak self] in self?.closeExecutionCard() },
             searchCommandAsFiles: { [weak self] in self?.searchCommandAsFiles() },
             closeInlinePreview: { [weak self] in self?.closeInlinePreview() },
             activateTranslation: { [weak self] in self?.activateTranslation() },
@@ -170,6 +179,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             beginIndex: { [weak self] in self?.startBackgroundIndex() },
             open: { [weak self] in self?.open($0) },
             browse: { [weak self] in self?.panel.browsing = true },
+            moveSelection: { [weak self] in self?.moveCurrentSelection($0) },
             fileAction: { [weak self] action, hit in self?.perform(action, on: hit) }
         ))
         results.translatesAutoresizingMaskIntoConstraints = false
@@ -205,6 +215,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     init(smoke: LauncherSmoke?) {
         self.smoke = smoke
         defaults = smoke != nil ? smoke?.shortcutFixturePreferences : .standard
+        scriptCatalog = smoke?.makeScriptCatalog() ?? LauncherScriptCatalog(defaults: defaults)
         let resources = Bundle.main.resourceURL ?? Bundle.main.bundleURL.appendingPathComponent("Contents/Resources")
         let executable = smoke?.executable ?? resources.appendingPathComponent("lumen")
         let database = smoke?.database ?? FileManager.default.homeDirectoryForCurrentUser
@@ -262,6 +273,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 self.updatePresentation()
             }
         }
+        executableUpdates = scriptCatalog.$scripts.combineLatest(scriptCatalog.$shortcuts).sink { [weak self] scripts, shortcuts in
+            guard let self else { return }
+            self.executableActions = (scripts + shortcuts).map(\.action)
+            self.commands.matchExecutables(self.executableActions)
+            if let execution = self.commands.execution, !(scripts + shortcuts).contains(execution.command) {
+                if self.commands.visibleExecution != nil { self.closeExecutionCard() }
+                else { self.commands.cancelExecution() }
+            }
+            self.updatePresentation()
+        }
+        executionUpdates = commands.$execution.dropFirst().sink { [weak self] _ in
+            // Published values are delivered before the stored property changes.
+            DispatchQueue.main.async { [weak self] in self?.updatePresentation() }
+        }
+        scriptCatalog.reloadScripts()
         updateLanguage()
         model.start(automaticallyIndex: smoke == nil || smoke?.automaticIndexScenario == true)
         if smoke == nil {
@@ -311,10 +337,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let execution = commands.cancelExecution()
+        let discovery = scriptCatalog.close()
+        guard execution != nil || discovery != nil else { return .terminateNow }
+        // Wait for the workers to signal their process groups before AppKit exits.
+        Task {
+            await execution?.value
+            await discovery?.value
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         localPreview?.close()
         translation.cancel()
         clipboard.stop()
+        commands.cancelExecution()
+        scriptCatalog.close()
         imageSearch.stop(refreshStatus: false)
         externalVolumes.stop()
         globalHotKey.close()
@@ -397,7 +438,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         localPreview?.close()
         translation.setCommand(nil)
         inlinePreview.close()
+        if commands.visibleExecution != nil { commands.cancelExecution() }
         commands.update(.search, raw: "", catalog: catalog)
+        commands.matchExecutables([], resetSelection: true)
         commands.updateClipboard([])
         literalCommand = nil
         contextActions.close()
@@ -442,6 +485,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         let priorRaw = commands.raw
         let hadCommandCard = commands.showsCard
         let hadClipboard = commands.isClipboardCommand
+        if commands.visibleExecution != nil {
+            if priorRaw == text { return }
+            commands.cancelExecution()
+        }
         let translationCommand = literalCommand == nil ? TranslationCommand.parse(text) : nil
         let next = literalCommand == nil
             ? catalog.resolve(text, isExistingTranslation: { _ in translationCommand != nil }) : .search
@@ -450,6 +497,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             inlinePreview.close()
         }
         commands.update(next, raw: text, catalog: catalog)
+        if priorRaw != text || previousCommand != next { commands.matchExecutables(executableActions, resetSelection: true) }
         translation.setCommand(translationCommand)
         if previousCommand != next {
             if commands.isClipboardCommand { clipboard.loadHistory() }
@@ -522,6 +570,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func moveCurrentSelection(_ delta: Int) {
+        if commands.visibleExecution != nil { return }
         if commands.resolution == .discovery { commands.move(delta); return }
         if commands.isClipboardCommand {
             if contextActions.isOpen { contextActions.move(delta) }
@@ -533,7 +582,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if contextActions.isOpen { contextActions.move(delta) }
         else {
             panel.browsing = true
-            model.moveSelection(delta)
+            commands.moveResults(delta, in: model)
             refreshInlinePreview()
         }
     }
@@ -545,6 +594,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func cancelCurrentPanelAction() {
+        if commands.visibleExecution != nil { closeExecutionCard(); return }
         if localPreview != nil { closeLocalPreview(); return }
         if closeInlinePreview() { return }
         if commands.answer == .loading { commands.invalidateAnswer() }
@@ -560,7 +610,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private var selectedContextID: String? {
         if commands.isClipboardCommand { return commands.clipboardSelection.map { "clipboard:\($0)" } }
-        return model.selectedResult?.id
+        return commands.selectedResult(in: model)?.id
     }
 
     private func showClipboardActions() {
@@ -579,6 +629,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func toggleContextActions() {
+        guard commands.visibleExecution == nil else { return }
         if commands.isClipboardCommand {
             if contextActions.isOpen { contextActions.close() }
             else { showClipboardActions() }
@@ -587,12 +638,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         guard translation.command == nil, !commands.showsCard,
               !commands.isImageCommand || model.isImageSearch else { return }
         if contextActions.isOpen { contextActions.close(); return }
-        guard let selected = model.selectedResult else { return }
+        guard let selected = commands.selectedResult(in: model) else { return }
         contextResultID = selected.id
         var items: [ContextActions.Item] = []
         func item(_ id: String, _ zh: String, _ en: String, _ symbol: String, _ callback: @escaping () -> Void) {
             items.append(.init(id: id, title: model.t(zh, en), symbol: symbol) { [weak self] in
-                guard self?.model.selectedResult?.id == selected.id else { return }
+                guard let self, self.commands.selectedResult(in: self.model)?.id == selected.id else { return }
                 callback()
             })
         }
@@ -628,6 +679,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 }
             }
         case .action(let action):
+            if case .executable(let command) = action.destination, case .shortcut = command.source {
+                item("shortcut-input", "使用输入文件运行…", "Run with Input File…", "doc") { [weak self] in
+                    self?.prepareExecution(command, withInputFile: true)
+                }
+            }
             if case .application = action.destination {
                 item("pin-app", "固定应用", "Pin Application", "pin") { [weak self] in
                     guard let self, self.model.containsCurrentAction(action) else { return }
@@ -652,6 +708,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func openSelection() {
+        if commands.visibleExecution != nil { activateExecution(); return }
         if commands.isImageCommand && !model.isImageSearch { return }
         if commands.isClipboardCommand && contextActions.isOpen {
             if selectedContextID == contextResultID { contextActions.run() }
@@ -664,15 +721,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             return
         }
         if contextActions.isOpen {
-            if model.selectedResult?.id == contextResultID { contextActions.run() }
+            if commands.selectedResult(in: model)?.id == contextResultID { contextActions.run() }
             else { contextActions.close() }
             return
         }
-        if let selected = model.selectedResult { open(selected) }
+        if let selected = commands.selectedResult(in: model) { open(selected) }
     }
 
     private func open(_ result: LauncherResult) {
-        guard translation.command == nil, !commands.showsCard,
+        guard commands.visibleExecution == nil, translation.command == nil, !commands.showsCard,
               !commands.isImageCommand || model.isImageSearch else { return }
         switch result {
         case .file(let hit): openFile(hit)
@@ -709,7 +766,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         dismissSearch()
     }
 
+    private func prepareExecution(_ command: LauncherExecutable, withInputFile: Bool = false) {
+        guard searchPresented, commands.canStartExecutable, scriptCatalog.contains(command),
+              searchText == commands.raw, (panel.firstResponder as? NSTextView)?.hasMarkedText() != true,
+              commands.executableMatches.contains(where: { $0.action.destination == .executable(command) }) else { return }
+        contextActions.close()
+        inlinePreview.close()
+        if withInputFile {
+            commands.prompt(command, placeholder: model.t("本机文件的绝对路径", "Absolute path to a local file"), required: true)
+        } else if let placeholder = command.argument {
+            commands.prompt(command, placeholder: placeholder, required: false)
+        } else {
+            runExecutable(command, argument: nil)
+        }
+        updatePresentation()
+    }
+
+    private func activateExecution() {
+        guard searchPresented, let execution = commands.visibleExecution,
+              (panel.firstResponder as? NSTextView)?.hasMarkedText() != true else { return }
+        switch execution.phase {
+        case .argument(_, let required):
+            let text = commands.executionArgument
+            guard !required || !text.isEmpty else { return }
+            runExecutable(execution.command, argument: text.isEmpty ? nil : text)
+        case .finished: copyCommandOutput()
+        case .running: break
+        }
+    }
+
+    private func runExecutable(_ command: LauncherExecutable, argument: String?) {
+        guard commands.canStartExecutable, scriptCatalog.contains(command) else { return }
+        if command.mode == .silent { dismissSearch() }
+        else { focusSearch() }
+        commands.run(command, argument: argument, catalog: scriptCatalog)
+        updatePresentation()
+    }
+
+    private func copyCommandOutput() {
+        commands.copyOutput(to: smoke?.filePasteboard ?? .general)
+    }
+
+    private func closeExecutionCard() {
+        guard commands.visibleExecution != nil else { return }
+        commands.cancelExecution()
+        if searchPresented { focusSearch(); updatePresentation() }
+    }
+
     private func runAction(_ action: LaunchAction, shortcut: SavedShortcut? = nil) {
+        if case .executable(let command) = action.destination { prepareExecution(command); return }
         let current = shortcut.map { saved in
             model.visibleResults.contains { row in
                 if case .shortcut(let value) = row { return value == saved && model.application(for: value) == action }
@@ -792,7 +897,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private func refreshInlinePreview() {
         guard inlinePreview.isOpen else { return }
-        guard !model.scopePending, let hit = model.selectedHit, model.containsCurrentFile(hit),
+        guard commands.visibleExecution == nil, !model.scopePending,
+              case .file(let hit) = commands.selectedResult(in: model), model.containsCurrentFile(hit),
               LauncherInlinePreview.kind(hit) != nil else { inlinePreview.close(); return }
         inlinePreview.show(hit)
     }
@@ -816,7 +922,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if !forceWindow, LauncherInlinePreview.kind(hit) != nil {
             guard searchPresented, !model.scopePending, model.containsCurrentFile(hit),
                   hit.isLocal || hit.isCloudReference else { return }
-            model.selection = hit.path
+            commands.choose(.file(hit), in: model)
             if inlinePreview.hit == hit { inlinePreview.close() }
             else { inlinePreview.show(hit) }
             updatePresentation()
@@ -878,6 +984,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
     }
 
+    func chooseScriptsFolder() {
+        guard let settings else { return }
+        if let smoke {
+            if let folder = smoke.chosenScriptsFolder { scriptCatalog.selectFolder(folder) }
+            return
+        }
+        let picker = NSOpenPanel()
+        picker.canChooseDirectories = true
+        picker.canChooseFiles = false
+        picker.allowsMultipleSelection = false
+        picker.resolvesAliases = false
+        picker.directoryURL = scriptCatalog.folder.map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? LauncherScriptFiles.suggestedFolder.deletingLastPathComponent()
+        picker.beginSheetModal(for: settings) { [weak self] response in
+            if response == .OK, let url = picker.url { self?.scriptCatalog.selectFolder(url) }
+        }
+    }
+
     func externalVolumeStateChanged() {
         model.externalVolumesChanged()
         if settings?.isVisible == true, settingsSession.page == .index { externalVolumes.reload() }
@@ -913,6 +1037,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 volumes: externalVolumes,
                 images: imageSearch,
                 clipboard: clipboard,
+                scriptCatalog: scriptCatalog,
+                chooseScriptsFolder: { [weak self] in self?.chooseScriptsFolder() },
                 chooseImageFolder: { [weak self] in self?.chooseImageResource(folder: true) },
                 chooseImageProjector: { [weak self] in self?.chooseImageResource(folder: false) },
                 chooseQuicklinkFolder: { [weak self] in self?.chooseQuicklinkFolder($0) },
@@ -1109,7 +1235,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         let hidesBuild = !model.canStartIndexFromLauncher
         if buildIndexItem?.isHidden != hidesBuild { buildIndexItem?.isHidden = hidesBuild }
         if let button = statusItem?.button {
-            let symbol = model.activityBusy ? "arrow.triangle.2.circlepath" : "magnifyingglass"
+            let silent = commands.visibleExecution == nil ? commands.execution : nil
+            let symbol: String
+            if let silent {
+                if silent.running { symbol = "terminal" }
+                else if case .finished(let result) = silent.phase, result.succeeded { symbol = "checkmark.circle" }
+                else { symbol = "exclamationmark.circle" }
+            } else { symbol = model.activityBusy ? "arrow.triangle.2.circlepath" : "magnifyingglass" }
             if statusSymbol != symbol {
                 button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
                 button.image?.isTemplate = true
@@ -1117,7 +1249,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
             let count = model.activeProgress?.entries.formatted(.number.notation(.compactName)) ?? ""
             if button.title != count { button.title = count }
-            let summary = ["Lumen", activity, metrics].compactMap { $0 }.joined(separator: " · ")
+            let summary = ["Lumen", silent?.status(chinese: model.zh) ?? activity, metrics].compactMap { $0 }.joined(separator: " · ")
             if button.toolTip != summary {
                 button.toolTip = summary
                 button.setAccessibilityLabel(summary)
@@ -1128,12 +1260,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         refreshInlinePreview()
         if contextActions.isOpen, selectedContextID != contextResultID { contextActions.close() }
         var frame = panel.frame
-        let commandHeight: CGFloat? = commands.isClipboardCommand ? ClipboardHistoryView.height
-            : (commands.showsCard || (commands.isImageCommand && !model.isImageSearch) ? 162 : nil)
+        let commandHeight: CGFloat?
+        if let execution = commands.visibleExecution {
+            commandHeight = execution.command.mode == .fullOutput && execution.hasOutput ? 316 : 100
+        } else if commands.isClipboardCommand { commandHeight = ClipboardHistoryView.height }
+        else { commandHeight = commands.showsCard || (commands.isImageCommand && !model.isImageSearch) ? 162 : nil }
         let height = SearchWindow.height(for: model, contextCount: contextActions.items.count,
                                          hasTranslation: translation.command != nil,
                                          commandHeight: commandHeight,
-                                         hasPreview: inlinePreview.isOpen)
+                                         hasPreview: inlinePreview.isOpen,
+                                         hasExecutableMatches: !commands.executableMatches.isEmpty)
         guard frame.height != height else { return }
         frame.origin.y += frame.height - height
         frame.size.height = height

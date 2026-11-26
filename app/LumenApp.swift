@@ -375,6 +375,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if firstShow { windowManagement.captureTarget() }
         searchPresentationGeneration &+= 1
         searchPresented = true
+        model.setSearchPresented(true)
         if firstShow {
             let mouse = NSEvent.mouseLocation
             if let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main {
@@ -444,6 +445,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         guard searchPresented else { return }
         searchPresentationGeneration &+= 1
         searchPresented = false
+        model.setSearchPresented(false)
         windowManagement.issue = nil
         panel.browsing = false
         localPreview?.close()
@@ -670,28 +672,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
         if case .calculation = selected {
             item("copy", "复制结果", "Copy Result", "doc.on.doc") { [weak self] in self?.open(selected) }
-        } else if case .file(let hit) = selected, !hit.isLocal {
-            item("reveal", "在 Finder 中显示", "Show in Finder", "folder") { [weak self] in self?.revealInFinder(hit) }
         } else {
             item("open", "打开", "Open", "return") { [weak self] in self?.open(selected) }
         }
 
         switch selected {
         case .file(let hit):
-            if hit.isLocal { item("reveal", "在 Finder 中显示", "Show in Finder", "folder") { [weak self] in self?.revealInFinder(hit) } }
-            if hit.isLocal && hit.kind == "file" {
+            item("reveal", "在 Finder 中显示", "Show in Finder", "folder") { [weak self] in self?.revealInFinder(hit) }
+            if hit.kind == "file" {
                 if LauncherInlinePreview.kind(hit) != nil {
-                    item("preview", "内嵌预览", "Inline Preview", "eye") { [weak self] in self?.previewFile(hit) }
+                    item("preview", "内嵌预览", "Inline Preview", "eye") { [weak self] in
+                        self?.previewFile(hit, allowCloudDownload: true)
+                    }
                     item("quick-look", "在窗口中预览", "Preview in Window", "macwindow") { [weak self] in
-                        self?.previewFile(hit, forceWindow: true)
+                        self?.previewFile(hit, forceWindow: true, allowCloudDownload: true)
                     }
                 } else {
-                    item("preview", "快速查看", "Quick Look", "eye") { [weak self] in self?.previewFile(hit) }
+                    item("preview", "快速查看", "Quick Look", "eye") { [weak self] in
+                        self?.previewFile(hit, allowCloudDownload: true)
+                    }
                 }
             }
             item("copy-name", "复制名称", "Copy Name", "doc.on.doc") { [weak self] in self?.perform(.copyName, on: hit) }
             item("copy-path", "复制路径", "Copy Path", "link") { [weak self] in self?.perform(.copyPath, on: hit) }
-            if hit.isLocal && hit.kind == "directory" {
+            if hit.isResident && hit.kind == "directory" {
                 item("pin-folder", "固定项目文件夹", "Pin Project Folder", "pin") { [weak self] in
                     guard let self else { return }
                     self.model.resolve(hit, action: .open) { [weak self] url in
@@ -775,7 +779,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             runAction(app, shortcut: shortcut)
             return
         case .folder(let path):
-            guard SearchHit.pathStamp(at: path, kind: "directory") != nil else { model.openingFailed(); return }
+            guard SearchHit.existsOnDisk(at: path, kind: "directory", permitsDatalessLeaf: true) else { model.openingFailed(); return }
             url = URL(fileURLWithPath: path, isDirectory: true)
         case .web(let destination):
             guard let verified = SavedShortcut.webURL(destination.absoluteString) else { model.openingFailed(); return }
@@ -911,11 +915,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
     }
 
-    private func perform(_ action: FileAction, on hit: SearchHit) {
+    func perform(_ action: FileAction, on hit: SearchHit) {
         switch action {
         case .open: openFile(hit)
         case .reveal: revealInFinder(hit)
-        case .preview: previewFile(hit)
+        case .preview: previewFile(hit, allowCloudDownload: true)
         case .copyName, .copyPath:
             model.resolve(hit, action: action) { [weak self] _ in
                 guard let self, self.searchPresented else { return }
@@ -962,15 +966,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func previewFile(_ hit: SearchHit, forceWindow: Bool = false, allowCloudDownload: Bool = false) {
-        guard searchPresented, !model.scopePending else { return }
+        guard searchPresented, !model.scopePending, model.containsCurrentFile(hit) else { return }
         if !forceWindow, let kind = LauncherInlinePreview.kind(hit) {
-            guard model.containsCurrentFile(hit), hit.isLocal || hit.isCloudReference else { return }
+            guard hit.isResident || hit.isPlaceholder else { return }
             commands.choose(.file(hit), in: model)
             if inlinePreview.hit == hit { inlinePreview.close() }
             else { inlinePreview.show(hit, kind: kind, allowCloudDownload: allowCloudDownload) }
             updatePresentation()
             return
         }
+        commands.choose(.file(hit), in: model)
         model.resolve(hit, action: .preview) { [weak self] url in
             guard let self, self.searchPresented, !self.model.scopePending, self.model.containsCurrentFile(hit),
                   self.commands.selectedResult(in: self.model)?.id == hit.id else { return }
@@ -986,7 +991,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func showLocalPreview(_ hit: SearchHit, at url: URL) throws {
-        guard let preview = try inlinePreview.withResidentFile(url, expectedStamp: hit.document_stamp, {
+        guard let preview = try inlinePreview.withResidentFile(url, expectedStamp: nil, {
             LocalPreviewPanel(url: url, title: hit.name, page: hit.pdf_page)
         }) else { throw PreviewFailure.invalidContent }
         localPreview?.close()
@@ -1094,6 +1099,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             settings = window
         }
         settings?.title = model.t("Lumen 设置", "Lumen Settings")
+        model.setSettingsPresented(true)
         if smoke == nil { settings?.makeKeyAndOrderFront(nil) }
         if searchPresented { dismissSearch() }
     }
@@ -1171,6 +1177,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             dismissSearchIfFocusLeft()
         }
         if let settings, (notification.object as? NSWindow) === settings {
+            model.setSettingsPresented(false)
             settings.makeFirstResponder(nil)
             translation.endSettingsSession()
             model.clearFileDiagnosis()
@@ -1261,6 +1268,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         updatePresentation()
     }
 
+    var statusBarSymbol: String {
+        if let silent = commands.visibleExecution == nil ? commands.execution : nil {
+            if silent.running { return "terminal" }
+            if case .finished(let result) = silent.phase, result.succeeded { return "checkmark.circle" }
+            return "exclamationmark.circle"
+        }
+        return "magnifyingglass"
+    }
+
+    var statusBarTitle: String { "" }
+
     private func updatePresentation() {
         let pinnedApps = model.visibleResults.prefix(SearchWindow.maximumVisibleRows).compactMap { row -> ActionMatch? in
             guard case .shortcut(let shortcut) = row, let action = model.application(for: shortcut) else { return nil }
@@ -1278,19 +1296,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if buildIndexItem?.isHidden != hidesBuild { buildIndexItem?.isHidden = hidesBuild }
         if let button = statusItem?.button {
             let silent = commands.visibleExecution == nil ? commands.execution : nil
-            let symbol: String
-            if let silent {
-                if silent.running { symbol = "terminal" }
-                else if case .finished(let result) = silent.phase, result.succeeded { symbol = "checkmark.circle" }
-                else { symbol = "exclamationmark.circle" }
-            } else { symbol = model.activityBusy ? "arrow.triangle.2.circlepath" : "magnifyingglass" }
+            let symbol = statusBarSymbol
             if statusSymbol != symbol {
                 button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
                 button.image?.isTemplate = true
                 statusSymbol = symbol
             }
-            let count = model.activeProgress?.entries.formatted(.number.notation(.compactName)) ?? ""
-            if button.title != count { button.title = count }
+            let title = statusBarTitle
+            if button.title != title { button.title = title }
             let summary = ["Lumen", silent?.status(chinese: model.zh) ?? activity, metrics].compactMap { $0 }.joined(separator: " · ")
             if button.toolTip != summary {
                 button.toolTip = summary

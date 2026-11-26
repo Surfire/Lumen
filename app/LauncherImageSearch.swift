@@ -129,8 +129,8 @@ struct LauncherImageSettings: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
-            Text(launcher.t("仅在所选本地目录为 PNG 和 JPEG 建立画面索引。输入「img 画面描述」搜索。",
-                            "Index PNG and JPEG pixels in one local folder. Search with “img description”."))
+            Text(launcher.t("仅在所选目录为已下载到本机的 PNG 和 JPEG 建立画面索引。输入「img 画面描述」搜索。",
+                            "Index resident PNG and JPEG pixels in one selected folder. Search with “img description”."))
                 .foregroundStyle(.secondary)
             LabeledContent(launcher.t("目录", "Folder")) {
                 if let root = images.scope?.root {

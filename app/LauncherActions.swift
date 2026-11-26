@@ -4,7 +4,7 @@ import Darwin
 
 struct LaunchAction: Equatable, Identifiable {
     enum Destination: Equatable {
-        case application(URL, stamp: String), settings(URL), system(LauncherSystemActions.Operation)
+        case application(URL, stamp: String), settings(URL), system(LauncherSystemActions.Operation), window(WindowCommand)
     }
 
     let id: String
@@ -146,6 +146,26 @@ enum LaunchCatalog {
         return settings + operations.map { id, english, chinese, symbol, aliases, operation in
             LaunchAction(id: "system:" + id, english: english, chinese: chinese, symbol: symbol,
                          destination: .system(operation), aliases: aliases + pinyinAliases(chinese))
+        } + windowActions()
+    }
+
+    private static func windowActions() -> [LaunchAction] {
+        let commands: [(WindowCommand, String, String, String, [String])] = [
+            (.leftHalf, "Left Half", "左半屏", "rectangle.lefthalf.filled", ["tile left", "window left"]),
+            (.rightHalf, "Right Half", "右半屏", "rectangle.righthalf.filled", ["tile right", "window right"]),
+            (.topHalf, "Top Half", "上半屏", "rectangle.tophalf.filled", ["tile top", "window top"]),
+            (.bottomHalf, "Bottom Half", "下半屏", "rectangle.bottomhalf.filled", ["tile bottom", "window bottom"]),
+            (.maximize, "Maximize", "最大化", "arrow.up.left.and.arrow.down.right", ["max", "maximize window"]),
+            (.center, "Center", "居中", "rectangle.center.inset.filled", ["centre", "center window", "窗口居中"]),
+            (.almostMaximize, "Almost Maximize", "接近最大化", "arrow.up.left.and.arrow.down.right", ["almost max"]),
+            (.reasonableSize, "Reasonable Size", "合适大小", "macwindow", ["reasonable", "resize window"]),
+            (.nextDisplay, "Next Display", "移至下一屏幕", "arrow.right.to.line", ["next screen", "下一屏"]),
+            (.previousDisplay, "Previous Display", "移至上一屏幕", "arrow.left.to.line", ["previous screen", "上一屏"]),
+            (.restore, "Restore Previous Frame", "恢复原窗口大小", "arrow.uturn.backward", ["restore", "undo window move", "恢复窗口"]),
+        ]
+        return commands.map { command, english, chinese, symbol, aliases in
+            LaunchAction(id: "window:" + command.rawValue, english: english, chinese: chinese, symbol: symbol,
+                         destination: .window(command), aliases: aliases + pinyinAliases(chinese))
         }
     }
 
@@ -369,15 +389,20 @@ enum LaunchDispatcher {
             }
             if started == nil { completion(false) }
         case .settings(let url):
-            // Require Apple's registered handler for these local System Settings URLs.
-            guard let destination = workspace.urlForApplication(toOpen: url),
-                  Bundle(url: destination)?.bundleIdentifier == LaunchCatalog.settingsBundleID else {
-                completion(false)
-                return
-            }
-            completion(workspace.open(url))
+            completion(openSettings(url))
         case .system(let operation):
             LauncherSystemActions.perform(operation, chinese: chinese, completion: completion)
+        case .window:
+            // Window commands need the target captured by AppDelegate for this presentation.
+            completion(false)
         }
+    }
+
+    static func openSettings(_ url: URL) -> Bool {
+        // Require Apple's registered handler for these local System Settings URLs.
+        let workspace = NSWorkspace.shared
+        guard let destination = workspace.urlForApplication(toOpen: url),
+              Bundle(url: destination)?.bundleIdentifier == LaunchCatalog.settingsBundleID else { return false }
+        return workspace.open(url)
     }
 }

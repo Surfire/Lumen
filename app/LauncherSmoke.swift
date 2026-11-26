@@ -41,6 +41,14 @@ final class LauncherSmoke {
     var chosenDiagnosticFile: URL?
     var chosenImageFolder: URL?
     var chosenImageProjector: URL?
+    private var frontmostWindowPID: pid_t? = 42_001
+    private let windowAdapter = SmokeWindowAccess()
+    private var openedAccessibilitySettings: [URL] = []
+
+    func makeWindowManagement() -> WindowManagement {
+        WindowManagement(adapter: windowAdapter, frontmostPID: { [weak self] in self?.frontmostWindowPID },
+                         layout: { Self.windowPlanner }, openSettings: { [weak self] in self?.openedAccessibilitySettings.append($0) })
+    }
 
     private lazy var translationSuite = "io.github.surfire.lumen.gui-smoke.\(UUID())"
     private lazy var translationPreferences = UserDefaults(suiteName: translationSuite)
@@ -225,6 +233,9 @@ final class LauncherSmoke {
             app.clipboard.poll()
             try check(app.clipboard.items.map(\.text) == ["External copy fixture"], "copy regression did not start with active capture")
             try await verifyActions(app)
+            try verifyWindowGeometry()
+            try verifyWindowAccess()
+            try await verifyWindowActions(app)
             app.clipboard.clearAll()
             try await verifyClipboardHistory(app)
             return
@@ -1186,6 +1197,192 @@ final class LauncherSmoke {
         }
         try check(launched == true, "NSWorkspace did not launch the app through its symlinked executable")
         try manager.removeItem(at: directory.appendingPathComponent("app-started"))
+    }
+
+    private static let windowPlanner = WindowLayoutPlanner(displays: [
+        // The primary has a Dock at the bottom and a menu bar/notch above the visible area.
+        .init(frame: CGRect(x: 0, y: 0, width: 1440, height: 900),
+              visibleFrame: CGRect(x: 0, y: 40, width: 1440, height: 822)),
+        .init(frame: CGRect(x: -1280, y: 0, width: 1280, height: 1024),
+              visibleFrame: CGRect(x: -1250, y: 0, width: 1250, height: 1000)),
+        .init(frame: CGRect(x: 0, y: 900, width: 1920, height: 1080),
+              visibleFrame: CGRect(x: 0, y: 930, width: 1920, height: 1026)),
+        .init(frame: CGRect(x: -300, y: -800, width: 1280, height: 800),
+              visibleFrame: CGRect(x: -300, y: -780, width: 1280, height: 750)),
+    ])
+
+    private func verifyWindowGeometry() throws {
+        let planner = Self.windowPlanner
+        let roundTrips: [(CGRect, CGRect)] = [
+            (CGRect(x: 0, y: 40, width: 1440, height: 822), CGRect(x: 0, y: 38, width: 1440, height: 822)),
+            (CGRect(x: -1200, y: 720, width: 640, height: 240), CGRect(x: -1200, y: -60, width: 640, height: 240)),
+            (CGRect(x: 88, y: 1600, width: 800, height: 300), CGRect(x: 88, y: -1000, width: 800, height: 300)),
+            (CGRect(x: -260, y: -760, width: 500, height: 400), CGRect(x: -260, y: 1260, width: 500, height: 400)),
+        ]
+        for (appKit, ax) in roundTrips {
+            try check(planner.axFrame(appKit) == ax && planner.appKitFrame(ax) == appKit,
+                      "AX coordinates did not reflect the far edge around the primary display top")
+        }
+        let original = CGRect(x: 120, y: 400, width: 600, height: 400)
+        let layouts: [(WindowCommand, CGRect)] = [
+            (.leftHalf, CGRect(x: 0, y: 38, width: 720, height: 822)),
+            (.rightHalf, CGRect(x: 720, y: 38, width: 720, height: 822)),
+            (.topHalf, CGRect(x: 0, y: 38, width: 1440, height: 411)),
+            (.bottomHalf, CGRect(x: 0, y: 449, width: 1440, height: 411)),
+            (.maximize, CGRect(x: 0, y: 38, width: 1440, height: 822)),
+            (.center, CGRect(x: 420, y: 249, width: 600, height: 400)),
+            (.almostMaximize, CGRect(x: 72, y: 79, width: 1296, height: 739)),
+            (.reasonableSize, CGRect(x: 240, y: 175, width: 960, height: 548)),
+        ]
+        for (command, frame) in layouts {
+            try check(planner.placement(for: command, currentAX: original)?.frame == frame,
+                      "incorrect \(command) frame or visibleFrame inset")
+        }
+        let corner = CGRect(x: 840, y: 38, width: 600, height: 400)
+        let left = CGRect(x: -600, y: -100, width: 600, height: 400)
+        let below = CGRect(x: 380, y: 930, width: 600, height: 400)
+        let above = CGRect(x: 1320, y: -1056, width: 600, height: 400)
+        try check(planner.placement(for: .nextDisplay, currentAX: corner)?.frame == left &&
+                  planner.placement(for: .nextDisplay, currentAX: left)?.frame == above &&
+                  planner.placement(for: .previousDisplay, currentAX: corner)?.frame == below &&
+                  planner.placement(for: .nextDisplay, currentAX: below)?.frame == corner,
+                  "display cycling did not preserve point size and relative placement across insets")
+        let spanning = CGRect(x: -450, y: 200, width: 600, height: 400)
+        try check(planner.placement(for: .maximize, currentAX: spanning)?.frame == CGRect(x: -1250, y: -100, width: 1250, height: 1000),
+                  "a spanning window did not use the display with the largest overlap")
+        let large = CGRect(x: 0, y: 38, width: 1440, height: 822)
+        try check(planner.placement(for: .nextDisplay, currentAX: large)?.frame == CGRect(x: -1250, y: -11, width: 1250, height: 822),
+                  "moving to a smaller display did not clamp the window")
+        let one = WindowLayoutPlanner(displays: [planner.displays[0]])
+        try check(planner.placement(for: .restore, currentAX: left, previousAX: original)?.frame == original &&
+                  one.placement(for: .restore, currentAX: original, previousAX: left)?.frame == CGRect(x: 0, y: 38, width: 600, height: 400) &&
+                  one.placement(for: .nextDisplay, currentAX: original) == nil,
+                  "restore did not honor the prior display or clamp after disconnection")
+    }
+
+    private func verifyWindowAccess() throws {
+        let adapter = SmokeWindowAccess()
+        adapter.trusted = true
+        let access = AXWindowAccess(adapter: adapter)
+        let planner = Self.windowPlanner
+        let initial = SmokeWindowAccess.State()
+        let rejected: [SmokeWindowAccess.State] = [
+            .init(role: "AXSheet"), .init(role: "AXPopover"), .init(role: "AXDrawer"),
+            .init(subrole: "AXDialog"), .init(minimized: true), .init(fullScreen: true),
+            .init(positionSettable: false), .init(sizeSettable: false), .init(frame: .zero),
+            .init(frame: CGRect(x: 120, y: 400, width: -600, height: 400)),
+        ]
+        for state in rejected {
+            adapter.states[1] = state
+            try check(access.perform(.leftHalf, targetPID: 42_001, planner: planner) == .noWindow && adapter.writes.isEmpty,
+                      "ineligible window was moved")
+        }
+        adapter.main = 2
+        adapter.states[2] = initial
+        let left = CGRect(x: 0, y: 38, width: 720, height: 822)
+        try check(access.perform(.leftHalf, targetPID: 42_001, planner: planner) == nil && adapter.states[2]?.frame == left &&
+                  adapter.writes == [.position(2, left.origin), .size(2, left.size), .position(2, left.origin)],
+                  "eligible main window fallback or position-size-position correction failed")
+        adapter.states[1] = initial
+        try check(access.perform(.maximize, targetPID: 42_001, planner: planner) == nil && adapter.states[2]?.frame == left &&
+                  access.perform(.rightHalf, targetPID: 42_001, planner: planner) == nil &&
+                  access.perform(.restore, targetPID: 42_001, planner: planner) == nil &&
+                  adapter.states[1]?.frame == CGRect(x: 0, y: 38, width: 1440, height: 822) &&
+                  access.perform(.restore, targetPID: 42_001, planner: planner) == .noPreviousFrame,
+                  "focused window did not retain only its last frame, or restore resurrected consumed history")
+        adapter.focused = nil
+        try check(access.perform(.restore, targetPID: 42_001, planner: planner) == nil && adapter.states[2]?.frame == initial.frame,
+                  "restore history did not stay isolated per window")
+        adapter.focused = 1
+        adapter.states[1] = .init(minimumWidth: 800)
+        try check(access.perform(.rightHalf, targetPID: 42_001, planner: planner) == .couldNotMove &&
+                  adapter.states[1]?.frame == CGRect(x: 640, y: 38, width: 800, height: 822),
+                  "app-enforced minimum size was not clamped or failed verification was reported as success")
+        adapter.states[1]?.minimumWidth = 0
+        try check(access.perform(.restore, targetPID: 42_001, planner: planner) == nil && adapter.states[1]?.frame == initial.frame,
+                  "partial move was not undoable")
+        adapter.main = nil
+        for id in 100...132 {
+            adapter.focused = id
+            adapter.states[id] = initial
+            try check(access.perform(.leftHalf, targetPID: 42_001, planner: planner) == nil, "history fill move failed")
+        }
+        adapter.focused = 100
+        try check(access.perform(.restore, targetPID: 42_001, planner: planner) == .noPreviousFrame,
+                  "oldest history entry was not evicted")
+        adapter.focused = 101
+        try check(access.perform(.restore, targetPID: 42_001, planner: planner) == nil && adapter.states[101]?.frame == initial.frame,
+                  "history discarded more than the oldest entry")
+    }
+
+    private func verifyWindowActions(_ app: AppDelegate) async throws {
+        let queries: [(WindowCommand, String, String)] = [
+            (.leftHalf, "left half", "左半屏"), (.rightHalf, "right half", "右半屏"),
+            (.topHalf, "top half", "上半屏"), (.bottomHalf, "bottom half", "下半屏"),
+            (.maximize, "max", "最大化"), (.center, "center", "居中"),
+            (.almostMaximize, "almost maximize", "接近最大化"), (.reasonableSize, "reasonable size", "合适大小"),
+            (.nextDisplay, "next display", "移至下一屏幕"), (.previousDisplay, "previous display", "移至上一屏幕"),
+            (.restore, "restore", "恢复原窗口大小"), (.leftHalf, "zuobanping", "zbp"),
+        ]
+        let catalog = LaunchCatalog.systemActions()
+        for (command, english, chinese) in queries {
+            for query in [english, chinese] {
+                let best = LaunchCatalog.matches(query, actions: catalog).first
+                try check(best?.action.destination == .window(command) && best?.primary == true,
+                          "window command did not rank first for \(query)")
+            }
+        }
+
+        app.dismissSearch()
+        app.showSettings()
+        try check(app.windowManagement.isTrusted == false && openedAccessibilitySettings.isEmpty,
+                  "opening Settings did not silently check Accessibility trust")
+        app.showSearch()
+        try type("left half", into: app)
+        let trustChecks = windowAdapter.trustChecks
+        let lookups = windowAdapter.lookups.count
+        try key(36, "\r", in: app)
+        try await until("untrusted window action did not present the onboarding banner") {
+            app.windowManagement.issue == .permissionRequired &&
+                app.panel.frame.height == SearchWindow.height(for: app.model, needsAccessibility: true)
+        }
+        try check(app.searchPresented && windowAdapter.trustChecks == trustChecks + 1 && windowAdapter.lookups.count == lookups &&
+                  windowAdapter.writes.isEmpty && openedAccessibilitySettings.isEmpty,
+                  "untrusted command opened System Settings, retried trust or contacted a window")
+        app.windowManagement.openAccessibilitySettings()
+        try check(openedAccessibilitySettings.map(\.absoluteString) ==
+                    ["x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"],
+                  "explicit onboarding action did not dispatch the Accessibility deep-link")
+
+        windowAdapter.trusted = true
+        app.showSettings()
+        try check(app.windowManagement.isTrusted == true && app.windowManagement.issue == nil,
+                  "Accessibility grant was not recognized when reopening Settings")
+        app.showSearch()
+        frontmostWindowPID = ProcessInfo.processInfo.processIdentifier
+        try type("half", into: app)
+        try check(app.model.launchMatches.first?.action.destination != .window(.rightHalf),
+                  "frecency test must start with another half command first")
+        try type("右半屏", into: app)
+        try key(36, "\r", in: app)
+        try await until("window command did not run through Return and dismiss") { !app.searchPresented }
+        try check(windowAdapter.lookups.last == 42_001 && !windowAdapter.lookedUpOnMainThread &&
+                  windowAdapter.states[1]?.frame == CGRect(x: 720, y: 38, width: 720, height: 822),
+                  "command did not target the app captured before showSearch off the main thread")
+        app.showSearch()
+        try check(app.windowManagement.targetPID == nil, "showSearch captured Lumen itself or reused a stale target")
+        try type("half", into: app)
+        try check(app.model.launchMatches.first?.action.destination == .window(.rightHalf),
+                  "successful window command did not improve Frecency ranking")
+        app.dismissSearch()
+        frontmostWindowPID = 42_001
+        app.showSearch()
+        try type("restore", into: app)
+        try key(36, "\r", in: app)
+        try await until("restore command did not dismiss after restoring the previous frame") { !app.searchPresented }
+        try check(windowAdapter.states[1]?.frame == SmokeWindowAccess.State().frame && !NSApp.isActive && !app.panel.isVisible,
+                  "restore did not target the original test window or activated the GUI")
+        print("Window management passed: geometry, AX eligibility and history, onboarding, bilingual actions, and Frecency")
     }
 
     private func makeFileFrecencyFixtures() throws -> (project: URL, success: URL, failure: URL) {
@@ -3465,6 +3662,76 @@ final class LauncherSmoke {
     private struct Failure: Error, CustomStringConvertible {
         let description: String
         init(_ description: String) { self.description = description }
+    }
+}
+
+// Smoke tests only inspect or change remote-window fixtures between completed commands.
+private final class SmokeWindowAccess: WindowAccessAdapter, @unchecked Sendable {
+    struct State {
+        var role = "AXWindow"
+        var subrole = "AXStandardWindow"
+        var minimized = false
+        var fullScreen = false
+        var positionSettable = true
+        var sizeSettable = true
+        var frame = CGRect(x: 120, y: 400, width: 600, height: 400)
+        var minimumWidth: CGFloat = 0
+    }
+
+    enum Write: Equatable {
+        case position(Int, CGPoint), size(Int, CGSize)
+    }
+
+    private let trustLock = NSLock()
+    private var trustState = (trusted: false, checks: 0)
+    var trusted: Bool {
+        get { trustLock.withLock { trustState.trusted } }
+        set { trustLock.withLock { trustState.trusted = newValue } }
+    }
+    var trustChecks: Int { trustLock.withLock { trustState.checks } }
+    private(set) var lookups: [pid_t] = []
+    private(set) var lookedUpOnMainThread = false
+    private(set) var writes: [Write] = []
+    var focused: Int? = 1
+    var main: Int?
+    var states: [Int: State] = [1: State()]
+
+    func isTrusted() -> Bool {
+        trustLock.withLock {
+            trustState.checks += 1
+            return trustState.trusted
+        }
+    }
+
+    func windows(in pid: pid_t) -> (focused: Int?, main: Int?) {
+        lookups.append(pid)
+        lookedUpOnMainThread = lookedUpOnMainThread || Thread.isMainThread
+        return pid == 42_001 ? (focused, main) : (nil, nil)
+    }
+
+    func inspect(_ window: Int) -> WindowAttributes? {
+        states[window].map { state in
+            WindowAttributes(role: state.role, subrole: state.subrole, minimized: state.minimized, fullScreen: state.fullScreen,
+                             positionSettable: state.positionSettable, sizeSettable: state.sizeSettable, frame: state.frame)
+        }
+    }
+
+    func frame(of window: Int) -> CGRect? { states[window]?.frame }
+
+    func setPosition(_ position: CGPoint, of window: Int) -> Bool {
+        writes.append(.position(window, position))
+        states[window]?.frame.origin = position
+        return true
+    }
+
+    func setSize(_ size: CGSize, of window: Int) -> Bool {
+        writes.append(.size(window, size))
+        if var state = states[window] {
+            state.frame.size = CGSize(width: max(size.width, state.minimumWidth), height: size.height)
+            state.frame.origin.y += 20 // Simulate WindowServer shifting the origin on resize.
+            states[window] = state
+        }
+        return true
     }
 }
 

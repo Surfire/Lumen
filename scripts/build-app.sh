@@ -22,6 +22,7 @@ done
 /usr/bin/iconutil -c icns -o "$APP/Contents/Resources/Lumen.icns" "$iconset"
 xcrun swiftc -O -swift-version 5 -target "$SWIFT_TARGET" -module-cache-path "$PWD/target/SwiftModuleCache" -parse-as-library \
     app/LumenApp.swift app/LauncherEngine.swift app/LauncherHotKey.swift app/LauncherModel.swift \
+    app/WindowAccess.swift app/WindowManagement.swift \
     app/LauncherViews.swift app/LauncherHighlight.swift app/LauncherActions.swift app/LauncherSystemActions.swift app/LauncherFileQuery.swift app/LauncherPreview.swift app/LauncherShortcuts.swift app/LauncherCalculation.swift app/LauncherSmoke.swift \
     app/LumenCommandCatalog.swift app/LumenQuickAnswer.swift app/LauncherCommands.swift app/LauncherImageSearch.swift \
     app/ClipboardStore.swift app/ClipboardManager.swift app/ClipboardViews.swift \

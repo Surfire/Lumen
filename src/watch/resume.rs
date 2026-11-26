@@ -1,8 +1,8 @@
 use super::fsevents;
 use crate::{
     Result, Scope,
-    index::{Coverage, in_explicit_content_root, resident_content_availability},
-    platform, saved_index_scope,
+    index::{Coverage, resident_content_availability},
+    platform,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -285,8 +285,51 @@ fn other_mount(coverage: &Coverage, roots: &[PathBuf]) -> Option<bool> {
     Some(!readonly_root && roots.iter().any(|root| root == Path::new("/")))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccessCheck {
+    Accessible,
+    PermissionDenied,
+    Transient,
+    Changed,
+}
+
+fn is_permission_denied(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM))
+}
+
+fn classify_io_error(error: &io::Error) -> AccessCheck {
+    if is_permission_denied(error) {
+        AccessCheck::PermissionDenied
+    } else if matches!(
+        error.raw_os_error(),
+        Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP)
+    ) {
+        AccessCheck::Changed
+    } else {
+        // Treat EAGAIN, EBUSY, EINTR, EIO, ETIMEDOUT, ESTALE, and File Provider
+        // hiccups as transient so they never wipe indexed subtrees to unverified.
+        AccessCheck::Transient
+    }
+}
+
 pub(crate) fn can_enumerate(path: &Path) -> bool {
     open_directory(path).is_ok()
+}
+
+fn check_directory(path: &Path, allow_one_level_symlink: bool) -> AccessCheck {
+    match open_directory(path) {
+        Ok(()) => AccessCheck::Accessible,
+        Err(error) if allow_one_level_symlink && error.raw_os_error() == Some(libc::ELOOP) => {
+            if crate::index::resolve_one_level_symlink(path)
+                .is_some_and(|resolved| resolved.metadata.is_dir())
+            {
+                AccessCheck::Accessible
+            } else {
+                AccessCheck::Changed
+            }
+        }
+        Err(error) => classify_io_error(&error),
+    }
 }
 
 fn open_directory(path: &Path) -> io::Result<()> {
@@ -295,7 +338,7 @@ fn open_directory(path: &Path) -> io::Result<()> {
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW_ANY)
         .open(path)?;
     if platform::availability(path, &file.metadata()?) == "placeholder" {
-        return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        return Err(io::Error::from_raw_os_error(libc::ENOENT));
     }
     let fd = file.into_raw_fd();
     let dir = unsafe { libc::fdopendir(fd) };
@@ -318,29 +361,60 @@ fn open_directory(path: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn can_read_document(path: &Path, stamp: Option<&str>) -> bool {
-    can_read_resident_document(path, stamp, false)
+    check_resident_document(path, stamp) == AccessCheck::Accessible
 }
 
-fn can_read_resident_document(path: &Path, stamp: Option<&str>, explicit: bool) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|metadata| {
-        metadata.is_file()
-            && resident_content_availability(platform::availability(path, &metadata), explicit)
-            && stamp.is_none_or(|expected| crate::index::stamp(&metadata) == expected)
-            && crate::index::can_open_document(path, &metadata)
-    })
+fn check_resident_document(path: &Path, stamp: Option<&str>) -> AccessCheck {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => return classify_io_error(&error),
+    };
+    if !metadata.is_file()
+        || !resident_content_availability(platform::availability(path, &metadata), true)
+        || !stamp.is_none_or(|expected| {
+            crate::index::stamp_matches(expected, &crate::index::stamp(&metadata))
+        })
+    {
+        return AccessCheck::Changed;
+    }
+    match crate::index::check_document_access(path, &metadata) {
+        Ok(true) => AccessCheck::Accessible,
+        Ok(false) => AccessCheck::Changed,
+        Err(error) => classify_io_error(&error),
+    }
 }
 
 pub(super) fn verify_access(conn: &mut Connection, roots: Option<&[PathBuf]>) -> Result<bool> {
+    verify_access_with(conn, roots, |path, directory, is_root| {
+        if directory {
+            check_directory(path, !is_root)
+        } else {
+            check_resident_document(path, None)
+        }
+    })
+}
+
+fn verify_access_with(
+    conn: &mut Connection,
+    roots: Option<&[PathBuf]>,
+    mut check: impl FnMut(&Path, bool, bool) -> AccessCheck,
+) -> Result<bool> {
     // Directory enumeration controls name visibility in the normal walker.
     // Also verify access to each cached document without reading its bytes.
     // The watcher's no-materialization I/O policy covers both operations.
     // The watcher has already restricted the catalog to this saved scope.
-    let scope = saved_index_scope(conn)?;
     let mut blocked = Vec::new();
     let mut opened_previously_blocked = false;
+    let mut needs_reconcile = false;
     for path in roots.into_iter().flatten() {
-        if open_directory(path).is_err() {
-            blocked.push(path.to_string_lossy().into_owned());
+        match check(path, true, true) {
+            AccessCheck::Accessible | AccessCheck::Transient => {}
+            AccessCheck::PermissionDenied => {
+                blocked.push(path.to_string_lossy().into_owned());
+            }
+            AccessCheck::Changed => {
+                needs_reconcile = true;
+            }
         }
     }
     {
@@ -356,23 +430,29 @@ pub(super) fn verify_access(conn: &mut Connection, roots: Option<&[PathBuf]>) ->
             let name: String = row.get(0)?;
             let path = Path::new(&name);
             let directory: bool = row.get(1)?;
-            let accessible = if directory {
-                open_directory(path).is_ok()
-            } else {
-                let explicit = scope
-                    .as_ref()
-                    .is_some_and(|scope| scope.documents && in_explicit_content_root(scope, path));
-                can_read_resident_document(path, None, explicit)
-            };
             let previously_blocked: bool = row.get(2)?;
-            if !accessible && !previously_blocked {
-                blocked.push(name);
+            match check(path, directory, false) {
+                AccessCheck::Accessible => {
+                    opened_previously_blocked |= previously_blocked;
+                }
+                AccessCheck::PermissionDenied => {
+                    if !previously_blocked {
+                        blocked.push(name);
+                    }
+                }
+                AccessCheck::Transient => {
+                    // Transient I/O / File Provider errors must not mark subtrees unverified.
+                }
+                AccessCheck::Changed => {
+                    if !previously_blocked {
+                        needs_reconcile = true;
+                    }
+                }
             }
-            opened_previously_blocked |= accessible && previously_blocked;
         }
     }
     if blocked.is_empty() {
-        return Ok(!opened_previously_blocked);
+        return Ok(!opened_previously_blocked && !needs_reconcile);
     }
     blocked.sort_unstable();
     let mut covered: Option<&str> = None;
@@ -397,4 +477,71 @@ pub(super) fn verify_access(conn: &mut Connection, roots: Option<&[PathBuf]>) ->
     invalidate(&tx)?;
     tx.commit()?;
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_io_errors_do_not_mark_subtrees_unverified() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE item(id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, availability TEXT NOT NULL);
+             CREATE TABLE document(id INTEGER PRIMARY KEY, body TEXT NOT NULL);
+             CREATE TABLE info(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO item VALUES
+               (1, '/root', 'directory', 'local'),
+               (2, '/root/cloud', 'directory', 'provider_metadata_only'),
+               (3, '/root/cloud/doc.md', 'file', 'provider_metadata_only');
+             INSERT INTO document VALUES (3, 'hello');
+             INSERT INTO info VALUES ('watch_checkpoint_v1', 'saved');",
+        )
+        .unwrap();
+        let roots = [PathBuf::from("/root")];
+
+        for errno in [libc::EAGAIN, libc::EBUSY, libc::EINTR, libc::EIO] {
+            let err = io::Error::from_raw_os_error(errno);
+            assert_eq!(classify_io_error(&err), AccessCheck::Transient);
+            let ok = verify_access_with(&mut conn, Some(&roots), |path, _, _| {
+                if path.starts_with("/root/cloud") {
+                    classify_io_error(&err)
+                } else {
+                    AccessCheck::Accessible
+                }
+            })
+            .unwrap();
+            assert!(ok, "transient errno {errno} should keep cached resume");
+            let unverified: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM item WHERE availability='unverified'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(unverified, 0, "transient errno {errno} marked unverified");
+        }
+
+        for errno in [libc::EACCES, libc::EPERM] {
+            let err = io::Error::from_raw_os_error(errno);
+            assert_eq!(classify_io_error(&err), AccessCheck::PermissionDenied);
+        }
+        let ok = verify_access_with(&mut conn, Some(&roots), |path, _, _| {
+            if path == Path::new("/root/cloud") {
+                classify_io_error(&io::Error::from_raw_os_error(libc::EACCES))
+            } else {
+                AccessCheck::Accessible
+            }
+        })
+        .unwrap();
+        assert!(!ok);
+        let unverified: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM item WHERE availability='unverified'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unverified, 2);
+    }
 }

@@ -17,32 +17,61 @@ pub fn classify(path: &Path, dataless: bool) -> &'static str {
     }
 }
 
+fn is_provider_folder_name(value: &[u8]) -> bool {
+    let equals = |name: &[u8]| value.eq_ignore_ascii_case(name);
+    let starts = |prefix: &[u8]| {
+        value
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    };
+    equals(b"onedrive")
+        || equals(b"dropbox")
+        || equals(b"google drive")
+        || equals(b"icloud drive")
+        || equals(b"box sync")
+        || starts(b"onedrive - ")
+        || starts(b"onedrive-")
+}
+
+fn direct_home_provider(path: &Path) -> bool {
+    use std::path::{Component, PathBuf};
+    static HOME: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    let home = HOME.get_or_init(|| crate::absolute(Path::new(&std::env::var_os("HOME")?)).ok());
+    if let Some(home) = home
+        && let Ok(tail) = path.strip_prefix(home)
+        && let Some(Component::Normal(first)) = tail.components().next()
+        && is_provider_folder_name(first.as_encoded_bytes())
+    {
+        return true;
+    }
+    let normalized = path.strip_prefix("/System/Volumes/Data").unwrap_or(path);
+    let mut parts = match normalized.strip_prefix("/Users") {
+        Ok(rest) => rest.components(),
+        Err(_) => match normalized.strip_prefix("Users") {
+            Ok(rest) => rest.components(),
+            Err(_) => return false,
+        },
+    };
+    if !matches!(parts.next(), Some(Component::Normal(_))) {
+        return false;
+    }
+    matches!(
+        parts.next(),
+        Some(Component::Normal(first)) if is_provider_folder_name(first.as_encoded_bytes())
+    )
+}
+
 fn provider(path: &Path) -> bool {
     let mut prior_library = false;
     for part in path.components() {
         let value = part.as_os_str().as_encoded_bytes();
         let equals = |name: &[u8]| value.eq_ignore_ascii_case(name);
-        let starts = |prefix: &[u8]| {
-            value
-                .get(..prefix.len())
-                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-        };
         if prior_library && (equals(b"cloudstorage") || equals(b"mobile documents")) {
             return true;
         }
         prior_library = equals(b"library");
-        if equals(b"onedrive")
-            || equals(b"dropbox")
-            || equals(b"google drive")
-            || equals(b"icloud drive")
-            || equals(b"box sync")
-            || starts(b"onedrive - ")
-            || starts(b"onedrive-")
-        {
-            return true;
-        }
     }
-    false
+    direct_home_provider(path)
 }
 
 #[cfg(target_os = "macos")]
@@ -87,8 +116,13 @@ impl Drop for NoMaterialization {
     }
 }
 
-/// Accept regular files only, no symlink of any component on macOS. Provider paths
-/// remain metadata-only even if a race changes flags after preflight.
+fn is_resident(path: &Path, meta: &fs::Metadata) -> bool {
+    !dataless(meta) && matches!(availability(path, meta), "local" | "provider_metadata_only")
+}
+
+/// Accept resident regular files only (local or hydrated cloud files with
+/// `SF_DATALESS == 0`), no symlink of any component on macOS. Placeholders
+/// remain unreadable even if a race changes flags after preflight.
 pub fn read_local(path: &Path, limit: u64) -> Result<Vec<u8>> {
     read_local_checked(path, limit, None)
 }
@@ -97,9 +131,8 @@ pub(crate) fn read_local_checked(path: &Path, limit: u64, stamp: Option<&str>) -
     #[cfg(target_os = "macos")]
     let _io = NoMaterialization::enter()?;
     let preflight = fs::symlink_metadata(path)?;
-    if !preflight.is_file() || preflight.len() > limit || availability(path, &preflight) != "local"
-    {
-        bail!("not a small local regular file");
+    if !preflight.is_file() || preflight.len() > limit || !is_resident(path, &preflight) {
+        bail!("not a small resident regular file");
     }
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     #[cfg(target_os = "macos")]
@@ -115,11 +148,13 @@ pub(crate) fn read_local_checked(path: &Path, limit: u64, stamp: Option<&str>) -
         || opened.dev() != preflight.dev()
         || opened.ino() != preflight.ino()
         || opened.len() > limit
-        || availability(path, &opened) != "local"
+        || !is_resident(path, &opened)
     {
-        bail!("file changed or is not local");
+        bail!("file changed or is not resident");
     }
-    if stamp.is_some_and(|expected| crate::index::stamp(&opened) != expected) {
+    if stamp.is_some_and(|expected| {
+        !crate::index::stamp_matches(expected, &crate::index::stamp(&opened))
+    }) {
         bail!("file changed before reading");
     }
     let mut data = Vec::new();
@@ -129,7 +164,9 @@ pub(crate) fn read_local_checked(path: &Path, limit: u64, stamp: Option<&str>) -
     }
     if let Some(stamp) = stamp {
         let after = file.metadata()?;
-        if crate::index::stamp(&after) != stamp || availability(path, &after) != "local" {
+        if !crate::index::stamp_matches(stamp, &crate::index::stamp(&after))
+            || !is_resident(path, &after)
+        {
             bail!("file changed while reading");
         }
     }
@@ -311,16 +348,20 @@ pub fn bulk_children(path: &Path, scratch: &mut Vec<u64>) -> Option<Children> {
             }
             let info = if fields & (KIND | MODTIME | FLAGS) == (KIND | MODTIME | FLAGS) {
                 let kind = u32at(r, i + 8)?;
-                if !matches!(kind, 1 | 2) {
+                if kind == 5 {
+                    // Emit VSYMLINK (VLNK) with None so Walk::visit handles 1-level symlinks.
+                    None
+                } else if matches!(kind, 1 | 2) {
+                    Some(FastInfo {
+                        directory: kind == 2,
+                        // Darwin packs attributes on 4-byte boundaries; MODTIME
+                        // is a timespec between the object type and flags.
+                        mtime: i64::from_ne_bytes(r.get(i + 12..i + 20)?.try_into().ok()?),
+                        dataless: u32at(r, i + 28)? & DATALESS != 0,
+                    })
+                } else {
                     continue;
                 }
-                Some(FastInfo {
-                    directory: kind == 2,
-                    // Darwin packs attributes on 4-byte boundaries; MODTIME
-                    // is a timespec between the object type and flags.
-                    mtime: i64::from_ne_bytes(r.get(i + 12..i + 20)?.try_into().ok()?),
-                    dataless: u32at(r, i + 28)? & DATALESS != 0,
-                })
             } else {
                 None
             };
@@ -525,6 +566,84 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "two.txt");
         assert_eq!(scratch.as_ptr(), allocation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_narrows_to_cloud_roots_and_direct_home_folders() {
+        for local in [
+            "/Users/alice/Projects/dropbox/readme.md",
+            "/Users/alice/Documents/OneDrive/plan.md",
+            "/Users/alice/Documents/Google Drive/export.pdf",
+            "/Users/alice/Desktop/Box Sync/notes.txt",
+            "/private/tmp/OneDrive-Fixture/image.heic",
+        ] {
+            assert_eq!(classify(Path::new(local), false), "local", "{local}");
+        }
+        for cloud in [
+            "/Users/alice/Library/CloudStorage/OneDrive-Personal/doc.md",
+            "/Users/alice/Library/Mobile Documents/com~apple~CloudDocs/doc.md",
+            "/Users/alice/OneDrive/doc.md",
+            "/Users/alice/OneDrive - Contoso/doc.md",
+            "/Users/alice/OneDrive-Work/doc.md",
+            "/Users/alice/Dropbox/doc.md",
+            "/Users/alice/Google Drive/doc.md",
+            "/Users/alice/iCloud Drive/doc.md",
+            "/Users/alice/Box Sync/doc.md",
+        ] {
+            assert_eq!(
+                classify(Path::new(cloud), false),
+                "provider_metadata_only",
+                "{cloud}"
+            );
+            assert_eq!(classify(Path::new(cloud), true), "placeholder", "{cloud}");
+        }
+    }
+
+    #[test]
+    fn read_local_checked_reads_resident_cloud_and_ignores_ctime() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-read-cloud-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let cloud_dir = root.join("Library/CloudStorage/OneDrive-Test");
+        fs::create_dir_all(&cloud_dir).unwrap();
+        let file = cloud_dir.join("resident.txt");
+        fs::write(&file, b"resident cloud payload").unwrap();
+        let meta = fs::symlink_metadata(&file).unwrap();
+        assert_eq!(availability(&file, &meta), "provider_metadata_only");
+        let five_field = crate::index::stamp(&meta);
+        assert_eq!(five_field.split(':').count(), 5);
+        let legacy_seven_field = format!("{five_field}:999999:123456");
+        assert_eq!(
+            read_local_checked(&file, 1024, Some(&five_field)).unwrap(),
+            b"resident cloud payload"
+        );
+        assert_eq!(
+            read_local_checked(&file, 1024, Some(&legacy_seven_field)).unwrap(),
+            b"resident cloud payload"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bulk_enumeration_emits_symlinks_instead_of_dropping_them() {
+        use std::os::unix::fs::symlink;
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-bulk-symlink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("real.txt");
+        fs::write(&target, "real").unwrap();
+        symlink(&target, root.join("link.txt")).unwrap();
+        let mut scratch = Vec::new();
+        let entries = bulk_children(&root, &mut scratch).expect("APFS batch enumeration");
+        let link = entries
+            .iter()
+            .find(|(name, _)| name == "link.txt")
+            .expect("bulk_children must emit VSYMLINK entries");
+        assert!(link.1.is_none());
         fs::remove_dir_all(root).unwrap();
     }
 }

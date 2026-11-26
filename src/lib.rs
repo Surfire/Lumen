@@ -183,19 +183,29 @@ fn system_path(path: &Path) -> bool {
         .any(|p| path.starts_with(p))
 }
 
-fn development_noise(path: &Path, roots: &[PathBuf]) -> bool {
-    let relative = roots
+fn is_build_target_dir(parent: &Path, target_dir: &Path) -> bool {
+    ["Cargo.toml", "pom.xml", "build.sbt"]
         .iter()
-        .filter_map(|root| path.strip_prefix(root).ok().map(|tail| (root, tail)))
-        .max_by_key(|(root, _)| root.as_os_str().len())
-        .map_or(path, |(_, tail)| tail);
-    relative.components().any(|part| {
-        part.as_os_str().to_str().is_some_and(|part| {
+        .any(|marker| fs::symlink_metadata(parent.join(marker)).is_ok())
+        || fs::symlink_metadata(target_dir.join("CACHEDIR.TAG")).is_ok()
+}
+
+fn development_noise(path: &Path, roots: &[PathBuf]) -> bool {
+    let (base, relative) = roots
+        .iter()
+        .filter_map(|root| {
+            path.strip_prefix(root)
+                .ok()
+                .map(|tail| (Some(root.as_path()), tail))
+        })
+        .max_by_key(|(root, _)| root.map_or(0, |r| r.as_os_str().len()))
+        .unwrap_or((None, path));
+    for (depth, part) in relative.components().enumerate() {
+        if let Some(name) = part.as_os_str().to_str() {
             // Hidden directories (including .venv, .gradle, .cargo, etc.)
             // are already excluded by sensitive_path.
-            [
+            if [
                 "node_modules",
-                "target",
                 "DerivedData",
                 "venv",
                 "__pycache__",
@@ -204,17 +214,55 @@ fn development_noise(path: &Path, roots: &[PathBuf]) -> bool {
                 "CMakeFiles",
             ]
             .iter()
-            .any(|name| part.eq_ignore_ascii_case(name))
-        })
-    })
+            .any(|noise| name.eq_ignore_ascii_case(noise))
+            {
+                return true;
+            }
+            if name.eq_ignore_ascii_case("target") {
+                let mut parent = base.map(Path::to_path_buf).unwrap_or_default();
+                for prefix in relative.components().take(depth) {
+                    parent.push(prefix.as_os_str());
+                }
+                let target_dir = parent.join(part.as_os_str());
+                if is_build_target_dir(&parent, &target_dir) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
-fn sensitive_path(path: &Path) -> bool {
-    path.components().any(|part| {
-        part.as_os_str().to_str().is_some_and(|p| {
-            p.starts_with('.')
-                || ["keychains", "cookies", "caches"]
+
+fn library_sensitive_tail(path: &Path) -> Option<&Path> {
+    if let Some(tail) = home_library_tail(path) {
+        if !tail.as_os_str().is_empty()
+            && !tail.starts_with("Mobile Documents")
+            && !tail.starts_with("CloudStorage")
+        {
+            return Some(tail);
+        }
+        return None;
+    }
+    path.strip_prefix("/Library")
+        .or_else(|_| path.strip_prefix("/System/Library"))
+        .ok()
+}
+
+pub(crate) fn sensitive_path(path: &Path) -> bool {
+    if path.components().any(|part| {
+        part.as_os_str()
+            .to_str()
+            .is_some_and(|p| p.starts_with('.'))
+    }) {
+        return true;
+    }
+    library_sensitive_tail(path).is_some_and(|tail| {
+        tail.components().any(|part| {
+            part.as_os_str().to_str().is_some_and(|p| {
+                ["keychains", "cookies", "caches"]
                     .iter()
                     .any(|name| p.eq_ignore_ascii_case(name))
+            })
         })
     })
 }
@@ -489,14 +537,11 @@ fn document_stamp_sql(conn: &Connection) -> rusqlite::Result<(&'static str, &'st
 
 fn read_document_stamp(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<String>> {
     let stamp: Option<String> = row.get("document_stamp")?;
-    Ok(stamp.and_then(|mut stamp| {
+    Ok(stamp.and_then(|stamp| {
         // The index may append an extractor version or a helper signature.
-        // The client compares just the seven fields from filesystem metadata.
-        if let Some((end, _)) = stamp.match_indices(':').nth(6) {
-            stamp.truncate(end);
-        }
-        (stamp.split(':').count() == 7 && stamp.split(':').all(|part| part.parse::<i128>().is_ok()))
-            .then_some(stamp)
+        // Normalize both legacy 7-field and current 5-field rows to the
+        // five filesystem metadata fields (dev:ino:size:mtime:mtime_nsec).
+        index::stamp_prefix(&stamp).map(str::to_owned)
     }))
 }
 
@@ -816,5 +861,57 @@ mod scope_tests {
         for path in ["/System", "/Users/example/Library"] {
             assert!(scope_ancestor(Path::new(path)));
         }
+    }
+
+    #[test]
+    fn user_target_cookies_and_caches_are_allowed_while_build_and_library_paths_are_excluded() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-scope-narrow-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let user_target = root.join("Documents/Q4/Target");
+        let user_cookies = root.join("Documents/Recipes/Cookies");
+        let user_caches = root.join("Documents/Caches");
+        let cargo_proj = root.join("Projects/crate");
+        let maven_proj = root.join("Projects/maven");
+        for dir in [
+            &user_target,
+            &user_cookies,
+            &user_caches,
+            &cargo_proj.join("target"),
+            &maven_proj.join("target"),
+        ] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(cargo_proj.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        fs::write(maven_proj.join("pom.xml"), "<project/>").unwrap();
+
+        let scope = Scope {
+            roots: vec![root.clone()],
+            ..Scope::default()
+        };
+        assert!(scope.allows(&user_target.join("plan.md")));
+        assert!(scope.allows(&user_cookies.join("chocolate.md")));
+        assert!(scope.allows(&user_caches.join("notes.md")));
+        assert!(!scope.allows(&cargo_proj.join("target/debug/bin")));
+        assert!(!scope.allows(&maven_proj.join("target/classes/App.class")));
+
+        let default_scope = Scope::default();
+        assert!(default_scope.allows(Path::new(
+            "/Users/example/Library/CloudStorage/OneDrive/Recipes/Cookies/oatmeal.md"
+        )));
+        for blocked in [
+            "/Users/example/Library/Caches/com.apple.Safari/cache.db",
+            "/Users/example/Library/Cookies/Cookies.binarycookies",
+            "/Users/example/Library/Keychains/login.keychain-db",
+            "/Library/Caches/system.cache",
+            "/Users/example/Documents/.secret/file.txt",
+        ] {
+            assert!(
+                !default_scope.allows(Path::new(blocked)),
+                "allowed {blocked}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 }

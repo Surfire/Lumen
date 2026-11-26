@@ -21,7 +21,8 @@ const MIN_COSINE: f32 = 0.65;
 const Z_THRESHOLD: f64 = 1.0;
 const LEGACY_VECTOR_BYTES: i64 = (DIMENSIONS * 4) as i64;
 const IMAGE_LIVE: &str = "FROM image_embedding e JOIN item i USING(id)
-    WHERE e.model=?1 AND i.path>=?2 AND i.path<?3 AND i.kind='file' AND i.availability='local'
+    WHERE e.model=?1 AND i.path>=?2 AND i.path<?3 AND i.kind='file'
+    AND i.availability IN ('local','provider_metadata_only')
     AND typeof(e.vector)='blob' AND length(e.vector) IN (?4/2,?4)";
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS image_scope(id INTEGER PRIMARY KEY CHECK(id=1), root TEXT, epoch INTEGER NOT NULL);
@@ -197,7 +198,7 @@ pub fn image_batch(
                 AND length(e.vector) IN (?6/2,?6) THEN e.stamp END,e.id IS NOT NULL
              FROM item i LEFT JOIN image_embedding e ON i.id=e.id
              WHERE i.path>=?1 AND i.path<?2 AND i.path>?3
-               AND i.kind='file' AND i.availability='local'
+               AND i.kind='file' AND i.availability IN ('local','provider_metadata_only')
                AND (substr(lower(i.path),-4) IN ('.png','.jpg')
                  OR substr(lower(i.path),-5) IN ('.jpeg','.heic','.heif','.webp'))
              ORDER BY i.path LIMIT ?5",
@@ -248,7 +249,10 @@ pub fn image_batch(
             batch.skipped += 1;
             continue;
         };
-        if prior.as_deref() == Some(&stamp) {
+        if prior
+            .as_deref()
+            .is_some_and(|prior| crate::index::stamp_matches(prior, &stamp))
+        {
             batch.reused += 1;
             continue;
         }
@@ -286,10 +290,15 @@ pub fn image_batch(
     let mut total: i64 = txn.query_row("SELECT count(*) FROM image_embedding", [], |r| r.get(0))?;
     for (id, path, stamp, packed) in encoded {
         let still_indexed: bool = txn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM item WHERE id=?1 AND path=?2 AND kind='file' AND availability='local')",
-            params![id, path], |r| r.get(0),
+            "SELECT EXISTS(SELECT 1 FROM item WHERE id=?1 AND path=?2 AND kind='file' AND availability IN ('local','provider_metadata_only'))",
+            params![id, path],
+            |r| r.get(0),
         )?;
-        if !still_indexed || local_stamp(Path::new(&path), false).as_deref() != Some(&stamp) {
+        if !still_indexed
+            || !local_stamp(Path::new(&path), false)
+                .as_deref()
+                .is_some_and(|live| crate::index::stamp_matches(&stamp, live))
+        {
             batch.skipped += 1;
             continue;
         }
@@ -323,13 +332,20 @@ pub(crate) fn stored_match(conn: &Connection, id: i64, path: &Path, stamp: &str)
     let Some(rules) = Rules::read(conn)? else {
         return Ok(false);
     };
-    Ok(rules.allows(path)
-        && conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM image_embedding WHERE id=?1 AND model=?2 AND stamp=?3
-             AND typeof(vector)='blob' AND length(vector) IN (?4/2,?4))",
-            params![id, MODEL_ID, stamp, LEGACY_VECTOR_BYTES],
+    if !rules.allows(path) {
+        return Ok(false);
+    }
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT stamp FROM image_embedding WHERE id=?1 AND model=?2
+             AND typeof(vector)='blob' AND length(vector) IN (?3/2,?3)",
+            params![id, MODEL_ID, LEGACY_VECTOR_BYTES],
             |r| r.get(0),
-        )?)
+        )
+        .optional()?;
+    Ok(stored
+        .as_deref()
+        .is_some_and(|stored| crate::index::stamp_matches(stored, stamp)))
 }
 
 pub struct ImageSearchSession<'a> {
@@ -392,6 +408,7 @@ impl<'a> ImageSearchSession<'a> {
 struct ImageRow {
     path: Box<str>,
     name: Box<str>,
+    availability: Box<str>,
     stamp: Box<str>,
 }
 
@@ -402,7 +419,7 @@ fn load_images(snapshot: &Connection) -> Result<Matrix<ImageRow>> {
     };
     let (lower, upper) = rules.bounds();
     let mut stmt = snapshot.prepare_cached(&format!(
-        "SELECT i.path,i.display,e.stamp,e.vector {IMAGE_LIVE}"
+        "SELECT i.path,i.display,i.availability,e.stamp,e.vector {IMAGE_LIVE}"
     ))?;
     let mut rows = stmt.query(params![MODEL_ID, lower, upper, LEGACY_VECTOR_BYTES])?;
     while let Some(row) = rows.next()? {
@@ -412,9 +429,10 @@ fn load_images(snapshot: &Connection) -> Result<Matrix<ImageRow>> {
                 ImageRow {
                     path: path.into(),
                     name: row.get_ref(1)?.as_str()?.into(),
-                    stamp: row.get_ref(2)?.as_str()?.into(),
+                    availability: row.get_ref(2)?.as_str()?.into(),
+                    stamp: row.get_ref(3)?.as_str()?.into(),
                 },
-                row.get_ref(3)?.as_blob()?,
+                row.get_ref(4)?.as_blob()?,
             );
         }
     }
@@ -432,19 +450,18 @@ fn rank_images(matrix: &Matrix<ImageRow>, query: &[f32], limit: usize) -> Vec<Hi
     hits.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.path.cmp(&b.1.path)));
     hits.into_iter()
         .filter_map(|(score, row)| {
-            if local_stamp(Path::new(row.path.as_ref()), false).as_deref()
-                != Some(row.stamp.as_ref())
-            {
+            let live = local_stamp(Path::new(row.path.as_ref()), false)?;
+            if !crate::index::stamp_matches(row.stamp.as_ref(), &live) {
                 return None;
             }
             Some(Hit {
                 path: row.path.to_string(),
                 name: row.name.to_string(),
                 kind: "file".into(),
-                availability: "local".into(),
+                availability: row.availability.to_string(),
                 matched_by: "image_embedding".into(),
                 snippet: None,
-                document_stamp: Some(row.stamp.to_string()),
+                document_stamp: Some(live),
                 pdf_page: None,
                 score: Some(score.into()),
             })
@@ -651,6 +668,76 @@ mod tests {
             );
             writer.execute_batch("UPDATE info SET value=json_set(value,'$.deny',json('[]')) WHERE key='scope'; UPDATE item SET availability='local' WHERE display='sample.png'").unwrap();
         }
+        drop(session);
+        drop(writer);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resident_cloud_images_index_search_and_match_legacy_seven_field_stamps() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-image-cloud-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let cloud_images = root.join("Library/CloudStorage/OneDrive-Test/Photos");
+        fs::create_dir_all(&cloud_images).unwrap();
+        let path = cloud_images.join("resident.png");
+        fs::write(&path, "resident cloud image fixture").unwrap();
+        let database = root.join("index.db");
+        crate::index::scan(
+            &database,
+            &Scope {
+                roots: vec![cloud_images.clone()],
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        let status = image_scope(&database, Some(&cloud_images)).unwrap();
+        assert_eq!(status.root.as_deref(), cloud_images.to_str());
+
+        let writer = Connection::open(&database).unwrap();
+        let (id, availability): (i64, String) = writer
+            .query_row(
+                "SELECT id,availability FROM item WHERE path=?1",
+                [path.to_str().unwrap()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(availability, "provider_metadata_only");
+
+        let live_stamp = local_stamp(&path, false).unwrap();
+        assert_eq!(live_stamp.split(':').count(), 5);
+        let legacy_stamp = format!("{live_stamp}:123456:789");
+        let vector = pack(&query_vector());
+        writer
+            .execute(
+                "INSERT INTO image_embedding VALUES (?1,?2,?3,?4)",
+                params![id, MODEL_ID, legacy_stamp, vector],
+            )
+            .unwrap();
+        assert!(stored_match(&writer, id, &path, &live_stamp).unwrap());
+        assert_eq!(image_status(&database).unwrap().vectors, 1);
+
+        let batch = image_batch(
+            &database,
+            &GemmaModel::installed(None).unwrap(),
+            Path::new("unused-projector"),
+            None,
+            16,
+        )
+        .unwrap();
+        assert_eq!((batch.processed, batch.reused, batch.skipped), (1, 1, 0));
+
+        let model = GemmaModel::installed(Some(&root)).unwrap();
+        let mut session =
+            ImageSearchSession::open(&database, &model, "unused-projector".into()).unwrap();
+        session.worker = Some(GemmaQuery::Fixture(Box::new(query_vector)));
+        let hits = session.search("resident photo", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, path.to_str().unwrap());
+        assert_eq!(hits[0].availability, "provider_metadata_only");
+        assert_eq!(hits[0].document_stamp.as_deref(), Some(live_stamp.as_str()));
+
         drop(session);
         drop(writer);
         fs::remove_dir_all(root).unwrap();

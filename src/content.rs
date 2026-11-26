@@ -1,7 +1,7 @@
 use crate::index::{
     Coverage, DocumentKind, ImageOcrExtractor, can_open_document, check_document_access,
-    document_version, extract_document, remove_document, resident_content_availability,
-    restrict_scope, save_document,
+    document_version, document_version_matches, extract_document, remove_document,
+    resident_content_availability, restrict_scope, save_document,
 };
 use crate::{MAX_DOCUMENT, PdfHelperPolicy, Scope, absolute, open_read, open_write, platform};
 use anyhow::{Context, Result, ensure};
@@ -181,23 +181,43 @@ pub(super) fn observe(conn: &Connection, id: i64, observation: &Observation) -> 
     // An orphaned body (e.g. a cleared stamp in an older catalog) is stale,
     // as is any body added since preparation that we did not verify.
     let verified_version = version.filter(|_| observation.verified);
-    let stale: bool = conn
+    let existing_doc: Option<Option<String>> = conn
         .prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM document d LEFT JOIN document_state s USING(id)
-             WHERE d.id=?1 AND (?2 IS NULL OR s.stamp IS NOT ?2))",
+            "SELECT s.stamp FROM document d LEFT JOIN document_state s USING(id) WHERE d.id=?1",
         )?
-        .query_row(params![id, verified_version], |r| r.get(0))?;
+        .query_row([id], |r| r.get(0))
+        .optional()?;
+    let stale = match existing_doc {
+        Some(Some(stored)) => {
+            !verified_version.is_some_and(|current| document_version_matches(&stored, current))
+        }
+        Some(None) => true,
+        None => false,
+    };
     if stale {
         remove_document(conn, id)?;
     }
-    let changed = conn
-        .prepare_cached(
-            "INSERT INTO content_job(item_id) VALUES(?1)
-             ON CONFLICT(item_id) DO UPDATE SET stamp=NULL
-             WHERE stamp IS NOT NULL AND (?3 OR stamp IS NOT ?2)",
-        )?
-        .execute(params![id, version, stale])?
-        != 0;
+    let existing_job: Option<Option<String>> = conn
+        .prepare_cached("SELECT stamp FROM content_job WHERE item_id=?1")?
+        .query_row([id], |r| r.get(0))
+        .optional()?;
+    let changed = match existing_job {
+        None => {
+            conn.prepare_cached("INSERT INTO content_job(item_id) VALUES(?1)")?
+                .execute([id])?
+                != 0
+        }
+        Some(Some(job_stamp))
+            if stale
+                || !version
+                    .is_some_and(|current| document_version_matches(&job_stamp, current)) =>
+        {
+            conn.prepare_cached("UPDATE content_job SET stamp=NULL WHERE item_id=?1")?
+                .execute([id])?
+                != 0
+        }
+        Some(_) => false,
+    };
     Ok(stale || changed)
 }
 
@@ -393,7 +413,11 @@ fn prepare_update(
             r.get::<_, String>(0)
         })
         .optional()?;
-    let unchanged = if let Some(meta) = before.as_ref().filter(|_| version == cached) {
+    let same_version = version
+        .as_deref()
+        .zip(cached.as_deref())
+        .is_some_and(|(live, stored)| document_version_matches(stored, live));
+    let unchanged = if let Some(meta) = before.as_ref().filter(|_| same_version) {
         match check_document_access(path, meta) {
             Ok(unchanged) => unchanged,
             Err(error) if error.kind() == ErrorKind::PermissionDenied => return Err(error.into()),

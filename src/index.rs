@@ -153,9 +153,9 @@ impl PdfExtractor {
 
     fn can_restamp_legacy(&self, previous: &str, document_stamp: &str) -> bool {
         self.bundled_binary.is_some()
-            && previous
-                .strip_prefix(document_stamp)
-                .is_some_and(|suffix| suffix.starts_with(":\""))
+            && split_document_version(previous).is_some_and(|(prev_stamp, ext)| {
+                stamp_matches(prev_stamp, document_stamp) && ext.starts_with('"')
+            })
     }
 }
 
@@ -206,8 +206,46 @@ pub(super) fn in_explicit_content_root(scope: &Scope, path: &Path) -> bool {
     })
 }
 
-pub(super) fn resident_content_availability(availability: &str, explicit_scope: bool) -> bool {
-    availability == "local" || (explicit_scope && availability == "provider_metadata_only")
+pub(super) fn resident_content_availability(availability: &str, _explicit_scope: bool) -> bool {
+    matches!(availability, "local" | "provider_metadata_only")
+}
+
+pub(crate) struct ResolvedSymlink {
+    pub(crate) target: PathBuf,
+    pub(crate) metadata: fs::Metadata,
+}
+
+/// Resolve a single symlink hop without following chained symlinks.
+/// Returns `None` for dangling links, multi-hop chains, or special files.
+pub(crate) fn resolve_one_level_symlink(path: &Path) -> Option<ResolvedSymlink> {
+    let raw_target = fs::read_link(path).ok()?;
+    let joined = if raw_target.is_absolute() {
+        raw_target
+    } else {
+        path.parent()?.join(raw_target)
+    };
+    let target = absolute(&joined).ok()?;
+    let metadata = fs::symlink_metadata(&target).ok()?;
+    if metadata.file_type().is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
+        return None;
+    }
+    Some(ResolvedSymlink { target, metadata })
+}
+
+pub(crate) fn symlink_availability(
+    link_availability: &'static str,
+    resolved: &ResolvedSymlink,
+) -> &'static str {
+    let target_availability = platform::availability(&resolved.target, &resolved.metadata);
+    if link_availability == "placeholder" || target_availability == "placeholder" {
+        "placeholder"
+    } else if link_availability == "provider_metadata_only"
+        || target_availability == "provider_metadata_only"
+    {
+        "provider_metadata_only"
+    } else {
+        "local"
+    }
 }
 
 pub(super) struct Coverage {
@@ -882,39 +920,69 @@ impl<'a> Walk<'a> {
                 self.stats.skipped += 1;
                 continue;
             }
-            let metadata = match cached {
-                Some(platform::FastInfo {
-                    directory: false, ..
-                }) => None,
-                _ => match fs::symlink_metadata(&path) {
-                    Ok(m) if m.is_file() || m.is_dir() => Some(m),
-                    Ok(_) => {
-                        self.stats.skipped += 1;
-                        subtree |= path == target;
-                        continue;
-                    }
-                    Err(error) => {
-                        if !confirmed_absent(&error) {
-                            self.gap(&path)?;
-                        } else if is_root {
-                            self.stats.entries_unreadable += 1;
+            let mut symlink_entry: Option<(fs::Metadata, ResolvedSymlink)> = None;
+            let metadata =
+                match cached {
+                    Some(platform::FastInfo {
+                        directory: false, ..
+                    }) => None,
+                    _ => match fs::symlink_metadata(&path) {
+                        Ok(m) if m.is_file() || m.is_dir() => Some(m),
+                        Ok(m) if m.file_type().is_symlink() && self.coverage.external.is_none() => {
+                            match resolve_one_level_symlink(&path) {
+                                Some(resolved)
+                                    if !self.coverage.scope.deny.iter().any(|rule| {
+                                        platform::denied_by(&resolved.target, rule)
+                                    }) && !crate::sensitive_path(&resolved.target) =>
+                                {
+                                    symlink_entry = Some((m, resolved));
+                                    None
+                                }
+                                _ => {
+                                    self.stats.skipped += 1;
+                                    subtree |= path == target;
+                                    continue;
+                                }
+                            }
                         }
-                        subtree |= path == target;
-                        continue;
+                        Ok(_) => {
+                            self.stats.skipped += 1;
+                            subtree |= path == target;
+                            continue;
+                        }
+                        Err(error) => {
+                            if !confirmed_absent(&error) {
+                                self.gap(&path)?;
+                            } else if is_root {
+                                self.stats.entries_unreadable += 1;
+                            }
+                            subtree |= path == target;
+                            continue;
+                        }
+                    },
+                };
+            if let Some(boundary) = &self.coverage.external {
+                let on_device = match (&metadata, &symlink_entry) {
+                    (Some(meta), _) => Some(meta.dev()) == boundary.device(),
+                    (None, Some((link_meta, resolved))) => {
+                        Some(link_meta.dev()) == boundary.device()
+                            && Some(resolved.metadata.dev()) == boundary.device()
                     }
-                },
-            };
-            if let Some(boundary) = &self.coverage.external
-                && metadata
-                    .as_ref()
-                    .is_none_or(|metadata| Some(metadata.dev()) != boundary.device())
-            {
-                self.stats.skipped += 1;
-                continue;
+                    (None, None) => false,
+                };
+                if !on_device {
+                    self.stats.skipped += 1;
+                    continue;
+                }
             }
-            let (directory, availability) = match &metadata {
-                Some(meta) => (meta.is_dir(), platform::availability(&path, meta)),
-                None => (
+            let is_symlink = symlink_entry.is_some();
+            let (directory, availability) = match (&metadata, &symlink_entry) {
+                (Some(meta), _) => (meta.is_dir(), platform::availability(&path, meta)),
+                (None, Some((link_meta, resolved))) => (
+                    resolved.metadata.is_dir(),
+                    symlink_availability(platform::availability(&path, link_meta), resolved),
+                ),
+                (None, None) => (
                     false,
                     platform::classify(&path, cached.as_ref().unwrap().dataless),
                 ),
@@ -929,8 +997,9 @@ impl<'a> Walk<'a> {
                 continue;
             };
             let opaque = directory && opaque_package(&path);
-            let mut descend = recursive && directory && availability != "placeholder" && !opaque;
-            if !recursive && directory && availability != "placeholder" && !opaque {
+            let mut descend =
+                recursive && directory && !is_symlink && availability != "placeholder" && !opaque;
+            if !recursive && directory && !is_symlink && availability != "placeholder" && !opaque {
                 let prior: Option<(String, String)> = self
                     .conn
                     .prepare_cached("SELECT kind,availability FROM item WHERE path=?")?
@@ -948,6 +1017,7 @@ impl<'a> Walk<'a> {
                 let explicit = self.coverage.scope.content_roots.is_some();
                 let resident = resident_content_availability(availability, explicit);
                 if !directory
+                    && !is_symlink
                     && self.coverage.permits_content(&path)
                     && let Some(kind) = crate::content::eligible_kind(self.coverage, &path)
                     && (resident || !explicit)
@@ -1002,10 +1072,11 @@ impl<'a> Walk<'a> {
                     path: path.clone(),
                     directory,
                     availability,
-                    mtime: metadata.as_ref().map_or_else(
-                        || cached.as_ref().expect("bulk file metadata").mtime,
-                        MetadataExt::mtime,
-                    ),
+                    mtime: match (&metadata, &symlink_entry) {
+                        (Some(meta), _) => meta.mtime(),
+                        (None, Some((_, resolved))) => resolved.metadata.mtime(),
+                        (None, None) => cached.as_ref().expect("bulk file metadata").mtime,
+                    },
                     legacy,
                     content,
                 });
@@ -1014,9 +1085,10 @@ impl<'a> Walk<'a> {
                 }
             }
             if path == target {
-                subtree |= descend || opaque || !directory || availability == "placeholder";
+                subtree |=
+                    descend || opaque || is_symlink || !directory || availability == "placeholder";
                 self.readable_roots +=
-                    usize::from(is_root && opaque && availability != "placeholder");
+                    usize::from(is_root && (opaque || is_symlink) && availability != "placeholder");
             }
             if !descend {
                 continue;
@@ -1246,7 +1318,10 @@ impl<'a> Walk<'a> {
                     )?
                     .query_row([path.to_str().expect("checked UTF-8 path")], |r| r.get(0))
                     .optional()?;
-            if previous.as_deref() == Some(&current) {
+            if previous
+                .as_deref()
+                .is_some_and(|prior| document_version_matches(prior, &current))
+            {
                 return Ok(if can_open_document(path, meta) {
                     LegacyDocument::Current
                 } else {
@@ -1469,17 +1544,66 @@ fn confirmed_absent(error: &std::io::Error) -> bool {
     )
 }
 
-pub(super) fn stamp(meta: &fs::Metadata) -> String {
+pub(crate) fn stamp(meta: &fs::Metadata) -> String {
     format!(
-        "{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}",
         meta.dev(),
         meta.ino(),
         meta.len(),
         meta.mtime(),
         meta.mtime_nsec(),
-        meta.ctime(),
-        meta.ctime_nsec(),
     )
+}
+
+/// Extract the validated 5-field `dev:ino:size:mtime:mtime_nsec` prefix from
+/// either a 5-field stamp or a legacy 7-field stamp (with optional suffix).
+pub(crate) fn stamp_prefix(stamp: &str) -> Option<&str> {
+    let prefix = match stamp.match_indices(':').nth(4) {
+        Some((end, _)) => &stamp[..end],
+        None => stamp,
+    };
+    let mut count = 0;
+    for part in prefix.split(':') {
+        if part.parse::<i128>().is_err() {
+            return None;
+        }
+        count += 1;
+    }
+    (count == 5).then_some(prefix)
+}
+
+/// Compare two metadata stamps by their first five `:`-separated fields
+/// (`dev:ino:size:mtime:mtime_nsec`), ignoring `ctime`/`ctime_nsec` so legacy
+/// 7-field catalog rows remain valid without re-extraction.
+pub(crate) fn stamp_matches(stored: &str, live: &str) -> bool {
+    stamp_prefix(stored)
+        .zip(stamp_prefix(live))
+        .is_some_and(|(a, b)| a == b)
+}
+
+pub(crate) fn split_document_version(version: &str) -> Option<(&str, &str)> {
+    let sep5 = version.match_indices(':').nth(4)?.0;
+    let prefix = stamp_prefix(&version[..sep5])?;
+    let rest = &version[sep5 + 1..];
+    if let Some((c1, tail)) = rest.split_once(':')
+        && c1.parse::<i128>().is_ok()
+    {
+        if let Some((c2, extractor)) = tail.split_once(':')
+            && c2.parse::<i128>().is_ok()
+        {
+            return Some((prefix, extractor));
+        }
+        if tail.parse::<i128>().is_ok() {
+            return Some((prefix, ""));
+        }
+    }
+    Some((prefix, rest))
+}
+
+pub(crate) fn document_version_matches(stored: &str, live: &str) -> bool {
+    split_document_version(stored)
+        .zip(split_document_version(live))
+        .is_some_and(|((s_stamp, s_ext), (l_stamp, l_ext))| s_stamp == l_stamp && s_ext == l_ext)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1638,14 +1762,19 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn dataless_bulk_metadata_cannot_queue_image_ocr() {
-        let path = Path::new("/private/tmp/OneDrive-Fixture/image.heic");
+        let path = Path::new("/Users/example/Library/CloudStorage/OneDrive-Fixture/image.heic");
         assert!(DocumentKind::for_path(path) == Some(DocumentKind::Image));
         let availability = |flags| platform::classify(path, platform::dataless_flags(flags));
+        assert_eq!(availability(0), "provider_metadata_only");
         assert!(resident_content_availability(availability(0), true));
-        assert!(!resident_content_availability(availability(0), false));
+        assert!(resident_content_availability(availability(0), false));
         assert!(!resident_content_availability(
             availability(0x4000_0000),
             true
+        )); // Darwin SF_DATALESS
+        assert!(!resident_content_availability(
+            availability(0x4000_0000),
+            false
         )); // Darwin SF_DATALESS
     }
 

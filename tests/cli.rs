@@ -53,6 +53,8 @@ impl Drop for Fixture {
 fn custom_root_indexes_project_material_but_not_development_noise() {
     let f = Fixture::new();
     let root = f.0.join("project");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"probe\"\n").unwrap();
     for dir in [
         "node_modules",
         "target",
@@ -171,8 +173,8 @@ fn docx_full_text_is_optional_and_respects_scope() {
     );
 
     let stats = f.run(&["index", "--root", r, "--deny", d, "--documents"]);
-    assert_eq!(stats["documents"], 1);
-    assert_eq!(stats["documents_not_read"], 1);
+    assert_eq!(stats["documents"], 2);
+    assert_eq!(stats["documents_not_read"], 0);
     for term in [
         "project brief & notes",
         "第三季度研究计划",
@@ -184,12 +186,14 @@ fn docx_full_text_is_optional_and_respects_scope() {
         assert_eq!(hit["name"], "Quarterly Report.DOCX", "{term}");
         assert!(hit.get("page").is_none());
     }
-    for term in ["cloud text marker", "denied text marker"] {
-        assert_eq!(
-            f.run(&["query", term, "--mode", "text"]),
-            serde_json::json!([])
-        );
-    }
+    assert_eq!(
+        f.run(&["query", "cloud text marker", "--mode", "text"])[0]["name"],
+        "restricted.docx"
+    );
+    assert_eq!(
+        f.run(&["query", "denied text marker", "--mode", "text"]),
+        serde_json::json!([])
+    );
     assert_eq!(
         f.run(&["query", "restricted.docx"])[0]["availability"],
         "provider_metadata_only"
@@ -303,16 +307,21 @@ fn deny_and_cloud_semantics_without_real_provider_access() {
     for query in ["excluded", "shortcut"] {
         assert!(f.run(&["query", query]).as_array().unwrap().is_empty());
     }
-    assert!(
+    // Resident provider files (SF_DATALESS == 0) enjoy full text parity when documents are enabled.
+    assert_eq!(
         f.run(&[
             "query",
             "THIS-CONTENT-MUST-NOT-BE-INDEXED",
             "--mode",
             "text"
-        ])
-        .as_array()
-        .unwrap()
-        .is_empty()
+        ])[0]["name"],
+        "air-only.md"
+    );
+    assert!(
+        f.run(&["query", "SHOULD-NOT-BE-READ", "--mode", "text"])
+            .as_array()
+            .unwrap()
+            .is_empty()
     );
     assert_eq!(
         f.run(&["query", "Content is opt-in", "--mode", "text"])[0]["name"],
@@ -324,6 +333,17 @@ fn deny_and_cloud_semantics_without_real_provider_access() {
             .as_array()
             .unwrap()
             .is_empty()
+    );
+    assert!(
+        f.run(&[
+            "query",
+            "THIS-CONTENT-MUST-NOT-BE-INDEXED",
+            "--mode",
+            "text"
+        ])
+        .as_array()
+        .unwrap()
+        .is_empty()
     );
 }
 
@@ -932,8 +952,14 @@ mod live {
         let outside = f.0.join("outside.txt");
         fs::write(&outside, "outside scope").unwrap();
         symlink(&outside, &file).unwrap();
-        assert!(!valid(&file, "file", None));
+        // A 1-level symlink validates for name-only hits, never for document stamps.
+        assert!(valid(&file, "file", None));
+        assert!(!valid(&file, "file", Some(stamp)));
         assert!(!valid(&outside, "file", None));
+        // A 2-level chained symlink is rejected.
+        let chain = root.join("chained.txt");
+        symlink(&file, &chain).unwrap();
+        assert!(!valid(&chain, "file", None));
 
         let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
         db.execute(
@@ -1844,7 +1870,7 @@ printf 'second batch text'
     #[test]
     fn cached_start_keeps_resident_provider_documents_verified() {
         let f = Fixture::new();
-        let provider = f.0.join("OneDrive-Fixture");
+        let provider = f.0.join("Library/CloudStorage/OneDrive-Fixture");
         let selected = provider.join("Selected");
         fs::create_dir_all(&selected).unwrap();
         fs::write(selected.join("resident.md"), "cachedresidentneedle").unwrap();
@@ -2089,14 +2115,9 @@ printf 'second batch text'
         assert_eq!(f.run(&["status"])["embeddings"], 4);
         assert_eq!(serve.names("obsolete body", "text"), ["draft.md"]);
 
-        // Preserve mtime and byte length to exercise change detection via ctime.
-        let modified = fs::metadata(&draft).unwrap().modified().unwrap();
-        fs::write(&draft, "replaced body").unwrap();
-        fs::File::open(&draft)
-            .unwrap()
-            .set_modified(modified)
-            .unwrap();
-        serve.wait("replaced body", "text", &["draft.md"]);
+        // Edit content so size/mtime change triggers incremental re-indexing.
+        fs::write(&draft, "replaced body text").unwrap();
+        serve.wait("replaced body text", "text", &["draft.md"]);
         assert_eq!(watcher.json(), serde_json::json!({"event":"updated"}));
         assert!(serve.names("obsolete body", "text").is_empty());
         assert_eq!(f.run(&["status"])["embeddings"], 3);
@@ -2134,12 +2155,13 @@ printf 'second batch text'
 
         fs::write(
             provider.join("provider-visible.txt"),
-            "provider body forbidden",
+            "provider body resident",
         )
         .unwrap();
         fs::write(denied.join("rule-excludes.txt"), "denied body forbidden").unwrap();
         fs::write(root.join("outside-allow.txt"), "outside body forbidden").unwrap();
         serve.wait("provider-visible", "name", &["provider-visible.txt"]);
+        serve.wait("provider body resident", "text", &["provider-visible.txt"]);
         assert!(serve.names("forbidden", "text").is_empty());
         assert!(serve.names("rule-excludes", "name").is_empty());
         assert!(serve.names("outside-allow", "name").is_empty());
@@ -2147,11 +2169,11 @@ printf 'second batch text'
         fs::rename(projects.join("allowed-again"), outside.join("detached")).unwrap();
         symlink(outside.join("detached"), projects.join("allowed-again")).unwrap();
         serve.wait("nested-item", "name", &[]);
-        assert!(serve.names("allowed-again", "name").is_empty());
+        assert_eq!(serve.names("allowed-again", "name"), ["allowed-again"]);
 
         fs::remove_file(&draft).unwrap();
         serve.wait("draft.md", "name", &[]);
-        assert!(serve.names("replaced body", "text").is_empty());
+        assert!(serve.names("replaced body text", "text").is_empty());
 
         drop(watcher);
         fs::remove_file(projects.join("created-on-watch.md")).unwrap();
@@ -2695,14 +2717,12 @@ esac
     fn metadata_stamp(path: &Path) -> String {
         let metadata = fs::symlink_metadata(path).unwrap();
         format!(
-            "{}:{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}",
             metadata.dev(),
             metadata.ino(),
             metadata.len(),
             metadata.mtime(),
             metadata.mtime_nsec(),
-            metadata.ctime(),
-            metadata.ctime_nsec()
         )
     }
 
@@ -3209,6 +3229,11 @@ done
         }
         symlink(&denied, allowed.join("aliased-parent")).unwrap();
         symlink(&outside, allowed.join("aliased-file.md")).unwrap();
+        symlink(
+            allowed.join("aliased-file.md"),
+            allowed.join("chained-file.md"),
+        )
+        .unwrap();
         let root = root.to_str().unwrap();
         let allow = allowed.to_str().unwrap();
         let deny = denied.to_str().unwrap();
@@ -3228,7 +3253,7 @@ done
         );
         assert_eq!(
             explain(&cloud),
-            serde_json::json!({"name":"indexed","text":"cloud_name_only","semantic":"cloud_name_only","availability":"provider_metadata_only"})
+            serde_json::json!({"name":"indexed","text":"text_disabled","semantic":"text_disabled","availability":"provider_metadata_only"})
         );
         assert_eq!(explain(&outside), blocked("outside_scope"));
         assert_eq!(
@@ -3241,6 +3266,10 @@ done
         );
         assert_eq!(
             explain(&allowed.join("aliased-file.md")),
+            serde_json::json!({"name":"indexed","text":"symlink","semantic":"symlink","availability":"local"})
+        );
+        assert_eq!(
+            explain(&allowed.join("chained-file.md")),
             blocked("symlink")
         );
         assert_eq!(
@@ -3462,7 +3491,7 @@ try rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithP
         assert_eq!(query(), serde_json::json!([]));
         let enabled = run(&["content-scope", "--content-root", selected, "--image-ocr"]);
         assert_eq!(enabled["scope"]["image_ocr"], true);
-        assert_eq!(enabled["content"]["pending"], 2); // Local HEIC and oversized PNG only.
+        assert_eq!(enabled["content"]["pending"], 3); // Local HEIC, oversized PNG, and 1-level symlink leaf (skipped on OCR).
         assert_eq!(run(&["content"])["indexed"], 1);
         let hits = query();
         assert_eq!(hits.as_array().unwrap().len(), 1);
@@ -3663,7 +3692,7 @@ static const struct { const void *replacement; const void *original; } hook = {d
         );
         assert_eq!(
             f.run(&["diagnose", sibling.to_str().unwrap()])["text"],
-            "cloud_name_only"
+            "outside_content_scope"
         );
         let hits = f.run(&[
             "query",
@@ -3706,6 +3735,11 @@ static const struct { const void *replacement; const void *original; } hook = {d
         assert_eq!(f.run(&["content"])["indexed"], 1);
         drop(watcher);
         f.run(&[&index[..], &["--documents"]].concat());
+        assert_eq!(
+            f.run(&["query", "residentneedle indexed", "--mode", "text"])[0]["name"],
+            "resident.md"
+        );
+        f.run(&index);
         assert_eq!(f.run(&["status"])["embedded_chunks"], 0);
         assert_eq!(
             f.run(&["query", "residentneedle", "--mode", "text"]),
@@ -4214,5 +4248,558 @@ printf '%s' '[{"page":1,"text":"northern inventory"},{"page":3,"text":"zircon ca
         ]);
         assert_eq!(related[0]["pdf_page"], 3);
         assert_eq!(related[0]["snippet"], "zircon calibrator");
+    }
+
+    #[test]
+    fn phase1_resident_cloud_parity_and_dataless_protection() {
+        let f = Fixture::new();
+        let root = f.0.join("workspace");
+        let cloud = root.join("Library/CloudStorage/OneDrive-Parity");
+        let local_dropbox = root.join("Projects/dropbox");
+        let local_onedrive = root.join("Documents/OneDrive");
+        for dir in [&cloud, &local_dropbox, &local_onedrive] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let resident_doc = cloud.join("resident-note.md");
+        let late_cloud_doc = cloud.join("late-cloud.md");
+        let placeholder_doc = cloud.join("dataless-only.md");
+        let resident_img = cloud.join("resident-photo.png");
+        fs::write(&resident_doc, "cloudparityneedle readable everywhere").unwrap();
+        fs::write(&placeholder_doc, "datalessforbidden must never be read").unwrap();
+        fs::write(&resident_img, "resident image payload").unwrap();
+        fs::write(local_dropbox.join("repo.md"), "localdropneedle").unwrap();
+        fs::write(local_onedrive.join("spec.md"), "localonedriveneedle").unwrap();
+
+        let source = f.0.join("dataless_hook.c");
+        let library = f.0.join("dataless_hook.dylib");
+        fs::write(
+            &source,
+            r#"
+#include <string.h>
+#include <sys/stat.h>
+static int hook_lstat(const char *path, struct stat *buf) {
+    int rc = lstat(path, buf);
+    const char *leaf = strrchr(path, '/');
+    if (rc == 0 && leaf && strcmp(leaf, "/dataless-only.md") == 0)
+        buf->st_flags |= SF_DATALESS;
+    return rc;
+}
+static int hook_fstatat(int fd, const char *path, struct stat *buf, int flag) {
+    int rc = fstatat(fd, path, buf, flag);
+    if (rc == 0 && path && strcmp(path, "dataless-only.md") == 0)
+        buf->st_flags |= SF_DATALESS;
+    return rc;
+}
+__attribute__((used, section("__DATA,__interpose")))
+static const struct { const void *replacement; const void *original; } interpose_lstat = {hook_lstat, lstat};
+__attribute__((used, section("__DATA,__interpose")))
+static const struct { const void *replacement; const void *original; } interpose_fstatat = {hook_fstatat, fstatat};
+"#,
+        )
+        .unwrap();
+        let cc = Command::new("cc")
+            .args(["-dynamiclib", "-o"])
+            .arg(&library)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            cc.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cc.stderr)
+        );
+
+        let run_hooked = |args: &[&str]| -> Value {
+            let out = f
+                .cli()
+                .args(args)
+                .env("DYLD_INSERT_LIBRARIES", &library)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            serde_json::from_slice(&out.stdout).unwrap()
+        };
+
+        // Narrowed provider() keeps ordinary local folders as "local".
+        run_hooked(&[
+            "index",
+            "--root",
+            root.to_str().unwrap(),
+            "--content-root",
+            cloud.to_str().unwrap(),
+        ]);
+        assert_eq!(f.run(&["query", "repo.md"])[0]["availability"], "local");
+        assert_eq!(f.run(&["query", "spec.md"])[0]["availability"], "local");
+        assert_eq!(
+            f.run(&["query", "resident-note.md"])[0]["availability"],
+            "provider_metadata_only"
+        );
+        // Simulate catalog classification for the SF_DATALESS placeholder (getattrlistbulk
+        // does not go through lstat, so test both catalog & live lstat protection).
+        let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+        db.execute(
+            "UPDATE item SET availability='placeholder' WHERE display='dataless-only.md'",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "DELETE FROM content_job WHERE item_id=(SELECT id FROM item WHERE display='dataless-only.md')",
+            [],
+        )
+        .unwrap();
+
+        // Content indexing reads resident cloud doc and skips SF_DATALESS placeholder.
+        let content = run_hooked(&["content"]);
+        assert_eq!(content["indexed"], 1);
+        assert_eq!(
+            f.run(&[
+                "query",
+                "cloudparityneedle",
+                "--mode",
+                "text",
+                "--check-access"
+            ])[0]["name"],
+            "resident-note.md"
+        );
+        // Re-inject a stale content_job for dataless-only.md and verify live SF_DATALESS blocks it.
+        db.execute_batch(
+            "UPDATE item SET availability='provider_metadata_only' WHERE display='dataless-only.md';
+             INSERT OR REPLACE INTO content_job(item_id, stamp)
+             SELECT id, NULL FROM item WHERE display='dataless-only.md';",
+        )
+        .unwrap();
+        assert_eq!(run_hooked(&["content"])["indexed"], 0);
+        assert_eq!(
+            f.run(&["query", "datalessforbidden", "--mode", "text"]),
+            serde_json::json!([])
+        );
+        db.execute(
+            "UPDATE item SET availability='placeholder' WHERE display='dataless-only.md'",
+            [],
+        )
+        .unwrap();
+
+        // Semantic indexing & search work on resident cloud doc.
+        let helper = f.0.join("cloud-parity-embed");
+        executable(
+            &helper,
+            "#!/bin/sh\ncat >/dev/null\nprintf '[1,0,0,0,0,0,0,0]'\n",
+        );
+        assert_eq!(
+            f.run(&["embed", "--helper", helper.to_str().unwrap()])["new_embeddings"],
+            1
+        );
+        assert_eq!(
+            f.run(&[
+                "query",
+                "cloud parity",
+                "--mode",
+                "semantic",
+                "--helper",
+                helper.to_str().unwrap()
+            ])[0]["name"],
+            "resident-note.md"
+        );
+
+        // Diagnose reports indexed / not_indexed cleanly for resident cloud files (never cloud_name_only / unknown),
+        // while SF_DATALESS placeholder still reports cloud_name_only.
+        assert_eq!(
+            f.run(&["diagnose", "--", resident_doc.to_str().unwrap()]),
+            serde_json::json!({
+                "name": "indexed",
+                "text": "indexed",
+                "semantic": "pending_gemma",
+                "availability": "provider_metadata_only"
+            })
+        );
+        fs::write(&late_cloud_doc, "arrived after scan").unwrap();
+        assert_eq!(
+            f.run(&["diagnose", "--", late_cloud_doc.to_str().unwrap()]),
+            serde_json::json!({
+                "name": "not_indexed",
+                "text": "not_indexed",
+                "semantic": "not_indexed",
+                "availability": "provider_metadata_only"
+            })
+        );
+        assert_eq!(
+            run_hooked(&["diagnose", "--", placeholder_doc.to_str().unwrap()]),
+            serde_json::json!({
+                "name": "indexed",
+                "text": "cloud_name_only",
+                "semantic": "cloud_name_only",
+                "availability": "placeholder"
+            })
+        );
+
+        // Image search scope, status, and hit validation work on resident cloud folders.
+        assert_eq!(
+            f.run(&["image-scope", cloud.to_str().unwrap()])["root"],
+            fs::canonicalize(&cloud).unwrap().to_str().unwrap()
+        );
+        let img_stamp = metadata_stamp(&resident_img);
+        let mut vector = vec![0_u8; 768 * 2];
+        vector[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        db.execute(
+            "INSERT INTO image_embedding SELECT id,?2,?3,?4 FROM item WHERE path=?1",
+            rusqlite::params![
+                fs::canonicalize(&resident_img).unwrap().to_str().unwrap(),
+                lumen::IMAGE_MODEL_ID,
+                img_stamp,
+                vector
+            ],
+        )
+        .unwrap();
+        assert_eq!(f.run(&["image-status"])["vectors"], 1);
+        assert_eq!(
+            f.run(&[
+                "validate-hit",
+                "--kind",
+                "file",
+                "--availability",
+                "provider_metadata_only",
+                "--document-stamp",
+                &img_stamp,
+                "--matched-by",
+                "image_embedding",
+                "--",
+                fs::canonicalize(&resident_img).unwrap().to_str().unwrap()
+            ])["valid"],
+            true
+        );
+    }
+
+    #[test]
+    fn phase1_five_field_stamp_ignores_ctime_and_accepts_legacy_seven_field_rows() {
+        let f = Fixture::new();
+        let root = f.0.join("docs");
+        fs::create_dir_all(&root).unwrap();
+        let doc = root.join("stable.md");
+        fs::write(&doc, "stablestampneedle unchanged content").unwrap();
+        let root_str = root.to_str().unwrap();
+        f.run(&["index", "--root", root_str, "--content-root", root_str]);
+        assert_eq!(f.run(&["content"])["indexed"], 1);
+
+        let five_field = metadata_stamp(&doc);
+        assert_eq!(five_field.split(':').count(), 5);
+        let hits = f.run(&[
+            "query",
+            "stablestampneedle",
+            "--mode",
+            "text",
+            "--check-access",
+        ]);
+        assert_eq!(hits[0]["document_stamp"], five_field);
+
+        // Rewrite DB rows to simulate a pre-Phase-1 catalog with legacy 7-field stamps.
+        let legacy_seven = format!("{five_field}:111111:222222");
+        let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+        db.execute(
+            "UPDATE document_state SET stamp=?1",
+            [format!("{legacy_seven}:")],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE content_job SET stamp=?1",
+            [format!("{legacy_seven}:")],
+        )
+        .unwrap();
+
+        // Bump ctime only via chmod without modifying file content or mtime.
+        let before_ctime = (
+            fs::symlink_metadata(&doc).unwrap().ctime(),
+            fs::symlink_metadata(&doc).unwrap().ctime_nsec(),
+        );
+        thread::sleep(Duration::from_millis(5));
+        fs::set_permissions(&doc, fs::Permissions::from_mode(0o600)).unwrap();
+        let after_ctime = (
+            fs::symlink_metadata(&doc).unwrap().ctime(),
+            fs::symlink_metadata(&doc).unwrap().ctime_nsec(),
+        );
+        assert_ne!(before_ctime, after_ctime, "chmod must advance ctime");
+        assert_eq!(metadata_stamp(&doc), five_field);
+
+        // Freshness holds across diagnose, query --check-access, validate-hit, and rescan!
+        assert_eq!(
+            f.run(&["diagnose", "--", doc.to_str().unwrap()])["text"],
+            "indexed"
+        );
+        assert_eq!(
+            f.run(&[
+                "query",
+                "stablestampneedle",
+                "--mode",
+                "text",
+                "--check-access"
+            ])[0]["document_stamp"],
+            five_field
+        );
+        assert_eq!(
+            f.run(&[
+                "validate-hit",
+                "--kind",
+                "file",
+                "--availability",
+                "local",
+                "--document-stamp",
+                &legacy_seven,
+                "--",
+                fs::canonicalize(&doc).unwrap().to_str().unwrap()
+            ])["valid"],
+            true
+        );
+        // Re-indexing must NOT reset content_job or re-extract the legacy 7-field document.
+        f.run(&["index", "--root", root_str, "--content-root", root_str]);
+        assert_eq!(f.run(&["status"])["content"]["pending"], 0);
+        assert_eq!(f.run(&["content"])["processed"], 0);
+        let kept: String = db
+            .query_row("SELECT stamp FROM document_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, format!("{legacy_seven}:"));
+    }
+
+    #[test]
+    fn phase1_user_target_cookies_caches_are_indexed_while_build_target_excluded() {
+        let f = Fixture::new();
+        let root = f.0.join("user");
+        let target_docs = root.join("Documents/Q4/Target");
+        let cookies_docs = root.join("Documents/Recipes/Cookies");
+        let caches_docs = root.join("Documents/Caches");
+        let cargo_target = root.join("Code/rust-crate/target");
+        let maven_target = root.join("Code/java-app/target");
+        for dir in [
+            &target_docs,
+            &cookies_docs,
+            &caches_docs,
+            &cargo_target,
+            &maven_target,
+        ] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(
+            root.join("Code/rust-crate/Cargo.toml"),
+            "[package]\nname = \"demo\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("Code/java-app/pom.xml"), "<project/>").unwrap();
+
+        fs::write(target_docs.join("q4-roadmap.md"), "q4targetneedle").unwrap();
+        fs::write(cookies_docs.join("chocolate-chip.md"), "cookierecipeneedle").unwrap();
+        fs::write(caches_docs.join("geo-caches.md"), "geocacheneedle").unwrap();
+        fs::write(cargo_target.join("cargo-artifact.txt"), "cargonoiseneedle").unwrap();
+        fs::write(maven_target.join("maven-artifact.txt"), "mavennoiseneedle").unwrap();
+
+        f.run(&["index", "--root", root.to_str().unwrap(), "--documents"]);
+        assert_eq!(f.run(&["query", "q4-roadmap"])[0]["name"], "q4-roadmap.md");
+        assert_eq!(
+            f.run(&["query", "q4targetneedle", "--mode", "text"])[0]["name"],
+            "q4-roadmap.md"
+        );
+        assert_eq!(
+            f.run(&["query", "chocolate-chip"])[0]["name"],
+            "chocolate-chip.md"
+        );
+        assert_eq!(
+            f.run(&["query", "cookierecipeneedle", "--mode", "text"])[0]["name"],
+            "chocolate-chip.md"
+        );
+        assert_eq!(f.run(&["query", "geo-caches"])[0]["name"], "geo-caches.md");
+        assert_eq!(
+            f.run(&["query", "geocacheneedle", "--mode", "text"])[0]["name"],
+            "geo-caches.md"
+        );
+        assert!(
+            f.run(&["query", "cargo-artifact"])
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            f.run(&["query", "maven-artifact"])
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn phase1_one_level_symlinks_indexed_safely_without_loops() {
+        let f = Fixture::new();
+        let root = f.0.join("workspace");
+        let apps = root.join("Apps");
+        let docs = root.join("Docs");
+        let denied = root.join("Denied");
+        let cask_app = f.0.join("Caskroom/HomebrewTool.app");
+        let external_notes = f.0.join("ExternalNotes");
+        for dir in [&apps, &docs, &denied, &cask_app, &external_notes] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(cask_app.join("inner-binary.txt"), "inside cask bundle").unwrap();
+        let ext_note = external_notes.join("linked-note.md");
+        fs::write(&ext_note, "symlinkednotebody must not be extracted").unwrap();
+        fs::write(denied.join("secret.md"), "denied secret").unwrap();
+
+        // 1-level symlinks: cask .app bundle, leaf file, and cyclic directory link to root!
+        let app_link = apps.join("HomebrewTool.app");
+        let file_link = docs.join("linked-note.md");
+        let loop_link = docs.join("loop-back");
+        let chain_link = docs.join("two-hop.md");
+        let denied_link = docs.join("denied-shortcut");
+        symlink(&cask_app, &app_link).unwrap();
+        symlink(&ext_note, &file_link).unwrap();
+        symlink(&root, &loop_link).unwrap();
+        symlink(&file_link, &chain_link).unwrap();
+        symlink(&denied, &denied_link).unwrap();
+
+        f.run(&[
+            "index",
+            "--root",
+            root.to_str().unwrap(),
+            "--deny",
+            denied.to_str().unwrap(),
+            "--documents",
+        ]);
+        // 1-level symlinks ARE searchable as leaf entries (no infinite loop!).
+        let app_hits = f.run(&["query", "HomebrewTool.app"]);
+        assert_eq!(app_hits.as_array().unwrap().len(), 1);
+        assert_eq!(app_hits[0]["kind"], "directory");
+        let file_hits = f.run(&["query", "linked-note.md"]);
+        assert_eq!(file_hits.as_array().unwrap().len(), 1);
+        assert_eq!(file_hits[0]["kind"], "file");
+        assert_eq!(f.run(&["query", "loop-back"])[0]["kind"], "directory");
+
+        // Never descend into symlinked directories or traverse 2-level / denied symlinks.
+        assert!(
+            f.run(&["query", "inner-binary"])
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(f.run(&["query", "two-hop"]).as_array().unwrap().is_empty());
+        assert!(
+            f.run(&["query", "denied-shortcut"])
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        // Never extract content through a symlink.
+        assert!(
+            f.run(&["query", "symlinkednotebody", "--mode", "text"])
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            f.run(&[
+                "validate-hit",
+                "--kind",
+                "directory",
+                "--availability",
+                "local",
+                "--",
+                fs::canonicalize(&apps)
+                    .unwrap()
+                    .join("HomebrewTool.app")
+                    .to_str()
+                    .unwrap()
+            ])["valid"],
+            true
+        );
+    }
+
+    #[test]
+    fn phase1_watch_transient_io_errors_do_not_mark_subtrees_unverified() {
+        let f = Fixture::new();
+        let root = f.0.join("watched");
+        let sub = root.join("flaky-provider");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("important.md"), "transientrecoveryneedle").unwrap();
+        let root_str = root.to_str().unwrap();
+        f.run(&["index", "--root", root_str, "--documents"]);
+        // Establish a settled watch checkpoint after initial fixture writes so
+        // the subsequent cached start exercises resume::verify_access directly.
+        let settle = Process::launch(f.cli().args(["watch", "--cached-start"]));
+        assert_eq!(settle.json()["event"], "cached");
+        assert_eq!(settle.json()["event"], "ready");
+        drop(settle);
+
+        // Inject EBUSY on open() for the flaky-provider directory during cached watch start.
+        let source = f.0.join("ebusy_open.c");
+        let library = f.0.join("ebusy_open.dylib");
+        let hit_marker = f.0.join("ebusy-triggered");
+        fs::write(
+            &source,
+            r#"
+#include <errno.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+static int hook_open(const char *path, int oflag, ...) {
+    const char *target = getenv("LUMEN_TEST_EBUSY_TARGET");
+    if (target && path && strcmp(path, target) == 0) {
+        const char *marker = getenv("LUMEN_TEST_EBUSY_MARKER");
+        if (marker) {
+            int fd = open(marker, O_CREAT | O_WRONLY, 0600);
+            if (fd >= 0) close(fd);
+        }
+        errno = EBUSY;
+        return -1;
+    }
+    if (oflag & O_CREAT) {
+        va_list ap;
+        va_start(ap, oflag);
+        mode_t mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+        return open(path, oflag, mode);
+    }
+    return open(path, oflag);
+}
+__attribute__((used, section("__DATA,__interpose")))
+static const struct { const void *replacement; const void *original; } interpose_open = {hook_open, open};
+"#,
+        )
+        .unwrap();
+        let cc = Command::new("cc")
+            .args(["-dynamiclib", "-o"])
+            .arg(&library)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            cc.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cc.stderr)
+        );
+
+        let mut command = f.cli();
+        command
+            .args(["watch", "--cached-start", "--progress"])
+            .stderr(Stdio::piped())
+            .env("DYLD_INSERT_LIBRARIES", &library)
+            .env("LUMEN_TEST_EBUSY_TARGET", fs::canonicalize(&sub).unwrap())
+            .env("LUMEN_TEST_EBUSY_MARKER", &hit_marker);
+        let mut watcher = Process::launch(&mut command);
+        assert_eq!(watcher.json()["event"], "cached");
+        assert_eq!(watcher.json()["event"], "ready");
+        watcher.child.kill().unwrap();
+        let stderr = std::io::read_to_string(watcher.child.stderr.take().unwrap()).unwrap();
+        assert!(
+            hit_marker.exists(),
+            "EBUSY interposer must have fired during verify_access"
+        );
+        assert!(stderr.contains("lumen watch: recovered"), "{stderr}");
+
+        assert_eq!(f.run(&["status"])["unverified"], 0);
+        assert_eq!(f.run(&["query", "important.md"])[0]["name"], "important.md");
+        assert_eq!(
+            f.run(&["query", "transientrecoveryneedle", "--mode", "text"])[0]["name"],
+            "important.md"
+        );
     }
 }

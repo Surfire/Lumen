@@ -66,6 +66,7 @@ pub fn verify_cached_access(hits: &mut Vec<crate::Hit>) {
                 return false;
             }
             if directory
+                && live.symlink_target.is_none()
                 && live.availability != "placeholder"
                 && !*directory_access
                     .entry(path.into())
@@ -74,17 +75,12 @@ pub fn verify_cached_access(hits: &mut Vec<crate::Hit>) {
                 return false;
             }
             if hit.snippet.is_some() || hit.document_stamp.is_some() {
-                return hit.document_stamp.is_some()
-                    && hit.document_stamp == live.stamp
-                    && if live.availability == "provider_metadata_only" {
-                        // The cached content hit already passed the saved document scope.
-                        std::fs::symlink_metadata(path).is_ok_and(|meta| {
-                            live.stamp.as_deref() == Some(crate::index::stamp(&meta).as_str())
-                                && crate::index::can_open_document(path, &meta)
-                        })
-                    } else {
-                        crate::watch::can_read_document(path, hit.document_stamp.as_deref())
-                    };
+                return hit.document_stamp.as_deref().is_some_and(|expected| {
+                    live.stamp
+                        .as_deref()
+                        .is_some_and(|actual| crate::index::stamp_matches(expected, actual))
+                        && crate::watch::can_read_document(path, Some(expected))
+                });
             }
             true
         });
@@ -426,10 +422,23 @@ impl<'a> CatalogValidator<'a> {
         if file.path != path || file.availability != availability {
             return Ok(false);
         }
+        if file.symlink_target.as_deref().is_some_and(|target| {
+            scope
+                .deny
+                .iter()
+                .any(|rule| crate::platform::denied_by(target, rule))
+                || crate::sensitive_path(target)
+        }) {
+            return Ok(false);
+        }
         let Some(stamp) = stamp else {
             return Ok(true);
         };
-        if file.stamp.as_deref() != Some(stamp) {
+        if !file
+            .stamp
+            .as_deref()
+            .is_some_and(|live| crate::index::stamp_matches(stamp, live))
+        {
             return Ok(false);
         }
         if matched_by == Some("image_embedding") {
@@ -455,7 +464,9 @@ impl<'a> CatalogValidator<'a> {
             )
             .optional()?
             .flatten();
-        Ok(stored.as_deref() == Some(stamp))
+        Ok(stored
+            .as_deref()
+            .is_some_and(|stored| crate::index::stamp_matches(stored, stamp)))
     }
 }
 
@@ -485,6 +496,15 @@ fn inspect(conn: &Connection, database: &Path, path: &Path) -> Diagnosis {
     if let Some(reason) = ruled_out(&file.path) {
         return Diagnosis::blocked(reason);
     }
+    if file.symlink_target.as_deref().is_some_and(|target| {
+        scope
+            .deny
+            .iter()
+            .any(|rule| crate::platform::denied_by(target, rule))
+            || crate::sensitive_path(target)
+    }) {
+        return Diagnosis::blocked(Reason::Excluded);
+    }
     inspect_file(conn, &scope, &file)
 }
 
@@ -509,9 +529,9 @@ fn inspect_file(conn: &Connection, scope: &Scope, file: &Selected) -> Diagnosis 
         return Diagnosis::blocked(Reason::Unknown);
     };
     let name = match item.as_ref() {
-        // Cloud entries are checked by stat alone. A missing exact cache row
-        // cannot disambiguate an alternate spelling of their indexed name.
-        None if file.availability != "local" => Reason::Unknown,
+        // Placeholder entries are checked by stat alone without opening an fd.
+        // A missing exact cache row cannot disambiguate an alternate spelling.
+        None if file.availability == "placeholder" => Reason::Unknown,
         None => Reason::NotIndexed,
         Some((_, _, availability)) if availability == "unverified" => Reason::Unverified,
         Some((_, kind, _)) if kind != "file" => Reason::Stale,
@@ -543,6 +563,9 @@ fn text_state(
     let explicit = in_explicit_content_root(scope, &file.path);
     if !resident_content_availability(file.availability, scope.documents && explicit) {
         return Reason::CloudNameOnly;
+    }
+    if file.symlink_target.is_some() {
+        return Reason::Symlink;
     }
     if !scope.documents {
         return Reason::TextDisabled;
@@ -580,7 +603,14 @@ fn text_state(
         .optional()
     {
         Ok(None) => Reason::NotIndexed,
-        Ok(Some(Some(stamp))) if file.stamp.as_deref() == Some(stamp.as_str()) => Reason::Indexed,
+        Ok(Some(Some(stamp)))
+            if file
+                .stamp
+                .as_deref()
+                .is_some_and(|live| crate::index::stamp_matches(&stamp, live)) =>
+        {
+            Reason::Indexed
+        }
         Ok(Some(Some(_))) => Reason::Stale,
         _ => Reason::Unknown,
     }
@@ -590,13 +620,17 @@ struct Selected {
     path: PathBuf,
     availability: &'static str,
     stamp: Option<String>,
+    symlink_target: Option<PathBuf>,
 }
 
 pub(crate) fn local_stamp(path: &Path, directory: bool) -> Option<String> {
     #[cfg(target_os = "macos")]
     let _io = crate::platform::NoMaterialization::enter().ok()?;
     let file = selected_metadata(path, directory).ok()?;
-    if file.path != path || file.availability != "local" {
+    if file.path != path
+        || file.symlink_target.is_some()
+        || !matches!(file.availability, "local" | "provider_metadata_only")
+    {
         return None;
     }
     file.stamp
@@ -664,7 +698,11 @@ impl MetadataBatch {
         }
         let parent = self.directory(path.parent().ok_or(Reason::Unknown)?)?;
         let (name, raw) = stat_component(parent, path)?;
-        if raw.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        let file_type = raw.st_mode & libc::S_IFMT;
+        if file_type == libc::S_IFLNK {
+            return Err(Reason::Symlink);
+        }
+        if file_type != libc::S_IFDIR {
             return Err(Reason::Missing);
         }
         metadata_availability(path, raw.st_flags, false)?;
@@ -679,12 +717,16 @@ impl MetadataBatch {
         use crate::platform::descriptor_path;
         let parent = self.directory(path.parent().ok_or(Reason::NotFile)?)?;
         let (name, raw) = stat_component(parent, path)?;
+        let file_type = raw.st_mode & libc::S_IFMT;
+        if file_type == libc::S_IFLNK {
+            return selected_symlink_metadata(parent, &name, &raw, directory);
+        }
         let expected = if directory {
             libc::S_IFDIR
         } else {
             libc::S_IFREG
         };
-        if raw.st_mode & libc::S_IFMT != expected {
+        if file_type != expected {
             return Err(Reason::NotFile);
         }
         let availability = metadata_availability(path, raw.st_flags, true)?;
@@ -697,6 +739,7 @@ impl MetadataBatch {
                 path,
                 availability,
                 stamp: None,
+                symlink_target: None,
             });
         }
         let (file, metadata) = open_component(parent, &name, &raw, directory)?;
@@ -706,8 +749,48 @@ impl MetadataBatch {
             path,
             availability,
             stamp: (availability != "placeholder").then(|| crate::index::stamp(&metadata)),
+            symlink_target: None,
         })
     }
+}
+
+#[cfg(target_os = "macos")]
+fn selected_symlink_metadata(
+    parent: &File,
+    name: &CString,
+    raw: &libc::stat,
+    directory: bool,
+) -> Result<Selected, Reason> {
+    use crate::platform::descriptor_path;
+    let flags = libc::O_SYMLINK | libc::O_EVTONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io_reason(io::Error::last_os_error()));
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata().map_err(io_reason)?;
+    if !metadata.file_type().is_symlink() {
+        return Err(Reason::Unknown);
+    }
+    if metadata.dev() != raw.st_dev as u64 || metadata.ino() != raw.st_ino {
+        return Err(Reason::Unknown);
+    }
+    let canonical = descriptor_path(&file).ok_or(Reason::Unknown)?;
+    let Some(resolved) = crate::index::resolve_one_level_symlink(&canonical) else {
+        return Err(Reason::Symlink);
+    };
+    if resolved.metadata.is_dir() != directory {
+        return Err(Reason::NotFile);
+    }
+    let link_availability =
+        crate::platform::classify(&canonical, crate::platform::dataless_flags(raw.st_flags));
+    let availability = crate::index::symlink_availability(link_availability, &resolved);
+    Ok(Selected {
+        path: canonical,
+        availability,
+        stamp: None,
+        symlink_target: Some(resolved.target),
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -729,10 +812,6 @@ fn stat_component(directory: &File, path: &Path) -> Result<(CString, libc::stat)
         return Err(io_reason(io::Error::last_os_error()));
     }
     let raw = unsafe { raw.assume_init() };
-    let file_type = raw.st_mode & libc::S_IFMT;
-    if file_type == libc::S_IFLNK {
-        return Err(Reason::Symlink);
-    }
     Ok((name, raw))
 }
 
@@ -853,8 +932,14 @@ mod tests {
 
         fs::remove_file(&second).unwrap();
         symlink(&first, &second).unwrap();
+        let linked = batch.selected_metadata(&second, false).unwrap();
+        assert_eq!(linked.path, second);
+        assert_eq!(linked.symlink_target.as_deref(), Some(first.as_path()));
+        assert!(linked.stamp.is_none());
+        let chained = parent.join("chained.txt");
+        symlink(&second, &chained).unwrap();
         assert!(matches!(
-            batch.selected_metadata(&second, false),
+            batch.selected_metadata(&chained, false),
             Err(Reason::Symlink)
         ));
         drop(batch);
@@ -891,6 +976,7 @@ mod tests {
             path: path.into(),
             availability: metadata_availability(path, flags, true).unwrap(),
             stamp: None,
+            symlink_target: None,
         };
         let diagnosis = inspect_file(&conn, &scope, &file);
         assert_eq!(diagnosis.name, Reason::Indexed);

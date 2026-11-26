@@ -438,7 +438,7 @@ def make_corpus(root):
         "open-safety.txt": "Stale action fixture.",
         "preview-safety.txt": "Stale Quick Look fixture.",
         "Excluded/privateneedle.txt": "Synthetic excluded path.",
-        "OneDrive - Synthetic/cloudledger.txt": "Synthetic provider path.",
+        "Library/CloudStorage/OneDrive - Synthetic/cloudledger.txt": "Synthetic provider path.",
         "青山月报.md": "合成测试样本。",
     }
     for name, content in samples.items():

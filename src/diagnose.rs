@@ -1,7 +1,10 @@
 //! Single-path diagnostics. The selected file contributes metadata, never bytes.
 use crate::{
     PdfHelperPolicy, Scope, absolute, document_stamp_sql,
-    index::{DocumentKind, INDEX_SIDECARS, is_index_path},
+    index::{
+        DocumentKind, INDEX_SIDECARS, in_explicit_content_root, is_index_path,
+        resident_content_availability,
+    },
     open_read, read_document_stamp, saved_index_scope, semantic, with_suffix,
 };
 use rusqlite::{Connection, OptionalExtension};
@@ -73,7 +76,15 @@ pub fn verify_cached_access(hits: &mut Vec<crate::Hit>) {
             if hit.snippet.is_some() || hit.document_stamp.is_some() {
                 return hit.document_stamp.is_some()
                     && hit.document_stamp == live.stamp
-                    && crate::watch::can_read_document(path, hit.document_stamp.as_deref());
+                    && if live.availability == "provider_metadata_only" {
+                        // The cached content hit already passed the saved document scope.
+                        std::fs::symlink_metadata(path).is_ok_and(|meta| {
+                            live.stamp.as_deref() == Some(crate::index::stamp(&meta).as_str())
+                                && crate::index::can_open_document(path, &meta)
+                        })
+                    } else {
+                        crate::watch::can_read_document(path, hit.document_stamp.as_deref())
+                    };
             }
             true
         });
@@ -427,13 +438,11 @@ impl<'a> CatalogValidator<'a> {
         // OCR and image embeddings share the live stamp. Even if only one
         // remains, an untyped cached image hit could have come from the other.
         let image = DocumentKind::for_path(&path) == Some(DocumentKind::Image);
+        let explicit = in_explicit_content_root(scope, &path);
         if !scope.documents
             || (image && (!scope.image_ocr || matched_by.is_none()))
-            || scope.content_roots.as_ref().is_some_and(|roots| {
-                !roots
-                    .iter()
-                    .any(|root| &path != root && path.starts_with(root))
-            })
+            || (scope.content_roots.is_some() && !explicit)
+            || !resident_content_availability(file.availability, explicit)
         {
             return Ok(false);
         }
@@ -531,17 +540,14 @@ fn text_state(
     name: Reason,
     id: Option<i64>,
 ) -> Reason {
-    if file.availability != "local" {
+    let explicit = in_explicit_content_root(scope, &file.path);
+    if !resident_content_availability(file.availability, scope.documents && explicit) {
         return Reason::CloudNameOnly;
     }
     if !scope.documents {
         return Reason::TextDisabled;
     }
-    if scope
-        .content_roots
-        .as_ref()
-        .is_some_and(|roots| !roots.iter().any(|root| file.path.starts_with(root)))
-    {
+    if scope.content_roots.is_some() && !explicit {
         return Reason::OutsideContentScope;
     }
     let Some(kind) = DocumentKind::for_path(&file.path) else {
@@ -682,7 +688,7 @@ impl MetadataBatch {
             return Err(Reason::NotFile);
         }
         let availability = metadata_availability(path, raw.st_flags, true)?;
-        if availability != "local" {
+        if availability == "placeholder" {
             // Do not open cloud-only leaves, even for events merely to get their spelling.
             let path = descriptor_path(parent)
                 .ok_or(Reason::Unknown)?
@@ -699,7 +705,7 @@ impl MetadataBatch {
         Ok(Selected {
             path,
             availability,
-            stamp: Some(crate::index::stamp(&metadata)),
+            stamp: (availability != "placeholder").then(|| crate::index::stamp(&metadata)),
         })
     }
 }

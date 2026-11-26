@@ -1842,6 +1842,42 @@ printf 'second batch text'
     }
 
     #[test]
+    fn cached_start_keeps_resident_provider_documents_verified() {
+        let f = Fixture::new();
+        let provider = f.0.join("OneDrive-Fixture");
+        let selected = provider.join("Selected");
+        fs::create_dir_all(&selected).unwrap();
+        fs::write(selected.join("resident.md"), "cachedresidentneedle").unwrap();
+        fs::write(provider.join("outside.md"), "outsidecloudneedle").unwrap();
+        f.run(&[
+            "index",
+            "--root",
+            provider.to_str().unwrap(),
+            "--content-root",
+            selected.to_str().unwrap(),
+        ]);
+        assert_eq!(f.run(&["content"])["indexed"], 1);
+
+        let mut watcher = Process::launch(
+            f.cli()
+                .args(["watch", "--cached-start", "--progress"])
+                .stderr(Stdio::piped()),
+        );
+        assert_eq!(watcher.json()["event"], "cached");
+        assert_eq!(watcher.json()["event"], "ready");
+        watcher.child.kill().unwrap();
+        let stderr = std::io::read_to_string(watcher.child.stderr.take().unwrap()).unwrap();
+        assert!(stderr.contains("lumen watch: recovered"), "{stderr}");
+
+        let mut checked = Serve::launch(&f, &["--check-access"]);
+        let hits = checked.hits("cachedresidentneedle", "text");
+        assert_eq!(hits[0]["name"], "resident.md");
+        assert_eq!(hits[0]["availability"], "provider_metadata_only");
+        assert!(checked.names("outsidecloudneedle", "text").is_empty());
+        assert_eq!(checked.names("outside.md", "name"), ["outside.md"]);
+    }
+
+    #[test]
     fn watcher_seeds_legacy_catalog_and_resumes_persisted_native_events() {
         let f = Fixture::new();
         let root = f.0.join("scope");
@@ -3339,9 +3375,10 @@ done
         let resources = f.0.join("Fixture.app/Contents/Resources");
         let root = f.0.join("scope");
         let selected = root.join("selected");
-        let provider = selected.join("Library/CloudStorage/OneDrive-Fixture");
+        let provider = root.join("Library/CloudStorage/OneDrive-Fixture");
         fs::create_dir_all(&resources).unwrap();
         fs::create_dir_all(&provider).unwrap();
+        fs::create_dir_all(&selected).unwrap();
         let engine = resources.join("lumen");
         fs::copy(env!("CARGO_BIN_EXE_lumen"), &engine).unwrap();
         let helper = resources.join("LumenImageOcrExtractor");
@@ -3524,12 +3561,165 @@ try rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithP
     }
 
     #[test]
+    fn explicit_cloud_content_root_seeds_only_resident_documents() {
+        let f = Fixture::new();
+        let provider = f.0.join("Library/CloudStorage/OneDrive-Fixture");
+        let selected = provider.join("Selected");
+        fs::create_dir_all(&selected).unwrap();
+        let resident = selected.join("resident.md");
+        let placeholder = selected.join("online-only.md");
+        let sibling = provider.join("outside.md");
+        for (path, body) in [
+            (&resident, "residentneedle indexed inside explicit scope"),
+            (&placeholder, "placeholderneedle must not be indexed"),
+            (&sibling, "outsideneedle must not be indexed"),
+        ] {
+            fs::write(path, body).unwrap();
+        }
+        let index = ["index", "--root", provider.to_str().unwrap()];
+        f.run(&index);
+        let db = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+        // APFS doesn't let ordinary files set SF_DATALESS via chflags. Inject
+        // its catalog classification, leaving a readable marker to catch reads.
+        db.execute(
+            "UPDATE item SET availability='placeholder' WHERE display='online-only.md'",
+            [],
+        )
+        .unwrap();
+        let scope = [
+            "content-scope",
+            "--content-root",
+            selected.to_str().unwrap(),
+        ];
+        assert_eq!(f.run(&scope)["content"]["pending"], 1);
+
+        // Reopening an unchanged pre-fix scope must also seed the existing row
+        // before any filesystem traversal (watch calls the same restrict_scope).
+        db.execute_batch(
+            "DELETE FROM content_job;
+            DELETE FROM info WHERE key='cloud_content_policy_v1';",
+        )
+        .unwrap();
+        assert_eq!(f.run(&scope)["content"]["pending"], 1);
+        assert_eq!(
+            f.run(&["content"]),
+            serde_json::json!({"processed":1,"indexed":1,"pending":0})
+        );
+        assert_eq!(f.run(&["status"])["gemma"]["pending"], true);
+
+        // Simulate the file becoming dataless after the catalog and job were
+        // written. The worker must reject the live SF_DATALESS flag too.
+        db.execute_batch(
+            "UPDATE item SET availability='provider_metadata_only' WHERE display='online-only.md';
+            INSERT INTO content_job(item_id) SELECT id FROM item WHERE display='online-only.md';",
+        )
+        .unwrap();
+        let source = f.0.join("dataless.c");
+        let library = f.0.join("dataless.dylib");
+        fs::write(&source, r#"
+#include <string.h>
+#include <sys/stat.h>
+static int dataless_lstat(const char *path, struct stat *buf) {
+    int result = lstat(path, buf);
+    const char *leaf = strrchr(path, '/');
+    if (result == 0 && leaf && strcmp(leaf, "/online-only.md") == 0)
+        buf->st_flags |= SF_DATALESS;
+    return result;
+}
+__attribute__((used, section("__DATA,__interpose")))
+static const struct { const void *replacement; const void *original; } hook = {dataless_lstat, lstat};
+"#).unwrap();
+        let compile = Command::new("cc")
+            .args(["-dynamiclib", "-o"])
+            .arg(&library)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let output = f
+            .cli()
+            .arg("content")
+            .env("DYLD_INSERT_LIBRARIES", &library)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+            serde_json::json!({"processed":1,"indexed":0,"pending":0})
+        );
+        assert_eq!(
+            f.run(&["diagnose", resident.to_str().unwrap()]),
+            serde_json::json!({
+                "name":"indexed", "text":"indexed", "semantic":"pending_gemma", "availability":"provider_metadata_only"
+            })
+        );
+        assert_eq!(
+            f.run(&["diagnose", sibling.to_str().unwrap()])["text"],
+            "cloud_name_only"
+        );
+        let hits = f.run(&[
+            "query",
+            "residentneedle",
+            "--mode",
+            "text",
+            "--check-access",
+        ]);
+        assert_eq!(hits[0]["name"], "resident.md");
+        assert_eq!(hits[0]["availability"], "provider_metadata_only");
+        for term in ["placeholderneedle", "outsideneedle"] {
+            assert_eq!(
+                f.run(&["query", term, "--mode", "text"]),
+                serde_json::json!([])
+            );
+        }
+        assert_eq!(
+            f.run(&["query", "outside.md"])[0]["availability"],
+            "provider_metadata_only"
+        );
+
+        let helper = f.0.join("cloud-vector-helper");
+        executable(
+            &helper,
+            "#!/bin/sh\ncat >/dev/null\nprintf '[1,0,0,0,0,0,0,0]'\n",
+        );
+        assert_eq!(
+            f.run(&["embed", "--helper", helper.to_str().unwrap()])["new_embeddings"],
+            1
+        );
+        fs::remove_file(placeholder).unwrap();
+        let watcher = watch(&f, &[]);
+        assert_eq!(f.run(&["status"])["embedded_chunks"], 1);
+        fs::write(
+            selected.join("new.md"),
+            "newresidentneedle picked up by watch",
+        )
+        .unwrap();
+        assert_eq!(watcher.json()["event"], "updated");
+        assert_eq!(f.run(&["content"])["indexed"], 1);
+        drop(watcher);
+        f.run(&[&index[..], &["--documents"]].concat());
+        assert_eq!(f.run(&["status"])["embedded_chunks"], 0);
+        assert_eq!(
+            f.run(&["query", "residentneedle", "--mode", "text"]),
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
     fn separate_content_resumes_batches_and_narrows_without_retiring_names() {
         let f = Fixture::new();
         let scope = f.0.join("scope");
         let selected = scope.join("Selected");
         let ignored = selected.join("Denied");
-        let cloud = selected.join("Library/CloudStorage/OneDrive-Test");
+        let cloud = scope.join("Library/CloudStorage/OneDrive-Test");
         let second = scope.join("Second");
         for directory in [&ignored, &cloud, &second] {
             fs::create_dir_all(directory).unwrap();

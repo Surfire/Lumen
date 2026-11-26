@@ -36,9 +36,9 @@ All milestones follow [AGENTS.md](../../AGENTS.md) anti-over-defense rules and e
 
 ---
 
-## Milestone 5: Window Management & Lightweight Script Commands (`pending`)
+## Milestone 5: Window Management & Lightweight Script Commands (`done`)
 
-### `T17` Native Accessibility Window Management (`pending`)
+### `T17` Native Accessibility Window Management (`done`)
 - **Worktree**: `m5-windows-scripts`
 - **Scope**:
   - Single shared `AXWindowAccess` layer (`AXUIElementSetMessagingTimeout` per element so hung apps never stall main): act on focused/main eligible standard window (excluding sheets/popovers/fullscreen/minimized unless unminimizing on switch).
@@ -46,7 +46,7 @@ All milestones follow [AGENTS.md](../../AGENTS.md) anti-over-defense rules and e
   - Explicit macOS Accessibility (`AXIsProcessTrusted`) onboarding banner + deep-link to System Settings → Privacy & Security → Accessibility when not yet granted; zero silent background prompt loops.
   - Geometry/layout planner pure Swift unit tests across multi-display/notch/`visibleFrame` coordinate conversions (`AppKit` bottom-left vs `AXUIElement` top-left).
 
-### `T18` Local Script Commands & Apple Shortcuts (`pending`)
+### `T18` Local Script Commands & Apple Shortcuts (`done`)
 - **Worktree**: `m5-windows-scripts`
 - **Scope**:
   - Opt-in local user scripts folder (e.g. `~/Library/Application Support/Lumen/Scripts` or user-selected folder under Settings) parsed for simple comment headers (`@lumen.title`, `@lumen.alias`, `@lumen.mode` = `compact` / `fullOutput` / `silent` / `inline`, `@lumen.argument1`), strictly non-recursive/non-symlinked regular executable files with explicit user consent on folder selection.

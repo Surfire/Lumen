@@ -698,22 +698,39 @@ final class LauncherSmoke {
             ClipboardItem(id: Int64(id), text: text, capturedAt: .now, sourceBundleID: "org.lumen.fixture",
                           sourceAppName: "Fixture Editor", pinned: false)
         }
-        try check(ClipboardItem.filtered(items, for: "fíxture editor").count == 500 &&
-                  ClipboardItem.filtered(items, for: "tail hit").isEmpty && items.first?.text == text,
-                  "search should fold metadata, index only the text prefix, and preserve the full payload")
-        // Nearly matching substring and fuzzy needles both fail at the last scalar.
-        let query = String(repeating: "a", count: 31) + "z"
+        try check(ClipboardItem.filtered(items, for: "fíxture editor").count == 500,
+                  "clipboard search did not fold metadata")
+        try check(ClipboardItem.filtered(items, for: "tail hit").count == 500 && items.first?.text == text,
+                  "clipboard search did not index and preserve the full payload")
+        let longFuzzyQuery = String(repeating: "a", count: 32) + "h"
+        try check(ClipboardItem.filtered(items, for: longFuzzyQuery).count == 500,
+                  "clipboard search missed a 33-scalar fuzzy match")
+
+        let rankedItems = [
+            ClipboardItem(id: 1, text: "界 / 🙂", capturedAt: .now, sourceBundleID: nil, sourceAppName: nil, pinned: false),
+            ClipboardItem(id: 2, text: "界 / 🙂", capturedAt: .now, sourceBundleID: nil, sourceAppName: "界🙂 Editor", pinned: false),
+        ]
+        try check(ClipboardItem.filtered(rankedItems, for: "界🙂").map(\.id) == [2, 1],
+                  "a literal app name match did not outrank a fuzzy text match")
+
         let clock = ContinuousClock()
-        let samples = try (0..<20).map { _ in
-            let start = clock.now
-            let rows = ClipboardItem.filtered(items, for: query)
-            let elapsed = start.duration(to: clock.now)
-            try check(rows.isEmpty, "worst-case clipboard filter unexpectedly matched")
-            return elapsed
-        }.sorted()
-        let p95 = samples[18]
-        try check(p95 < .milliseconds(15), "500-item clipboard search exceeded 15 ms (p95: \(p95))")
-        print("500-item clipboard no-match search: p95 \(p95)")
+        let queries = [
+            ("absent character", String(repeating: "a", count: 31) + "z"),
+            // All bytes are present, but the first 't' is near the end with no 'a' after it.
+            ("all bytes present", "t" + String(repeating: "a", count: 32)),
+        ]
+        for (label, query) in queries {
+            let samples = try (0..<20).map { _ in
+                let start = clock.now
+                let rows = ClipboardItem.filtered(items, for: query)
+                let elapsed = start.duration(to: clock.now)
+                try check(rows.isEmpty, "500-item clipboard no-match query (\(label)) unexpectedly matched")
+                return elapsed
+            }.sorted()
+            let p95 = samples[18]
+            try check(p95 < .milliseconds(15), "500-item clipboard search (\(label)) exceeded 15 ms (p95: \(p95))")
+            print("500-item clipboard no-match search (\(label)): p95 \(p95)")
+        }
     }
 
     private func verifyClipboardStorageLinks() throws {

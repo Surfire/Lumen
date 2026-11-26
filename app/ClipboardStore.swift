@@ -13,9 +13,58 @@ struct ClipboardItem: Identifiable, Equatable {
     let sourceAppName: String?
     let pinned: Bool
 
-    private static let searchPrefixLength = 2_048
-    private static let maximumFuzzyLength = 32
-    private let searchableFields: [Data]
+    private struct SearchField: Equatable {
+        let bytes: [UInt8]
+        let lowMask: UInt64
+        let highMask: UInt64
+        let nonAsciiMask: UInt64
+
+        init(_ value: String) {
+            bytes = Array(ClipboardItem.fold(value).utf8)
+            (lowMask, highMask, nonAsciiMask) = Self.presenceMask(bytes)
+        }
+
+        static func presenceMask(_ bytes: [UInt8]) -> (UInt64, UInt64, UInt64) {
+            var low: UInt64 = 0
+            var high: UInt64 = 0
+            var nonAscii: UInt64 = 0
+            for byte in bytes {
+                let bit = UInt64(1) << (byte & 63)
+                switch byte {
+                case 0..<64: low |= bit
+                case 64..<128: high |= bit
+                default: nonAscii |= bit
+                }
+            }
+            return (low, high, nonAscii)
+        }
+
+        func match(needle: UnsafeBufferPointer<UInt8>, scalarRanges: [Range<Int>], checkFuzzy: Bool) -> SearchMatch? {
+            bytes.withUnsafeBufferPointer { field in
+                guard field.count >= needle.count, let base = field.baseAddress, let query = needle.baseAddress else { return nil }
+                // Valid UTF-8 is self-synchronizing, so these byte searches match whole scalars.
+                if memmem(base, field.count, query, needle.count) != nil { return .substring }
+                guard checkFuzzy else { return nil }
+
+                var offset = 0
+                for scalar in scalarRanges {
+                    let remaining = field.count - offset
+                    guard remaining >= scalar.count else { return nil }
+                    let start = base + offset
+                    let scalarStart = query + scalar.lowerBound
+                    let found = scalar.count == 1
+                        ? memchr(start, Int32(scalarStart.pointee), remaining)
+                        : memmem(start, remaining, scalarStart, scalar.count)
+                    guard let found else { return nil }
+                    offset = UnsafeRawPointer(base).distance(to: UnsafeRawPointer(found)) + scalar.count
+                }
+                return .fuzzy
+            }
+        }
+    }
+
+    private enum SearchMatch { case substring, fuzzy }
+    private let searchableFields: [SearchField]
 
     init(id: Int64, text: String?, capturedAt: Date, sourceBundleID: String?, sourceAppName: String?, pinned: Bool) {
         self.id = id
@@ -24,10 +73,7 @@ struct ClipboardItem: Identifiable, Equatable {
         self.sourceBundleID = sourceBundleID
         self.sourceAppName = sourceAppName
         self.pinned = pinned
-        // Only the search index is truncated; copy and preview still use the original text.
-        searchableFields = [text, sourceAppName, sourceBundleID].compactMap { field in
-            field.map { Data(Self.fold(String($0.unicodeScalars.prefix(Self.searchPrefixLength))).utf8) }
-        }
+        searchableFields = [text, sourceAppName, sourceBundleID].compactMap { $0.map(SearchField.init) }
     }
 
     private static func fold(_ value: String) -> String {
@@ -40,27 +86,38 @@ struct ClipboardItem: Identifiable, Equatable {
         guard !query.isEmpty else { return items }
         let folded = fold(query)
         guard !folded.isEmpty else { return [] }
-        let needle = Data(folded.utf8)
-        let scalars = folded.unicodeScalars.prefix(maximumFuzzyLength + 1)
-        let fuzzyNeedles = scalars.count <= maximumFuzzyLength ? scalars.map { Data(String($0).utf8) } : []
-        var substrings: [ClipboardItem] = []
-        var fuzzy: [ClipboardItem] = []
-        for item in items {
-            if item.searchableFields.contains(where: { $0.range(of: needle) != nil }) {
-                substrings.append(item)
-            } else if !fuzzyNeedles.isEmpty, item.searchableFields.contains(where: { field in
-                var offset = field.startIndex
-                // Match complete UTF-8 scalars, not individual bytes from different characters.
-                for scalar in fuzzyNeedles {
-                    guard let match = field.range(of: scalar, in: offset..<field.endIndex) else { return false }
-                    offset = match.upperBound
-                }
-                return true
-            }) {
-                fuzzy.append(item)
-            }
+        let needleBytes = Array(folded.utf8)
+        let (needLow, needHigh, needNonAscii) = SearchField.presenceMask(needleBytes)
+        var scalarRanges: [Range<Int>] = []
+        var offset = 0
+        for scalar in folded.unicodeScalars {
+            let end = offset + scalar.utf8.count
+            scalarRanges.append(offset..<end)
+            offset = end
         }
-        return substrings + fuzzy
+
+        return needleBytes.withUnsafeBufferPointer { needle in
+            var substrings: [ClipboardItem] = []
+            var fuzzy: [ClipboardItem] = []
+            for item in items {
+                var bestMatch: SearchMatch?
+                for field in item.searchableFields {
+                    if (field.lowMask & needLow) != needLow || (field.highMask & needHigh) != needHigh ||
+                        (field.nonAsciiMask & needNonAscii) != needNonAscii { continue }
+                    // After a fuzzy hit, later fields can still promote the item to a substring hit.
+                    if let match = field.match(needle: needle, scalarRanges: scalarRanges, checkFuzzy: bestMatch == nil) {
+                        bestMatch = match
+                        if match == .substring { break }
+                    }
+                }
+                switch bestMatch {
+                case .substring: substrings.append(item)
+                case .fuzzy: fuzzy.append(item)
+                case nil: break
+                }
+            }
+            return substrings + fuzzy
+        }
     }
 }
 

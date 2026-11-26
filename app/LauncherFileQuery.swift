@@ -2,6 +2,8 @@ import Foundation
 
 /// Normalize Spotlight-style qualifiers before sending them to the lexical engine.
 struct LauncherFileQuery {
+    private static let tokenRegex = try! NSRegularExpression(pattern: #"(?:[^\s"“”]+|["“][^"”]*(?:["”]|$))+"#)
+
     let words: String
     private let kinds: [String]
     private let paths: [String]
@@ -16,8 +18,10 @@ struct LauncherFileQuery {
     var isFiltered: Bool { !kinds.isEmpty || !paths.isEmpty || !extensions.isEmpty }
 
     init(_ raw: String) {
-        let pattern = #"(?:[^\s"“”]+|["“][^"”]*(?:["”]|$))+"#
-        let tokens = raw.ranges(of: pattern, options: .regularExpression).map { String(raw[$0]) }
+        let fullRange = NSRange(raw.startIndex..<raw.endIndex, in: raw)
+        let tokens = Self.tokenRegex.matches(in: raw, range: fullRange).compactMap { match in
+            Range(match.range, in: raw).map { String(raw[$0]) }
+        }
         var words: [String] = []
         var extensions: [String] = []
         var kinds: [String] = []
@@ -71,17 +75,5 @@ struct LauncherFileQuery {
         guard unquoted.hasPrefix("/") || unquoted.hasPrefix("~/") else { return nil }
         // Preserve the trailing slash, which distinguishes a subtree from its root row.
         return unquoted.precomposedStringWithCanonicalMapping
-    }
-}
-
-private extension String {
-    func ranges(of pattern: String, options: String.CompareOptions) -> [Range<String.Index>] {
-        var ranges: [Range<String.Index>] = []
-        var start = startIndex
-        while start < endIndex, let match = range(of: pattern, options: options, range: start..<endIndex) {
-            ranges.append(match)
-            start = match.upperBound
-        }
-        return ranges
     }
 }

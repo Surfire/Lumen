@@ -1,5 +1,6 @@
 import AppKit
 import CryptoKit
+import os
 import SwiftUI
 
 struct SavedShortcut: Codable, Equatable, Identifiable {
@@ -66,9 +67,36 @@ final class LauncherFrecency {
         entries = defaults?.data(forKey: key).flatMap { try? JSONDecoder().decode([String: Entry].self, from: $0) } ?? [:]
     }
 
+    private struct FileIDCache: Sendable {
+        static let maxEntries = 2048
+        var values: [String: String] = [:]
+        var keys: [String] = []
+        var head = 0
+
+        mutating func insert(_ id: String, for path: String) {
+            if values[path] != nil { return }
+            if values.count >= Self.maxEntries {
+                let evicted = keys[head]
+                keys[head] = path
+                head = (head + 1) % Self.maxEntries
+                values.removeValue(forKey: evicted)
+            } else {
+                keys.append(path)
+            }
+            values[path] = id
+        }
+    }
+
+    private nonisolated static let fileIDCache = OSAllocatedUnfairLock(initialState: FileIDCache())
+
     nonisolated static func fileID(_ path: String) -> String {
+        if let cached = fileIDCache.withLock({ $0.values[path] }) {
+            return cached
+        }
         // Do not keep a plaintext list of opened file paths in preferences.
-        "file:" + Data(SHA256.hash(data: Data(path.utf8))).base64EncodedString()
+        let id = "file:" + Data(SHA256.hash(data: Data(path.utf8))).base64EncodedString()
+        fileIDCache.withLock { $0.insert(id, for: path) }
+        return id
     }
 
     func noteOpened(_ id: String, now: Date = .now) {

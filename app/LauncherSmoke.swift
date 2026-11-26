@@ -235,8 +235,8 @@ final class LauncherSmoke {
         let model = app.model
         var observedScan: [IndexProgress] = []
         var observedWatch: [IndexProgress] = []
-        let scanObservation = model.$scanProgress.compactMap { $0 }.sink { observedScan.append($0) }
-        let watchObservation = model.$watchProgress.compactMap { $0 }.sink { observedWatch.append($0) }
+        let scanObservation = model.indexStatus.$scanProgress.compactMap { $0 }.sink { observedScan.append($0) }
+        let watchObservation = model.indexStatus.$watchProgress.compactMap { $0 }.sink { observedWatch.append($0) }
         defer { scanObservation.cancel(); watchObservation.cancel() }
         try check(!app.searchPresented && !NSApp.windows.contains { $0 is SearchPanel }, "startup opened the search panel")
         guard let search = app.statusMenu?.items.first, let action = search.action else { throw Failure("missing status menu item") }
@@ -1025,6 +1025,7 @@ final class LauncherSmoke {
         try await verifyBackgroundEmbeddingInterleavesContent()
         try await verifyPhase1Regressions()
         try await verifyPhase2Regressions(app)
+        try await verifyPhase3Regressions(app)
         try check(model.indexPhase == .needsIndex && !model.canSearch, "action smoke unexpectedly had a file index")
         func chosen() -> LaunchAction? {
             if case .action(let action)? = model.selectedResult { return action }
@@ -4069,7 +4070,7 @@ final class LauncherSmoke {
         try check(batches == ["content", "embed", "content", "embed", "content", "embed"],
                   "semantic indexing waited for content to drain: \(batches)")
         var resumedFromIdle = false
-        let stateUpdates = model.$embeddingState.sink { if $0 == .idle { resumedFromIdle = true } }
+        let stateUpdates = model.indexStatus.$embeddingState.sink { if $0 == .idle { resumedFromIdle = true } }
         defer { stateUpdates.cancel() }
         try Data().write(to: root.appendingPathComponent("recover-document"))
         try await until("watch recovery automatically embedded newly visible text") {
@@ -4395,6 +4396,280 @@ final class LauncherSmoke {
 
         try type("", into: app)
         print("Phase 2 core regressions passed (HotKey, PanelGeometry, ranking, 2-Han semantic trigger, image-status retry, Tab, calc ^/commas, wiki locale)")
+    }
+
+    private func verifyPhase3Regressions(_ app: AppDelegate) async throws {
+        let model = app.model
+        // 1. L3 Physical Split: background indexStatus mutations trigger 0 Launcher.objectWillChange pulses and 0 panel relayouts.
+        var launcherPulses = 0
+        var statusPulses = 0
+        let launcherSub = model.objectWillChange.sink { launcherPulses += 1 }
+        let statusSub = model.indexStatus.objectWillChange.sink { statusPulses += 1 }
+        defer { launcherSub.cancel(); statusSub.cancel() }
+
+        let savedScan = model.indexStatus.scanProgress
+        let savedWatch = model.indexStatus.watchProgress
+        let savedContent = model.indexStatus.contentRunning
+        let savedBatch = model.indexStatus.embeddingBatch
+        let frameBefore = app.panel.frame
+
+        let probeScan = IndexProgress(event: "progress", phase: "scanning", entries: 42, elapsed_ms: 500, estimated_total: 100, eta_seconds: 1)
+        let probeWatch = IndexProgress(event: "progress", phase: "scanning", entries: 7, elapsed_ms: 100, estimated_total: nil, eta_seconds: nil)
+        let probeBatch = EmbeddingBatch(new_embeddings: 3, skipped_chunks: 1, has_more: true)
+        model.indexStatus.set(\.scanProgress, to: probeScan)
+        model.indexStatus.set(\.watchProgress, to: probeWatch)
+        model.indexStatus.set(\.contentRunning, to: !savedContent)
+        model.indexStatus.set(\.embeddingBatch, to: probeBatch)
+        try check(launcherPulses == 0 && statusPulses == 4,
+                  "background indexStatus mutations leaked to Launcher.objectWillChange (\(launcherPulses)) or missed status pulses (\(statusPulses))")
+
+        // Equal-value guarded writes emit 0 pulses on both Launcher and IndexStatusState.
+        model.indexStatus.set(\.scanProgress, to: probeScan)
+        model.indexStatus.set(\.watchProgress, to: probeWatch)
+        model.indexStatus.set(\.contentRunning, to: !savedContent)
+        model.indexStatus.set(\.embeddingBatch, to: probeBatch)
+        model.setQuery(model.query)
+        model.set(\.selectedID, to: model.selectedID)
+        model.set(\.hotKey, to: model.hotKey)
+        model.set(\.hotKeyIssue, to: model.hotKeyIssue)
+        model.set(\.language, to: model.language)
+        try check(launcherPulses == 0 && statusPulses == 4,
+                  "no-op guarded setters emitted pulses (launcher=\(launcherPulses), status=\(statusPulses))")
+
+        try await Task.sleep(for: .milliseconds(50))
+        try check(app.panel.frame == frameBefore && launcherPulses == 0,
+                  "indexStatus updates triggered SearchPanel relayout")
+
+        model.indexStatus.set(\.scanProgress, to: savedScan)
+        model.indexStatus.set(\.watchProgress, to: savedWatch)
+        model.indexStatus.set(\.contentRunning, to: savedContent)
+        model.indexStatus.set(\.embeddingBatch, to: savedBatch)
+        try check(launcherPulses == 0, "restoring indexStatus emitted Launcher.objectWillChange")
+
+        // 2. Bounded caches & precomputed normalization & visibleResults caching.
+        let samplePath = "/tmp/phase3/cached-file.txt"
+        let firstID = LauncherFrecency.fileID(samplePath)
+        try check(firstID.hasPrefix("file:") && LauncherFrecency.fileID(samplePath) == firstID,
+                  "LauncherFrecency.fileID was not stable across cached lookups")
+        for index in 0..<2100 {
+            let id = LauncherFrecency.fileID("/tmp/phase3/bulk-\(index).txt")
+            try check(id.hasPrefix("file:"), "LauncherFrecency.fileID failed under >2048 cache churn")
+        }
+        try check(LauncherFrecency.fileID(samplePath) == firstID,
+                  "LauncherFrecency.fileID changed after bounded cache eviction")
+
+        let precomputed = LaunchAction(id: "app:phase3.demo", english: "Visual Studio Code", chinese: "VS Code 中文",
+                                       symbol: "app", destination: .application(URL(fileURLWithPath: "/Applications/Demo.app"), stamp: "0"),
+                                       aliases: ["vscode", "代码"])
+        try check(precomputed.normalizedNames == ["visualstudiocode", "vscode中文"] &&
+                  precomputed.normalizedSearchable == ["visualstudiocode", "vscode中文", "vscode", "代码"] &&
+                  LaunchCatalog.matches("vscode", actions: [precomputed]).first?.action.id == precomputed.id,
+                  "LaunchAction did not precompute normalized names/searchable cleanly")
+
+        let highlight = LauncherHighlight("cdyh")
+        for index in 0..<520 {
+            _ = highlight.text("测试文件第\(index)号", size: 13, colorScheme: .light, mode: .action)
+        }
+        let painted = highlight.text("成都银行", size: 13, colorScheme: .light, mode: .action).runs
+            .filter { $0.foregroundColor != nil }.count
+        let repainted = highlight.text("成都银行", size: 13, colorScheme: .light, mode: .action).runs
+            .filter { $0.foregroundColor != nil }.count
+        try check(painted > 0 && painted == repainted, "LauncherHighlight pinyin LRU cache broke highlighting")
+
+        // Icon cache survives dismissSearch() without wiping loaded CGImages.
+        try type("lap", into: app)
+        try await until("icon loaded before dismissSearch caching check") {
+            guard case .action(let action)? = model.visibleResults.first,
+                  let key = ApplicationIcons.Key(action) else { return false }
+            return app.applicationIcons.images[key] != nil
+        }
+        guard case .action(let lapAction)? = model.visibleResults.first,
+              let lapKey = ApplicationIcons.Key(lapAction) else {
+            throw Failure("missing LaunchAction for icon cache persistence test")
+        }
+        app.dismissSearch()
+        try check(app.applicationIcons.images[lapKey] != nil, "dismissSearch wiped cached app icons")
+        app.showSearch()
+
+        // 3. Dual-lane CoreSearchConnection: blocked text/validate lane never delays name lane.
+        let resources = Bundle.main.resourceURL ?? Bundle.main.bundleURL.appendingPathComponent("Contents/Resources")
+        let bundled = resources.appendingPathComponent("lumen")
+        let laneDir = directory.appendingPathComponent("phase3-dual-lane", isDirectory: true)
+        let laneCorpus = laneDir.appendingPathComponent("corpus", isDirectory: true)
+        try FileManager.default.createDirectory(at: laneCorpus, withIntermediateDirectories: true)
+        let laneFile = laneCorpus.appendingPathComponent("lane-probe.txt")
+        try Data("dual lane body needle".utf8).write(to: laneFile)
+        let laneDB = laneDir.appendingPathComponent("index.sqlite")
+        let indexer = Process()
+        indexer.executableURL = bundled
+        indexer.arguments = ["--db", laneDB.path, "index", "--root", laneCorpus.path, "--documents"]
+        try indexer.run()
+        indexer.waitUntilExit()
+        try check(indexer.terminationStatus == 0, "bundled indexer failed during phase3 dual-lane setup")
+
+        let laneEngine = LauncherEngine(executable: bundled, database: laneDB)
+        defer { laneEngine.close() }
+        try check(laneEngine.usesCoreLibrary, "bundled engine did not enable CoreSearchConnection")
+        guard let core = laneEngine.core else { throw Failure("missing CoreSearchConnection") }
+
+        var statusReport: IndexReport?
+        laneEngine.status(includeScope: true) { response in
+            if response.succeeded { statusReport = try? JSONDecoder().decode(IndexReport.self, from: response.output) }
+        }
+        try await until("LauncherEngine.status(includeScope:) did not return report") { statusReport != nil }
+        try check((statusReport?.items ?? 0) >= 1, "LauncherEngine.status report had zero items")
+
+        let releaseText = DispatchSemaphore(value: 0)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            core.textLane.worker.queue.async {
+                continuation.resume()
+                releaseText.wait()
+            }
+        }
+
+        var textDone = false
+        var validateDone = false
+        var nameHits: [SearchHit]?
+        laneEngine.search("needle", mode: "text") { _ in textDone = true }
+        let probeHit = SearchHit(path: IndexScope.folderPath(laneFile), name: "lane-probe.txt", kind: "file",
+                                 availability: "local", matched_by: "name", snippet: nil, document_stamp: nil, pdf_page: nil)
+        laneEngine.validate([probeHit]) { _ in validateDone = true }
+        laneEngine.search("lane-probe", mode: "name") { result in
+            nameHits = try? result.get()
+        }
+        try await until("name lane was blocked by text/validate lane") { nameHits != nil }
+        try check(!textDone && !validateDone && nameHits?.contains(where: { $0.name == "lane-probe.txt" }) == true,
+                  "name search waited on text/validate lane or missed lane-probe.txt")
+        releaseText.signal()
+        try await until("blocked text and validate requests did not finish after release") { textDone && validateDone }
+
+        // 4. ContentBatch poison-pill skip & streaming embed / image-index client paths.
+        let streamDir = directory.appendingPathComponent("phase3-stream", isDirectory: true)
+        try FileManager.default.createDirectory(at: streamDir, withIntermediateDirectories: true)
+        let streamEngineFile = streamDir.appendingPathComponent("engine")
+        let streamDB = streamDir.appendingPathComponent("index.sqlite")
+        let streamScript = #"""
+        #!/usr/bin/python3
+        import json, signal, sys, time
+        from pathlib import Path
+        root = Path(__file__).parent
+        command, *args = sys.argv[3:]
+        if command == 'status':
+            pending = not (root / 'embed-done').exists()
+            print(json.dumps(dict(
+                items=2, documents=2,
+                scope=dict(roots=[str(root)], allow=[], deny=[], documents=True, content_roots=[str(root)]),
+                content=dict(pending=0, checked=2, total=2),
+                gemma=dict(documents_enabled=True, embedded_chunks=0, skipped_chunks=0, pending=pending, limited=False, chunk_limit=100)
+            )))
+        elif command == 'watch':
+            if '--help' in args:
+                print('--progress')
+            else:
+                print('{"event":"ready"}', flush=True)
+                signal.pause()
+        elif command == 'model-status':
+            print(json.dumps(dict(available=True, verified='--verify' in args)))
+        elif command == 'embed':
+            assert '--stream' in args and '--max' in args
+            with (root / 'embed-launches').open('a') as f:
+                f.write('1\n')
+            if (root / 'pause-mode').exists():
+                def stopped(*_):
+                    (root / 'embed-sigterm').touch()
+                    sys.exit(0)
+                signal.signal(signal.SIGTERM, stopped)
+                print(json.dumps(dict(new_embeddings=1, skipped_chunks=0, has_more=True)), flush=True)
+                (root / 'embed-first-sent').touch()
+                signal.pause()
+            else:
+                print(json.dumps(dict(new_embeddings=4, skipped_chunks=0, has_more=True)), flush=True)
+                time.sleep(0.02)
+                (root / 'embed-done').touch()
+                print(json.dumps(dict(new_embeddings=2, skipped_chunks=1, has_more=False)), flush=True)
+        elif command == 'image-status':
+            vectors = 4 if (root / 'img-done').exists() else 0
+            print(json.dumps(dict(root=str(root), vectors=vectors)))
+        elif command == 'image-index':
+            assert '--stream' in args and '--max' in args
+            with (root / 'img-launches').open('a') as f:
+                f.write('1\n')
+            print(json.dumps(dict(indexed=2, reused=1, limited=False, next_after='k1')), flush=True)
+            time.sleep(0.02)
+            (root / 'img-done').touch()
+            print(json.dumps(dict(indexed=1, reused=0, limited=False, next_after=None)), flush=True)
+        """#
+        try Data(streamScript.utf8).write(to: streamEngineFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: streamEngineFile.path)
+        try Data().write(to: streamDB)
+        let streamDefaultsSuite = "lumen-phase3-stream-\(UUID().uuidString)"
+        guard let streamDefaults = UserDefaults(suiteName: streamDefaultsSuite) else {
+            throw Failure("missing isolated phase3 defaults")
+        }
+        defer { streamDefaults.removePersistentDomain(forName: streamDefaultsSuite) }
+
+        let streamEngine = LauncherEngine(executable: streamEngineFile, database: streamDB, supportsStreamingBatches: true)
+        let streamModel = Launcher(engine: streamEngine, defaults: streamDefaults, locale: "en")
+        defer { streamModel.close() }
+        streamModel.start(automaticallyIndex: false)
+        try await until("phase3 stream fixture did not become searchable") { streamModel.canSearch && streamModel.watchState == .running }
+
+        streamModel.applyContentBatch(ContentBatch(processed: 0, indexed: 0, pending: 2, skipped: 1))
+        try check(!streamModel.contentFailed, "skipped poison-pill ContentBatch wrongly set contentFailed")
+        streamModel.applyContentBatch(ContentBatch(processed: 0, indexed: 0, pending: 2, skipped: 0))
+        try check(streamModel.contentFailed, "zero-progress ContentBatch did not set contentFailed")
+
+        streamModel.buildEmbeddings()
+        try await until("streaming embed did not reach finished") {
+            streamModel.embeddingState == .finished && streamModel.indexWork == nil &&
+                streamModel.gemmaCoverage?.pending == false
+        }
+        let embedLaunches = try String(contentsOf: streamDir.appendingPathComponent("embed-launches"), encoding: .utf8)
+            .split(separator: "\n").count
+        try check(embedLaunches == 1 && streamModel.embeddingBatch?.new_embeddings == 2 &&
+                  streamModel.embeddingBatch?.skipped_chunks == 1,
+                  "streaming embed launched multiple processes (\(embedLaunches)) or missed final batch")
+        streamModel.close()
+
+        try? FileManager.default.removeItem(at: streamDir.appendingPathComponent("embed-done"))
+        try Data().write(to: streamDir.appendingPathComponent("pause-mode"))
+        let pauseDefaultsSuite = "lumen-phase3-pause-\(UUID().uuidString)"
+        guard let pauseDefaults = UserDefaults(suiteName: pauseDefaultsSuite) else {
+            throw Failure("missing isolated phase3 pause defaults")
+        }
+        defer { pauseDefaults.removePersistentDomain(forName: pauseDefaultsSuite) }
+        let pauseModel = Launcher(engine: streamEngine, defaults: pauseDefaults, locale: "en")
+        defer { pauseModel.close() }
+        pauseModel.start(automaticallyIndex: false)
+        try await until("phase3 pause fixture did not become ready") {
+            pauseModel.canSearch && pauseModel.watchState == .running && pauseModel.canBuildEmbeddings
+        }
+        pauseModel.buildEmbeddings()
+        try await until("streaming embed did not emit first batch") {
+            FileManager.default.fileExists(atPath: streamDir.appendingPathComponent("embed-first-sent").path)
+        }
+        pauseModel.pauseEmbeddings()
+        try await until("streaming pause did not send SIGTERM and settle in paused") {
+            FileManager.default.fileExists(atPath: streamDir.appendingPathComponent("embed-sigterm").path) &&
+                pauseModel.embeddingState == .paused && pauseModel.embeddingNotice == nil
+        }
+        pauseModel.close()
+
+        let streamImages = LauncherImageSearch(engine: streamEngine, defaults: streamDefaults)
+        streamImages.setProjector(streamDir.appendingPathComponent("projector"))
+        streamImages.ensureStatus()
+        try await until("streaming image status failed") { !streamImages.loading && streamImages.scope != nil }
+        streamImages.build()
+        try await until("streaming image-index did not finish") {
+            !streamImages.building && !streamImages.loading && streamImages.scope?.vectors == 4
+        }
+        let imgLaunches = try String(contentsOf: streamDir.appendingPathComponent("img-launches"), encoding: .utf8)
+            .split(separator: "\n").count
+        try check(!streamImages.failed && streamImages.checked == 4 && imgLaunches == 1,
+                  "streaming image-index failed or launched multiple processes (\(imgLaunches))")
+
+        try type("", into: app)
+        print("Phase 3 regressions passed (IndexStatusState isolation, caches, dual-lane CoreSearchConnection, ContentBatch skip, streaming clients)")
     }
 
     private func verifyPhase2LiveFileInteractions(_ app: AppDelegate) async throws {

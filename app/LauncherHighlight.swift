@@ -1,4 +1,5 @@
 import CoreFoundation
+import os
 import SwiftUI
 
 struct LauncherHighlight {
@@ -245,11 +246,35 @@ struct LauncherHighlight {
         }
     }
 
-    private static let pinyinCache: NSCache<NSString, Pinyin> = {
-        let cache = NSCache<NSString, Pinyin>()
-        cache.countLimit = 256
-        return cache
-    }()
+    private struct BoundedLRU<Key: Hashable, Value> {
+        let capacity: Int
+        private var entries: [Key: (value: Value, tick: UInt64)] = [:]
+        private var tick: UInt64 = 0
+
+        init(capacity: Int) {
+            self.capacity = capacity
+        }
+
+        mutating func value(for key: Key) -> Value? {
+            guard var entry = entries[key] else { return nil }
+            tick &+= 1
+            entry.tick = tick
+            entries[key] = entry
+            return entry.value
+        }
+
+        mutating func insert(_ value: Value, for key: Key) {
+            tick &+= 1
+            if entries[key] == nil, entries.count >= capacity,
+               let oldest = entries.min(by: { $0.value.tick < $1.value.tick })?.key {
+                entries.removeValue(forKey: oldest)
+            }
+            entries[key] = (value, tick)
+        }
+    }
+
+    private static let pinyinCache = OSAllocatedUnfairLock(initialState: BoundedLRU<String, Pinyin>(capacity: 512))
+    private static let transliterateCache = OSAllocatedUnfairLock(initialState: BoundedLRU<String, [String]>(capacity: 512))
 
     // Keep the current and older catalog syllables in sync with src/pinyin.rs.
     private static let readings = [
@@ -265,8 +290,7 @@ struct LauncherHighlight {
               value.unicodeScalars.contains(where: isHan) else { return nil }
         let indices = Array(value.indices) + [value.endIndex]
         // Cache owner offsets, not String.Index values, and include Latin and separators in the key.
-        let key = value as NSString
-        if let cached = pinyinCache.object(forKey: key) { return (cached, indices) }
+        if let cached = pinyinCache.withLock({ $0.value(for: value) }) { return (cached, indices) }
 
         let characters = Array(value)
         let asciiAlphanumeric = characters.map { $0.utf8.count == 1 && $0.utf8.allSatisfy(isASCIILetterOrDigit) }
@@ -306,15 +330,18 @@ struct LauncherHighlight {
             }
         }
         let pinyin = Pinyin(current: current, legacy: legacy, asciiAlphanumeric: asciiAlphanumeric)
-        pinyinCache.setObject(pinyin, forKey: key)
+        pinyinCache.withLock { $0.insert(pinyin, for: value) }
         return (pinyin, indices)
     }
 
     private static func transliterate(_ input: String) -> [String] {
+        if let cached = transliterateCache.withLock({ $0.value(for: input) }) { return cached }
         let latin = NSMutableString(string: input)
         CFStringTransform(latin, nil, kCFStringTransformMandarinLatin, false)
         CFStringTransform(latin, nil, kCFStringTransformStripDiacritics, false)
-        return (latin as String).lowercased().split { !$0.isASCII || !$0.isLetter }.map(String.init)
+        let result = (latin as String).lowercased().split { !$0.isASCII || !$0.isLetter }.map(String.init)
+        transliterateCache.withLock { $0.insert(result, for: input) }
+        return result
     }
 
     private static func isHan(_ scalar: Unicode.Scalar) -> Bool {

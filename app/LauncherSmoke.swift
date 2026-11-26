@@ -714,23 +714,34 @@ final class LauncherSmoke {
                   "a literal app name match did not outrank a fuzzy text match")
 
         let clock = ContinuousClock()
-        let queries = [
-            ("absent character", String(repeating: "a", count: 31) + "z"),
-            // All bytes are present, but the first 't' is near the end with no 'a' after it.
-            ("all bytes present", "t" + String(repeating: "a", count: 32)),
-        ]
-        for (label, query) in queries {
+        func verifyLatency(_ items: [ClipboardItem], query: String, label: String, expectedCount: Int) throws {
             let samples = try (0..<20).map { _ in
                 let start = clock.now
                 let rows = ClipboardItem.filtered(items, for: query)
                 let elapsed = start.duration(to: clock.now)
-                try check(rows.isEmpty, "500-item clipboard no-match query (\(label)) unexpectedly matched")
+                try check(rows.count == expectedCount,
+                          "500-item clipboard search (\(label)) returned \(rows.count) matches, expected \(expectedCount)")
                 return elapsed
             }.sorted()
             let p95 = samples[18]
             try check(p95 < .milliseconds(15), "500-item clipboard search (\(label)) exceeded 15 ms (p95: \(p95))")
-            print("500-item clipboard no-match search (\(label)): p95 \(p95)")
+            print("500-item clipboard search (\(label)): p95 \(p95)")
         }
+        func periodicItems(afterID: String = "", suffix: String = "") -> [ClipboardItem] {
+            (0..<500).map { id in
+                let prefix = "\(id)\(afterID)"
+                let padding = String(repeating: "a", count: ClipboardStore.maximumTextBytes - prefix.utf8.count - suffix.utf8.count)
+                return ClipboardItem(id: Int64(id), text: prefix + padding + suffix, capturedAt: .now,
+                                     sourceBundleID: nil, sourceAppName: nil, pinned: false)
+            }
+        }
+
+        let periodicQuery = String(repeating: "a", count: 31) + "z"
+        try verifyLatency(items, query: periodicQuery, label: "absent character", expectedCount: 0)
+        // All bytes are present, but the first 't' is near the end with no 'a' after it.
+        try verifyLatency(items, query: "t" + String(repeating: "a", count: 32), label: "all bytes present", expectedCount: 0)
+        try verifyLatency(periodicItems(afterID: "z"), query: periodicQuery, label: "reverse late mismatch", expectedCount: 0)
+        try verifyLatency(periodicItems(suffix: "xz"), query: periodicQuery, label: "fuzzy hit without substring", expectedCount: 500)
     }
 
     private func verifyClipboardStorageLinks() throws {

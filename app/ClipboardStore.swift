@@ -39,26 +39,95 @@ struct ClipboardItem: Identifiable, Equatable {
             return (low, high, nonAscii)
         }
 
-        func match(needle: UnsafeBufferPointer<UInt8>, scalarRanges: [Range<Int>], checkFuzzy: Bool) -> SearchMatch? {
+        private static func containsSubstring(haystack: UnsafeBufferPointer<UInt8>, needle: UnsafeBufferPointer<UInt8>,
+                                              anchorIndex: Int, allIdenticalBytes: Bool, lps: [Int], startOffset: Int) -> Bool {
+            let n = haystack.count
+            let m = needle.count
+            let lastStart = n - m
+            guard startOffset <= lastStart, let hBase = haystack.baseAddress, let nBase = needle.baseAddress else { return false }
+            if m == 1 { return memchr(hBase + startOffset, Int32(nBase[0]), n - startOffset) != nil }
+
+            if allIdenticalBytes {
+                let byte = nBase[0]
+                var pos = startOffset
+                while pos <= lastStart {
+                    let end = pos + m - 1
+                    if hBase[end] != byte {
+                        pos = end + 1
+                        continue
+                    }
+                    var runStart = end
+                    while runStart > pos && hBase[runStart - 1] == byte { runStart -= 1 }
+                    if runStart == pos { return true }
+                    var next = end + 1
+                    while next - runStart < m && next < n && hBase[next] == byte { next += 1 }
+                    if next - runStart == m { return true }
+                    // No start through the mismatch at `next` can work. Never revisit these bytes.
+                    pos = next + 1
+                }
+                return false
+            }
+
+            let anchorByte = Int32(nBase[anchorIndex])
+            let anchorEnd = n - (m - 1 - anchorIndex)
+            var nextAnchor = startOffset + anchorIndex
+            for _ in 0..<32 {
+                guard nextAnchor < anchorEnd, let hit = memchr(hBase + nextAnchor, anchorByte, anchorEnd - nextAnchor) else { return false }
+                let anchor = UnsafeRawPointer(hBase).distance(to: UnsafeRawPointer(hit))
+                if memcmp(hBase + anchor - anchorIndex, nBase, m) == 0 { return true }
+                nextAnchor = anchor + 1
+            }
+
+            // Bound the cost of full comparisons. All starts before the next candidate were ruled out.
+            var offset = nextAnchor - anchorIndex
+            var matched = 0
+            while offset < n {
+                if matched == 0 {
+                    guard offset <= lastStart, let hit = memchr(hBase + offset, Int32(nBase[0]), lastStart - offset + 1) else { return false }
+                    offset = UnsafeRawPointer(hBase).distance(to: UnsafeRawPointer(hit)) + 1
+                    matched = 1
+                    continue
+                }
+                let byte = hBase[offset]
+                while matched > 0 && nBase[matched] != byte { matched = lps[matched - 1] }
+                if nBase[matched] == byte {
+                    matched += 1
+                    if matched == m { return true }
+                }
+                offset += 1
+            }
+            return false
+        }
+
+        func match(needle: UnsafeBufferPointer<UInt8>, scalarRanges: [Range<Int>], anchorIndex: Int,
+                   allIdenticalBytes: Bool, lps: [Int], checkFuzzy: Bool) -> SearchMatch? {
             bytes.withUnsafeBufferPointer { field in
                 guard field.count >= needle.count, let base = field.baseAddress, let query = needle.baseAddress else { return nil }
-                // Valid UTF-8 is self-synchronizing, so these byte searches match whole scalars.
-                if memmem(base, field.count, query, needle.count) != nil { return .substring }
-                guard checkFuzzy else { return nil }
-
-                var offset = 0
-                for scalar in scalarRanges {
-                    let remaining = field.count - offset
-                    guard remaining >= scalar.count else { return nil }
-                    let start = base + offset
-                    let scalarStart = query + scalar.lowerBound
-                    let found = scalar.count == 1
-                        ? memchr(start, Int32(scalarStart.pointee), remaining)
-                        : memmem(start, remaining, scalarStart, scalar.count)
-                    guard let found else { return nil }
-                    offset = UnsafeRawPointer(base).distance(to: UnsafeRawPointer(found)) + scalar.count
+                var firstMatchOffset = 0
+                if checkFuzzy {
+                    var offset = 0
+                    for scalar in scalarRanges {
+                        let scalarStart = query + scalar.lowerBound
+                        let lastStart = field.count - scalar.count
+                        // A valid UTF-8 scalar's first byte cannot be a continuation byte.
+                        while true {
+                            guard offset <= lastStart,
+                                  let found = memchr(base + offset, Int32(scalarStart.pointee), lastStart - offset + 1) else { return nil }
+                            offset = UnsafeRawPointer(base).distance(to: UnsafeRawPointer(found))
+                            if scalar.count == 1 || memcmp(found, scalarStart, scalar.count) == 0 { break }
+                            offset += 1
+                        }
+                        if scalar.lowerBound == 0 { firstMatchOffset = offset }
+                        offset += scalar.count
+                    }
+                    if offset - firstMatchOffset == needle.count { return .substring }
                 }
-                return .fuzzy
+
+                if Self.containsSubstring(haystack: field, needle: needle, anchorIndex: anchorIndex,
+                                          allIdenticalBytes: allIdenticalBytes, lps: lps, startOffset: firstMatchOffset) {
+                    return .substring
+                }
+                return checkFuzzy ? .fuzzy : nil
             }
         }
     }
@@ -96,6 +165,22 @@ struct ClipboardItem: Identifiable, Equatable {
             offset = end
         }
 
+        var frequencies = [Int](repeating: 0, count: 256)
+        for byte in needleBytes { frequencies[Int(byte)] += 1 }
+        var anchorIndex = needleBytes.count - 1
+        for index in needleBytes.indices.reversed() where frequencies[Int(needleBytes[index])] < frequencies[Int(needleBytes[anchorIndex])] {
+            anchorIndex = index
+        }
+        let allIdenticalBytes = frequencies[Int(needleBytes[anchorIndex])] == needleBytes.count
+
+        var kmpLPS = [Int](repeating: 0, count: needleBytes.count)
+        var prefix = 0
+        for index in 1..<needleBytes.count {
+            while prefix > 0 && needleBytes[index] != needleBytes[prefix] { prefix = kmpLPS[prefix - 1] }
+            if needleBytes[index] == needleBytes[prefix] { prefix += 1 }
+            kmpLPS[index] = prefix
+        }
+
         return needleBytes.withUnsafeBufferPointer { needle in
             var substrings: [ClipboardItem] = []
             var fuzzy: [ClipboardItem] = []
@@ -105,7 +190,8 @@ struct ClipboardItem: Identifiable, Equatable {
                     if (field.lowMask & needLow) != needLow || (field.highMask & needHigh) != needHigh ||
                         (field.nonAsciiMask & needNonAscii) != needNonAscii { continue }
                     // After a fuzzy hit, later fields can still promote the item to a substring hit.
-                    if let match = field.match(needle: needle, scalarRanges: scalarRanges, checkFuzzy: bestMatch == nil) {
+                    if let match = field.match(needle: needle, scalarRanges: scalarRanges, anchorIndex: anchorIndex,
+                                               allIdenticalBytes: allIdenticalBytes, lps: kmpLPS, checkFuzzy: bestMatch == nil) {
                         bestMatch = match
                         if match == .substring { break }
                     }

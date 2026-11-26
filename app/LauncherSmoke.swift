@@ -2,6 +2,7 @@ import AppKit
 import Carbon
 import Combine
 import Foundation
+import SwiftUI
 
 // Runs inside the built app with app-local AppKit and Carbon events and an isolated index.
 @MainActor
@@ -141,6 +142,7 @@ final class LauncherSmoke {
         try check(app.searchField.placeholderString == (language == "zh" ? "搜索文件、应用和系统设置" : "Search files, apps, and system settings"),
                   "search field did not use requested language")
         _ = try editor(app)
+        try check(app.panel.alphaValue == 1 && !app.panel.isVisible, "smoke presentation ordered in or faded the panel")
         try check(app.panel.styleMask.contains(.nonactivatingPanel) &&
                   app.panel.collectionBehavior == [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle],
                   "search panel was activating or had incorrect Spaces behavior")
@@ -395,6 +397,7 @@ final class LauncherSmoke {
 
     private func verifyActions(_ app: AppDelegate) async throws {
         let model = app.model
+        try verifyHighlights()
         try await verifyCatalogRegressions()
         try await verifyEngineRegressions()
         try check(model.indexPhase == .needsIndex && !model.canSearch, "action smoke unexpectedly had a file index")
@@ -528,6 +531,16 @@ final class LauncherSmoke {
             return false
         }
         try check(chosen()?.id == probe.id, "late file results moved selection from the application")
+        try await until("app and direct file rows painted category labels at the trailing edge") {
+            let widths = self.categoryInkWidths(in: app.panel, rowHeights: [44, 44])
+            return widths.count == 2 && widths.allSatisfy { $0 > 18 }
+        }
+        app.panel.appearance = nil
+        if exists("capture-icons") {
+            try capture("lumen-mixed-light.png", appearance: .aqua, window: app.panel)
+            try capture("lumen-mixed-dark.png", appearance: .darkAqua, window: app.panel)
+            app.panel.appearance = nil
+        }
         try key(kVK_DownArrow, "\u{f701}", in: app)
         try check(model.selectedHit?.name == "Lumen Action Probe notes.txt", "arrow selection did not reach the file result")
         try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
@@ -719,6 +732,116 @@ final class LauncherSmoke {
         let reloaded = LauncherFrecency(defaults: defaults)
         try check(boost(openedHit) > 0 && reloaded.rankFiles([failed, openedHit]).first == openedHit,
                   "a successful workspace open did not persist and affect file ranking")
+    }
+
+    private func verifyHighlights() throws {
+        func verify(_ query: String, _ value: String, _ expected: [String],
+                    mode: LauncherHighlight.Mode = .literal) throws {
+            let highlight = LauncherHighlight(query)
+            let light = highlight.text(value, size: 13, colorScheme: .light, mode: mode)
+            let dark = highlight.text(value, size: 13, colorScheme: .dark, mode: mode)
+            for result in [light, dark] {
+                let painted = result.runs.filter { $0.foregroundColor != nil }
+                let runs = painted.map { String(result[$0.range].characters) }
+                try check(String(result.characters).utf8.elementsEqual(value.utf8) && runs == expected,
+                          "highlight '\(query.prefix(80))' in '\(value.prefix(80))' painted \(runs), expected \(expected)")
+                try check(painted.allSatisfy { $0.font == .system(size: 13, weight: .semibold) },
+                          "matched highlight runs were not semibold")
+            }
+            if !expected.isEmpty {
+                try check(light.runs.first { $0.foregroundColor != nil }?.foregroundColor !=
+                          dark.runs.first { $0.foregroundColor != nil }?.foregroundColor,
+                          "highlight did not adapt its tint to the appearance")
+            }
+        }
+
+        try verify("arch", "ARCHIVE-archive.txt", ["ARCH", "arch"])
+        try verify(#"“design brief” budget"#, "BUDGET · design-brief.md", ["BUDGET", "design", "brief"])
+        try verify("sign design", "Design draft", ["Design"])
+        try verify("青山 月报", "青山的月报.md", ["青山", "月报"])
+        try verify("cafe abc", "👩🏽‍💻 Cafe\u{301} ＡＢＣ", ["Cafe\u{301}", "ＡＢＣ"])
+        try verify("👩", "👩🏽‍💻 report", ["👩🏽‍💻"])
+        try verify("vsc", "Visual Studio Code", ["V", "S", "C"], mode: .action)
+        try verify("vsc", "VSC · Visual Studio Code", ["VSC"], mode: .action)
+        try verify("mka", "Make Available", ["M", "k", "A"], mode: .action)
+        try verify("vsc", "Visual Studio Code.md", [], mode: .name)
+        try verify("vsz", "Visual Studio Code", [], mode: .action)
+        try verify("QSY", "👩🏽‍💻 青山·月报", ["青山", "月"], mode: .name)
+        try verify("qingshan", "青山·月报", ["青山"], mode: .action)
+        try verify("qing shan", "青山·月报", ["青山"], mode: .name)
+        for (query, name) in [
+            ("chengdu", "成都"), ("chengdou", "成都"), ("chongqing", "重庆"), ("xiamen", "厦门"),
+            ("changsha", "长沙"), ("changchun", "长春"), ("changan", "长安"), ("changzhi", "长治"),
+            ("luan", "六安"), ("xizang", "西藏"), ("yinhang", "银行"), ("yinyue", "音乐"),
+        ] {
+            try verify(query, "\(name).txt", [name], mode: .name)
+        }
+        try verify("rqst", "Report青山.txt", ["R", "青山", "t"], mode: .name)
+        try verify("rtqs", "Report青山.txt", [], mode: .name)
+        try verify("reportqingshan", "Report青山.txt", ["Report青山"], mode: .name)
+        try verify("qingshan2", "Report青山-2.txt", ["青山", "2"], mode: .name)
+        try verify("lny", "蓝牙", ["蓝牙"], mode: .action)
+        try verify("lny", "蓝牙", [], mode: .name)
+        try verify("qyb", "青山·月报", ["青", "月报"], mode: .action)
+        try verify("sg", "松风谷", ["松", "谷"], mode: .action)
+        try verify("lnz", "蓝牙", [], mode: .action)
+        try verify("qingshan", String(repeating: "x", count: 62) + "青山", ["青山"], mode: .name)
+        try verify("qingshan", String(repeating: "x", count: 63) + "青山", [], mode: .name)
+        try verify("qingshan", "青山", [])
+        try verify(#"KIND:doc EXT:.PDF path:“/Archive Folder/” /Design/ ~/Drafts/ report"#,
+                   "~/Drafts/Archive Folder/Design/Report.pdf", ["Report"])
+        try verify(#"kind:doc ext:pdf path:"/Archive Folder/" /Design/ ~/Drafts/"#,
+                   "~/Drafts/Archive Folder/Design/Report.pdf", [])
+        let snippet = "A pdf reference in the report"
+        try verify("report pdf", snippet, ["report"])
+        try verify("report PDF", "Report.pdf", ["Report"], mode: .name)
+        try verify("pdf", snippet, ["pdf"])
+        try verify(#"report "pdf""#, snippet, ["pdf", "report"])
+        try verify("report pdf", snippet, ["pdf", "report"], mode: .action)
+
+        let distinct = (0...16).map { "word\($0)x" }
+        try verify(distinct.joined(separator: " "), distinct.joined(separator: " "), Array(distinct.prefix(16)))
+        let repeated = String(repeating: "report REPORT ", count: 146) + "note" // 2 KiB
+        let head = "Report note "
+        let start = head + String(repeating: "x", count: 512 - head.count) + "report note "
+        let large = start + String(repeating: "x", count: 32 * 1024 - start.count)
+        try verify(repeated, large, ["Report", "note"])
+
+        // Measure construction and rendering after warm-up; use the median batch to avoid scheduler noise.
+        let batchSize = 10
+        let milliseconds = (0..<7).map { _ -> Double in
+            let began = ContinuousClock.now
+            for _ in 0..<batchSize {
+                let output = LauncherHighlight(repeated).text(large, size: 13, colorScheme: .light)
+                precondition(output.runs.count == 4)
+            }
+            let elapsed = began.duration(to: .now).components
+            return (Double(elapsed.seconds) * 1_000 + Double(elapsed.attoseconds) / 1e15) / Double(batchSize)
+        }.sorted()[3]
+        try check(milliseconds < 1, "2 KiB query on a 32 KiB value averaged \(milliseconds) ms per highlight")
+        print(String(format: "Highlight smoke passed (literal, Unicode, fuzzy, pinyin, qualifiers, light/dark; bounded input %.3f ms)",
+                     milliseconds))
+    }
+
+    private func categoryInkWidths(in panel: NSPanel, rowHeights: [CGFloat]) -> [CGFloat] {
+        guard let image = try? render(.aqua, window: panel) else { return [] }
+        let scale = CGFloat(image.pixelsWide) / panel.frame.width
+        var top = SearchWindow.headerHeight
+        return rowHeights.map { height in
+            let yRange = Int((top + 5) * scale)..<Int((top + height - 5) * scale)
+            top += height
+            // Look for foreground ink in the badge column, excluding the panel and selection borders.
+            let columns = (image.pixelsWide - Int(78 * scale))..<(image.pixelsWide - Int(18 * scale))
+            let ink = columns.filter { x in
+                yRange.contains { y in
+                    guard let color = image.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { return false }
+                    let luminance = 0.2126 * color.redComponent + 0.7152 * color.greenComponent + 0.0722 * color.blueComponent
+                    return (1 - luminance) * color.alphaComponent > 0.30
+                }
+            }
+            guard let first = ink.first, let last = ink.last else { return 0 }
+            return CGFloat(last - first + 1) / scale
+        }
     }
 
     private func verifyEngineRegressions() async throws {
@@ -2251,6 +2374,14 @@ final class LauncherSmoke {
     }
 
     private func capture(_ filename: String, appearance: NSAppearance.Name, window: NSWindow) throws {
+        let image = try render(appearance, window: window)
+        guard let png = image.representation(using: .png, properties: [:]) else {
+            throw Failure("could not encode offscreen snapshot")
+        }
+        try png.write(to: directory.appendingPathComponent(filename))
+    }
+
+    private func render(_ appearance: NSAppearance.Name, window: NSWindow) throws -> NSBitmapImageRep {
         guard let surface = window.contentView, let appearance = NSAppearance(named: appearance) else {
             throw Failure("could not configure snapshot appearance")
         }
@@ -2261,10 +2392,7 @@ final class LauncherSmoke {
             throw Failure("could not allocate offscreen snapshot")
         }
         appearance.performAsCurrentDrawingAppearance { surface.cacheDisplay(in: bounds, to: image) }
-        guard let png = image.representation(using: .png, properties: [:]) else {
-            throw Failure("could not encode offscreen snapshot")
-        }
-        try png.write(to: directory.appendingPathComponent(filename))
+        return image
     }
 
     private func verifyWatch(_ app: AppDelegate) async throws {
@@ -2351,6 +2479,14 @@ final class LauncherSmoke {
         guard let hit = model.hits.first(where: { $0.name == "notes.md" && $0.isSemanticCandidate })
         else { throw Failure("missing Gemma candidate") }
         try check(model.relatedExcerptsLabel == "相关原文", "candidate label did not say related excerpts")
+        let rowHeights: [CGFloat] = model.hits.map { $0.hasPreview ? 60 : 44 }
+        try await until("direct files and related excerpts painted distinct categories in the rendered list") {
+            let widths = self.categoryInkWidths(in: app.panel, rowHeights: rowHeights)
+            guard let widestDirect = widths.prefix(direct.count).max(), widths.count == rowHeights.count else { return false }
+            return widths.prefix(direct.count).allSatisfy { $0 > 18 } &&
+                widths.dropFirst(direct.count).allSatisfy { $0 > widestDirect + 8 }
+        }
+        app.panel.appearance = nil
         var resolved: URL?
         model.resolve(hit, action: .open) { resolved = $0 }
         try await until("candidate action validated the indexed document snapshot") { resolved?.path == hit.path }

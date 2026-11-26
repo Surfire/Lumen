@@ -1,6 +1,7 @@
 import AppKit
 import Carbon
 import Combine
+import QuartzCore
 import SwiftUI
 
 @main
@@ -314,7 +315,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
         updatePresentation()
         (panel.contentView as? SearchBackdrop)?.refreshTransparency()
-        if smoke == nil { panel.makeKeyAndOrderFront(nil) }
+        if self.smoke == nil {
+            let reveal = firstShow && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            if firstShow { panel.alphaValue = reveal ? 0 : 1 }
+            panel.makeKeyAndOrderFront(nil)
+            if reveal {
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0.14
+                    context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                    panel.animator().alphaValue = 1
+                }
+            }
+        }
         focusSearch()
         if firstShow {
             loadApplicationCatalog()

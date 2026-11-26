@@ -744,7 +744,7 @@ final class LauncherSmoke {
                 let painted = result.runs.filter { $0.foregroundColor != nil }
                 let runs = painted.map { String(result[$0.range].characters) }
                 try check(String(result.characters).utf8.elementsEqual(value.utf8) && runs == expected,
-                          "highlight '\(query)' in '\(value)' painted \(runs), expected \(expected)")
+                          "highlight '\(query.prefix(80))' in '\(value.prefix(80))' painted \(runs), expected \(expected)")
                 try check(painted.allSatisfy { $0.font == .system(size: 13, weight: .semibold) },
                           "matched highlight runs were not semibold")
             }
@@ -769,7 +769,20 @@ final class LauncherSmoke {
         try verify("QSY", "👩🏽‍💻 青山·月报", ["青山", "月"], mode: .name)
         try verify("qingshan", "青山·月报", ["青山"], mode: .action)
         try verify("qing shan", "青山·月报", ["青山"], mode: .name)
-        try verify("chongqing", "重庆", ["重庆"], mode: .name)
+        for (query, name) in [
+            ("chengdu", "成都"), ("chengdou", "成都"), ("chongqing", "重庆"), ("xiamen", "厦门"),
+            ("changsha", "长沙"), ("changchun", "长春"), ("changan", "长安"), ("changzhi", "长治"),
+            ("luan", "六安"), ("xizang", "西藏"), ("yinhang", "银行"), ("yinyue", "音乐"),
+        ] {
+            try verify(query, "\(name).txt", [name], mode: .name)
+        }
+        try verify("reportqingshan", "Report青山.txt", ["Report青山"], mode: .name)
+        try verify("qingshan2", "Report青山-2.txt", ["青山", "2"], mode: .name)
+        try verify("lny", "蓝牙", ["蓝牙"], mode: .action)
+        try verify("lny", "蓝牙", [], mode: .name)
+        try verify("qyb", "青山·月报", ["青", "月报"], mode: .action)
+        try verify("sg", "松风谷", ["松", "谷"], mode: .action)
+        try verify("lnz", "蓝牙", [], mode: .action)
         try verify("qingshan", String(repeating: "x", count: 62) + "青山", ["青山"], mode: .name)
         try verify("qingshan", String(repeating: "x", count: 63) + "青山", [], mode: .name)
         try verify("qingshan", "青山", [])
@@ -777,7 +790,35 @@ final class LauncherSmoke {
                    "~/Drafts/Archive Folder/Design/Report.pdf", ["Report"])
         try verify(#"kind:doc ext:pdf path:"/Archive Folder/" /Design/ ~/Drafts/"#,
                    "~/Drafts/Archive Folder/Design/Report.pdf", [])
-        print("Highlight smoke passed (literal, multiword, Unicode, fuzzy, pinyin, qualifiers, light/dark)")
+        let snippet = "A pdf reference in the report"
+        try verify("report pdf", snippet, ["report"])
+        try verify("report PDF", "Report.pdf", ["Report"], mode: .name)
+        try verify("pdf", snippet, ["pdf"])
+        try verify(#"report "pdf""#, snippet, ["pdf", "report"])
+        try verify("report pdf", snippet, ["pdf", "report"], mode: .action)
+
+        let distinct = (0...16).map { "word\($0)x" }
+        try verify(distinct.joined(separator: " "), distinct.joined(separator: " "), Array(distinct.prefix(16)))
+        let repeated = String(repeating: "report REPORT ", count: 146) + "note" // 2 KiB
+        let head = "Report note "
+        let start = head + String(repeating: "x", count: 512 - head.count) + "report note "
+        let large = start + String(repeating: "x", count: 32 * 1024 - start.count)
+        try verify(repeated, large, ["Report", "note"])
+
+        // Measure construction and rendering after warm-up; use the median batch to avoid scheduler noise.
+        let batchSize = 10
+        let milliseconds = (0..<7).map { _ -> Double in
+            let began = ContinuousClock.now
+            for _ in 0..<batchSize {
+                let output = LauncherHighlight(repeated).text(large, size: 13, colorScheme: .light)
+                precondition(output.runs.count == 4)
+            }
+            let elapsed = began.duration(to: .now).components
+            return (Double(elapsed.seconds) * 1_000 + Double(elapsed.attoseconds) / 1e15) / Double(batchSize)
+        }.sorted()[3]
+        try check(milliseconds < 1, "2 KiB query on a 32 KiB value averaged \(milliseconds) ms per highlight")
+        print(String(format: "Highlight smoke passed (literal, Unicode, fuzzy, pinyin, qualifiers, light/dark; bounded input %.3f ms)",
+                     milliseconds))
     }
 
     private func categoryInkWidths(in panel: NSPanel, rowHeights: [CGFloat]) -> [CGFloat] {

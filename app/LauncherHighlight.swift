@@ -6,50 +6,125 @@ struct LauncherHighlight {
 
     private static let comparison: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive, .widthInsensitive]
     private static let locale = Locale(identifier: "en_US_POSIX")
-    private let terms: [String]
+    private static let maxTerms = 16
+    private static let maxCharacters = 512
+    private static let maxRuns = 64
+    // Same shorthand set as common_extension in src/query.rs, not the full kind lists.
+    private static let commonExtensions = Set("""
+        pdf doc docx ppt pptx xls xlsx txt md markdown rtf odt ods odp csv tsv json yaml yml xml html htm
+        png jpg jpeg gif webp heic svg tiff tif bmp mp3 wav m4a aac flac mp4 mov mkv avi webm zip rar 7z gz tar dmg
+        """.split(whereSeparator: \.isWhitespace).map(String.init))
+    private static let kinds: Set<String> = ["kind:doc", "kind:image", "kind:video", "kind:audio",
+                                            "kind:code", "kind:archive", "kind:folder", "kind:app"]
+    private let fileTerms: [String]
+    private let actionTerms: [String]
     private let fuzzyTerm: String
 
     init(_ query: String) {
-        let words = LauncherFileQuery(query).words
-        terms = words.split { $0.isWhitespace || "\"“”".contains($0) }.map(String.init)
-        if terms.count == 1, terms[0].prefix(13).count <= 12 {
-            fuzzyTerm = Self.normalized(terms[0])
-        } else {
-            fuzzyTerm = ""
+        // Only paths and colon qualifiers need the launcher's syntax normalization.
+        let input = query.utf8.contains { $0 == 47 || $0 == 58 } ? LauncherFileQuery(query).engineQuery : query
+        let tokens = Self.tokenize(input)
+        // Like the engine, decide whether bare extensions are filters before removing qualifiers.
+        let hasSearchWord = tokens.contains { $0.quoted || (!Self.isExtension($0.key) && !Self.commonExtensions.contains($0.key)) }
+        var files: [String] = [], actions: [String] = []
+        var seenFiles: Set<String> = [], seenActions: Set<String> = []
+        collect: for (word, key, quoted) in tokens {
+            if key.hasPrefix("/") || key.hasPrefix("~/") { continue }
+            let explicit = !quoted && Self.isExtension(key)
+            if !quoted && (Self.kinds.contains(key) || (explicit && key.hasPrefix("ext:"))) { continue }
+            let fileFilter = explicit || (!quoted && hasSearchWord && Self.commonExtensions.contains(key))
+            for part in word.split(whereSeparator: \.isWhitespace) {
+                let term = part.folding(options: Self.comparison, locale: Self.locale)
+                guard !term.isEmpty else { continue }
+                if !fileFilter && files.count < Self.maxTerms && seenFiles.insert(term).inserted { files.append(term) }
+                if actions.count < Self.maxTerms && seenActions.insert(term).inserted { actions.append(term) }
+                if files.count == Self.maxTerms && actions.count == Self.maxTerms { break collect }
+            }
         }
+        fileTerms = files
+        actionTerms = actions
+        fuzzyTerm = actions.count == 1 && actions[0].prefix(13).count <= 12 ? Self.normalized(actions[0]) : ""
+    }
+
+    private static func isExtension(_ word: String) -> Bool {
+        let ext: Substring
+        if word.hasPrefix(".") { ext = word.dropFirst() }
+        else if word.hasPrefix("ext:") { ext = word.dropFirst(4) }
+        else { return false }
+        return !ext.isEmpty && ext.utf8.allSatisfy(isASCIILetterOrDigit)
+    }
+
+    private static func tokenize(_ query: String) -> [(word: String, key: String, quoted: Bool)] {
+        let quotes = "\"“”"
+        var tokens: [(String, String, Bool)] = []
+        var seenUnquoted: Set<String> = [], seenQuoted: Set<String> = []
+        var word = ""
+        var quoted = false
+        func push() {
+            guard !word.isEmpty else { return }
+            defer { word = "" }
+            let inserted = quoted ? seenQuoted.insert(word).inserted : seenUnquoted.insert(word).inserted
+            if inserted && (!quoted || word.contains(where: { !$0.isWhitespace })) {
+                tokens.append((word, word.precomposedStringWithCompatibilityMapping.lowercased(), quoted))
+            }
+        }
+        var index = query.startIndex
+        while index < query.endIndex {
+            let character = query[index]
+            query.formIndex(after: &index)
+            if character == "\\", index < query.endIndex, quotes.contains(query[index]) || query[index] == "\\" {
+                word.append(query[index])
+                query.formIndex(after: &index)
+            } else if quotes.contains(character) {
+                push()
+                quoted.toggle()
+            } else if !quoted && character.isWhitespace {
+                push()
+            } else {
+                word.append(character)
+            }
+        }
+        push()
+        return tokens
     }
 
     func text(_ value: String, size: CGFloat, colorScheme: ColorScheme, mode: Mode = .literal) -> AttributedString {
+        // These rows truncate to a single line. Keep the full value, but only search and style its prefix.
+        let scanned = String(value.prefix(Self.maxCharacters))
+        let matches = ranges(in: scanned, mode: mode)
         var text = AttributedString(value)
-        let matches = ranges(in: value, mode: mode)
         guard !matches.isEmpty else { return text }
         // Use a text-strength accent rather than the control tint (which can be pale in light mode).
         let tint = colorScheme == .dark ? Color(red: 0.60, green: 0.78, blue: 1)
             : Color(red: 0.07, green: 0.29, blue: 0.60)
+        let style = AttributeContainer().foregroundColor(tint).font(.system(size: size, weight: .semibold))
+        // The scan starts at offset zero, so its indices refer to the same prefix of the attributed value.
         for match in matches {
             guard let start = AttributedString.Index(match.lowerBound, within: text),
                   let end = AttributedString.Index(match.upperBound, within: text) else { continue }
-            text[start..<end].foregroundColor = tint
-            text[start..<end].font = .system(size: size, weight: .semibold)
+            text[start..<end].mergeAttributes(style)
         }
         return text
     }
 
     private func ranges(in value: String, mode: Mode) -> [Range<String.Index>] {
+        let terms = mode == .action ? actionTerms : fileTerms
+        guard !terms.isEmpty else { return [] }
         var matches: [Range<String.Index>] = []
+        let nsValue = value as NSString
         // Paths and excerpts stay literal; only display names need transliteration.
         lazy var pinyin = mode == .literal ? nil : Self.pinyin(for: value)
         for term in terms {
-            let literal = Self.occurrences(of: term, in: value, options: Self.comparison)
+            let literal = Self.occurrences(of: term, in: nsValue)
             if !literal.isEmpty {
                 // Foundation search can match a scalar inside an extended grapheme (e.g. a ZWJ emoji).
-                let nsValue = value as NSString
                 matches += literal.compactMap {
-                    Range(nsValue.rangeOfComposedCharacterSequences(for: NSRange($0, in: value)), in: value)
+                    Range(nsValue.rangeOfComposedCharacterSequences(for: $0), in: value)
                 }
-            } else if term.utf8.allSatisfy({ (65...90).contains($0) || (97...122).contains($0) }),
-                      let (alias, hanRanges) = pinyin {
-                matches += alias.indices(for: term.lowercased()).map { hanRanges[$0] }
+            } else if term.utf8.allSatisfy(Self.isASCIILetterOrDigit),
+                      let (alias, indices) = pinyin {
+                matches += alias.indices(for: term, allowsSubsequence: mode == .action)
+                    .map { indices[$0]..<indices[$0 + 1] }
             }
         }
         if matches.isEmpty, mode == .action, (2...12).contains(fuzzyTerm.count) {
@@ -62,20 +137,28 @@ struct LauncherHighlight {
             if let last = merged.last, last.upperBound >= match.lowerBound {
                 merged[merged.count - 1] = last.lowerBound..<max(last.upperBound, match.upperBound)
             } else {
+                // Avoid creating hundreds of separately styled runs for inputs like "a a a ...".
+                guard merged.count < Self.maxRuns else { break }
                 merged.append(match)
             }
         }
         return merged
     }
 
-    private static func occurrences(of term: String, in value: String,
-                                    options: String.CompareOptions = []) -> [Range<String.Index>] {
-        var ranges: [Range<String.Index>] = []
-        var start = value.startIndex
-        while start < value.endIndex,
-              let match = value.range(of: term, options: options, range: start..<value.endIndex, locale: locale) {
-            ranges.append(match)
-            start = match.upperBound
+    private static func occurrences(of term: String, in value: NSString) -> [NSRange] {
+        var ranges: [NSRange] = []
+        var start = 0
+        let end = value.length
+        while start < end {
+            let match = value.range(of: term, options: comparison,
+                                    range: NSRange(start..<end), locale: locale)
+            guard match.location != NSNotFound, match.length > 0 else { break }
+            if let last = ranges.last, NSMaxRange(last) == match.location {
+                ranges[ranges.count - 1].length += match.length
+            } else {
+                ranges.append(match)
+            }
+            start = NSMaxRange(match)
         }
         return ranges
     }
@@ -104,33 +187,56 @@ struct LauncherHighlight {
         return []
     }
 
-    private final class Pinyin {
-        let full: String
-        let initials: String
+    private struct PinyinAlias {
+        // Both strings are ASCII, so NSString ranges and UTF-8 offsets index the same owners.
+        let text: NSString
         let owners: [Int]
 
-        init(_ syllables: [Substring]) {
-            full = syllables.joined()
-            initials = String(syllables.compactMap(\.first))
-            owners = syllables.enumerated().flatMap { index, syllable in
-                Array(repeating: index, count: syllable.utf8.count)
+        init(_ tokens: [String], initials: Bool) {
+            let pieces = initials ? tokens.map { String($0.prefix(1)) } : tokens
+            text = pieces.joined() as NSString
+            owners = pieces.enumerated().flatMap { index, piece in
+                Array(repeating: index, count: piece.utf8.count)
             }
         }
 
-        func indices(for term: String) -> [Int] {
-            let matches = LauncherHighlight.occurrences(of: term, in: full)
-            if !matches.isEmpty {
-                return matches.flatMap { match in
-                    let start = full.utf8.distance(from: full.startIndex, to: match.lowerBound)
-                    let end = full.utf8.distance(from: full.startIndex, to: match.upperBound)
-                    return owners[start]...owners[end - 1]
+        func contiguous(_ term: String) -> [Int]? {
+            let ranges = LauncherHighlight.occurrences(of: term, in: text)
+            return ranges.isEmpty ? nil : ranges.flatMap { owners[$0.location..<NSMaxRange($0)] }
+        }
+
+        func subsequence(_ term: String) -> [Int]? {
+            var remaining = term.utf8[...]
+            var matches: [Int] = []
+            for (offset, letter) in (text as String).utf8.enumerated() where letter == remaining.first {
+                matches.append(owners[offset])
+                remaining = remaining.dropFirst()
+                if remaining.isEmpty { return matches }
+            }
+            return nil
+        }
+    }
+
+    private final class Pinyin {
+        let variants: [(full: PinyinAlias, initials: PinyinAlias)]
+
+        init(current: [String], legacy: [String]) {
+            variants = (current == legacy ? [current] : [current, legacy]).map {
+                (PinyinAlias($0, initials: false), PinyinAlias($0, initials: true))
+            }
+        }
+
+        func indices(for term: String, allowsSubsequence: Bool) -> Set<Int> {
+            for (full, initials) in variants {
+                if let matches = full.contiguous(term) ?? initials.contiguous(term) { return Set(matches) }
+            }
+            if allowsSubsequence && term.utf8.count >= 2 {
+                // Prefer syllable starts, just as the Latin fallback prefers word starts.
+                for (full, initials) in variants {
+                    if let matches = initials.subsequence(term) ?? full.subsequence(term) { return Set(matches) }
                 }
             }
-            return LauncherHighlight.occurrences(of: term, in: initials).flatMap { match in
-                let start = initials.utf8.distance(from: initials.startIndex, to: match.lowerBound)
-                let end = initials.utf8.distance(from: initials.startIndex, to: match.upperBound)
-                return start..<end
-            }
+            return []
         }
     }
 
@@ -140,30 +246,76 @@ struct LauncherHighlight {
         return cache
     }()
 
-    private static func pinyin(for value: String) -> (Pinyin, [Range<String.Index>])? {
+    // Keep the current and older catalog syllables in sync with src/pinyin.rs.
+    private static let readings = [
+        ("成都", "cheng du", "cheng dou"), ("重庆", "chong qing", "chong qing"),
+        ("厦门", "xia men", "sha men"), ("长沙", "chang sha", "zhang sha"),
+        ("长春", "chang chun", "zhang chun"), ("长安", "chang an", "zhang an"),
+        ("长治", "chang zhi", "zhang zhi"), ("六安", "lu an", "liu an"),
+        ("西藏", "xi zang", "xi cang"), ("银行", "yin hang", "yin xing"), ("音乐", "yin yue", "yin le"),
+    ]
+
+    private static func pinyin(for value: String) -> (Pinyin, [String.Index])? {
         guard value.prefix(65).count <= 64,
               value.unicodeScalars.contains(where: isHan) else { return nil }
-        var han = String()
-        var ranges: [Range<String.Index>] = []
-        for index in value.indices {
-            for scalar in value[index].unicodeScalars where isHan(scalar) {
+        let indices = Array(value.indices) + [value.endIndex]
+        // Cache owner offsets, not String.Index values, and include Latin and separators in the key.
+        let key = value as NSString
+        if let cached = pinyinCache.object(forKey: key) { return (cached, indices) }
+
+        let characters = Array(value)
+        var current = Array(repeating: "", count: characters.count)
+        var legacy = current
+        var offset = 0
+        while offset < characters.count {
+            let character = characters[offset]
+            guard let scalar = character.unicodeScalars.first, isHan(scalar) else {
+                if character.utf8.count == 1, let byte = character.utf8.first, isASCIILetterOrDigit(byte) {
+                    current[offset] = character.lowercased()
+                    legacy[offset] = current[offset]
+                }
+                offset += 1
+                continue
+            }
+            // Keep Han context within a run, rather than inventing a phrase across Latin or punctuation.
+            let start = offset
+            var han = ""
+            while offset < characters.count, let scalar = characters[offset].unicodeScalars.first, isHan(scalar) {
                 han.unicodeScalars.append(scalar)
-                ranges.append(index..<value.index(after: index))
+                offset += 1
+            }
+            var input = han, oldInput = han
+            for (phrase, reading, oldReading) in readings where han.contains(phrase) {
+                input = input.replacingOccurrences(of: phrase, with: " \(reading) ")
+                oldInput = oldInput.replacingOccurrences(of: phrase, with: " \(oldReading) ")
+            }
+            let syllables = transliterate(input)
+            // Only paint when the transform gives us an unambiguous syllable-to-Han mapping.
+            if syllables.count == offset - start {
+                current.replaceSubrange(start..<offset, with: syllables)
+            }
+            let oldSyllables = input == oldInput ? syllables : transliterate(oldInput)
+            if oldSyllables.count == offset - start {
+                legacy.replaceSubrange(start..<offset, with: oldSyllables)
             }
         }
-        // Transliterate the Han together, like LaunchCatalog.pinyinAliases, to preserve contextual readings.
-        // Cache syllables, not String.Index values: the same Han can appear with different emoji or accents.
-        let key = han as NSString
-        if let cached = pinyinCache.object(forKey: key) { return (cached, ranges) }
-        let latin = NSMutableString(string: han)
-        CFStringTransform(latin, nil, kCFStringTransformToLatin, false)
-        CFStringTransform(latin, nil, kCFStringTransformStripCombiningMarks, false)
-        let syllables = (latin as String).lowercased().split { !$0.isASCII || !$0.isLetter }
-        // Only paint when the transform gives us an unambiguous syllable-to-Han mapping.
-        let alias = Pinyin(syllables.count == ranges.count ? syllables : [])
-        pinyinCache.setObject(alias, forKey: key)
-        return (alias, ranges)
+        let pinyin = Pinyin(current: current, legacy: legacy)
+        pinyinCache.setObject(pinyin, forKey: key)
+        return (pinyin, indices)
     }
 
-    private static func isHan(_ scalar: Unicode.Scalar) -> Bool { (0x3400...0x9fff).contains(scalar.value) }
+    private static func transliterate(_ input: String) -> [String] {
+        let latin = NSMutableString(string: input)
+        CFStringTransform(latin, nil, kCFStringTransformMandarinLatin, false)
+        CFStringTransform(latin, nil, kCFStringTransformStripDiacritics, false)
+        return (latin as String).lowercased().split { !$0.isASCII || !$0.isLetter }.map(String.init)
+    }
+
+    private static func isHan(_ scalar: Unicode.Scalar) -> Bool {
+        (0x3400...0x9fff).contains(scalar.value) || (0x20000...0x2ffff).contains(scalar.value)
+    }
+
+    private static func isASCIILetterOrDigit(_ byte: UInt8) -> Bool {
+        (97...122).contains(byte | 32) || (48...57).contains(byte)
+    }
 }

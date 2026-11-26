@@ -140,7 +140,6 @@ pub(super) fn has_generation_buckets(conn: &Connection) -> Result<bool> {
         .query_row([], |row| row.get(0))?)
 }
 
-#[allow(dead_code)] // Wired by semantic and image_search after Phase 3 merge.
 pub(crate) fn bucket_generation(conn: &Connection, key: &str) -> Result<i64> {
     let value: Option<i64> = conn
         .prepare_cached("SELECT CAST(value AS INTEGER) FROM info WHERE key=?1")?

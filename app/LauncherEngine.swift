@@ -248,7 +248,7 @@ struct EngineResponse {
 @MainActor
 final class LauncherEngine {
     // Coordinator: flip to true after merging rust-pipelines (--stream on embed / image-index).
-    private static let streamIndexingEnabled = false
+    private static let streamIndexingEnabled = true
 
     let executable: URL
     let database: URL
@@ -268,8 +268,8 @@ final class LauncherEngine {
     func setCachedHitAccess(_ enabled: Bool) {
         guard checksCachedHitAccess != enabled else { return }
         checksCachedHitAccess = enabled
-        // M1 accepts access checking only as a startup flag; don't leave that server running after ready.
-        close()
+        // Subprocess servers accept access checking only at startup; keep the in-process core open.
+        closeSubprocesses()
     }
 
     init(executable: URL, database: URL, syntheticRoot: URL? = nil, gemmaHome: URL? = nil,
@@ -417,7 +417,11 @@ final class LauncherEngine {
 
     @discardableResult
     func status(includeScope: Bool, complete: @escaping @MainActor (EngineResponse) -> Void) -> Process? {
-        // Coordinator: route core != nil to lumen_session_status_json on textWorker after rust-hotpath merges.
+        if let core {
+            nextID &+= 1
+            core.status(SearchRequest(id: nextID, op: "status", include_scope: includeScope), complete: complete)
+            return nil
+        }
         let command = includeScope ? ["status", "--include-scope"] : ["status"]
         return run(command, complete: complete)
     }
@@ -587,12 +591,16 @@ final class LauncherEngine {
         semanticConnection = nil
     }
 
-    func close() {
-        core?.close()
+    private func closeSubprocesses() {
         connection?.stop()
         connection = nil
         closeSemantic()
         closeImages()
+    }
+
+    func close() {
+        core?.close()
+        closeSubprocesses()
     }
 
     nonisolated static func readLines(_ file: FileHandle, line: (Data) -> Void) {
@@ -625,6 +633,7 @@ struct SearchRequest: Encodable {
     var check_access: Bool? = nil
     var op: String? = nil
     var hits: [ValidationHit]? = nil
+    var include_scope: Bool? = nil
 }
 
 struct ValidationHit: Encodable {
@@ -702,20 +711,60 @@ final class CoreSearchWorker: @unchecked Sendable {
         if let error = reply.error { throw SearchFailure(error) }
         return reply
     }
+
+    func requestStatus(_ request: SearchRequest) throws -> Data {
+        guard let handle = open() else { throw SearchFailure("no usable index; run lumen index first") }
+        var bytes = try JSONEncoder().encode(request)
+        bytes.append(0)
+        let output = bytes.withUnsafeBytes { buffer in
+            lumen_session_status_json(handle, buffer.bindMemory(to: CChar.self).baseAddress)
+        }
+        guard let output else { throw SearchFailure("Missing response from lumen core") }
+        defer { lumen_string_free(output) }
+        let data = Data(bytesNoCopy: output, count: strlen(output), deallocator: .none)
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw SearchFailure("Invalid response from lumen core")
+        }
+        if let id = object["id"] as? NSNumber {
+            guard id.uint64Value == request.id else { throw SearchFailure("Invalid response from lumen core") }
+        } else if object["error"] == nil {
+            throw SearchFailure("Invalid response from lumen core")
+        }
+        if let error = object["error"] as? String { throw SearchFailure(error) }
+        guard let statusObject = object["status"] else { throw SearchFailure("Missing status from lumen core") }
+        return try JSONSerialization.data(withJSONObject: statusObject)
+    }
 }
 
 @MainActor
 final class CoreSearchLane {
+    private static let cancelledStatus = EngineResponse(
+        exitStatus: -1,
+        output: Data(),
+        errors: Data("lumen core session closed".utf8)
+    )
+
+    private enum Job {
+        case rpc(SearchRequest, ServeCompletion)
+        case status(SearchRequest, [@MainActor (EngineResponse) -> Void])
+    }
+
     private struct Pending {
-        let request: SearchRequest
+        let job: Job
         let explicit: Bool
-        let complete: ServeCompletion
+        let discardable: Bool
+
+        var mode: String? {
+            if case .rpc(let request, _) = job { return request.mode }
+            return nil
+        }
     }
 
     let worker: CoreSearchWorker
     private var generation: UInt64 = 0
+    private var active: Pending?
     private var queued: [Pending] = []
-    private(set) var isBusy = false
+    var isBusy: Bool { active != nil }
 
     init(label: String, database: URL, root: URL?) {
         worker = CoreSearchWorker(label: label, database: database, root: root)
@@ -724,37 +773,82 @@ final class CoreSearchLane {
     func warm() { worker.queue.async { [worker] in _ = worker.open() } }
 
     func enqueue(_ request: SearchRequest, explicit: Bool = false, complete: @escaping ServeCompletion) {
-        let pending = Pending(request: request, explicit: explicit, complete: complete)
+        let pending = Pending(job: .rpc(request, complete), explicit: explicit, discardable: !explicit)
         if explicit { queued.insert(pending, at: 0) }
         else {
-            if let mode = request.mode { queued.removeAll { $0.request.mode == mode } }
+            if let mode = request.mode { queued.removeAll { $0.mode == mode } }
             queued.append(pending)
         }
         sendNext()
     }
 
-    func discardQueued() { queued.removeAll { !$0.explicit } }
+    func enqueueStatus(_ request: SearchRequest, complete: @escaping @MainActor (EngineResponse) -> Void) {
+        if let index = queued.firstIndex(where: {
+            if case .status(let existing, _) = $0.job { return existing.include_scope == request.include_scope }
+            return false
+        }), case .status(_, let callbacks) = queued[index].job {
+            queued[index] = Pending(job: .status(request, callbacks + [complete]), explicit: false, discardable: false)
+        } else {
+            queued.append(Pending(job: .status(request, [complete]), explicit: false, discardable: false))
+        }
+        sendNext()
+    }
+
+    func discardQueued() { queued.removeAll { $0.discardable } }
 
     func close() {
+        var settledStatusCallbacks: [@MainActor (EngineResponse) -> Void] = []
+        if case .status(_, let callbacks) = active?.job {
+            settledStatusCallbacks.append(contentsOf: callbacks)
+        }
+        for pending in queued {
+            if case .status(_, let callbacks) = pending.job {
+                settledStatusCallbacks.append(contentsOf: callbacks)
+            }
+        }
         generation &+= 1
-        isBusy = false
+        active = nil
         queued.removeAll()
         worker.queue.async { [worker] in worker.close() }
+        if !settledStatusCallbacks.isEmpty {
+            let cancelled = Self.cancelledStatus
+            DispatchQueue.main.async {
+                for callback in settledStatusCallbacks { callback(cancelled) }
+            }
+        }
     }
 
     private func sendNext() {
         guard !isBusy, !queued.isEmpty else { return }
         let next = queued.removeFirst(), generation = generation
-        isBusy = true
+        active = next
         worker.queue.async { [weak self, worker] in
-            let result = Result { try worker.request(next.request) }.mapError {
-                $0 as? SearchFailure ?? SearchFailure($0.localizedDescription)
-            }
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.generation == generation else { return }
-                self.isBusy = false
-                next.complete(result)
-                self.sendNext()
+            switch next.job {
+            case .rpc(let request, let complete):
+                let result = Result { try worker.request(request) }.mapError {
+                    $0 as? SearchFailure ?? SearchFailure($0.localizedDescription)
+                }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.generation == generation else { return }
+                    self.active = nil
+                    complete(result)
+                    self.sendNext()
+                }
+            case .status(let request, let callbacks):
+                let response: EngineResponse
+                do {
+                    let payload = try worker.requestStatus(request)
+                    response = EngineResponse(exitStatus: 0, output: payload, errors: Data())
+                } catch {
+                    let message = (error as? SearchFailure)?.detail ?? error.localizedDescription
+                    response = EngineResponse(exitStatus: 1, output: Data(), errors: Data(message.utf8))
+                }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.generation == generation else { return }
+                    self.active = nil
+                    for complete in callbacks { complete(response) }
+                    self.sendNext()
+                }
             }
         }
     }
@@ -778,6 +872,10 @@ final class CoreSearchConnection {
     func enqueue(_ request: SearchRequest, explicit: Bool = false, complete: @escaping ServeCompletion) {
         let target = request.mode == "name" ? nameLane : textLane
         target.enqueue(request, explicit: explicit, complete: complete)
+    }
+
+    func status(_ request: SearchRequest, complete: @escaping @MainActor (EngineResponse) -> Void) {
+        textLane.enqueueStatus(request, complete: complete)
     }
 
     func discardQueued() {

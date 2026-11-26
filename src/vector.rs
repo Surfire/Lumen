@@ -121,16 +121,6 @@ impl<T> MatrixCache<T> {
         Ok(&self.0.as_ref().expect("loaded matrix").1)
     }
 
-    pub fn get(
-        &mut self,
-        snapshot: &Connection,
-        load: impl FnOnce(&Connection) -> Result<Matrix<T>>,
-    ) -> Result<&Matrix<T>> {
-        let version = crate::name_fast::data_version(snapshot)?;
-        self.get_with_version(snapshot, version, load)
-    }
-
-    #[allow(dead_code)] // Wired by semantic and image_search after Phase 3 merge.
     pub fn get_for_bucket(
         &mut self,
         snapshot: &Connection,

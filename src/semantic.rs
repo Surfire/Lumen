@@ -1033,7 +1033,7 @@ fn rank_gemma(
     limit: usize,
     cache: &mut MatrixCache<Paragraph>,
 ) -> Result<Vec<Hit>> {
-    let matrix = cache.get(snapshot, |snapshot| {
+    let matrix = cache.get_for_bucket(snapshot, "vec_generation", |snapshot| {
         let Some(scope) = saved_index_scope(snapshot)?.filter(|scope| scope.documents) else {
             return Ok(Matrix::new(gemma::DIMENSIONS));
         };
@@ -1299,9 +1299,11 @@ mod tests {
         );
         session.conn.execute_batch("BEGIN").unwrap();
         read_snapshot(&session.conn, |snapshot| {
-            session.matrix.get(snapshot, |_| {
-                panic!("unchanged catalog reloaded the matrix")
-            })?;
+            session
+                .matrix
+                .get_for_bucket(snapshot, "vec_generation", |_| {
+                    panic!("unchanged catalog reloaded the matrix")
+                })?;
             Ok(())
         })
         .unwrap();
@@ -1323,11 +1325,25 @@ mod tests {
         session.conn.execute_batch("COMMIT").unwrap();
         assert_eq!(lookup(&mut session), first[..1]);
 
+        let vec_before = crate::bucket_generation(&session.conn, "vec_generation").unwrap();
         start_benign_writes(&session.conn, &database);
         for _ in 0..8 {
             assert_eq!(lookup(&mut session), first[..1]);
         }
         assert!(stop_benign_writes(&session.conn) >= 8);
+        assert_eq!(
+            crate::bucket_generation(&session.conn, "vec_generation").unwrap(),
+            vec_before
+        );
+        read_snapshot(&session.conn, |snapshot| {
+            session
+                .matrix
+                .get_for_bucket(snapshot, "vec_generation", |_| {
+                    panic!("unrelated item write reloaded semantic matrix")
+                })?;
+            Ok(())
+        })
+        .unwrap();
 
         for (update, expected, revoked) in [
             (

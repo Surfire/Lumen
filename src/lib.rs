@@ -30,7 +30,6 @@ pub use image_search::{
 };
 pub use index::{scan, scan_with_progress};
 pub use model::{BgeModel, Model, ModelBackend};
-#[allow(dead_code)]
 pub(crate) use name_fast::bucket_generation;
 pub use progress::{ScanPhase, ScanProgress, ScanProgressReporter};
 pub use query::allows_semantic as query_allows_semantic;

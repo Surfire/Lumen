@@ -4543,6 +4543,46 @@ final class LauncherSmoke {
         releaseText.signal()
         try await until("blocked text and validate requests did not finish after release") { textDone && validateDone }
 
+        // Coalesced status callbacks survive cached-hit access switches and settle when closed.
+        let holdStatusAccess = DispatchSemaphore(value: 0)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            core.textLane.worker.queue.async {
+                continuation.resume()
+                holdStatusAccess.wait()
+            }
+        }
+        var firstAccessStatus: IndexReport?
+        var secondAccessStatus: IndexReport?
+        laneEngine.status(includeScope: true) { response in
+            if response.succeeded { firstAccessStatus = try? JSONDecoder().decode(IndexReport.self, from: response.output) }
+        }
+        laneEngine.status(includeScope: true) { response in
+            if response.succeeded { secondAccessStatus = try? JSONDecoder().decode(IndexReport.self, from: response.output) }
+        }
+        laneEngine.setCachedHitAccess(true)
+        laneEngine.setCachedHitAccess(false)
+        holdStatusAccess.signal()
+        try await until("coalesced status callbacks dropped across cached-hit access toggle") {
+            (firstAccessStatus?.items ?? 0) >= 1 && (secondAccessStatus?.items ?? 0) >= 1
+        }
+
+        let holdStatusClose = DispatchSemaphore(value: 0)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            core.textLane.worker.queue.async {
+                continuation.resume()
+                holdStatusClose.wait()
+            }
+        }
+        var closedStatusResponse: EngineResponse?
+        laneEngine.status(includeScope: true) { response in
+            closedStatusResponse = response
+        }
+        laneEngine.close()
+        holdStatusClose.signal()
+        try await until("in-flight status callback did not settle on engine close") {
+            closedStatusResponse?.succeeded == false
+        }
+
         // 4. ContentBatch poison-pill skip & streaming embed / image-index client paths.
         let streamDir = directory.appendingPathComponent("phase3-stream", isDirectory: true)
         try FileManager.default.createDirectory(at: streamDir, withIntermediateDirectories: true)

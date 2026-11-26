@@ -547,7 +547,8 @@ impl<'a> ImageSearchSession<'a> {
         let query = worker.encode(text)?;
         read_snapshot(&self.conn, |snapshot| {
             Ok(rank_images(
-                self.matrix.get(snapshot, load_images)?,
+                self.matrix
+                    .get_for_bucket(snapshot, "img_generation", load_images)?,
                 &query,
                 limit,
             ))
@@ -713,9 +714,11 @@ mod tests {
         };
         assert_eq!(lookup(&mut session), ["a.HEIC", "b.heif", "c.webp"]);
         read_snapshot(&session.conn, |snapshot| {
-            session.matrix.get(snapshot, |_| {
-                panic!("unchanged image scope reloaded the matrix")
-            })?;
+            session
+                .matrix
+                .get_for_bucket(snapshot, "img_generation", |_| {
+                    panic!("unchanged image scope reloaded the matrix")
+                })?;
             Ok(())
         })
         .unwrap();

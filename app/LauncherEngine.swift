@@ -201,6 +201,7 @@ final class LauncherEngine {
     let executable: URL
     let database: URL
     private let root: URL?
+    private let core: CoreSearchConnection?
     private var connection: SearchConnection?
     private var semanticConnection: SearchConnection?
     private var imageConnection: SearchConnection?
@@ -224,6 +225,10 @@ final class LauncherEngine {
         self.root = syntheticRoot
         self.gemmaHome = gemmaHome
         self.requestTimeout = requestTimeout
+        let resources = Bundle.main.resourceURL ?? Bundle.main.bundleURL.appendingPathComponent("Contents/Resources")
+        let bundled = resources.appendingPathComponent("lumen")
+        self.core = executable.standardizedFileURL.path == bundled.standardizedFileURL.path
+            ? CoreSearchConnection(database: database, root: syntheticRoot) : nil
     }
 
     var hasDatabase: Bool {
@@ -352,10 +357,11 @@ final class LauncherEngine {
         return tail
     }
 
-    var nameSearchBusy: Bool { connection?.isBusy == true }
+    var nameSearchBusy: Bool { core?.isBusy == true || connection?.isBusy == true }
 
     func warmNameSearch() {
-        _ = try? connect(\.connection, command: ["serve"])
+        if let core { core.warm() }
+        else { _ = try? connect(\.connection, command: ["serve"]) }
     }
 
     func search(_ query: String, mode: String, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
@@ -365,6 +371,19 @@ final class LauncherEngine {
     // nil means the server explicitly rejected the validation operation as unsupported.
     func validate(_ hits: [SearchHit], explicit: Bool = false,
                   complete: @escaping (Result<[Bool]?, SearchFailure>) -> Void) {
+        if let core {
+            nextID &+= 1
+            core.enqueue(SearchRequest(id: nextID, op: "validate", hits: hits.map(ValidationHit.init)),
+                         explicit: explicit) { result in
+                complete(result.flatMap { reply in
+                    guard let flags = reply.valid, flags.count == hits.count else {
+                        return .failure(SearchFailure("Invalid validation response from lumen core"))
+                    }
+                    return .success(flags)
+                })
+            }
+            return
+        }
         guard !legacyValidation else { complete(.success(nil)); return }
         do {
             let batches = try validationBatches(hits)
@@ -461,7 +480,7 @@ final class LauncherEngine {
                                     check_access: command.first == "serve" ? checksCachedHitAccess : nil)
         submit(request, to: lane, command: command, idleTimeout: idleTimeout) { result in
             complete(result.flatMap { reply in
-                reply.hits.map { .success($0) } ?? .failure(SearchFailure("Invalid search response from lumen serve"))
+                reply.hits.map { .success($0) } ?? .failure(SearchFailure("Invalid search response from lumen"))
             })
         }
     }
@@ -469,6 +488,10 @@ final class LauncherEngine {
     private func submit(_ request: SearchRequest, to lane: ReferenceWritableKeyPath<LauncherEngine, SearchConnection?>,
                         command: [String], idleTimeout: Duration?, explicit: Bool = false,
                         complete: @escaping ServeCompletion) {
+        if let core, command.first == "serve", request.mode == "name" || request.mode == "text" {
+            core.enqueue(request, explicit: explicit, complete: complete)
+            return
+        }
         do {
             let server = try connect(lane, command: command, idleTimeout: idleTimeout)
             server.enqueue(request, explicit: explicit, complete: complete)
@@ -490,7 +513,10 @@ final class LauncherEngine {
         return started
     }
 
-    func discardQueuedSearch() { connection?.discardQueued() }
+    func discardQueuedSearch() {
+        core?.discardQueued()
+        connection?.discardQueued()
+    }
     func discardQueuedSemantic() { semanticConnection?.discardQueued() }
 
     func closeSemantic() {
@@ -499,6 +525,7 @@ final class LauncherEngine {
     }
 
     func close() {
+        core?.close()
         connection?.stop()
         connection = nil
         closeSemantic()
@@ -558,6 +585,113 @@ private struct SearchReply: Decodable {
     let hits: [SearchHit]?
     let valid: [Bool]?
     let error: String?
+}
+
+// The handle is confined to this serial queue until the worker's last reference
+// is released. The main actor only schedules requests and delivers replies.
+private final class CoreSearchWorker: @unchecked Sendable {
+    let queue = DispatchQueue(label: "lumen.core.search", qos: .userInitiated)
+    private let database: URL
+    private let root: URL?
+    private var handle: OpaquePointer?
+
+    init(database: URL, root: URL?) {
+        self.database = database
+        self.root = root
+    }
+
+    deinit {
+        // Queued work retains the worker, so no call can still be using the handle.
+        lumen_session_close(handle)
+    }
+
+    func open() -> OpaquePointer? {
+        if let handle { return handle }
+        handle = database.path.withCString { db in
+            if let root { return root.path.withCString { lumen_session_open(db, $0) } }
+            return lumen_session_open(db, nil)
+        }
+        return handle
+    }
+
+    func close() {
+        lumen_session_close(handle)
+        handle = nil
+    }
+
+    func request(_ request: SearchRequest) throws -> SearchReply {
+        guard let handle = open() else { throw SearchFailure("no usable index; run lumen index first") }
+        var bytes = try JSONEncoder().encode(request)
+        bytes.append(0)
+        let output = bytes.withUnsafeBytes { buffer in
+            let json = buffer.bindMemory(to: CChar.self).baseAddress
+            return request.op == "validate" ? lumen_session_validate_json(handle, json)
+                                            : lumen_session_search_json(handle, json)
+        }
+        guard let output else { throw SearchFailure("Missing response from lumen core") }
+        defer { lumen_string_free(output) }
+        let data = Data(bytesNoCopy: output, count: strlen(output), deallocator: .none)
+        let reply = try JSONDecoder().decode(SearchReply.self, from: data)
+        guard reply.id == request.id || reply.id == nil && reply.error != nil else {
+            throw SearchFailure("Invalid response from lumen core")
+        }
+        if let error = reply.error { throw SearchFailure(error) }
+        return reply
+    }
+}
+
+@MainActor
+private final class CoreSearchConnection {
+    private struct Pending {
+        let request: SearchRequest
+        let explicit: Bool
+        let complete: ServeCompletion
+    }
+
+    private let worker: CoreSearchWorker
+    private var generation: UInt64 = 0
+    private var queued: [Pending] = []
+    private(set) var isBusy = false
+
+    init(database: URL, root: URL?) { worker = CoreSearchWorker(database: database, root: root) }
+
+    func warm() { worker.queue.async { [worker] in _ = worker.open() } }
+
+    func enqueue(_ request: SearchRequest, explicit: Bool = false, complete: @escaping ServeCompletion) {
+        let pending = Pending(request: request, explicit: explicit, complete: complete)
+        if explicit { queued.insert(pending, at: 0) }
+        else {
+            if let mode = request.mode { queued.removeAll { $0.request.mode == mode } }
+            queued.append(pending)
+        }
+        sendNext()
+    }
+
+    func discardQueued() { queued.removeAll { !$0.explicit } }
+
+    func close() {
+        generation &+= 1
+        isBusy = false
+        queued.removeAll()
+        worker.queue.async { [worker] in worker.close() }
+    }
+
+    private func sendNext() {
+        guard !isBusy, !queued.isEmpty else { return }
+        let next = queued.removeFirst(), generation = generation
+        isBusy = true
+        worker.queue.async { [weak self, worker] in
+            let result = Result { try worker.request(next.request) }.mapError {
+                $0 as? SearchFailure ?? SearchFailure($0.localizedDescription)
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.generation == generation else { return }
+                self.isBusy = false
+                next.complete(result)
+                self.sendNext()
+            }
+        }
+    }
 }
 
 @MainActor

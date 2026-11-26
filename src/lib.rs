@@ -3,6 +3,7 @@ mod content;
 mod diagnose;
 mod docx;
 mod external;
+mod ffi;
 mod gemma;
 mod image_decode;
 mod image_search;

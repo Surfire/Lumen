@@ -106,19 +106,39 @@ impl<T> Default for MatrixCache<T> {
 }
 
 impl<T> MatrixCache<T> {
-    pub fn get(
+    fn get_with_version(
         &mut self,
         snapshot: &Connection,
+        version: i64,
         load: impl FnOnce(&Connection) -> Result<Matrix<T>>,
     ) -> Result<&Matrix<T>> {
         debug_assert!(!snapshot.is_autocommit());
-        let version = crate::name_fast::data_version(snapshot)?;
         if self.0.as_ref().is_none_or(|(saved, _)| *saved != version) {
             // Drop the old matrix before allocating its replacement.
             self.0 = None;
             self.0 = Some((version, load(snapshot)?));
         }
         Ok(&self.0.as_ref().expect("loaded matrix").1)
+    }
+
+    pub fn get(
+        &mut self,
+        snapshot: &Connection,
+        load: impl FnOnce(&Connection) -> Result<Matrix<T>>,
+    ) -> Result<&Matrix<T>> {
+        let version = crate::name_fast::data_version(snapshot)?;
+        self.get_with_version(snapshot, version, load)
+    }
+
+    #[allow(dead_code)] // Wired by semantic and image_search after Phase 3 merge.
+    pub fn get_for_bucket(
+        &mut self,
+        snapshot: &Connection,
+        bucket_key: &str,
+        load: impl FnOnce(&Connection) -> Result<Matrix<T>>,
+    ) -> Result<&Matrix<T>> {
+        let version = crate::bucket_generation(snapshot, bucket_key)?;
+        self.get_with_version(snapshot, version, load)
     }
 }
 
@@ -183,5 +203,116 @@ mod tests {
             adaptive_floor(&[0.0, 0.1, 0.1, 0.2, 0.2, 0.1, 0.1, 0.3], 0.65, 1.0),
             f64::from(0.65_f32)
         );
+    }
+
+    #[test]
+    fn get_for_bucket_ignores_unrelated_writes_and_falls_back_on_legacy_dbs() {
+        let dir = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-vector-bucket-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("index.sqlite");
+
+        // Legacy DB without bucket counters falls back to PRAGMA data_version.
+        let legacy_db = dir.join("legacy.sqlite");
+        let legacy_writer = Connection::open(&legacy_db).unwrap();
+        legacy_writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE info(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE other(n INTEGER);",
+            )
+            .unwrap();
+        let legacy_reader =
+            Connection::open_with_flags(&legacy_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let mut legacy_cache = MatrixCache::<i64>::default();
+        let mut legacy_loads = 0;
+        let load_const = |loads: &mut usize, marker: i64| {
+            *loads += 1;
+            let mut m = Matrix::new(1);
+            m.push(marker, &pack(&[1.0]));
+            Ok(m)
+        };
+        let tx = legacy_reader.unchecked_transaction().unwrap();
+        tx.prepare_cached("SELECT 1 FROM main.sqlite_schema LIMIT 1")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert_eq!(
+            legacy_cache
+                .get_for_bucket(&tx, "vec_generation", |_| load_const(&mut legacy_loads, 1))
+                .unwrap()
+                .rows,
+            [1]
+        );
+        tx.commit().unwrap();
+        assert_eq!(legacy_loads, 1);
+
+        legacy_writer
+            .execute("INSERT INTO other VALUES (1)", [])
+            .unwrap();
+        let tx = legacy_reader.unchecked_transaction().unwrap();
+        tx.prepare_cached("SELECT 1 FROM main.sqlite_schema LIMIT 1")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert_eq!(
+            legacy_cache
+                .get_for_bucket(&tx, "vec_generation", |_| load_const(&mut legacy_loads, 2))
+                .unwrap()
+                .rows,
+            [2]
+        );
+        tx.commit().unwrap();
+        assert_eq!(legacy_loads, 2);
+
+        // Full Lumen DB with independent buckets does not evict on unrelated writes.
+        let (writer, _) = crate::open_write(&db, false).unwrap();
+        let reader = crate::open_read(&db).unwrap();
+        let mut cache = MatrixCache::<i64>::default();
+        let mut loads = 0;
+
+        let read_once = |cache: &mut MatrixCache<i64>, loads: &mut usize, marker: i64| {
+            let tx = reader.unchecked_transaction().unwrap();
+            tx.prepare_cached("SELECT 1 FROM main.sqlite_schema LIMIT 1")
+                .unwrap()
+                .exists([])
+                .unwrap();
+            let rows = cache
+                .get_for_bucket(&tx, "vec_generation", |_| load_const(loads, marker))
+                .unwrap()
+                .rows
+                .clone();
+            tx.commit().unwrap();
+            rows
+        };
+
+        assert_eq!(read_once(&mut cache, &mut loads, 10), [10]);
+        assert_eq!(loads, 1);
+
+        // Unrelated item + image writes advance data_version and other buckets, NOT vec_generation.
+        writer
+            .execute_batch(
+                "INSERT INTO item VALUES(1,'/a','a','file','local','a','','','/a',0);
+                 INSERT INTO image_scope VALUES(1,'/img',1);",
+            )
+            .unwrap();
+        assert_eq!(read_once(&mut cache, &mut loads, 20), [10]);
+        assert_eq!(loads, 1);
+
+        // Semantic write advances vec_generation and reloads the matrix.
+        writer
+            .execute_batch(
+                "INSERT INTO document VALUES(1,'body','body');
+                 INSERT INTO semantic_chunk(id,document_id,start_byte,end_byte) VALUES(1,1,0,4);",
+            )
+            .unwrap();
+        assert_eq!(read_once(&mut cache, &mut loads, 30), [30]);
+        assert_eq!(loads, 2);
+
+        drop((legacy_reader, legacy_writer, reader, writer));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

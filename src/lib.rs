@@ -30,6 +30,8 @@ pub use image_search::{
 };
 pub use index::{scan, scan_with_progress};
 pub use model::{BgeModel, Model, ModelBackend};
+#[allow(dead_code)]
+pub(crate) use name_fast::bucket_generation;
 pub use progress::{ScanPhase, ScanProgress, ScanProgressReporter};
 pub use query::allows_semantic as query_allows_semantic;
 pub use semantic::{
@@ -349,8 +351,19 @@ fn open_write(path: &Path, exclusive_indexer: bool) -> Result<(Connection, Optio
     conn.busy_timeout(Duration::from_secs(5))?;
     // Unlike journal_mode, synchronous is a per-connection setting.
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "wal_autocheckpoint", 1000)?;
+    conn.pragma_update(None, "journal_size_limit", 67_108_864)?;
+    conn.pragma_update(None, "cache_size", -16_000)?;
     match catalog_schema(&conn)? {
-        (DATABASE_APPLICATION_ID, SCHEMA_VERSION) => {}
+        (DATABASE_APPLICATION_ID, SCHEMA_VERSION) => {
+            if !name_fast::has_generation_buckets(&conn)? {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                if !name_fast::has_generation_buckets(&tx)? {
+                    name_fast::install_generation(&tx)?;
+                    tx.commit()?;
+                }
+            }
+        }
         (DATABASE_APPLICATION_ID, version) if LEGACY_SCHEMA_VERSIONS.contains(&version) => {
             migrate_catalog(&mut conn)?;
         }
@@ -432,6 +445,7 @@ pub fn open_read(path: &Path) -> Result<Connection> {
     }
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     connection.busy_timeout(Duration::from_secs(3))?;
+    connection.pragma_update(None, "cache_size", -8_000)?;
     let (application, version) = catalog_schema(&connection)?;
     if application != DATABASE_APPLICATION_ID
         || (version != SCHEMA_VERSION && !LEGACY_SCHEMA_VERSIONS.contains(&version))
@@ -617,6 +631,13 @@ impl SearchSession {
             return vec![false; hits.len()];
         };
         diagnose::validate_session_hits(&self.conn, Path::new(database), hits)
+    }
+
+    /// Report scan coverage and embedding counts from one consistent catalog snapshot.
+    pub fn status(&self, include_scope: bool) -> Result<serde_json::Value> {
+        diagnose::read_snapshot(&self.conn, |snapshot| {
+            status_with_scope(snapshot, include_scope)
+        })
     }
 
     pub fn search(&mut self, query: &str, mode: Mode, limit: usize) -> Result<Vec<Hit>> {
@@ -825,6 +846,20 @@ pub fn status(conn: &Connection) -> Result<serde_json::Value> {
     semantic::add_status(conn, &mut data)?;
     data["unverified"] = unverified.into();
     Ok(data)
+}
+
+pub fn status_with_scope(conn: &Connection, include_scope: bool) -> Result<serde_json::Value> {
+    let mut report = status(conn)?;
+    if include_scope && let Some(scope) = saved_index_scope(conn)? {
+        report["scope"] = serde_json::json!({
+            "roots": scope.roots,
+            "allow": scope.allow,
+            "deny": scope.deny,
+            "documents": scope.documents,
+            "content_roots": scope.content_roots,
+        });
+    }
+    Ok(report)
 }
 
 #[cfg(test)]

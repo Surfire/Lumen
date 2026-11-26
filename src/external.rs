@@ -7,9 +7,11 @@ use anyhow::{Context, bail, ensure};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
 
 #[cfg(target_os = "macos")]
@@ -107,9 +109,7 @@ fn uuid_valid(uuid: &str) -> bool {
         })
 }
 
-fn check_folder(path: &Path) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let meta = fs::symlink_metadata(path)?;
+fn check_folder_meta(meta: &fs::Metadata) -> Result<()> {
     ensure!(
         meta.is_dir()
             && meta.uid() == unsafe { libc::geteuid() }
@@ -119,13 +119,11 @@ fn check_folder(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn catalogs(database: &Path) -> Vec<PathBuf> {
-    let Ok(folder) = folder(database) else {
-        return Vec::new();
-    };
-    if check_folder(&folder).is_err() {
-        return Vec::new();
-    }
+fn check_folder(path: &Path) -> Result<()> {
+    check_folder_meta(&fs::symlink_metadata(path)?)
+}
+
+fn catalogs_in_dir(folder: &Path) -> Vec<PathBuf> {
     let mut paths: Vec<_> = fs::read_dir(folder)
         .into_iter()
         .flatten()
@@ -156,6 +154,335 @@ fn registration(conn: &Connection) -> Option<Mount> {
         .then_some(volume)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DirStamp {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    nlink: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+impl DirStamp {
+    fn of(meta: &fs::Metadata) -> Self {
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.size(),
+            nlink: meta.nlink(),
+            mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+            ctime: meta.ctime(),
+            ctime_nsec: meta.ctime_nsec(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    dev: u64,
+    ino: u64,
+}
+
+impl FileId {
+    fn of(meta: &fs::Metadata) -> Self {
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }
+    }
+}
+
+struct CachedSidecar {
+    path: PathBuf,
+    file_id: FileId,
+    conn: Connection,
+    reg_version: i64,
+    mount: Option<Mount>,
+}
+
+impl CachedSidecar {
+    fn open(path: PathBuf, file_id: FileId) -> Option<Self> {
+        #[cfg(test)]
+        test_counters::record_sidecar_open();
+        let conn = open_read(&path).ok()?;
+        let (reg_version, mount) = read_sidecar_registration(&conn, &path)?;
+        Some(Self {
+            path,
+            file_id,
+            conn,
+            reg_version,
+            mount,
+        })
+    }
+
+    fn refresh(&mut self) -> bool {
+        let Ok(version) = crate::name_fast::data_version(&self.conn) else {
+            return false;
+        };
+        if version == self.reg_version {
+            return true;
+        }
+        let Some((reg_version, mount)) = read_sidecar_registration(&self.conn, &self.path) else {
+            return false;
+        };
+        self.reg_version = reg_version;
+        self.mount = mount;
+        true
+    }
+}
+
+fn read_sidecar_registration(conn: &Connection, path: &Path) -> Option<(i64, Option<Mount>)> {
+    crate::diagnose::read_snapshot(conn, |snapshot| {
+        let version = crate::name_fast::data_version(snapshot)?;
+        let mount = registration(snapshot).filter(|volume| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| stem == volume.uuid)
+        });
+        Ok((version, mount))
+    })
+    .ok()
+}
+
+struct CachedPrimary {
+    file_id: FileId,
+    conn: Connection,
+    deny_version: i64,
+    deny: Option<Vec<PathBuf>>,
+}
+
+fn read_primary_deny(conn: &Connection) -> Result<(i64, Option<Vec<PathBuf>>)> {
+    crate::diagnose::read_snapshot(conn, |snapshot| {
+        let version = crate::name_fast::data_version(snapshot)?;
+        let deny = crate::saved_index_scope(snapshot)?.map(|scope| scope.deny);
+        Ok((version, deny))
+    })
+}
+
+#[derive(Default)]
+struct DatabaseCache {
+    primary: Option<CachedPrimary>,
+    dir_stamp: Option<DirStamp>,
+    sidecars: Vec<CachedSidecar>,
+}
+
+impl DatabaseCache {
+    fn deny_rules(&mut self, database: &Path) -> Result<Vec<PathBuf>> {
+        let meta = fs::symlink_metadata(database)?;
+        ensure!(meta.is_file(), "index is not a regular file");
+        let id = FileId::of(&meta);
+        if let Some(primary) = &mut self.primary {
+            if primary.file_id == id {
+                let version = crate::name_fast::data_version(&primary.conn)?;
+                if version != primary.deny_version {
+                    let (new_version, new_deny) = read_primary_deny(&primary.conn)?;
+                    primary.deny_version = new_version;
+                    primary.deny = new_deny;
+                }
+                return primary
+                    .deny
+                    .clone()
+                    .context("main catalog scope is not verified");
+            }
+            self.primary = None;
+        }
+        #[cfg(test)]
+        test_counters::record_primary_open();
+        let conn = open_read(database)?;
+        let (deny_version, deny) = read_primary_deny(&conn)?;
+        self.primary = Some(CachedPrimary {
+            file_id: id,
+            conn,
+            deny_version,
+            deny: deny.clone(),
+        });
+        deny.context("main catalog scope is not verified")
+    }
+
+    fn refresh_sidecars(&mut self, database: &Path) {
+        let Ok(dir) = folder(database) else {
+            self.clear_sidecars();
+            return;
+        };
+        let Ok(meta) = fs::symlink_metadata(&dir) else {
+            self.clear_sidecars();
+            return;
+        };
+        if check_folder_meta(&meta).is_err() {
+            self.clear_sidecars();
+            return;
+        }
+        let stamp = DirStamp::of(&meta);
+        if self.dir_stamp == Some(stamp) && self.reuse_cached_sidecars() {
+            return;
+        }
+        self.rescan_sidecars(&dir, stamp);
+    }
+
+    fn clear_sidecars(&mut self) {
+        self.dir_stamp = None;
+        self.sidecars.clear();
+    }
+
+    fn reuse_cached_sidecars(&mut self) -> bool {
+        for sidecar in &mut self.sidecars {
+            let Ok(meta) = fs::symlink_metadata(&sidecar.path) else {
+                return false;
+            };
+            if !meta.is_file() || FileId::of(&meta) != sidecar.file_id || !sidecar.refresh() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn rescan_sidecars(&mut self, dir: &Path, stamp: DirStamp) {
+        #[cfg(test)]
+        test_counters::record_dir_scan();
+        let paths = catalogs_in_dir(dir);
+        let mut previous: HashMap<PathBuf, CachedSidecar> = self
+            .sidecars
+            .drain(..)
+            .map(|entry| (entry.path.clone(), entry))
+            .collect();
+        let mut next = Vec::with_capacity(paths.len());
+        for path in paths {
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let id = FileId::of(&meta);
+            let cached = match previous.remove(&path) {
+                Some(mut existing) if existing.file_id == id => {
+                    existing.refresh().then_some(existing)
+                }
+                _ => CachedSidecar::open(path, id),
+            };
+            if let Some(entry) = cached {
+                next.push(entry);
+            }
+        }
+        self.sidecars = next;
+        self.dir_stamp = Some(stamp);
+    }
+
+    fn active_indices(&self) -> Vec<usize> {
+        let mut seen = HashSet::new();
+        let mut indices = Vec::new();
+        for (i, sidecar) in self.sidecars.iter().enumerate() {
+            if let Some(mount) = &sidecar.mount
+                && seen.insert(mount.uuid.clone())
+            {
+                indices.push(i);
+            }
+        }
+        indices
+    }
+}
+
+const MAX_CACHED_DATABASES: usize = 8;
+
+#[derive(Default)]
+struct ExternalCacheRegistry {
+    epoch: u64,
+    entries: HashMap<PathBuf, DatabaseCache>,
+    order: Vec<PathBuf>,
+}
+
+fn cache_registry() -> &'static Mutex<ExternalCacheRegistry> {
+    static CACHE: OnceLock<Mutex<ExternalCacheRegistry>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+struct CacheLease {
+    key: PathBuf,
+    epoch: u64,
+    cache: Option<DatabaseCache>,
+}
+
+impl CacheLease {
+    fn acquire(database: &Path) -> Result<Self> {
+        let key = absolute(database)?;
+        let mut guard = cache_registry().lock().unwrap();
+        let epoch = guard.epoch;
+        let cache = guard.entries.remove(&key).unwrap_or_default();
+        guard.order.retain(|item| item != &key);
+        Ok(Self {
+            key,
+            epoch,
+            cache: Some(cache),
+        })
+    }
+}
+
+impl Drop for CacheLease {
+    fn drop(&mut self) {
+        let Some(cache) = self.cache.take() else {
+            return;
+        };
+        let mut guard = cache_registry().lock().unwrap();
+        if guard.epoch != self.epoch {
+            return;
+        }
+        let ExternalCacheRegistry { entries, order, .. } = &mut *guard;
+        entries.retain(|path, _| path.exists());
+        order.retain(|path| entries.contains_key(path));
+        if entries.len() >= MAX_CACHED_DATABASES
+            && let Some(oldest) = order.first().cloned()
+        {
+            order.remove(0);
+            entries.remove(&oldest);
+        }
+        entries.insert(self.key.clone(), cache);
+        order.push(self.key.clone());
+    }
+}
+
+fn invalidate_cache(database: &Path) {
+    let key = absolute(database).unwrap_or_else(|_| database.to_path_buf());
+    let mut guard = cache_registry().lock().unwrap();
+    guard.epoch = guard.epoch.wrapping_add(1);
+    guard.entries.remove(&key);
+    guard.order.retain(|item| item != &key);
+}
+
+#[cfg(test)]
+mod test_counters {
+    use std::cell::Cell;
+
+    thread_local! {
+        static DIR_SCANS: Cell<usize> = const { Cell::new(0) };
+        static SIDECAR_OPENS: Cell<usize> = const { Cell::new(0) };
+        static PRIMARY_OPENS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record_dir_scan() {
+        DIR_SCANS.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(super) fn record_sidecar_open() {
+        SIDECAR_OPENS.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(super) fn record_primary_open() {
+        PRIMARY_OPENS.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(super) fn snapshot() -> (usize, usize, usize) {
+        (
+            DIR_SCANS.with(Cell::get),
+            SIDECAR_OPENS.with(Cell::get),
+            PRIMARY_OPENS.with(Cell::get),
+        )
+    }
+}
+
 #[derive(Serialize)]
 pub struct VolumeStatus {
     uuid: String,
@@ -169,14 +496,20 @@ pub struct VolumeStatus {
 }
 
 pub fn volumes(database: &Path) -> Vec<VolumeStatus> {
-    let (deny, registered) = match deny_rules(database) {
-        Ok(deny) => (
-            deny,
-            registrations(database)
+    let Ok(mut lease) = CacheLease::acquire(database) else {
+        return Vec::new();
+    };
+    let cache = lease.cache.as_mut().unwrap();
+    let (deny, registered) = match cache.deny_rules(&lease.key) {
+        Ok(deny) => {
+            cache.refresh_sidecars(&lease.key);
+            let registered = cache
+                .active_indices()
                 .into_iter()
-                .map(|(_, _, volume)| volume)
-                .collect::<Vec<_>>(),
-        ),
+                .filter_map(|i| cache.sidecars[i].mount.clone())
+                .collect::<Vec<_>>();
+            (deny, registered)
+        }
         // Before first indexing the panel can list eligible devices, but
         // publishing an existing catalog requires a verified primary scope.
         Err(_) if database.try_exists().is_ok_and(|exists| !exists) => (Vec::new(), Vec::new()),
@@ -290,6 +623,7 @@ pub fn index_volume(
         "INSERT INTO info(key,value) VALUES(?1,?2)",
         params![KEY, serde_json::to_string(volume)?],
     )?;
+    invalidate_cache(database);
     Ok(stats)
 }
 
@@ -311,20 +645,8 @@ pub fn forget_volume(database: &Path, uuid: &str) -> Result<bool> {
     // database under a reader or releasing the writer lease early.
     tx.execute_batch("DELETE FROM name_fts; DELETE FROM item; DELETE FROM info;")?;
     tx.commit()?;
+    invalidate_cache(database);
     Ok(removed)
-}
-
-fn registrations(database: &Path) -> Vec<(PathBuf, Connection, Mount)> {
-    let mut seen = HashSet::new();
-    catalogs(database)
-        .into_iter()
-        .filter_map(|path| {
-            let conn = open_read(&path).ok()?;
-            let mount = registration(&conn)?;
-            (path.file_stem()?.to_str()? == mount.uuid && seen.insert(mount.uuid.clone()))
-                .then_some((path, conn, mount))
-        })
-        .collect()
 }
 
 pub(super) fn append_hits(
@@ -380,13 +702,22 @@ fn append_mounted(
     if !matches!(mode, Mode::Name | Mode::All) || hits.len() >= limit {
         return;
     }
-    let candidates = registrations(database)
+    let Ok(mut lease) = CacheLease::acquire(database) else {
+        return;
+    };
+    let cache = lease.cache.as_mut().unwrap();
+    cache.refresh_sidecars(&lease.key);
+    let candidates: Vec<_> = cache
+        .active_indices()
         .into_iter()
-        .filter_map(|(catalog, conn, volume)| {
-            let found = super::search_with_names(&conn, query, Mode::Name, 100, None, None).ok()?;
+        .filter_map(|sidecar_idx| {
+            let sidecar = &cache.sidecars[sidecar_idx];
+            let volume = sidecar.mount.clone()?;
+            let found =
+                super::search_with_names(&sidecar.conn, query, Mode::Name, 100, None, None).ok()?;
             (!found.is_empty()).then_some(Candidates {
-                catalog,
-                conn,
+                sidecar: sidecar_idx,
+                reg_version: sidecar.reg_version,
                 volume,
                 found,
             })
@@ -394,7 +725,8 @@ fn append_mounted(
         .collect();
     let mut remaining = limit - hits.len();
     hits.extend(filter_mounted(
-        database,
+        &lease.key,
+        cache,
         candidates,
         mount_state,
         |hit| Path::new(&hit.path),
@@ -410,8 +742,8 @@ fn append_mounted(
 }
 
 struct Candidates<T> {
-    catalog: PathBuf,
-    conn: Connection,
+    sidecar: usize,
+    reg_version: i64,
     volume: Mount,
     found: Vec<T>,
 }
@@ -422,9 +754,13 @@ struct Visibility {
 }
 
 impl Visibility {
-    fn read(database: &Path, mount_state: &impl Fn() -> Mounted) -> Option<Self> {
+    fn read(
+        database: &Path,
+        cache: &mut DatabaseCache,
+        mount_state: &impl Fn() -> Mounted,
+    ) -> Option<Self> {
         Some(Self {
-            deny: deny_rules(database).ok()?,
+            deny: cache.deny_rules(database).ok()?,
             mounts: mount_state(),
         })
     }
@@ -442,13 +778,14 @@ impl Visibility {
 
 fn filter_mounted<T>(
     database: &Path,
+    cache: &mut DatabaseCache,
     mut candidates: Vec<Candidates<T>>,
     mount_state: impl Fn() -> Mounted,
     path_of: impl Fn(&T) -> &Path,
     mut check: impl FnMut(&Connection, &Path, &mut Vec<T>),
 ) -> impl Iterator<Item = T> {
     if !candidates.is_empty()
-        && let Some(initial) = Visibility::read(database, &mount_state)
+        && let Some(initial) = Visibility::read(database, cache, &mount_state)
     {
         candidates.retain_mut(|group| {
             let Some(boundary) = initial.boundary(&group.volume) else {
@@ -458,7 +795,8 @@ fn filter_mounted<T>(
                 .found
                 .retain(|value| initial.allows(&boundary, path_of(value)));
             if !group.found.is_empty() {
-                check(&group.conn, &group.catalog, &mut group.found);
+                let sidecar = &cache.sidecars[group.sidecar];
+                check(&sidecar.conn, &sidecar.path, &mut group.found);
             }
             !group.found.is_empty()
         });
@@ -469,13 +807,16 @@ fn filter_mounted<T>(
     // One fresh policy/mount snapshot gates the whole batch, with a fresh
     // registration check per sidecar, including nested mount points.
     if !candidates.is_empty()
-        && let Some(latest) = Visibility::read(database, &mount_state)
+        && let Some(latest) = Visibility::read(database, cache, &mount_state)
     {
         candidates.retain_mut(|group| {
             let Some(boundary) = latest.boundary(&group.volume) else {
                 return false;
             };
-            if registration(&group.conn).as_ref() != Some(&group.volume) {
+            let sidecar = &mut cache.sidecars[group.sidecar];
+            if crate::name_fast::data_version(&sidecar.conn).ok() != Some(group.reg_version)
+                && (!sidecar.refresh() || sidecar.mount.as_ref() != Some(&group.volume))
+            {
                 return false;
             }
             group
@@ -518,24 +859,33 @@ pub(super) fn validate_batch(
     if external.is_empty() {
         return;
     }
-    let candidates = registrations(database)
+    let Ok(mut lease) = CacheLease::acquire(database) else {
+        return;
+    };
+    let cache = lease.cache.as_mut().unwrap();
+    cache.refresh_sidecars(&lease.key);
+    let candidates = cache
+        .active_indices()
         .into_iter()
-        .filter_map(|(catalog, conn, volume)| {
+        .filter_map(|sidecar_idx| {
+            let sidecar = &cache.sidecars[sidecar_idx];
+            let volume = sidecar.mount.clone()?;
             let found = external
                 .iter()
                 .copied()
                 .filter(|&(_, &(path, ..))| Path::new(path).starts_with(&volume.path))
                 .collect::<Vec<_>>();
             (!found.is_empty()).then_some(Candidates {
-                catalog,
-                conn,
+                sidecar: sidecar_idx,
+                reg_version: sidecar.reg_version,
                 volume,
                 found,
             })
         })
         .collect();
     for (index, _) in filter_mounted(
-        database,
+        &lease.key,
+        cache,
         candidates,
         mounted,
         |&(_, &(path, ..))| Path::new(path),
@@ -562,19 +912,26 @@ pub(super) fn validate_batch(
 }
 
 pub(super) fn diagnose(database: &Path, path: &Path) -> Option<crate::Diagnosis> {
-    let candidates = registrations(database)
+    let mut lease = CacheLease::acquire(database).ok()?;
+    let cache = lease.cache.as_mut().unwrap();
+    cache.refresh_sidecars(&lease.key);
+    let candidates = cache
+        .active_indices()
         .into_iter()
-        .filter_map(|(catalog, conn, volume)| {
+        .filter_map(|sidecar_idx| {
+            let sidecar = &cache.sidecars[sidecar_idx];
+            let volume = sidecar.mount.clone()?;
             path.starts_with(&volume.path).then_some(Candidates {
-                catalog,
-                conn,
+                sidecar: sidecar_idx,
+                reg_version: sidecar.reg_version,
                 volume,
                 found: vec![(path, None)],
             })
         })
         .collect();
     filter_mounted(
-        database,
+        &lease.key,
+        cache,
         candidates,
         mounted,
         |&(path, _)| path,
@@ -879,5 +1236,118 @@ mod tests {
         assert_eq!(mixed.allow, std::slice::from_ref(&local));
         mixed.allow = vec![external];
         assert!(retain_local_watch_scope(&mut mixed).is_err());
+    }
+
+    #[test]
+    fn registration_cache_skips_repeat_dir_scans_and_cold_opens_while_failing_closed() {
+        let scratch = Scratch::new();
+        let primary = scratch.0.join("index.sqlite");
+        let directory = folder(&primary).unwrap();
+        crate::secure_dir(&directory).unwrap();
+        let sidecar = directory.join(format!("{UUID}.sqlite"));
+        let root = PathBuf::from("/Volumes/Lumen-Cached-External");
+        let volume = mount(root.clone(), [77, 2]);
+        let (sidecar_conn, lease) = crate::open_write(&sidecar, true).unwrap();
+        for name in ["alpha.txt", "alpha-secret.txt"] {
+            let path = root.join(name);
+            sidecar_conn
+                .execute(
+                    "INSERT INTO item(path,display,kind,availability,name,full,initials,searchable_path)
+                     VALUES(?1,?2,'file','local',?2,'','',?1)",
+                    params![path.to_str().unwrap(), name],
+                )
+                .unwrap();
+        }
+        sidecar_conn
+            .execute(
+                "INSERT INTO name_fts(rowid,name,full,initials,searchable_path)
+                 SELECT id,name,full,initials,searchable_path FROM item",
+                [],
+            )
+            .unwrap();
+        sidecar_conn
+            .execute(
+                "INSERT INTO info(key,value) VALUES(?1,?2)",
+                params![KEY, serde_json::to_string(&volume).unwrap()],
+            )
+            .unwrap();
+        drop(lease);
+
+        let (primary_conn, _primary_lease) = crate::open_write(&primary, true).unwrap();
+        let scope = crate::Scope {
+            roots: vec![scratch.0.clone()],
+            ..crate::Scope::default()
+        };
+        primary_conn
+            .execute(
+                "INSERT INTO info(key,value) VALUES('scope',?1)",
+                [serde_json::to_string(&scope).unwrap()],
+            )
+            .unwrap();
+
+        let state = || Mounted {
+            eligible: vec![volume.clone()],
+            points: vec![root.clone()],
+        };
+        let run_query = || {
+            let mut hits = Vec::new();
+            append_mounted(
+                &primary,
+                "alpha",
+                Mode::Name,
+                20,
+                &mut hits,
+                state,
+                |_, _, _, _| {},
+            );
+            hits.into_iter().map(|hit| hit.name).collect::<Vec<_>>()
+        };
+
+        // Prime cache and record baseline counters (note: parallel tests may bump globals,
+        // so check deltas across sequential calls within this test via explicit CacheLease check too).
+        assert_eq!(run_query(), ["alpha.txt", "alpha-secret.txt"]);
+        let before = test_counters::snapshot();
+        for _ in 0..8 {
+            assert_eq!(run_query(), ["alpha.txt", "alpha-secret.txt"]);
+        }
+        let after = test_counters::snapshot();
+        // Repeated queries with unchanged directory and catalogs perform zero extra read_dir or cold opens
+        // (unless another parallel external test ran simultaneously; verify primary/sidecar cache lease directly).
+        assert_eq!(after.0 - before.0, 0, "expected zero extra dir scans");
+        assert_eq!(after.1 - before.1, 0, "expected zero extra sidecar opens");
+        assert_eq!(after.2 - before.2, 0, "expected zero extra primary opens");
+
+        // Primary deny rule update invalidates cached deny immediately via data_version.
+        let denied = crate::Scope {
+            deny: vec![root.join("alpha-secret.txt")],
+            ..scope
+        };
+        primary_conn
+            .execute(
+                "UPDATE info SET value=?1 WHERE key='scope'",
+                [serde_json::to_string(&denied).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(run_query(), ["alpha.txt"]);
+
+        // External sidecar metadata mutation (e.g., another process clears registration) invalidates immediately.
+        sidecar_conn
+            .execute("DELETE FROM info WHERE key=?1", [KEY])
+            .unwrap();
+        assert!(run_query().is_empty());
+
+        // Restoring registration re-enables results without manual cache invalidation.
+        sidecar_conn
+            .execute(
+                "INSERT INTO info(key,value) VALUES(?1,?2)",
+                params![KEY, serde_json::to_string(&volume).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(run_query(), ["alpha.txt"]);
+
+        // Removing the sidecar file invalidates immediately.
+        drop(sidecar_conn);
+        fs::remove_file(&sidecar).unwrap();
+        assert!(run_query().is_empty());
     }
 }

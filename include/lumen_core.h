@@ -13,11 +13,12 @@ typedef struct LumenSessionHandle LumenSessionHandle;
 LumenSessionHandle *lumen_session_open(const char *database_path, const char *root_path);
 
 /* One NUL-terminated UTF-8 JSON request (no line framing). Use the lumen serve
- * name/text search or cached-hit validation fields; op may be omitted, otherwise
- * it must match the function. Replies carry id and hits/valid, or error (with id
- * if decoded). Free every reply with lumen_string_free. */
+ * name/text search, cached-hit validation, or status fields; op may be omitted,
+ * otherwise it must match the function. Replies carry id and hits/valid/status,
+ * or error (with id if decoded). Free every reply with lumen_string_free. */
 char *lumen_session_search_json(LumenSessionHandle *handle, const char *request_json);
 char *lumen_session_validate_json(LumenSessionHandle *handle, const char *request_json);
+char *lumen_session_status_json(LumenSessionHandle *handle, const char *request_json);
 
 /* NULL is a no-op. Release each non-NULL handle and reply exactly once. */
 void lumen_session_close(LumenSessionHandle *handle);

@@ -15,7 +15,7 @@ mod soa;
 use soa::{MAX_INDEX_BYTES, NameIndex};
 
 // SQLite remains the query path while building or when the byte budget is exceeded.
-const REBUILD_DELAY: Duration = Duration::from_millis(200);
+const REBUILD_DELAY: Duration = Duration::from_millis(1200);
 const OVER_BUDGET_DELAY: Duration = Duration::from_secs(30);
 const MAX_BUILD_DELAY: Duration = Duration::from_secs(15 * 60);
 
@@ -27,21 +27,129 @@ pub(super) fn has_mtime(conn: &Connection) -> Result<bool> {
     )?)
 }
 
+fn advance_bucket_sql(key: &str) -> String {
+    format!(
+        "INSERT INTO info(key,value) VALUES('{key}',1)
+         ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1;"
+    )
+}
+
+fn table_bucket_triggers(bucket_key: &str, tables: &[&str]) -> String {
+    let advance = advance_bucket_sql(bucket_key);
+    let mut sql = String::new();
+    for table in tables {
+        for (op, event) in [
+            ("insert", "INSERT"),
+            ("update", "UPDATE"),
+            ("delete", "DELETE"),
+        ] {
+            sql.push_str(&format!(
+                "CREATE TRIGGER IF NOT EXISTS {bucket_key}_{table}_{op} AFTER {event} ON {table} BEGIN {advance} END;"
+            ));
+        }
+    }
+    sql
+}
+
+fn info_bucket_triggers(bucket_key: &str, keys_sql: &str) -> String {
+    let advance = advance_bucket_sql(bucket_key);
+    format!(
+        "CREATE TRIGGER IF NOT EXISTS {bucket_key}_info_insert AFTER INSERT ON info
+         WHEN new.key {keys_sql} BEGIN {advance} END;
+         CREATE TRIGGER IF NOT EXISTS {bucket_key}_info_update AFTER UPDATE ON info
+         WHEN old.key {keys_sql} OR new.key {keys_sql} BEGIN {advance} END;
+         CREATE TRIGGER IF NOT EXISTS {bucket_key}_info_delete AFTER DELETE ON info
+         WHEN old.key {keys_sql} BEGIN {advance} END;"
+    )
+}
+
 pub(super) fn install_generation(conn: &Connection) -> Result<()> {
     // Triggers also cover visibility changes and item writes outside the walker.
-    let advance = "INSERT INTO info(key,value) VALUES('name_generation',1)
-                   ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1;";
+    let adv_name = advance_bucket_sql("name_generation");
+    let adv_doc = advance_bucket_sql("doc_generation");
+    let adv_vec = advance_bucket_sql("vec_generation");
+    let adv_img = advance_bucket_sql("img_generation");
+    let doc_triggers = table_bucket_triggers(
+        "doc_generation",
+        &["document", "document_state", "content_job"],
+    );
+    let vec_triggers = table_bucket_triggers(
+        "vec_generation",
+        &[
+            "semantic_vector",
+            "semantic_chunk",
+            "semantic_state",
+            "document",
+            "document_state",
+        ],
+    );
+    let img_triggers = table_bucket_triggers("img_generation", &["image_embedding", "image_scope"]);
+    let doc_info = info_bucket_triggers("doc_generation", "IN ('scope','cloud_content_policy_v1')");
+    let vec_info = info_bucket_triggers("vec_generation", "IN ('scope','model')");
+    let img_info = info_bucket_triggers("img_generation", "= 'scope'");
     conn.execute_batch(&format!(
-        "INSERT OR IGNORE INTO info(key,value) VALUES('name_generation',0);
-         CREATE TRIGGER IF NOT EXISTS item_name_generation_insert AFTER INSERT ON item BEGIN {advance} END;
-         CREATE TRIGGER IF NOT EXISTS item_name_generation_delete AFTER DELETE ON item BEGIN {advance} END;
+        "CREATE TABLE IF NOT EXISTS image_scope(id INTEGER PRIMARY KEY CHECK(id=1), root TEXT, epoch INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS image_embedding(
+             id INTEGER PRIMARY KEY, model TEXT NOT NULL, stamp TEXT NOT NULL, vector BLOB NOT NULL
+         );
+         INSERT OR IGNORE INTO info(key,value) VALUES('name_generation',0),('doc_generation',0),('vec_generation',0),('img_generation',0);
+         CREATE TRIGGER IF NOT EXISTS item_name_generation_insert AFTER INSERT ON item BEGIN {adv_name} END;
+         CREATE TRIGGER IF NOT EXISTS item_name_generation_delete AFTER DELETE ON item BEGIN {adv_name} END;
          DROP TRIGGER IF EXISTS item_name_generation_update;
          CREATE TRIGGER item_name_generation_update AFTER UPDATE ON item
          WHEN (old.id,old.path,old.display,old.kind,old.availability,old.name,old.full,old.initials,old.searchable_path,old.mtime)
            IS NOT (new.id,new.path,new.display,new.kind,new.availability,new.name,new.full,new.initials,new.searchable_path,new.mtime)
-         BEGIN {advance} END;"
+         BEGIN {adv_name} END;
+         {doc_triggers}
+         {doc_info}
+         CREATE TRIGGER IF NOT EXISTS doc_generation_item_update AFTER UPDATE ON item
+         WHEN (old.availability IS NOT new.availability OR old.path IS NOT new.path OR old.kind IS NOT new.kind)
+           AND EXISTS(SELECT 1 FROM document WHERE id=old.id)
+         BEGIN {adv_doc} END;
+         CREATE TRIGGER IF NOT EXISTS doc_generation_item_delete AFTER DELETE ON item
+         WHEN EXISTS(SELECT 1 FROM document WHERE id=old.id)
+         BEGIN {adv_doc} END;
+         {vec_triggers}
+         {vec_info}
+         CREATE TRIGGER IF NOT EXISTS vec_generation_item_update AFTER UPDATE ON item
+         WHEN (old.availability IS NOT new.availability OR old.path IS NOT new.path OR old.kind IS NOT new.kind)
+           AND (EXISTS(SELECT 1 FROM document WHERE id=old.id) OR EXISTS(SELECT 1 FROM semantic_chunk WHERE document_id=old.id))
+         BEGIN {adv_vec} END;
+         CREATE TRIGGER IF NOT EXISTS vec_generation_item_delete AFTER DELETE ON item
+         WHEN EXISTS(SELECT 1 FROM document WHERE id=old.id) OR EXISTS(SELECT 1 FROM semantic_chunk WHERE document_id=old.id)
+         BEGIN {adv_vec} END;
+         {img_triggers}
+         {img_info}
+         CREATE TRIGGER IF NOT EXISTS img_generation_item_update AFTER UPDATE ON item
+         WHEN (old.availability IS NOT new.availability OR old.path IS NOT new.path OR old.kind IS NOT new.kind)
+           AND EXISTS(SELECT 1 FROM image_embedding WHERE id=old.id)
+         BEGIN {adv_img} END;
+         CREATE TRIGGER IF NOT EXISTS img_generation_item_delete AFTER DELETE ON item
+         WHEN EXISTS(SELECT 1 FROM image_embedding WHERE id=old.id)
+         BEGIN {adv_img} END;"
     ))?;
     Ok(())
+}
+
+pub(super) fn has_generation_buckets(conn: &Connection) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT (SELECT count(*)=4 FROM info WHERE key IN ('name_generation','doc_generation','vec_generation','img_generation'))
+             AND EXISTS(SELECT 1 FROM sqlite_schema WHERE type='trigger' AND name='img_generation_image_embedding_insert')",
+        )?
+        .query_row([], |row| row.get(0))?)
+}
+
+#[allow(dead_code)] // Wired by semantic and image_search after Phase 3 merge.
+pub(crate) fn bucket_generation(conn: &Connection, key: &str) -> Result<i64> {
+    let value: Option<i64> = conn
+        .prepare_cached("SELECT CAST(value AS INTEGER) FROM info WHERE key=?1")?
+        .query_row([key], |row| row.get(0))
+        .optional()?;
+    match value {
+        Some(generation) => Ok(generation),
+        None => data_version(conn),
+    }
 }
 
 pub(super) fn name_generation(conn: &Connection) -> Result<Option<i64>> {
@@ -232,12 +340,13 @@ pub(super) fn search_disk(conn: &Connection, query: &str, limit: usize) -> Resul
 
 struct Build {
     cancel: Arc<AtomicBool>,
-    worker: JoinHandle<Result<Option<NameIndex>>>,
+    worker: JoinHandle<Result<Option<(i64, NameIndex)>>>,
 }
 
 pub(super) struct NameFast {
     db: PathBuf,
-    generation: Option<i64>,
+    loaded_generation: Option<i64>,
+    building_generation: Option<i64>,
     index: Option<NameIndex>,
     build: Option<Build>,
     next_build: Instant,
@@ -249,6 +358,16 @@ pub(super) fn data_version(conn: &Connection) -> Result<i64> {
     Ok(conn.pragma_query_value(None, "data_version", |row| row.get(0))?)
 }
 
+fn drop_off_hot_path(index: Option<NameIndex>) {
+    if let Some(index) = index
+        && let Err(error) = thread::Builder::new()
+            .name("lumen-names-drop".to_owned())
+            .spawn(move || drop(index))
+    {
+        drop(error);
+    }
+}
+
 impl NameFast {
     pub(super) fn new(db: &Path, conn: &Connection) -> Self {
         Self::with_budget(db, conn, MAX_INDEX_BYTES)
@@ -257,7 +376,8 @@ impl NameFast {
     fn with_budget(db: &Path, conn: &Connection, budget: usize) -> Self {
         let mut fast = Self {
             db: db.to_owned(),
-            generation: None,
+            loaded_generation: None,
+            building_generation: None,
             index: None,
             build: None,
             next_build: Instant::now(),
@@ -278,25 +398,27 @@ impl NameFast {
         limit: usize,
     ) -> Result<Option<(i64, Vec<Hit>)>> {
         let generation = name_generation(conn)?;
-        let current = generation.is_some() && self.generation == generation;
-        if let Some(build) = &self.build {
-            if build.worker.is_finished() {
-                let build = self.build.take().unwrap();
-                match build.worker.join() {
-                    Ok(Ok(Some(index))) => {
-                        self.build_delay = OVER_BUDGET_DELAY;
-                        if current {
-                            self.index = Some(index);
-                        }
+        if let Some(build) = &self.build
+            && build.worker.is_finished()
+        {
+            let build = self.build.take().unwrap();
+            let _building = self.building_generation.take();
+            match build.worker.join() {
+                Ok(Ok(Some((built_gen, index)))) => {
+                    self.build_delay = OVER_BUDGET_DELAY;
+                    let previous = self.index.replace(index);
+                    drop_off_hot_path(previous);
+                    self.loaded_generation = Some(built_gen);
+                    if generation.is_some_and(|current| current != built_gen) {
+                        self.next_build = Instant::now() + REBUILD_DELAY;
                     }
-                    _ if !build.cancel.load(Ordering::Relaxed) => self.back_off(),
-                    _ => {}
                 }
-            } else if !current {
-                build.cancel.store(true, Ordering::Relaxed);
+                _ if !build.cancel.load(Ordering::Relaxed) => self.back_off(),
+                _ => {}
             }
         }
         if let Some(generation) = generation {
+            let current = self.loaded_generation == Some(generation);
             if self.build.is_none()
                 && (!current || self.index.is_none())
                 && Instant::now() >= self.next_build
@@ -320,21 +442,18 @@ impl NameFast {
 
     fn start(&mut self, generation: i64) {
         let db = self.db.clone();
-        let stale = self.index.take();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancellation = Arc::clone(&cancel);
-        self.generation = Some(generation);
+        self.building_generation = Some(generation);
         self.next_build = Instant::now() + REBUILD_DELAY;
         let budget = self.budget;
         self.build = thread::Builder::new()
             .name("lumen-names".to_owned())
-            .spawn(move || {
-                drop(stale);
-                NameIndex::load(&db, &cancellation, budget)
-            })
+            .spawn(move || NameIndex::load(&db, &cancellation, budget))
             .ok()
             .map(|worker| Build { cancel, worker });
         if self.build.is_none() {
+            self.building_generation = None;
             self.back_off();
         }
     }
@@ -358,6 +477,66 @@ fn literal_prefix_safe(query: &str) -> bool {
     query
         .chars()
         .all(|c| c.is_ascii() || matches!(c, '\u{3400}'..='\u{9fff}'))
+}
+
+#[cfg(test)]
+struct TestPause {
+    entered: (std::sync::Mutex<bool>, std::sync::Condvar),
+    released: (std::sync::Mutex<bool>, std::sync::Condvar),
+}
+
+#[cfg(test)]
+impl TestPause {
+    fn new() -> Self {
+        Self {
+            entered: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+            released: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+        }
+    }
+
+    fn wait_entered(&self) {
+        let mut entered = self.entered.0.lock().unwrap();
+        while !*entered {
+            entered = self.entered.1.wait(entered).unwrap();
+        }
+    }
+
+    fn release(&self) {
+        *self.released.0.lock().unwrap() = true;
+        self.released.1.notify_all();
+    }
+}
+
+#[cfg(test)]
+fn test_pause_registry()
+-> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<TestPause>>> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<TestPause>>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn install_test_pause(db: &Path) -> Arc<TestPause> {
+    let pause = Arc::new(TestPause::new());
+    test_pause_registry()
+        .lock()
+        .unwrap()
+        .insert(db.to_path_buf(), Arc::clone(&pause));
+    pause
+}
+
+#[cfg(test)]
+pub(super) fn maybe_pause_load_for_test(db: &Path) {
+    let pause = test_pause_registry().lock().unwrap().remove(db);
+    if let Some(pause) = pause {
+        *pause.entered.0.lock().unwrap() = true;
+        pause.entered.1.notify_all();
+        let mut released = pause.released.0.lock().unwrap();
+        while !*released {
+            released = pause.released.1.wait(released).unwrap();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -394,6 +573,157 @@ mod tests {
             assert!(Instant::now() < deadline, "name build did not complete");
             thread::yield_now();
         }
+    }
+
+    #[test]
+    fn independent_generation_buckets_isolate_domain_writes_and_configure_pragmas() -> Result<()> {
+        let catalog = Catalog::new("buckets")?;
+        let db = catalog.db();
+        let (writer, _) = crate::open_write(&db, false)?;
+        let reader = open_read(&db)?;
+
+        let pragma = |conn: &Connection, name: &str| -> Result<i64> {
+            Ok(conn.pragma_query_value(None, name, |row| row.get(0))?)
+        };
+        assert_eq!(pragma(&writer, "wal_autocheckpoint")?, 1000);
+        assert_eq!(pragma(&writer, "journal_size_limit")?, 67_108_864);
+        assert_eq!(pragma(&writer, "cache_size")?, -16_000);
+        assert_eq!(pragma(&reader, "cache_size")?, -8_000);
+
+        let generations = |conn: &Connection| -> Result<(i64, i64, i64, i64)> {
+            Ok((
+                bucket_generation(conn, "name_generation")?,
+                bucket_generation(conn, "doc_generation")?,
+                bucket_generation(conn, "vec_generation")?,
+                bucket_generation(conn, "img_generation")?,
+            ))
+        };
+        assert_eq!(generations(&reader)?, (0, 0, 0, 0));
+
+        // Plain item writes bump only name_generation.
+        writer.execute_batch(
+            "INSERT INTO item VALUES(1,'/scope/a.txt','a.txt','file','local','a.txt','','','/scope/a.txt',10);
+             INSERT INTO item VALUES(2,'/scope/b.png','b.png','file','local','b.png','','','/scope/b.png',10);
+             INSERT INTO item VALUES(3,'/scope/c.txt','c.txt','file','local','c.txt','','','/scope/c.txt',10);
+             UPDATE item SET mtime=20 WHERE id=3;",
+        )?;
+        assert_eq!(generations(&reader)?, (4, 0, 0, 0));
+
+        // content_job affects only doc_generation.
+        writer.execute_batch("INSERT INTO content_job VALUES(1, NULL);")?;
+        assert_eq!(generations(&reader)?, (4, 1, 0, 0));
+
+        // document / document_state affect doc_generation and vec_generation, not name or img.
+        writer.execute_batch(
+            "INSERT INTO document VALUES(1,'body','body');
+             INSERT INTO document_state VALUES(1,'1:2:3:4:5');",
+        )?;
+        assert_eq!(generations(&reader)?, (4, 3, 2, 0));
+
+        // semantic_chunk / semantic_vector affect only vec_generation.
+        writer.execute_batch(
+            "INSERT INTO semantic_chunk(id,document_id,start_byte,end_byte) VALUES(1,1,0,4);
+             INSERT INTO semantic_vector VALUES('gemma',1,zeroblob(16));",
+        )?;
+        assert_eq!(generations(&reader)?, (4, 3, 4, 0));
+
+        // image_scope / image_embedding affect only img_generation.
+        writer.execute_batch(
+            "INSERT INTO image_scope VALUES(1,'/scope',1);
+             INSERT INTO image_embedding VALUES(2,'model','1:2:3:4:5',zeroblob(16));",
+        )?;
+        assert_eq!(generations(&reader)?, (4, 3, 4, 2));
+
+        // Updating availability on an item referenced by document bumps name, doc, vec (not img).
+        writer.execute_batch("UPDATE item SET availability='unverified' WHERE id=1;")?;
+        assert_eq!(generations(&reader)?, (5, 4, 5, 2));
+
+        // Updating availability on an item referenced by image_embedding (even without image_entry_moved) bumps name and img.
+        writer.execute_batch("UPDATE item SET availability='unverified' WHERE id=2;")?;
+        assert_eq!(generations(&reader)?, (6, 4, 5, 3));
+
+        // Updating scope bumps doc, vec, img (not name).
+        writer.execute_batch("INSERT INTO info(key,value) VALUES('scope','{}');")?;
+        assert_eq!(generations(&reader)?, (6, 5, 6, 4));
+
+        // Updating model bumps only vec_generation.
+        writer.execute_batch("INSERT INTO info(key,value) VALUES('model','bge');")?;
+        assert_eq!(generations(&reader)?, (6, 5, 7, 4));
+        Ok(())
+    }
+
+    #[test]
+    fn burst_writes_do_not_cancel_or_discard_active_name_index_build() -> Result<()> {
+        let catalog = Catalog::new("burst-coalesce")?;
+        let db = catalog.db();
+        let (writer, _) = crate::open_write(&db, false)?;
+        writer.execute(
+            "INSERT INTO item VALUES(1,'/scope/alpha.txt','alpha.txt','file','local','alpha.txt','','','/scope/alpha.txt',10)",
+            [],
+        )?;
+        let reader = open_read(&db)?;
+        let mut fast = NameFast::new(&db, &reader);
+        finish_build(&fast);
+        let (gen0, hits) = fast.search(&reader, "alpha", None, 10)?.unwrap();
+        assert_eq!(hits[0].name, "alpha.txt");
+        assert_eq!(fast.loaded_generation, Some(gen0));
+
+        // Arm a pause gate inside NameIndex::load so the gen1 rebuild stays active across burst writes.
+        let gate = install_test_pause(&db);
+        writer.execute(
+            "INSERT INTO item VALUES(2,'/scope/beta.txt','beta.txt','file','local','beta.txt','','','/scope/beta.txt',20)",
+            [],
+        )?;
+        fast.next_build = Instant::now();
+        assert!(fast.search(&reader, "beta", None, 10)?.is_none());
+        assert!(fast.build.is_some());
+        // Warm NameIndex from gen0 stays intact in memory while the rebuild runs.
+        assert!(fast.index.is_some());
+        assert_eq!(fast.loaded_generation, Some(gen0));
+        gate.wait_entered();
+
+        // Commit a burst of item mutations while gen1 rebuild is mid-flight.
+        for (id, name) in [(3, "gamma.txt"), (4, "delta.txt"), (5, "epsilon.txt")] {
+            writer.execute(
+                "INSERT INTO item VALUES(?1,?2,?3,'file','local',?3,'','',?2,30)",
+                params![id, format!("/scope/{name}"), name],
+            )?;
+            // Must NOT cancel the active build or discard the warm index; must fall back cleanly.
+            assert!(fast.search(&reader, "epsilon", None, 10)?.is_none());
+            let build = fast
+                .build
+                .as_ref()
+                .expect("active build must remain running");
+            assert!(
+                !build.cancel.load(Ordering::Relaxed),
+                "burst writes must not cancel active NameIndex build"
+            );
+            assert!(fast.index.is_some(), "warm NameIndex must not be discarded");
+        }
+
+        // Release the active gen1 build and let it swap in cleanly.
+        gate.release();
+        finish_build(&fast);
+        let stale_gen = gen0 + 1;
+        let final_gen = gen0 + 4;
+        assert_eq!(name_generation(&reader)?, Some(final_gen));
+        // Because loaded_generation (stale_gen) != final_gen, query falls back to SQLite and
+        // schedules one coalesced follow-up rebuild after REBUILD_DELAY (1200ms).
+        let before_swap = Instant::now();
+        assert!(fast.search(&reader, "epsilon", None, 10)?.is_none());
+        assert_eq!(fast.loaded_generation, Some(stale_gen));
+        assert!(fast.build.is_none());
+        assert!(fast.next_build >= before_swap + REBUILD_DELAY);
+
+        // Once the coalesced delay elapses, one rebuild converges to final_gen.
+        fast.next_build = Instant::now();
+        assert!(fast.search(&reader, "epsilon", None, 10)?.is_none());
+        assert!(fast.build.is_some());
+        finish_build(&fast);
+        let (ram_gen, ram_hits) = fast.search(&reader, "epsilon", None, 10)?.unwrap();
+        assert_eq!(ram_gen, final_gen);
+        assert_eq!(ram_hits[0].name, "epsilon.txt");
+        Ok(())
     }
 
     #[test]

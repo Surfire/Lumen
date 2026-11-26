@@ -16,6 +16,7 @@ pub struct LumenSessionHandle(SearchSession);
 enum Operation {
     Search,
     Validate,
+    Status,
 }
 
 #[derive(Deserialize)]
@@ -28,6 +29,7 @@ struct Request {
     limit: Option<usize>,
     check_access: Option<bool>,
     hits: Option<Vec<ValidationHit>>,
+    include_scope: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -44,6 +46,7 @@ struct ValidationHit {
 enum Reply {
     Search { id: u64, hits: Vec<Hit> },
     Validate { id: u64, valid: Vec<bool> },
+    Status { id: u64, status: serde_json::Value },
 }
 
 // The caller vouches that each non-null pointer is live for the duration of the call.
@@ -144,6 +147,10 @@ unsafe fn request(
                     valid: session.validate(&inputs),
                 })
             }
+            Operation::Status => Ok(Reply::Status {
+                id: q.id,
+                status: session.status(q.include_scope.unwrap_or(false))?,
+            }),
         }
     })
 }
@@ -162,6 +169,14 @@ pub unsafe extern "C" fn lumen_session_validate_json(
     json: *const c_char,
 ) -> *mut c_char {
     unsafe { request(handle, json, Operation::Validate) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lumen_session_status_json(
+    handle: *mut LumenSessionHandle,
+    json: *const c_char,
+) -> *mut c_char {
+    unsafe { request(handle, json, Operation::Status) }
 }
 
 #[unsafe(no_mangle)]
@@ -202,7 +217,11 @@ mod tests {
             assert!(lumen_session_open(invalid, null).is_null());
             assert!(lumen_session_open(c"index.sqlite".as_ptr(), invalid).is_null());
             assert!(lumen_session_open(c"".as_ptr(), null).is_null());
-            for request in [lumen_session_search_json, lumen_session_validate_json] {
+            for request in [
+                lumen_session_search_json,
+                lumen_session_validate_json,
+                lumen_session_status_json,
+            ] {
                 for json in [null, invalid, c"{broken".as_ptr()] {
                     let response = reply(request(no_handle, json));
                     assert!(response["error"].is_string());
@@ -289,6 +308,31 @@ mod tests {
                 json!({"id":7,"error":"validate requires hits"}),
             ),
         ];
+        let reader = crate::open_read(&db).unwrap();
+        let expected_status = crate::status(&reader).unwrap();
+        let expected_status_with_scope = crate::status_with_scope(&reader, true).unwrap();
+        assert!(expected_status.get("scope").is_none());
+        assert!(expected_status_with_scope.get("scope").is_some());
+        drop(reader);
+        let status_checks = [
+            (cr#"{"id":8}"#, json!({"id":8,"status":expected_status})),
+            (
+                cr#"{"id":9,"op":"status","include_scope":false}"#,
+                json!({"id":9,"status":expected_status}),
+            ),
+            (
+                cr#"{"id":10,"include_scope":true}"#,
+                json!({"id":10,"status":expected_status_with_scope}),
+            ),
+            (
+                cr#"{"id":11,"op":"status","include_scope":true}"#,
+                json!({"id":11,"status":expected_status_with_scope}),
+            ),
+            (
+                cr#"{"id":12,"op":"search"}"#,
+                json!({"id":12,"error":"request op does not match entry point"}),
+            ),
+        ];
         for root in [ptr::null(), c_root.as_ptr()].into_iter().cycle().take(32) {
             unsafe {
                 let handle = lumen_session_open(c_db.as_ptr(), root);
@@ -302,6 +346,12 @@ mod tests {
                 for (request, expected) in &validations {
                     assert_eq!(
                         &reply(lumen_session_validate_json(handle, request.as_ptr())),
+                        expected
+                    );
+                }
+                for (request, expected) in &status_checks {
+                    assert_eq!(
+                        &reply(lumen_session_status_json(handle, request.as_ptr())),
                         expected
                     );
                 }

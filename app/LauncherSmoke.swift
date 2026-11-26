@@ -2844,6 +2844,13 @@ final class LauncherSmoke {
         let model = app.model
         let frame = app.panel.frame
         let chrome = app.panel.contentView
+        guard let backdrop = chrome as? SearchBackdrop,
+              backdrop.layer?.cornerRadius == SearchBackdrop.cornerRadius,
+              backdrop.layer?.cornerCurve == .continuous,
+              backdrop.layer?.masksToBounds == true,
+              backdrop.effect.maskImage?.resizingMode == .stretch else {
+            throw Failure("SearchBackdrop missing continuous rounded mask or layer clipping")
+        }
         var resizeCount = 0
         let resize = NotificationCenter.default.publisher(for: NSWindow.didResizeNotification, object: app.panel)
             .sink { _ in resizeCount += 1 }

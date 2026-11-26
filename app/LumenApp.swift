@@ -134,12 +134,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             else { self.perform(action, on: hit) }
         }
         let content = SearchBackdrop()
-        content.material = .popover
-        content.blendingMode = .behindWindow
-        content.state = .active
-        content.wantsLayer = true
-        content.layer?.cornerRadius = 15
-        content.layer?.masksToBounds = true
         let icon = NSImageView(image: NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil) ?? NSImage())
         icon.image?.isTemplate = true
         icon.symbolConfiguration = .init(pointSize: 18, weight: .medium)
@@ -194,6 +188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         content.addSubview(close)
         content.addSubview(results)
         panel.contentView = content
+        panel.invalidateShadow()
         panel.initialFirstResponder = searchField
         NSLayoutConstraint.activate([
             searchField.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
@@ -393,6 +388,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             let reveal = firstShow && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
             if firstShow { panel.alphaValue = reveal ? 0 : 1 }
             panel.makeKeyAndOrderFront(nil)
+            panel.invalidateShadow()
             if reveal {
                 NSAnimationContext.runAnimationGroup { context in
                     context.duration = 0.14
@@ -1313,6 +1309,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         frame.origin.y += frame.height - height
         frame.size.height = height
         panel.setFrame(frame, display: true)
+        panel.invalidateShadow()
     }
 
     private func installEditMenu() {
@@ -1362,9 +1359,33 @@ final class SearchField: NSTextField {
 }
 
 @MainActor
-final class SearchBackdrop: NSVisualEffectView {
+final class SearchBackdrop: NSView {
+    static let cornerRadius: CGFloat = 16
+    let effect = NSVisualEffectView()
     private var transparencyChange: AnyCancellable?
     var appearanceChanged: (() -> Void)?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerRadius = Self.cornerRadius
+        layer?.cornerCurve = .continuous
+        layer?.masksToBounds = true
+        effect.material = .popover
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        effect.maskImage = Self.roundedMask(radius: Self.cornerRadius)
+        effect.autoresizingMask = [.width, .height]
+        effect.frame = bounds
+        addSubview(effect)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func layout() {
+        super.layout()
+        effect.frame = bounds
+    }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -1384,8 +1405,22 @@ final class SearchBackdrop: NSVisualEffectView {
 
     func refreshTransparency() {
         let reduced = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
-        material = reduced ? .windowBackground : .popover
-        blendingMode = reduced ? .withinWindow : .behindWindow
+        effect.material = reduced ? .windowBackground : .popover
+        effect.blendingMode = reduced ? .withinWindow : .behindWindow
+        effect.maskImage = Self.roundedMask(radius: Self.cornerRadius)
+        window?.invalidateShadow()
+    }
+
+    private static func roundedMask(radius: CGFloat) -> NSImage {
+        let side = radius * 2 + 2
+        let image = NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
+            NSColor.black.setFill()
+            NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
+            return true
+        }
+        image.capInsets = NSEdgeInsets(top: radius, left: radius, bottom: radius, right: radius)
+        image.resizingMode = .stretch
+        return image
     }
 }
 

@@ -6,6 +6,8 @@ final class LauncherCommands: ObservableObject {
     @Published private(set) var resolution: LumenCommandResolution = .search
     @Published private(set) var entries: [LumenCommandCatalog.Entry] = []
     @Published private(set) var selection = 0
+    @Published private(set) var clipboardRows: [ClipboardItem] = []
+    @Published private(set) var clipboardSelection: Int64?
     @Published private(set) var answer: LumenQuickAnswer.State = .idle
     @Published private var partialAnswer = ""
     @Published private(set) var copied = false
@@ -23,6 +25,8 @@ final class LauncherCommands: ObservableObject {
     }()
 
     var isImageCommand: Bool { if case .image = resolution { return true }; return false }
+    var isClipboardCommand: Bool { if case .clipboard = resolution { return true }; return false }
+    var selectedClipboardItem: ClipboardItem? { clipboardRows.first { $0.id == clipboardSelection } }
     var showsCard: Bool { resolution != .search && resolution != .translation && !isImageCommand }
     var selectedEntry: LumenCommandCatalog.Entry? { entries.indices.contains(selection) ? entries[selection] : nil }
 
@@ -37,6 +41,25 @@ final class LauncherCommands: ObservableObject {
         if selection != 0 { selection = 0 }
         if webFailed { webFailed = false }
         if resolution != next { resolution = next }
+    }
+
+    func updateClipboard(_ items: [ClipboardItem], resetSelection: Bool = false) {
+        let rows: [ClipboardItem]
+        if case .clipboard(let filter) = resolution { rows = ClipboardItem.filtered(items, for: filter) }
+        else { rows = [] }
+        if clipboardRows != rows { clipboardRows = rows }
+        if resetSelection || selectedClipboardItem == nil {
+            if clipboardSelection != rows.first?.id { clipboardSelection = rows.first?.id }
+        }
+    }
+
+    func chooseClipboard(_ id: Int64) {
+        if clipboardRows.contains(where: { $0.id == id }) { clipboardSelection = id }
+    }
+
+    func moveClipboard(_ delta: Int) {
+        guard let index = clipboardRows.firstIndex(where: { $0.id == clipboardSelection }) else { return }
+        chooseClipboard(clipboardRows[min(max(0, index + delta), clipboardRows.count - 1)].id)
     }
 
     func move(_ delta: Int) { selection = min(max(0, selection + delta), max(0, entries.count - 1)) }
@@ -93,8 +116,8 @@ struct LauncherCommandCard: View {
                     }
                 }
                 if !commands.answerText.isEmpty {
-                    QAAnswerView(text: commands.answerText, page: commands.answerPage,
-                                 label: t("模型回答", "Model Answer"))
+                    LauncherScrollableText(text: commands.answerText, label: t("模型回答", "Model Answer"),
+                                           identifier: "qa-answer-scroll", page: commands.answerPage)
                 } else {
                     Text(message).font(.callout).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -157,6 +180,7 @@ struct LauncherCommandCard: View {
         case "wikipedia": return t("搜索维基百科", fallback)
         case "maps": return t("搜索 Google 地图", fallback)
         case "img": return t("按画面搜索图片", "Search Images by Description")
+        case "clipboard": return t("剪贴板历史", "Clipboard History")
         default: return fallback
         }
     }
@@ -222,13 +246,14 @@ struct LauncherCommandCard: View {
     private func t(_ zh: String, _ en: String) -> String { chinese ? zh : en }
 }
 
-// A native non-editable text view preserves wrapping and text selection across
-// the answer while Page Up/Down can scroll it from the search field.
+// A native non-editable text view preserves wrapping and text selection.
+// The QA card also uses it to scroll from the search field on Page Up/Down.
 @MainActor
-private struct QAAnswerView: NSViewRepresentable {
+struct LauncherScrollableText: NSViewRepresentable {
     let text: String
-    let page: Int
     let label: String
+    let identifier: String
+    var page = 0
 
     final class Coordinator { var page = 0 }
 
@@ -236,7 +261,7 @@ private struct QAAnswerView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> NSScrollView {
         let scroll = NSScrollView()
-        scroll.identifier = NSUserInterfaceItemIdentifier("qa-answer-scroll")
+        scroll.identifier = NSUserInterfaceItemIdentifier(identifier)
         scroll.hasVerticalScroller = true
         scroll.drawsBackground = false
         let display = NSTextView(frame: .zero)

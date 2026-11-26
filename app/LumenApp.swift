@@ -25,6 +25,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     let commands = LauncherCommands()
     let inlinePreview = LauncherInlinePreview()
     let imageSearch: LauncherImageSearch
+    let clipboard: ClipboardManager
+    private var clipboardUpdates: AnyCancellable?
     private var imageUpdates: AnyCancellable?
     private var literalCommand: String?
     private var providerUpdates: AnyCancellable?
@@ -98,6 +100,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         panel.delegate = self
         panel.onCancel = { [weak self] in self?.cancelCurrentPanelAction() }
         panel.onContextActions = { [weak self] in self?.toggleContextActions() }
+        panel.onClipboardActions = { [weak self] in
+            guard let self, self.commands.isClipboardCommand else { return false }
+            self.toggleContextActions()
+            return true
+        }
         panel.onAnswerPage = { [weak self] delta in self?.commands.pageAnswer(delta) ?? false }
         panel.onSettings = { [weak self] in self?.showSearchSettings() }
         panel.isSearchFieldClick = { [weak self] point in
@@ -149,6 +156,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             commands: commands,
             inlinePreview: inlinePreview,
             imageSearch: imageSearch,
+            clipboard: clipboard,
+            selectClipboard: { [weak self] id in
+                self?.commands.chooseClipboard(id)
+                self?.focusSearch()
+            },
             activateCommand: { [weak self] in self?.activateCommand() },
             searchCommandAsFiles: { [weak self] in self?.searchCommandAsFiles() },
             closeInlinePreview: { [weak self] in self?.closeInlinePreview() },
@@ -202,6 +214,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         model = Launcher(engine: engine, defaults: defaults, locale: smoke?.language)
         externalVolumes = ExternalVolumeCatalog(engine: engine)
         imageSearch = LauncherImageSearch(engine: engine, defaults: defaults)
+        clipboard = smoke?.makeClipboardManager() ?? ClipboardManager(defaults: .standard, pasteboard: .general)
         translation = smoke?.makeTranslationModel() ?? TranslationPanelModel()
     }
 
@@ -223,6 +236,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 self.updatePresentation()
             }
         }
+        clipboardUpdates = clipboard.$items.dropFirst().sink { [weak self] items in
+            guard let self, self.commands.isClipboardCommand else { return }
+            self.commands.updateClipboard(items)
+            self.updatePresentation()
+        }
+        clipboard.start()
         contextUpdates = contextActions.$items.dropFirst().sink { [weak self] _ in
             DispatchQueue.main.async { [weak self] in self?.updatePresentation() }
         }
@@ -295,6 +314,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     func applicationWillTerminate(_ notification: Notification) {
         localPreview?.close()
         translation.cancel()
+        clipboard.stop()
         imageSearch.stop(refreshStatus: false)
         externalVolumes.stop()
         globalHotKey.close()
@@ -378,6 +398,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         translation.setCommand(nil)
         inlinePreview.close()
         commands.update(.search, raw: "", catalog: catalog)
+        commands.updateClipboard([])
         literalCommand = nil
         contextActions.close()
         // Release the field editor first so an earlier composition cannot be restored on reopen.
@@ -420,6 +441,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         let previousCommand = commands.resolution
         let priorRaw = commands.raw
         let hadCommandCard = commands.showsCard
+        let hadClipboard = commands.isClipboardCommand
         let translationCommand = literalCommand == nil ? TranslationCommand.parse(text) : nil
         let next = literalCommand == nil
             ? catalog.resolve(text, isExistingTranslation: { _ in translationCommand != nil }) : .search
@@ -429,6 +451,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
         commands.update(next, raw: text, catalog: catalog)
         translation.setCommand(translationCommand)
+        if previousCommand != next {
+            if commands.isClipboardCommand { clipboard.loadHistory() }
+            commands.updateClipboard(clipboard.items, resetSelection: true)
+        }
         if case .image(let term) = next {
             imageSearch.ensureStatus()
             if let projector = imageSearch.readyProjector {
@@ -441,7 +467,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         } else if previousCommand == .search || model.isImageSearch {
             model.clear()
         }
-        if hadCommandCard != commands.showsCard || previousCommand != next && commands.isImageCommand ||
+        if hadCommandCard != commands.showsCard || hadClipboard != commands.isClipboardCommand ||
+            previousCommand != next && commands.isImageCommand ||
             (previousCommand == .translation) != (next == .translation) {
             updatePresentation()
         }
@@ -461,11 +488,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             guard let item = commands.selectedEntry, item.keyword != "?",
                   let editor = searchField.currentEditor() as? NSTextView else { return }
             editor.insertText(item.keyword + " ", replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
+        case .clipboard:
+            if let id = commands.clipboardSelection { copyClipboardItem(id) }
         case .question(let question):
             if case .answer(let output) = commands.answer {
-                let pasteboard = smoke?.filePasteboard ?? .general
-                pasteboard.clearContents()
-                if pasteboard.setString(output, forType: .string) { commands.noteCopied() }
+                if ClipboardManager.writeInternalString(output, to: smoke?.filePasteboard ?? .general) { commands.noteCopied() }
             } else if commands.answer != .loading, let ask = translation.answerWithSavedProvider() {
                 commands.submit(question, using: ask)
             }
@@ -496,6 +523,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private func moveCurrentSelection(_ delta: Int) {
         if commands.resolution == .discovery { commands.move(delta); return }
+        if commands.isClipboardCommand {
+            if contextActions.isOpen { contextActions.move(delta) }
+            else { commands.moveClipboard(delta) }
+            return
+        }
         guard translation.command == nil, !commands.showsCard,
               !commands.isImageCommand || model.isImageSearch else { return }
         if contextActions.isOpen { contextActions.move(delta) }
@@ -521,7 +553,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         else { dismissSearch() }
     }
 
+    private func copyClipboardItem(_ id: Int64) {
+        guard searchPresented, commands.isClipboardCommand, commands.clipboardSelection == id else { return }
+        if clipboard.copy(id: id) { dismissSearch() }
+    }
+
+    private var selectedContextID: String? {
+        if commands.isClipboardCommand { return commands.clipboardSelection.map { "clipboard:\($0)" } }
+        return model.selectedResult?.id
+    }
+
+    private func showClipboardActions() {
+        guard let clip = commands.selectedClipboardItem else { return }
+        contextResultID = selectedContextID
+        contextActions.show([
+            .init(id: "copy-clip", title: model.t("复制", "Copy"), symbol: "doc.on.doc") { [weak self] in
+                self?.copyClipboardItem(clip.id)
+            },
+            .init(id: "pin-clip", title: clip.pinned ? model.t("取消固定", "Unpin") : model.t("固定", "Pin"),
+                  symbol: clip.pinned ? "pin.slash" : "pin") { [weak self] in self?.clipboard.togglePin(id: clip.id) },
+            .init(id: "delete-clip", title: model.t("删除", "Delete"), symbol: "trash") { [weak self] in
+                self?.clipboard.remove(id: clip.id)
+            }
+        ])
+    }
+
     private func toggleContextActions() {
+        if commands.isClipboardCommand {
+            if contextActions.isOpen { contextActions.close() }
+            else { showClipboardActions() }
+            return
+        }
         guard translation.command == nil, !commands.showsCard,
               !commands.isImageCommand || model.isImageSearch else { return }
         if contextActions.isOpen { contextActions.close(); return }
@@ -591,6 +653,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private func openSelection() {
         if commands.isImageCommand && !model.isImageSearch { return }
+        if commands.isClipboardCommand && contextActions.isOpen {
+            if selectedContextID == contextResultID { contextActions.run() }
+            else { contextActions.close() }
+            return
+        }
         if commands.showsCard { activateCommand(); return }
         if translation.command != nil {
             activateTranslation()
@@ -613,9 +680,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         case .shortcut(let shortcut): openShortcut(shortcut)
         case .calculation(let calculation):
             guard searchPresented, model.calculation == calculation else { return }
-            let pasteboard = smoke?.filePasteboard ?? NSPasteboard.general
-            pasteboard.clearContents()
-            if pasteboard.setString(calculation.copyValue, forType: .string) { dismissSearch() }
+            if ClipboardManager.writeInternalString(calculation.copyValue, to: smoke?.filePasteboard ?? .general) { dismissSearch() }
             else { model.openingFailed() }
         }
     }
@@ -717,11 +782,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         case .copyName, .copyPath:
             model.resolve(hit, action: action) { [weak self] _ in
                 guard let self, self.searchPresented else { return }
-                let pasteboard = self.smoke?.filePasteboard ?? NSPasteboard.general
                 let value = action == .copyName ? hit.name : hit.path
-                pasteboard.clearContents()
-                if pasteboard.setString(value, forType: .string) { self.model.copied(action) }
-                else { self.model.openingFailed() }
+                if ClipboardManager.writeInternalString(value, to: self.smoke?.filePasteboard ?? .general) {
+                    self.model.copied(action)
+                } else { self.model.openingFailed() }
             }
         }
     }
@@ -827,6 +891,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func showSearchSettings() {
+        if commands.isClipboardCommand { presentSettings(page: .general); return }
         presentSettings(page: commands.isImageCommand ? .index : (translation.command != nil || isQuestion ? .translation : nil))
     }
 
@@ -847,6 +912,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 translation: translation,
                 volumes: externalVolumes,
                 images: imageSearch,
+                clipboard: clipboard,
                 chooseImageFolder: { [weak self] in self?.chooseImageResource(folder: true) },
                 chooseImageProjector: { [weak self] in self?.chooseImageResource(folder: false) },
                 chooseQuicklinkFolder: { [weak self] in self?.chooseQuicklinkFolder($0) },
@@ -910,7 +976,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if let smoke {
             if let file = smoke.chosenDiagnosticFile {
                 smoke.chosenDiagnosticFile = nil
-                model.diagnoseFile(file)
+                diagnoseFile(file)
             }
             return
         }
@@ -922,8 +988,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         open.message = model.t("选择一个要查看索引状态的文件。", "Choose a file to check its indexing status.")
         open.beginSheetModal(for: settings) { [weak self] result in
             guard result == .OK, let file = open.url else { return }
-            self?.model.diagnoseFile(file)
+            self?.diagnoseFile(file)
         }
+    }
+
+    private func diagnoseFile(_ url: URL) {
+        guard !clipboard.store.contains(url) else { model.clearFileDiagnosis(); return }
+        model.diagnoseFile(url)
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -950,9 +1021,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if translation.output.isEmpty {
             translation.translate()
         } else {
-            let pasteboard = smoke?.filePasteboard ?? .general
-            pasteboard.clearContents()
-            if pasteboard.setString(translation.output, forType: .string) { translation.noteCopied() }
+            if ClipboardManager.writeInternalString(translation.output, to: smoke?.filePasteboard ?? .general) { translation.noteCopied() }
         }
     }
 
@@ -1057,11 +1126,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if model.scopePending, imageSearch.building { imageSearch.stop() }
         guard searchPresented else { return }
         refreshInlinePreview()
-        if contextActions.isOpen, model.selectedResult?.id != contextResultID { contextActions.close() }
+        if contextActions.isOpen, selectedContextID != contextResultID { contextActions.close() }
         var frame = panel.frame
+        let commandHeight: CGFloat? = commands.isClipboardCommand ? ClipboardHistoryView.height
+            : (commands.showsCard || (commands.isImageCommand && !model.isImageSearch) ? 162 : nil)
         let height = SearchWindow.height(for: model, contextCount: contextActions.items.count,
                                          hasTranslation: translation.command != nil,
-                                         commandHeight: commands.showsCard || (commands.isImageCommand && !model.isImageSearch) ? 162 : nil,
+                                         commandHeight: commandHeight,
                                          hasPreview: inlinePreview.isOpen)
         guard frame.height != height else { return }
         frame.origin.y += frame.height - height
@@ -1151,6 +1222,7 @@ final class SearchPanel: NSPanel {
     var onCancel: (() -> Void)?
     var onFileAction: ((FileAction) -> Void)?
     var onContextActions: (() -> Void)?
+    var onClipboardActions: (() -> Bool)?
     var onAnswerPage: ((Int) -> Bool)?
     var onSettings: (() -> Void)?
     override var canBecomeKey: Bool { true }
@@ -1160,6 +1232,8 @@ final class SearchPanel: NSPanel {
         guard event.type == .keyDown, (firstResponder as? NSTextView)?.hasMarkedText() != true else { return false }
         let key = event.charactersIgnoringModifiers?.lowercased()
         if modifiers == [.command], key == "," { onSettings?(); return true }
+        if modifiers == [.shift], event.keyCode == kVK_Return || event.keyCode == kVK_ANSI_KeypadEnter,
+           onClipboardActions?() == true { return true }
         if modifiers == [.command] {
             if key == "y" { if !event.isARepeat { onFileAction?(.preview) } }
             else if key == "k" { onContextActions?() }

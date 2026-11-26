@@ -1,13 +1,5 @@
 import Foundation
 
-public enum PreviewResidency: Sendable, Equatable {
-    /// The index owner affirmatively identifies the path as resident on a local,
-    /// non-provider-managed volume and in an opted-in preview scope.
-    case provenLocal
-    case placeholderOrManaged
-    case unknown
-}
-
 public struct PreviewEvidence: Sendable, Equatable {
     public enum Match: Sendable, Equatable { case literal, related }
     public let text: String
@@ -25,6 +17,8 @@ public enum PreviewKind: Sendable, Equatable {
     /// nil means no match page is known. It must not be labelled a hit.
     case pdf(matchPage: Int?)
     case excerpt
+    /// Use the inline area for hydration progress, then hand off to Quick Look.
+    case quickLook
 }
 
 public struct PreviewSelection: Sendable, Equatable {
@@ -33,15 +27,12 @@ public struct PreviewSelection: Sendable, Equatable {
     public let revision: String
     public let url: URL
     public let kind: PreviewKind
-    public let residency: PreviewResidency
     public let evidence: PreviewEvidence?
-    public init(id: String, revision: String, url: URL, kind: PreviewKind,
-                residency: PreviewResidency, evidence: PreviewEvidence? = nil) {
+    public init(id: String, revision: String, url: URL, kind: PreviewKind, evidence: PreviewEvidence? = nil) {
         self.id = id
         self.revision = revision
         self.url = url
         self.kind = kind
-        self.residency = residency
         self.evidence = evidence
     }
 }
@@ -60,18 +51,20 @@ public struct PreviewDocument: Sendable, Equatable {
 }
 
 public enum PreviewFailure: Error, Sendable, Equatable {
-    case notLocal, missing, overLimit, invalidContent, unavailablePage, noExcerpt
+    case notLocal, missing, downloadFailed, invalidContent, unavailablePage, noExcerpt
 }
 public enum InlinePreviewState: Sendable, Equatable {
     case closed
     case loading(PreviewSelection)
+    case downloading(PreviewSelection, fraction: Double?)
     case ready(PreviewSelection, PreviewDocument)
     case unavailable(PreviewSelection, PreviewFailure)
 }
 
 @MainActor
 public final class InlinePreviewCoordinator {
-    public typealias Loader = @Sendable (PreviewSelection) async throws -> PreviewDocument
+    public typealias DownloadProgress = @MainActor @Sendable (Double?) -> Void
+    public typealias Loader = @Sendable (PreviewSelection, Bool, @escaping DownloadProgress) async throws -> PreviewDocument
     private let load: Loader
     private var operation: Task<Void, Never>?
     private var generation = UUID()
@@ -83,22 +76,22 @@ public final class InlinePreviewCoordinator {
     public init(load: @escaping Loader) { self.load = load }
     deinit { operation?.cancel() }
 
-    public func show(_ item: PreviewSelection) {
+    public func show(_ item: PreviewSelection, allowCloudDownload: Bool) {
         if item == selection { return }
         invalidate()
         selection = item
-        guard item.residency == .provenLocal, item.url.isFileURL,
-              item.url.host == nil || item.url.host == "" || item.url.host == "localhost" else {
-            publish(.unavailable(item, .notLocal))
-            return
-        }
         let current = generation
         let loader = load
         operation = Task { [weak self] in
             let next: InlinePreviewState
             do {
                 try Task.checkCancellation()
-                next = .ready(item, try await loader(item))
+                next = .ready(item, try await loader(item, allowCloudDownload) { [weak self] fraction in
+                    guard let self, !Task.isCancelled, self.generation == current, self.operation != nil else { return }
+                    let bounded = fraction.flatMap { $0.isFinite ? min(1, max(0, $0)) : nil }
+                    let downloading = InlinePreviewState.downloading(item, fraction: bounded)
+                    if self.state != downloading { self.publish(downloading) }
+                })
             } catch is CancellationError {
                 return
             } catch let error as PreviewFailure {

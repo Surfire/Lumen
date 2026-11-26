@@ -832,6 +832,7 @@ struct LauncherSettings: View {
     let clipboard: ClipboardManager
     @ObservedObject var windowManagement: WindowManagement
     @ObservedObject var scriptCatalog: LauncherScriptCatalog
+    let updates: UpdateSettings?
     let chooseScriptsFolder: () -> Void
     let chooseImageFolder: () -> Void
     let chooseImageProjector: () -> Void
@@ -1205,6 +1206,7 @@ struct LauncherSettings: View {
         group("Lumen") {
             LabeledContent(model.t("版本", "Version"), value: version)
             LabeledContent(model.t("当前状态", "Current Status"), value: model.activityTitle)
+            if let updates { LauncherUpdateControls(updates: updates, model: model) }
         }
         group(model.t("索引统计", "Index Counts")) {
             if let report = model.indexReport {
@@ -1412,6 +1414,36 @@ struct LauncherSettings: View {
         case .starting: return model.t("正在核对索引与访问权限…", "Checking the saved index and file access…")
         case .running: return model.t("正在监听文件变化。", "Lumen is watching for file changes.")
         case .failed: return model.t("文件监听未运行。", "File watching is stopped.")
+        }
+    }
+}
+
+private struct LauncherUpdateControls: View {
+    @ObservedObject var updates: UpdateSettings
+    let model: Launcher
+
+    var body: some View {
+        if let backup = updates.backup {
+            Text(model.t("更新已安装。请退出并重新打开 Lumen。", "Update installed. Quit and reopen Lumen to finish."))
+            Text(model.t("旧版本备份：\(backup.path)", "Previous app backup: \(backup.path)"))
+                .font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
+        } else {
+            HStack {
+                Button(model.t("检查更新", "Check for Updates"), action: updates.check)
+                    .accessibilityIdentifier("settings.updates.check")
+                if let release = updates.release {
+                    Button(model.t("安装 \(release.version)", "Install \(release.version)"), action: updates.install)
+                }
+                if updates.busy { ProgressView().controlSize(.small) }
+            }
+            .disabled(updates.busy)
+            if let error = updates.error {
+                Text(model.t("更新失败：\(error)", "Update failed: \(error)")).textSelection(.enabled)
+            } else if let release = updates.release {
+                if !release.notes.isEmpty { Text(release.notes).textSelection(.enabled) }
+            } else if updates.checked {
+                Text(model.t("当前已是最新版本。", "Lumen is up to date."))
+            }
         }
     }
 }

@@ -20,6 +20,75 @@ private final class FixtureSecrets: TranslationSecrets, @unchecked Sendable {
     }
 }
 
+private final class CountingLegacySecrets: TranslationSecrets, @unchecked Sendable {
+    private let lock = NSLock()
+    var calls = 0
+    var result: Result<String?, Error>
+
+    init(result: Result<String?, Error>) {
+        self.result = result
+    }
+
+    func key(provider: UUID, endpoint: TranslationEndpoint) throws -> String? {
+        lock.withLock { calls += 1 }
+        return try result.get()
+    }
+
+    func save(_ key: String, provider: UUID, endpoint: TranslationEndpoint) {}
+    func remove(provider: UUID) {}
+}
+
+private func posixPermissions(at url: URL) throws -> UInt16 {
+    let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+    return (attrs[.posixPermissions] as? NSNumber)?.uint16Value ?? 0
+}
+
+private func verifyLocalTranslationSecrets() throws {
+    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("lumen-local-secrets-\(UUID().uuidString)", isDirectory: true)
+    let appDir = tempDir.appendingPathComponent("Lumen", isDirectory: true)
+    let fileURL = appDir.appendingPathComponent("provider-keys.json")
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+
+    let endpointA = try TranslationEndpoint("https://api.example.test/v1")
+    let endpointB = try TranslationEndpoint("https://other.example.test/v1")
+    let providerA = UUID()
+    let store = LocalTranslationSecrets(fileURL: fileURL, legacy: nil)
+    try store.save("secret-a", provider: providerA, endpoint: endpointA)
+    if (try posixPermissions(at: appDir)) & 0o777 != 0o700 { fail("expected 0700 parent directory permissions") }
+    if (try posixPermissions(at: fileURL)) & 0o777 != 0o600 { fail("expected 0600 key file permissions") }
+    if (try store.key(provider: providerA, endpoint: endpointA)) != "secret-a" { fail("saved local secret not returned") }
+    if (try store.key(provider: providerA, endpoint: endpointB)) != nil { fail("endpoint mismatch leaked local secret") }
+    let reloaded = LocalTranslationSecrets(fileURL: fileURL, legacy: nil)
+    if (try reloaded.key(provider: providerA, endpoint: endpointA)) != "secret-a" { fail("reloaded local secret mismatch") }
+    try store.remove(provider: providerA)
+    if (try store.key(provider: providerA, endpoint: endpointA)) != nil { fail("removed local secret still present") }
+
+    let providerMigrated = UUID()
+    let legacyHit = CountingLegacySecrets(result: .success("legacy-migrated-key"))
+    let migratingStore = LocalTranslationSecrets(fileURL: fileURL, legacy: legacyHit)
+    if (try migratingStore.key(provider: providerMigrated, endpoint: endpointA)) != "legacy-migrated-key" {
+        fail("did not migrate legacy key on first read")
+    }
+    if legacyHit.calls != 1 { fail("expected exactly 1 legacy lookup during migration") }
+    if (try posixPermissions(at: fileURL)) & 0o777 != 0o600 { fail("expected 0600 permissions after migration") }
+    let postRestartLegacy = CountingLegacySecrets(result: .failure(TranslationFailure.keychain))
+    let restartedStore = LocalTranslationSecrets(fileURL: fileURL, legacy: postRestartLegacy)
+    if (try restartedStore.key(provider: providerMigrated, endpoint: endpointA)) != "legacy-migrated-key" {
+        fail("migrated key lost after restart")
+    }
+    if postRestartLegacy.calls != 0 { fail("restarted store must not re-query legacy keychain") }
+
+    let providerDenied = UUID()
+    let legacyDenied = CountingLegacySecrets(result: .failure(TranslationFailure.keychain))
+    let deniedStore = LocalTranslationSecrets(fileURL: fileURL, legacy: legacyDenied)
+    if (try deniedStore.key(provider: providerDenied, endpoint: endpointA)) != nil {
+        fail("legacy error should downgrade to nil instead of throwing")
+    }
+    if (try deniedStore.key(provider: providerDenied, endpoint: endpointA)) != nil || legacyDenied.calls != 1 {
+        fail("denied legacy provider re-prompted on second read")
+    }
+}
+
 @main
 struct TranslationSmoke {
     @MainActor static func main() async throws {
@@ -104,7 +173,8 @@ struct TranslationSmoke {
         expect(ipv6.url.absoluteString == "http://[::1]:8000/v1", "IPv6 loopback")
         let localhost = try TranslationEndpoint("http://localhost:8000")
         expect(localhost.url.absoluteString == "http://127.0.0.1:8000/v1", "numeric loopback preset alias")
-        print("PASS: translation model, provider setup, Keychain boundary, loopback API, cancel, timeout, redirects")
+        try verifyLocalTranslationSecrets()
+        print("PASS: translation model, local 0600 secret store & migration, loopback API, cancel, timeout, redirects")
     }
 
     @MainActor private static func idle(_ model: TranslationPanelModel) async throws {
@@ -114,13 +184,13 @@ struct TranslationSmoke {
         }
         fail("model did not return to idle")
     }
+}
 
-    private static func expect(_ satisfied: Bool, _ message: String) {
-        if !satisfied { fail(message) }
-    }
+private func expect(_ satisfied: Bool, _ message: String) {
+    if !satisfied { fail(message) }
+}
 
-    private static func fail(_ message: String) -> Never {
-        FileHandle.standardError.write(Data("FAIL: \(message)\n".utf8))
-        exit(1)
-    }
+private func fail(_ message: String) -> Never {
+    FileHandle.standardError.write(Data("FAIL: \(message)\n".utf8))
+    exit(1)
 }

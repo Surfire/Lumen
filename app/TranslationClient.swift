@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Security
 
@@ -57,7 +58,7 @@ enum TranslationFailure: Error, Equatable, Sendable {
         case .invalidLanguages:
             message = ("请选择不同的源语言和目标语言。", "Choose different source and target languages.")
         case .invalidKey: message = ("API 密钥必须是不带空白的纯文本。", "Enter an API key without whitespace.")
-        case .keychain: message = ("无法访问 Lumen 的钥匙串项目。", "Lumen could not access its Keychain item.")
+        case .keychain: message = ("无法访问 Lumen 的本地密钥文件。", "Lumen could not access its local API key file.")
         case .timeout: message = ("请求超时，请检查服务或模型是否就绪。", "The request timed out. Check that the server and model are ready.")
         case .transport: message = ("无法连接服务。请检查地址和服务状态。", "Could not reach the provider. Check its address and status.")
         case .redirected: message = ("提供商返回了重定向，请直接配置最终地址。", "The provider redirected the request. Configure the final URL directly.")
@@ -149,6 +150,181 @@ struct TranslationKeychain: TranslationSecrets {
     }
 }
 
+final class LocalTranslationSecrets: TranslationSecrets, @unchecked Sendable {
+    private struct Entry: Codable {
+        let endpoint: String
+        let secret: String
+    }
+
+    private struct StoreFile: Codable {
+        var keys: [String: Entry] = [:]
+        var migrated: Set<String> = []
+    }
+
+    private let lock = NSLock()
+    private let fileURL: URL
+    private let legacy: (any TranslationSecrets)?
+
+    static var defaultFileURL: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support", isDirectory: true)
+        return base
+            .appendingPathComponent("Lumen", isDirectory: true)
+            .appendingPathComponent("provider-keys.json", isDirectory: false)
+    }
+
+    init(fileURL: URL = LocalTranslationSecrets.defaultFileURL,
+         legacy: (any TranslationSecrets)? = TranslationKeychain()) {
+        self.fileURL = fileURL
+        self.legacy = legacy
+    }
+
+    func key(provider: UUID, endpoint: TranslationEndpoint) throws -> String? {
+        try lock.withLock {
+            var store = try readStore()
+            let id = provider.uuidString
+            if let entry = store.keys[id] {
+                return entry.endpoint == endpoint.url.absoluteString ? entry.secret : nil
+            }
+            if store.migrated.contains(id) {
+                return nil
+            }
+            guard let legacy else { return nil }
+            let migratedSecret = try? legacy.key(provider: provider, endpoint: endpoint)
+            store.migrated.insert(id)
+            if let migratedSecret {
+                store.keys[id] = Entry(endpoint: endpoint.url.absoluteString, secret: migratedSecret)
+            }
+            try writeStore(store)
+            return migratedSecret
+        }
+    }
+
+    func save(_ key: String, provider: UUID, endpoint: TranslationEndpoint) throws {
+        try lock.withLock {
+            var store = try readStore()
+            let id = provider.uuidString
+            store.keys[id] = Entry(endpoint: endpoint.url.absoluteString, secret: key)
+            store.migrated.insert(id)
+            try writeStore(store)
+        }
+    }
+
+    func remove(provider: UUID) throws {
+        try lock.withLock {
+            var store = try readStore()
+            let id = provider.uuidString
+            store.keys.removeValue(forKey: id)
+            store.migrated.insert(id)
+            try writeStore(store)
+        }
+    }
+
+    private func ensurePrivateDirectory(_ directory: URL) throws {
+        var info = Darwin.stat()
+        if lstat(directory.path, &info) == 0 {
+            guard (info.st_mode & S_IFMT) == S_IFDIR else { throw TranslationFailure.keychain }
+            _ = Darwin.chmod(directory.path, 0o700)
+            return
+        }
+        guard errno == ENOENT else { throw TranslationFailure.keychain }
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+        } catch {
+            throw TranslationFailure.keychain
+        }
+        guard lstat(directory.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFDIR,
+              Darwin.chmod(directory.path, 0o700) == 0 else {
+            throw TranslationFailure.keychain
+        }
+    }
+
+    private func readStore() throws -> StoreFile {
+        let fd = Darwin.open(fileURL.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        if fd < 0 {
+            if errno == ENOENT { return StoreFile() }
+            throw TranslationFailure.keychain
+        }
+        defer { _ = Darwin.close(fd) }
+        var info = Darwin.stat()
+        guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else {
+            throw TranslationFailure.keychain
+        }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 16 * 1024)
+        while true {
+            let count = Darwin.read(fd, &buffer, buffer.count)
+            if count > 0 {
+                data.append(buffer, count: count)
+            } else if count == 0 {
+                break
+            } else if errno == EINTR {
+                continue
+            } else {
+                throw TranslationFailure.keychain
+            }
+        }
+        if data.isEmpty { return StoreFile() }
+        guard let decoded = try? JSONDecoder().decode(StoreFile.self, from: data) else {
+            throw TranslationFailure.keychain
+        }
+        return decoded
+    }
+
+    private func writeStore(_ store: StoreFile) throws {
+        let directory = fileURL.deletingLastPathComponent()
+        try ensurePrivateDirectory(directory)
+        var existing = Darwin.stat()
+        if lstat(fileURL.path, &existing) == 0 {
+            guard (existing.st_mode & S_IFMT) == S_IFREG else { throw TranslationFailure.keychain }
+        } else if errno != ENOENT {
+            throw TranslationFailure.keychain
+        }
+        let data: Data
+        do {
+            data = try JSONEncoder().encode(store)
+        } catch {
+            throw TranslationFailure.keychain
+        }
+        let tempURL = directory.appendingPathComponent(".\(fileURL.lastPathComponent).tmp-\(UUID().uuidString)")
+        let fd = Darwin.open(tempURL.path, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw TranslationFailure.keychain }
+        var closed = false
+        defer {
+            if !closed { _ = Darwin.close(fd) }
+            try? FileManager.default.removeItem(at: tempURL)
+        }
+        guard Darwin.fchmod(fd, 0o600) == 0 else { throw TranslationFailure.keychain }
+        do {
+            try data.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                var written = 0
+                while written < raw.count {
+                    let count = Darwin.write(fd, base.advanced(by: written), raw.count - written)
+                    if count > 0 {
+                        written += count
+                    } else if errno == EINTR {
+                        continue
+                    } else {
+                        throw TranslationFailure.keychain
+                    }
+                }
+            }
+        } catch {
+            throw TranslationFailure.keychain
+        }
+        guard Darwin.close(fd) == 0 else {
+            closed = true
+            throw TranslationFailure.keychain
+        }
+        closed = true
+        guard Darwin.rename(tempURL.path, fileURL.path) == 0 else {
+            throw TranslationFailure.keychain
+        }
+    }
+}
+
 struct TranslationClient: Sendable {
     private final class RejectRedirects: NSObject, URLSessionTaskDelegate {
         func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
@@ -228,7 +404,7 @@ struct TranslationClient: Sendable {
     let secrets: any TranslationSecrets
     private let timeout: TimeInterval
 
-    init(secrets: any TranslationSecrets = TranslationKeychain(), timeout: TimeInterval = 30) {
+    init(secrets: any TranslationSecrets = LocalTranslationSecrets(), timeout: TimeInterval = 30) {
         self.secrets = secrets
         self.timeout = timeout
     }

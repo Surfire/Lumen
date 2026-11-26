@@ -188,12 +188,11 @@ struct LauncherHighlight {
     }
 
     private struct PinyinAlias {
-        // Both strings are ASCII, so NSString ranges and UTF-8 offsets index the same owners.
+        // Aliases are ASCII, so NSString ranges and UTF-8 offsets index the same owners.
         let text: NSString
         let owners: [Int]
 
-        init(_ tokens: [String], initials: Bool) {
-            let pieces = initials ? tokens.map { String($0.prefix(1)) } : tokens
+        init(_ pieces: [String]) {
             text = pieces.joined() as NSString
             owners = pieces.enumerated().flatMap { index, piece in
                 Array(repeating: index, count: piece.utf8.count)
@@ -220,9 +219,15 @@ struct LauncherHighlight {
     private final class Pinyin {
         let variants: [(full: PinyinAlias, initials: PinyinAlias)]
 
-        init(current: [String], legacy: [String]) {
-            variants = (current == legacy ? [current] : [current, legacy]).map {
-                (PinyinAlias($0, initials: false), PinyinAlias($0, initials: true))
+        init(current: [String], legacy: [String], asciiAlphanumeric: [Bool]) {
+            variants = (current == legacy ? [current] : [current, legacy]).map { tokens in
+                let initials = tokens.enumerated().map { offset, token in
+                    // Like the indexer, take one initial per ASCII word and one per Han syllable.
+                    // Keep empty pieces so alias owners still point to the original characters.
+                    if offset > 0 && asciiAlphanumeric[offset] && asciiAlphanumeric[offset - 1] { return "" }
+                    return String(token.prefix(1))
+                }
+                return (PinyinAlias(tokens), PinyinAlias(initials))
             }
         }
 
@@ -264,13 +269,14 @@ struct LauncherHighlight {
         if let cached = pinyinCache.object(forKey: key) { return (cached, indices) }
 
         let characters = Array(value)
+        let asciiAlphanumeric = characters.map { $0.utf8.count == 1 && $0.utf8.allSatisfy(isASCIILetterOrDigit) }
         var current = Array(repeating: "", count: characters.count)
         var legacy = current
         var offset = 0
         while offset < characters.count {
             let character = characters[offset]
             guard let scalar = character.unicodeScalars.first, isHan(scalar) else {
-                if character.utf8.count == 1, let byte = character.utf8.first, isASCIILetterOrDigit(byte) {
+                if asciiAlphanumeric[offset] {
                     current[offset] = character.lowercased()
                     legacy[offset] = current[offset]
                 }
@@ -299,7 +305,7 @@ struct LauncherHighlight {
                 legacy.replaceSubrange(start..<offset, with: oldSyllables)
             }
         }
-        let pinyin = Pinyin(current: current, legacy: legacy)
+        let pinyin = Pinyin(current: current, legacy: legacy, asciiAlphanumeric: asciiAlphanumeric)
         pinyinCache.setObject(pinyin, forKey: key)
         return (pinyin, indices)
     }

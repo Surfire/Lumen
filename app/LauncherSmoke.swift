@@ -776,6 +776,8 @@ final class LauncherSmoke {
         ] {
             try verify(query, "\(name).txt", [name], mode: .name)
         }
+        try verify("rqst", "Report青山.txt", ["R", "青山", "t"], mode: .name)
+        try verify("rtqs", "Report青山.txt", [], mode: .name)
         try verify("reportqingshan", "Report青山.txt", ["Report青山"], mode: .name)
         try verify("qingshan2", "Report青山-2.txt", ["青山", "2"], mode: .name)
         try verify("lny", "蓝牙", ["蓝牙"], mode: .action)

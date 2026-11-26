@@ -278,18 +278,21 @@ enum LaunchCatalog {
         let term = normalized(query)
         guard !term.isEmpty, term.utf8.count <= 128, !query.contains("/") && !query.contains("\\") else { return [] }
         return actions.compactMap { action -> ActionMatch? in
+            let isApplication: Bool
+            if case .application = action.destination { isApplication = true }
+            else { isApplication = false }
             let names = [action.english, action.chinese].map(normalized)
             let score: Int
             if names.contains(term) { score = 110 }
-            else if term.count == 1 && names.contains(where: { $0.hasPrefix(term) }) { score = 62 }
-            else { score = action.searchable.lazy.map { match(term, in: normalized($0)) }.max() ?? 0 }
+            else if term.count == 1 && names.contains(where: { $0.hasPrefix(term) }) { score = isApplication ? 86 : 62 }
+            else { score = action.searchable.lazy.map { match(term, in: normalized($0), isApplication: isApplication) }.max() ?? 0 }
             guard score > 0 else { return nil }
             return ActionMatch(action: action, score: score + boost(action.id))
         }.sorted {
             if $0.score != $1.score { return $0.score > $1.score }
             if $0.action.english.count != $1.action.english.count { return $0.action.english.count < $1.action.english.count }
             return $0.action.id < $1.action.id
-        }.prefix(4).map { $0 }
+        }.prefix(8).map { $0 }
     }
 
     static func pinyinAliases(_ value: String) -> [String] {
@@ -308,17 +311,20 @@ enum LaunchCatalog {
             .filter { $0.isLetter || $0.isNumber }
     }
 
-    private static func match(_ term: String, in candidate: String) -> Int {
+    private static func match(_ term: String, in candidate: String, isApplication: Bool) -> Int {
         if candidate == term { return 100 }
-        if candidate.hasPrefix(term) { return term.count == 1 ? 45 : 80 }
+        if candidate.hasPrefix(term) { return term.count == 1 ? (isApplication ? 82 : 45) : 92 }
         guard term.count >= 2 else { return 0 }
-        if candidate.contains(term) { return 55 }
+        if candidate.contains(term) { return 74 }
         var remaining = term[...]
         var gaps = 0
         for letter in candidate {
             if letter == remaining.first {
                 remaining = remaining.dropFirst()
-                if remaining.isEmpty { return max(26, 42 - gaps) }
+                if remaining.isEmpty {
+                    if isApplication && candidate.first == term.first { return max(82, 88 - gaps) }
+                    return max(26, 42 - gaps)
+                }
             } else {
                 gaps += 1
             }

@@ -83,10 +83,15 @@ final class Launcher: ObservableObject {
     var isImageSearch: Bool { imageProjector != nil }
     @Published private(set) var hits: [SearchHit] = []
     @Published private(set) var launchMatches: [ActionMatch] = []
+    @Published private(set) var executableMatches: [ActionMatch] = []
     @Published private(set) var calculation: CalculationResult?
     let shortcuts: ShortcutLibrary
     private var shortcutChanges: AnyCancellable?
-    @Published var selection: String?
+    @Published var selectedID: String?
+    var selection: String? {
+        get { selectedID }
+        set { selectedID = newValue }
+    }
     @Published private(set) var searching = false
     @Published private(set) var semanticBusy = false
     @Published private(set) var localModelState = LocalModelState.unchecked
@@ -212,7 +217,8 @@ final class Launcher: ObservableObject {
             (LauncherResult.action($0.action), $0.score)
         }
         let saved = shortcuts.map { (LauncherResult.shortcut($0.record), $0.score) }
-        let commands = native + saved
+        let executables = executableMatches.map { (LauncherResult.action($0.action), $0.score) }
+        let commands = native + saved + executables
         let result = calculation.map { [LauncherResult.calculation($0)] } ?? []
         guard !commands.isEmpty else { return result + hits.map(LauncherResult.file) }
         let files: [(LauncherResult, Int)] = hits.map { hit in
@@ -397,11 +403,25 @@ final class Launcher: ObservableObject {
             switch first {
             case .file: break
             case .action(let action):
-                if launchMatches.first(where: { $0.action.id == action.id })?.primary == true { selection = first.id }
-            case .shortcut, .calculation: selection = first.id
+                if isPrimaryAction(action) { selectedID = first.id }
+            case .shortcut, .calculation: selectedID = first.id
             }
         }
         reconcileSelection()
+    }
+
+    func setExecutableMatches(_ matches: [ActionMatch], resetSelection: Bool = false) {
+        if executableMatches != matches { executableMatches = matches }
+        if resetSelection, let first = visibleResults.first,
+           case .action(let action) = first, isPrimaryAction(action), selectedID != first.id {
+            selectedID = first.id
+        }
+        reconcileSelection()
+    }
+
+    private func isPrimaryAction(_ action: LaunchAction) -> Bool {
+        launchMatches.first(where: { $0.action.id == action.id })?.primary == true
+            || executableMatches.first(where: { $0.action.id == action.id })?.primary == true
     }
 
     func setImageQuery(_ text: String, projector: URL) {
@@ -410,6 +430,7 @@ final class Launcher: ObservableObject {
         imageProjector = projector
         query = text
         launchMatches = []
+        executableMatches = []
         calculation = nil
         scheduleSearch(clearRows: true)
     }
@@ -445,6 +466,7 @@ final class Launcher: ObservableObject {
         query = ""
         calculation = nil
         launchMatches = []
+        executableMatches = []
         scheduleSearch(clearRows: true)
     }
 
@@ -625,30 +647,30 @@ final class Launcher: ObservableObject {
 
     private func reconcileSelection() {
         let rows = visibleResults
-        if !rows.contains(where: { $0.id == selection }), selection != rows.first?.id {
-            selection = rows.first?.id
+        if !rows.contains(where: { $0.id == selectedID }), selectedID != rows.first?.id {
+            selectedID = rows.first?.id
         }
     }
 
     func moveSelection(_ step: Int) {
         let rows = visibleResults
         guard !rows.isEmpty else { return }
-        guard let index = rows.firstIndex(where: { $0.id == selection }) else {
-            selection = (step > 0 ? rows.first : rows.last)?.id
+        guard let index = rows.firstIndex(where: { $0.id == selectedID }) else {
+            selectedID = (step > 0 ? rows.first : rows.last)?.id
             return
         }
-        selection = rows[min(max(index + step, 0), rows.count - 1)].id
+        selectedID = rows[min(max(index + step, 0), rows.count - 1)].id
     }
 
     var selectedResult: LauncherResult? {
-        guard let row = visibleResults.first(where: { $0.id == selection }) else { return nil }
+        guard let row = visibleResults.first(where: { $0.id == selectedID }) else { return nil }
         if case .file = row { return selectedHit.map(LauncherResult.file) }
         return row
     }
 
     var selectedHit: SearchHit? {
         guard resultsRevision == revision || presentedQuery == query else { return nil }
-        return hits.first { $0.path == selection }
+        return hits.first { $0.path == selectedID }
     }
 
     func openingFailed() { searchNotice = LauncherNotice(.opening) }
@@ -709,9 +731,8 @@ final class Launcher: ObservableObject {
         searchNotice = LauncherNotice(.stale)
     }
 
-    private func shouldFindRelatedExcerpts(directCount: Int) -> Bool {
-        guard gemmaCoverage?.hasResults == true, !scopePending, directCount < 8,
-              !LauncherFileQuery(query).isFiltered else { return false }
+    static func qualifiesForRelatedExcerpts(_ query: String, directCount: Int) -> Bool {
+        guard directCount < 8, !LauncherFileQuery(query).isFiltered else { return false }
         let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard text.utf8.count <= 512, !text.contains("/"), !text.contains("\\"),
               !text.split(whereSeparator: \.isWhitespace).contains(where: {
@@ -719,7 +740,12 @@ final class Launcher: ObservableObject {
               }) else { return false }
         let words = text.split { !$0.isLetter && !$0.isNumber }
         let han = text.unicodeScalars.filter { (0x3400...0x9fff).contains($0.value) }.count
-        return han >= 6 || (words.count >= 2 && text.count >= 10)
+        return han >= 2 || (words.count >= 2 && text.count >= 6)
+    }
+
+    private func shouldFindRelatedExcerpts(directCount: Int) -> Bool {
+        gemmaCoverage?.hasResults == true && !scopePending
+            && Self.qualifiesForRelatedExcerpts(query, directCount: directCount)
     }
 
     private func queueRelatedExcerpts() {

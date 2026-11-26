@@ -43,6 +43,7 @@ final class LauncherSmoke {
     var chosenDiagnosticFile: URL?
     var chosenImageFolder: URL?
     var chosenImageProjector: URL?
+    var definitionProvider: (@Sendable (String) -> String?)?
     private var previewDownloadRelease: AsyncStream<Void>.Continuation?
     private var previewDownloadsStarted = 0
     private var previewDownloadsCancelled = 0
@@ -371,7 +372,10 @@ final class LauncherSmoke {
                           app.statusMenu?.items.contains(where: { $0.title.contains("剩余时间待估") }) == true,
                           "cold progress showed an estimate or was missing from menu")
                 try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
-                try check(!app.searchPresented && model.isIndexing, "Escape canceled background indexing")
+                try check(app.searchPresented && model.query.isEmpty && model.isIndexing,
+                          "First Escape on a non-empty query did not clear the query in place")
+                try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+                try check(!app.searchPresented && model.isIndexing, "Second Escape canceled background indexing or failed to dismiss")
                 try signal("finish-cold-progress")
             }
             do {
@@ -492,8 +496,11 @@ final class LauncherSmoke {
 
         try type("archive", into: app)
         try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
-        try check(model.query.isEmpty && model.hits.isEmpty && app.searchField.currentEditor() == nil,
-                  "Escape did not dismiss the panel and reset the editor")
+        try check(model.query.isEmpty && model.hits.isEmpty && app.searchPresented,
+                  "First Escape did not clear the non-empty query while keeping the panel open")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try check(!app.searchPresented && model.query.isEmpty && model.hits.isEmpty && app.searchField.currentEditor() == nil,
+                  "Second Escape did not dismiss the panel and reset the editor")
         if executable == nil && !startsWithIndex {
             try verifyShortcut(app)
         } else {
@@ -709,8 +716,10 @@ final class LauncherSmoke {
         try key(kVK_DownArrow, "\u{f701}", in: app)
         try key(kVK_DownArrow, "\u{f701}", in: app)
         try key(kVK_Return, "\r", in: app)
-        try check(try store.image(id: clip.id) == nil && !app.commands.clipboardRows.contains { $0.id == clip.id },
-                  "Delete did not remove the selected image")
+        try await until("Delete did not remove the selected image from clipboard rows") {
+            !app.commands.clipboardRows.contains { $0.id == clip.id }
+        }
+        try check(try store.image(id: clip.id) == nil, "Delete did not remove the selected image from storage")
 
         try store.clearUnpinned()
         try check(try store.items().map(\.id) == [pinned.id], "clearUnpinned deleted a pin or retained a recent clip")
@@ -718,8 +727,11 @@ final class LauncherSmoke {
         let inFlightImage = history.poll()
         history.clearAll()
         await inFlightImage?.value
-        try check(try history.items.isEmpty && ClipboardStore(directory: store.directory).items().isEmpty &&
-                  app.commands.clipboardRows.isEmpty, "Clear All did not remove pins and persisted history")
+        try await until("Clear All did not clear clipboard rows") {
+            history.items.isEmpty && app.commands.clipboardRows.isEmpty
+        }
+        try check(try ClipboardStore(directory: store.directory).items().isEmpty,
+                  "Clear All did not remove pins and persisted history")
         try key(kVK_ANSI_Comma, ",", in: app, throughPanel: true, flags: [.command])
         try check(app.settingsSession.page == .general && !app.searchPresented, "clipboard Settings did not open General")
         if let file = files.first {
@@ -1012,6 +1024,7 @@ final class LauncherSmoke {
         try await verifyEngineRegressions()
         try await verifyBackgroundEmbeddingInterleavesContent()
         try await verifyPhase1Regressions()
+        try await verifyPhase2Regressions(app)
         try check(model.indexPhase == .needsIndex && !model.canSearch, "action smoke unexpectedly had a file index")
         func chosen() -> LaunchAction? {
             if case .action(let action)? = model.selectedResult { return action }
@@ -1022,7 +1035,8 @@ final class LauncherSmoke {
         let top = app.panel.frame.maxY
         try type("lumen action probe", into: app)
         try await until("a discovered application is selectable before any file index exists") {
-            chosen()?.english == "Lumen Action Probe" && app.panel.frame.height == 436
+            let expected = PanelGeometry.size(for: app.panelState, rows: model.visibleResults, showsResults: model.showsResults)
+            return chosen()?.english == "Lumen Action Probe" && app.panel.frame.size == expected
         }
         try check(app.panel.frame.maxY == top, "growing the results panel moved its top edge")
         try type("lap", into: app)
@@ -1081,7 +1095,9 @@ final class LauncherSmoke {
                 throw Failure("Launch Services did not route the URL to Apple System Settings")
             }
             if term == "无线局域网" && exists("capture-icons") {
-                try await until("the setting row is laid out offscreen") { app.panel.frame.height == 436 }
+                try await until("the setting row is laid out offscreen") {
+                    app.panel.frame.size == PanelGeometry.size(for: app.panelState, rows: model.visibleResults, showsResults: model.showsResults)
+                }
                 try capture("lumen-setting-icon.png", appearance: .aqua, window: app.panel)
             }
             try key(kVK_Return, "\r", in: app)
@@ -1221,7 +1237,7 @@ final class LauncherSmoke {
                   "the definition was not presented as selectable plain text")
         let operations: [(String, LauncherSystemActions.Operation)] = [
             ("suoping", .lock), ("睡眠", .sleep), ("empty trash", .emptyTrash), ("切换深色模式", .darkMode),
-            ("mute", .mute), ("quxiaojingyin", .unmute), ("eject", .eject), ("define macintosh", .define("macintosh")),
+            ("mute", .mute), ("quxiaojingyin", .unmute), ("eject", .eject),
         ]
         for (term, operation) in operations {
             app.showSearch()
@@ -1230,11 +1246,36 @@ final class LauncherSmoke {
             try key(kVK_Return, "\r", in: app)
             try check(dispatchedActions.last == .system(operation), "System action did not route: \(term)")
         }
+        definitionProvider = { word in word == "macintosh" ? definition : nil }
+        defer { definitionProvider = nil }
+        app.showSearch()
+        try type("define macintosh", into: app)
+        guard chosen()?.destination == .system(.define("macintosh")) else {
+            throw Failure("System action not found: define macintosh")
+        }
+        try key(kVK_Return, "\r", in: app)
+        try await until("inline dictionary card did not load definition") {
+            app.panelState.mode == .definition(word: "macintosh", text: definition, loading: false)
+                && app.searchPresented && app.panel.frame.height == PanelGeometry.headerHeight + PanelGeometry.footerHeight + 220
+        }
+        try key(kVK_Return, "\r", in: app)
+        try check(app.commands.definitionCopied && filePasteboard.string(forType: .string) == definition && app.searchPresented,
+                  "Return on inline definition card did not copy in place")
+        try verifyInternalCopy(app, "Copy Dictionary Definition")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try check(app.commands.definition == nil && app.panelState.mode == .search && app.searchPresented &&
+                  model.query == "define macintosh",
+                  "Escape on inline definition card did not close card while keeping query")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try check(app.searchPresented && model.query.isEmpty, "Second Escape did not clear query in place")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try check(!app.searchPresented, "Third Escape on empty query did not dismiss search")
         if let defaults = shortcutFixturePreferences {
             try check(LauncherFrecency(defaults: defaults).boost("system:lock") > 0,
                       "a completed system action was not saved to the shared frecency store")
         }
         app.showSearch()
+        try await verifyPhase2LiveFileInteractions(app)
 
         if exists("syntax-scenario") { try await verifyRawFileQuery(app) }
         if let fixtures = frecencyFixtures {
@@ -1471,11 +1512,19 @@ final class LauncherSmoke {
         try await until("silent script spawned a descendant") { fm.fileExists(atPath: ready.path) }
         let silentPIDs = try pids()
         app.showSearch()
-        try check(app.searchPresented && app.commands.visibleExecution == nil && app.commands.execution?.running == true,
+        try check(app.searchPresented && app.commands.visibleExecution == nil && app.commands.execution?.running == true &&
+                  app.panelState.mode == .search,
                   "reopening the launcher did not keep the silent script running in the background")
+        try type("Lumen Silent Group Probe", into: app)
         try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
-        try await until("Esc after reopening did not cancel both silent process-group members") {
-            gone(silentPIDs) && app.commands.canStartExecutable && app.commands.execution == nil && !app.searchPresented
+        try check(app.searchPresented && app.model.query.isEmpty && app.commands.execution?.running == true && !gone(silentPIDs),
+                  "silent background script hijacked Escape instead of clearing the query")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try check(!app.searchPresented && app.commands.execution?.running == true && !gone(silentPIDs),
+                  "silent background script hijacked Escape on empty query")
+        app.commands.cancelExecution()
+        try await until("explicit cancellation did not kill both silent process-group members") {
+            gone(silentPIDs) && app.commands.canStartExecutable && app.commands.execution == nil
         }
         catalog.setScriptsEnabled(false)
         catalog.setShortcutsEnabled(false)
@@ -1688,9 +1737,8 @@ final class LauncherSmoke {
         app.dismissSearch()
         app.settingsSession.page = .general
         app.showSettings()
-        try check(app.windowManagement.isTrusted == false && openedAccessibilitySettings.isEmpty,
-                  "opening Settings did not silently check Accessibility trust")
-        try await verifyAccessibilitySettingsButton(in: app)
+        try check(app.windowManagement.isTrusted == false && app.windowManagement.issue == nil && openedAccessibilitySettings.isEmpty,
+                  "opening Settings did not silently check Accessibility trust without unsolicited banner")
         app.showSearch()
         try type("left half", into: app)
         let trustChecks = windowAdapter.trustChecks
@@ -1698,11 +1746,16 @@ final class LauncherSmoke {
         try key(36, "\r", in: app)
         try await until("untrusted window action did not present the onboarding banner") {
             app.windowManagement.issue == .permissionRequired &&
-                app.panel.frame.height == SearchWindow.height(for: app.model, needsAccessibility: true)
+                app.panel.frame.size == PanelGeometry.size(for: app.panelState, rows: app.model.visibleResults,
+                                                           showsResults: app.model.showsResults, needsAccessibility: true)
         }
         try check(app.searchPresented && windowAdapter.trustChecks == trustChecks + 1 && windowAdapter.lookups.count == lookups &&
-                  windowAdapter.writes.isEmpty && openedAccessibilitySettings.count == 1,
+                  windowAdapter.writes.isEmpty && openedAccessibilitySettings.isEmpty,
                   "untrusted command opened System Settings, retried trust or contacted a window")
+        app.showSettings()
+        try check(app.windowManagement.issue == .permissionRequired,
+                  "opening Settings from an untrusted window action lost the permission issue")
+        try await verifyAccessibilitySettingsButton(in: app)
 
         windowAdapter.trusted = true
         app.showSettings()
@@ -2859,7 +2912,6 @@ final class LauncherSmoke {
         let idleFrame = app.panel.frame
         try type("x", into: app)
         try await until("initial nonempty query expanded the launcher") { app.panel.frame.height > idleFrame.height }
-        let frame = app.panel.frame
         for (query, filename, original) in [
             ("怎样摆放太阳能板才能让它朝着正午阳光？", "entry-a.md", "midday sun"),
             ("How do I get the clock to run after its battery died?", "entry-b.md", "换上新的电池"),
@@ -2875,7 +2927,9 @@ final class LauncherSmoke {
                 self.revealed?.lastPathComponent == filename
             }
             revealed = nil
-            try check(app.panel.frame == frame, "Gemma result resized the search panel")
+            let expected = PanelGeometry.size(for: app.panelState, rows: model.visibleResults, showsResults: model.showsResults)
+            try check(app.panel.frame.size == expected && abs(app.panel.frame.maxY - idleFrame.maxY) <= 1,
+                      "Gemma result did not match PanelGeometry or moved top edge")
         }
         let semanticQuery = model.query
         try type("x", into: app)
@@ -2888,14 +2942,16 @@ final class LauncherSmoke {
         try await until("the real partial index still returned its covered source", seconds: 30) {
             model.selectedHit?.name == "entry-b.md" && model.selectedHit?.isSemanticCandidate == true
         }
-        try check(app.panel.frame == frame, "the watcher or partial Gemma coverage resized the launcher")
+        let expectedPartial = PanelGeometry.size(for: app.panelState, rows: model.visibleResults, showsResults: model.showsResults)
+        try check(app.panel.frame.size == expectedPartial && abs(app.panel.frame.maxY - idleFrame.maxY) <= 1,
+                  "the watcher or partial Gemma coverage mis-sized the launcher")
         try check(!NSApp.isActive && opened == nil, "Gemma test activated the GUI or opened a document")
         print("Installed Gemma GUI smoke passed (Chinese-to-English, English-to-Chinese, and partial coverage)")
     }
 
     private func verifyTiming(_ app: AppDelegate) async throws {
         let model = app.model
-        let frame = app.panel.frame
+        let top = app.panel.frame.maxY
         let chrome = app.panel.contentView
         guard let backdrop = chrome as? SearchBackdrop,
               backdrop.layer?.cornerRadius == SearchBackdrop.cornerRadius,
@@ -2904,10 +2960,6 @@ final class LauncherSmoke {
               backdrop.effect.maskImage?.resizingMode == .stretch else {
             throw Failure("SearchBackdrop missing continuous rounded mask or layer clipping")
         }
-        var resizeCount = 0
-        let resize = NotificationCenter.default.publisher(for: NSWindow.didResizeNotification, object: app.panel)
-            .sink { _ in resizeCount += 1 }
-        defer { resize.cancel() }
 
         try signal("hold-archive-text")
         try type("archive x", into: app)
@@ -3008,8 +3060,10 @@ final class LauncherSmoke {
             self.revealed?.lastPathComponent == "body-match.md"
         }
         revealed = nil
-        try check(app.panel.frame == frame && app.panel.contentView === chrome && resizeCount == 0,
-                  "typing or result lane delivery resized or replaced the launcher")
+        let expectedTimingSize = PanelGeometry.size(for: app.panelState, rows: model.visibleResults, showsResults: model.showsResults)
+        try check(app.panel.frame.size == expectedTimingSize && abs(app.panel.frame.maxY - top) <= 1 &&
+                  app.panel.contentView === chrome,
+                  "typing or result lane delivery broke anchored PanelGeometry or replaced the launcher")
 
         // Verify background watch refresh does not close an open Command–K context menu.
         try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
@@ -3190,13 +3244,19 @@ final class LauncherSmoke {
         guard let pdfImage = app.inlinePreview.image else { throw Failure("PDF bitmap was not decoded for the view") }
         app.panel.contentView?.layoutSubtreeIfNeeded()
         try check(app.inlinePreview.image === pdfImage, "layout discarded the cached PDF bitmap")
-        // Start from a taller frame and verify the close-button action recomputes the natural height.
-        let frame = app.panel.frame
-        app.panel.setFrame(frame.insetBy(dx: 0, dy: -16).offsetBy(dx: 0, dy: -16), display: false)
+        // Start from a taller frame while inline preview is widened (860pt) and verify close restores 680pt + natural height.
+        let openFrame = app.panel.frame
+        try check(openFrame.width == PanelGeometry.previewWidth,
+                  "inline preview did not widen panel to \(PanelGeometry.previewWidth)pt (got \(openFrame.width))")
+        app.panel.setFrame(openFrame.insetBy(dx: 0, dy: -16).offsetBy(dx: 0, dy: -16), display: false)
         app.closeInlinePreview()
-        try check(!app.inlinePreview.isOpen && app.inlinePreview.image == nil && app.panel.frame == frame &&
+        let closedExpected = PanelGeometry.size(for: app.panelState, rows: model.visibleResults, showsResults: model.showsResults)
+        try check(!app.inlinePreview.isOpen && app.inlinePreview.image == nil &&
+                  app.panel.frame.width == PanelGeometry.defaultWidth &&
+                  app.panel.frame.size == closedExpected &&
+                  abs(app.panel.frame.maxY - openFrame.maxY) <= 1 &&
                   model.query == "zircon calibration" && app.searchPresented,
-                  "closing inline preview did not restore the anchored layout or retain the search")
+                  "closing inline preview did not restore 680pt anchored layout or retain the search")
         try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
         try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
         try check(!app.inlinePreview.isOpen && model.query == "zircon calibration" && app.searchPresented,
@@ -3225,7 +3285,7 @@ final class LauncherSmoke {
                 await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
                 try check(preview.isKeyWindow && !app.panel.isKeyWindow && app.searchPresented &&
                           model.query == "zircon calibration" && model.selection == pdfPath,
-                          "settled focus did not move to the preview while preserving the search session")
+                          "settled focus did not move to the preview while preserving the search session (previewKey=\(preview.isKeyWindow), panelKey=\(app.panel.isKeyWindow), presented=\(app.searchPresented), active=\(NSApp.isActive), query=\(model.query), selection=\(model.selection ?? "nil"))")
             }
             func verifyFocusLeft(_ message: String) async throws {
                 try await until(message) {
@@ -3715,11 +3775,9 @@ final class LauncherSmoke {
         let model = app.model
         try type("watchneedle", into: app)
         try await until("watch query starts with no results") { model.hits.isEmpty && !model.searching }
-        let frame = app.panel.frame
-        var resizeCount = 0
-        let resize = NotificationCenter.default.publisher(for: NSWindow.didResizeNotification, object: app.panel)
-            .sink { _ in resizeCount += 1 }
-        defer { resize.cancel() }
+        let top = app.panel.frame.maxY
+        try check(app.panel.frame.size == PanelGeometry.size(for: app.panelState, rows: model.visibleResults, showsResults: model.showsResults),
+                  "empty watch query did not use compact PanelGeometry height")
         let file = corpus.appendingPathComponent("watchneedle.txt")
         try Data().write(to: file)
         if controlledTiming {
@@ -3735,11 +3793,14 @@ final class LauncherSmoke {
         }
         try await until("watch notification refreshed active results") { model.hits.first?.name == "watchneedle.txt" }
         try check(model.watchProgress == nil, "watch completion left progress busy")
+        try check(app.panel.frame.size == PanelGeometry.size(for: app.panelState, rows: model.visibleResults, showsResults: model.showsResults) &&
+                  abs(app.panel.frame.maxY - top) <= 1, "watch addition did not match compact PanelGeometry or moved top edge")
         if !controlledTiming {
             try FileManager.default.removeItem(at: file)
             try await until("watch notification removed deleted result") { model.hits.isEmpty && !model.searching }
         }
-        try check(app.panel.frame == frame && resizeCount == 0, "watch events resized the launcher")
+        try check(app.panel.frame.size == PanelGeometry.size(for: app.panelState, rows: model.visibleResults, showsResults: model.showsResults) &&
+                  abs(app.panel.frame.maxY - top) <= 1, "watch events broke PanelGeometry or moved the launcher top edge")
     }
 
     private func verifyCloudAction(_ app: AppDelegate) async throws {
@@ -3774,11 +3835,12 @@ final class LauncherSmoke {
 
     private func verifySemanticInvalidation(_ app: AppDelegate) async throws {
         let model = app.model
+        let top = app.panel.frame.maxY
         try type("health examination", into: app)
         try await until("related excerpts started automatically after direct results") {
-            self.exists("semantic-enrichment-started") && app.panel.frame.height == 436
+            self.exists("semantic-enrichment-started") &&
+                app.panel.frame.size == PanelGeometry.size(for: app.panelState, rows: model.visibleResults, showsResults: model.showsResults)
         }
-        let frame = app.panel.frame
         let direct = model.hits.map(\.path)
         try check(direct.count == 2 && model.hits.allSatisfy { !$0.isSemanticCandidate },
                   "direct hits were delayed or replaced by the optional lane")
@@ -3789,10 +3851,15 @@ final class LauncherSmoke {
         try await until("bounded related excerpts appended") {
             model.hits.filter(\.isSemanticCandidate).count == 3 && !model.semanticBusy
         }
+        let enrichedSize = PanelGeometry.size(for: app.panelState, rows: model.visibleResults, showsResults: model.showsResults)
+        try await until("panel height adjusted to actual semantic preview row heights") {
+            app.panel.frame.size == enrichedSize
+        }
+        let frame = app.panel.frame
         try check(Array(model.hits.prefix(direct.count)).map(\.path) == direct && model.selection == selected &&
-                  Set(model.hits.map(\.path)).count == model.hits.count && app.panel.frame == frame &&
+                  Set(model.hits.map(\.path)).count == model.hits.count && abs(frame.maxY - top) <= 1 &&
                   app.panel.firstResponder === responder,
-                  "related excerpts duplicated results, changed direct rank, focus, selection, or panel size")
+                  "related excerpts duplicated results, changed direct rank, focus, selection, or top anchor")
         guard let hit = model.hits.first(where: { $0.name == "notes.md" && $0.isSemanticCandidate })
         else { throw Failure("missing Gemma candidate") }
         try check(model.relatedExcerptsLabel == "相关原文", "candidate label did not say related excerpts")
@@ -4181,6 +4248,201 @@ final class LauncherSmoke {
         try check(mixedDuringSearch.contains(where: { if case .file(let h) = $0 { return h.name == "doc.txt" }; return false }),
                   "visibleResults blanked prior file rows while commands matched and search was pending")
         print("Phase 1 regressions passed (cloud parity, 5-field stamps, symlinks, zero idle status, silent refresh)")
+    }
+
+    private func verifyPhase2Regressions(_ app: AppDelegate) async throws {
+        // 1. Default hotkey for fresh installs is Option-Space.
+        try check(HotKey.standard == HotKey(code: UInt32(kVK_Space), modifiers: UInt32(optionKey), key: "␣") &&
+                  HotKey.standard.label == "⌥␣",
+                  "HotKey.standard was not Option-Space (got \(HotKey.standard.label))")
+
+        // 2. PanelGeometry exact (width, height) derived from (PanelMode, PanelOverlay).
+        let plainHit = SearchHit(path: "/tmp/a.txt", name: "a.txt", kind: "file", availability: "local",
+                                 matched_by: "name", snippet: nil, document_stamp: nil, pdf_page: nil)
+        let snippetHit = SearchHit(path: "/tmp/b.md", name: "b.md", kind: "file", availability: "local",
+                                   matched_by: "text", snippet: "match excerpt", document_stamp: "1:2:3:4:5", pdf_page: nil)
+        let shell = PanelGeometry.headerHeight + PanelGeometry.footerHeight
+        try check(PanelGeometry.size(for: PanelState(mode: .search, overlay: .none), rows: [], showsResults: false)
+                  == CGSize(width: 680, height: shell), "idle search geometry mismatch")
+        try check(PanelGeometry.size(for: PanelState(mode: .search, overlay: .none), rows: [], showsResults: true)
+                  == CGSize(width: 680, height: shell + 56), "empty search results should be compact (56pt body)")
+        try check(PanelGeometry.size(for: PanelState(mode: .search, overlay: .none), rows: [.file(plainHit), .file(snippetHit)], showsResults: true)
+                  == CGSize(width: 680, height: shell + 44 + 60), "mixed row heights did not sum accurately")
+        try check(PanelGeometry.size(for: PanelState(mode: .search, overlay: .inlinePreview(plainHit)), rows: [.file(plainHit)], showsResults: true)
+                  == CGSize(width: 860, height: shell + 176), "inline preview did not widen to 860pt with 176pt floor")
+        try check(PanelGeometry.size(for: PanelState(mode: .search, overlay: .contextMenu(count: 3)), rows: [.file(plainHit)], showsResults: true)
+                  == CGSize(width: 680, height: shell + 132), "search context menu geometry mismatch")
+        try check(PanelGeometry.size(for: PanelState(mode: .clipboard, overlay: .none), rows: [], showsResults: false)
+                  == CGSize(width: 680, height: shell + ClipboardHistoryView.height), "clipboard geometry mismatch")
+        try check(PanelGeometry.size(for: PanelState(mode: .clipboard, overlay: .contextMenu(count: 2)), rows: [], showsResults: false)
+                  == CGSize(width: 680, height: shell + 88), "clipboard context menu geometry mismatch")
+        try check(PanelGeometry.size(for: PanelState(mode: .definition(word: "apple", text: "fruit", loading: false), overlay: .none), rows: [], showsResults: false)
+                  == CGSize(width: 680, height: shell + 220), "definition card geometry mismatch")
+        try check(PanelGeometry.size(for: PanelState(mode: .imageSetup, overlay: .none), rows: [], showsResults: false)
+                  == CGSize(width: 680, height: shell + 162), "image setup geometry mismatch")
+        try check(PanelGeometry.size(for: PanelState(mode: .commandCard, overlay: .none), rows: [], showsResults: false)
+                  == CGSize(width: 680, height: shell + 162), "command card geometry mismatch")
+        let fullExec = LauncherExecutable(source: .shortcut("demo"), title: "demo", mode: .fullOutput)
+        var capturedOut = LauncherProcess.Capture()
+        Data("hello".utf8).withUnsafeBytes { capturedOut.append($0) }
+        let execWithOut = CommandExecution(command: fullExec, phase: .finished(.init(status: .exited(0), stdout: capturedOut)))
+        let execRunning = CommandExecution(command: fullExec, phase: .running)
+        try check(PanelGeometry.size(for: PanelState(mode: .scriptOutput(execWithOut), overlay: .none), rows: [], showsResults: false)
+                  == CGSize(width: 680, height: shell + 316), "fullOutput with output geometry mismatch")
+        try check(PanelGeometry.size(for: PanelState(mode: .scriptOutput(execRunning), overlay: .none), rows: [], showsResults: false)
+                  == CGSize(width: 680, height: shell + 100), "running script output geometry mismatch")
+        if let tr = TranslationCommand.parse("tr hello") {
+            try check(PanelGeometry.size(for: PanelState(mode: .translation(tr), overlay: .none), rows: [], showsResults: false)
+                      == CGSize(width: 680, height: shell + 138), "translation geometry mismatch")
+        }
+
+        // 3. Ranking cap raised to 8 and app-vs-file scoring tiers.
+        let dummyAppURL = URL(fileURLWithPath: "/Applications/Dummy.app", isDirectory: true)
+        let tenApps = (0..<10).map { index in
+            LaunchAction(id: "app:alpha.\(index)", english: "AlphaTool\(index)", chinese: "AlphaTool\(index)",
+                         symbol: "app", destination: .application(dummyAppURL, stamp: "0"), aliases: [])
+        }
+        try check(LaunchCatalog.matches("alpha", actions: tenApps).count == 8,
+                  "LaunchCatalog.matches did not return up to 8 matches")
+        let safariApp = LaunchAction(id: "app:safari.rank", english: "Safari", chinese: "Safari", symbol: "app",
+                                     destination: .application(dummyAppURL, stamp: "0"), aliases: [])
+        let imageCapture = LaunchAction(id: "app:imagecapture.rank", english: "Image Capture", chinese: "Image Capture",
+                                        symbol: "app", destination: .application(dummyAppURL, stamp: "0"), aliases: [])
+        try check(LaunchCatalog.matches("safari", actions: [safariApp]).first?.score == 110 &&
+                  LaunchCatalog.matches("saf", actions: [safariApp]).first?.score == 92 &&
+                  LaunchCatalog.matches("s", actions: [safariApp]).first?.score == 86 &&
+                  (82...88).contains(LaunchCatalog.matches("sfr", actions: [safariApp]).first?.score ?? 0) &&
+                  LaunchCatalog.matches("far", actions: [safariApp]).first?.score == 74,
+                  "app scoring tiers did not match exact 110 / prefix 92 / 1-char 86 / fuzzy 82..88 / substring 74")
+        try check((LaunchCatalog.matches("mac", actions: [imageCapture]).first?.score ?? 0) < 79,
+                  "unanchored fuzzy app match outranked direct files")
+
+        // 4. Lowered Chinese (2+ Han) & English (2+ words, 6+ chars) semantic trigger.
+        try check(Launcher.qualifiesForRelatedExcerpts("报销", directCount: 0) &&
+                  !Launcher.qualifiesForRelatedExcerpts("月", directCount: 0) &&
+                  Launcher.qualifiesForRelatedExcerpts("tax doc", directCount: 0) &&
+                  !Launcher.qualifiesForRelatedExcerpts("ab c", directCount: 0) &&
+                  !Launcher.qualifiesForRelatedExcerpts("报销", directCount: 8) &&
+                  !Launcher.qualifiesForRelatedExcerpts("ext:pdf 报销", directCount: 0) &&
+                  !Launcher.qualifiesForRelatedExcerpts("dir/报销", directCount: 0) &&
+                  !Launcher.qualifiesForRelatedExcerpts("report.pdf 报销", directCount: 0),
+                  "related-excerpts threshold did not match 2-Han / 2-word-6-char rules")
+
+        // 5. LauncherImageSearch retries ensureStatus() after DB becomes ready.
+        let imageDir = directory.appendingPathComponent("phase2-image-status", isDirectory: true)
+        try FileManager.default.createDirectory(at: imageDir, withIntermediateDirectories: true)
+        let stubEngine = imageDir.appendingPathComponent("image-status-stub")
+        try Data("""
+        #!/usr/bin/env python3
+        import json, sys
+        if 'image-status' in sys.argv:
+            print(json.dumps({'root': '/tmp/images', 'vectors': 3}))
+        """.utf8).write(to: stubEngine)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stubEngine.path)
+        let lazyDB = imageDir.appendingPathComponent("lazy.sqlite")
+        let lazyImages = LauncherImageSearch(engine: LauncherEngine(executable: stubEngine, database: lazyDB), defaults: nil)
+        lazyImages.ensureStatus()
+        try check(lazyImages.scope == nil && !lazyImages.loading, "ensureStatus ran without a database")
+        try Data().write(to: lazyDB)
+        lazyImages.ensureStatus()
+        try await until("ensureStatus stayed permanently locked after early no-DB call") {
+            lazyImages.scope?.root == "/tmp/images" && lazyImages.scope?.vectors == 3 && !lazyImages.loading
+        }
+
+        // 6. Tab autocomplete: discovery, command prefix, and never inserting \t.
+        let field = try editor(app)
+        try type("?", into: app)
+        try key(kVK_Tab, "\t", in: app)
+        try check(field.string == "qa " && !field.string.contains("\t"),
+                  "Tab in discovery did not fill selected command: \(field.string.debugDescription)")
+        try type("im", into: app)
+        try key(kVK_Tab, "\t", in: app)
+        try check(field.string == "img " && !field.string.contains("\t"),
+                  "Tab did not complete command prefix 'im' -> 'img ': \(field.string.debugDescription)")
+        try type("cb", into: app)
+        try key(kVK_Tab, "\t", in: app)
+        try check(field.string == "cb " && !field.string.contains("\t"),
+                  "Tab did not complete 'cb' -> 'cb ': \(field.string.debugDescription)")
+        try type("tr", into: app)
+        try key(kVK_Tab, "\t", in: app)
+        try check(field.string == "tr " && !field.string.contains("\t"),
+                  "Tab did not complete 'tr' -> 'tr ': \(field.string.debugDescription)")
+        try type("unmatched_tab_text", into: app)
+        try key(kVK_Tab, "\t", in: app)
+        try check(field.string == "unmatched_tab_text" && !field.string.contains("\t"),
+                  "Tab inserted a literal tab character")
+        try type("", into: app)
+        print("Phase 2 core regressions passed (HotKey, PanelGeometry, ranking, 2-Han semantic trigger, image-status retry, Tab)")
+    }
+
+    private func verifyPhase2LiveFileInteractions(_ app: AppDelegate) async throws {
+        let model = app.model
+        let fm = FileManager.default
+
+        // 1. Tab folder path completion when a folder hit is selected.
+        let tabFolder = corpus.appendingPathComponent("Phase2TabFolder", isDirectory: true)
+        try fm.createDirectory(at: tabFolder, withIntermediateDirectories: true)
+        let folderPath = IndexScope.folderPath(tabFolder)
+        try type("Phase2TabFolder", into: app)
+        try await until("Tab folder fixture was indexed") {
+            model.hits.contains { $0.path == folderPath && $0.kind == "directory" }
+        }
+        model.selectedID = folderPath
+        try key(kVK_Tab, "\t", in: app)
+        let field = try editor(app)
+        try check(field.string == folderPath + "/" && !field.string.contains("\t"),
+                  "Tab did not complete selected folder path + '/': \(field.string.debugDescription)")
+
+        // 2. Unified selection: clicking/selecting a script row immediately closes an open file inline preview and restores 680pt width.
+        let imageFixture = corpus.appendingPathComponent("phase2-shared-preview.png")
+        try Data(Self.minimalPNG()).write(to: imageFixture)
+        let imagePath = IndexScope.folderPath(imageFixture)
+        let scriptsFolder = directory.appendingPathComponent("Phase2SelectionScripts", isDirectory: true)
+        try fm.createDirectory(at: scriptsFolder, withIntermediateDirectories: true)
+        let scriptFile = scriptsFolder.appendingPathComponent("phase2-shared-script")
+        try Data("#!/bin/sh\n# @lumen.title phase2-shared-script\necho ok\n".utf8).write(to: scriptFile)
+        try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptFile.path)
+        app.scriptCatalog.selectFolder(scriptsFolder)
+        app.scriptCatalog.setScriptsEnabled(true)
+        defer { app.scriptCatalog.setScriptsEnabled(false) }
+        try await until("Phase 2 script fixture loaded") {
+            !app.scriptCatalog.scriptLoading && app.scriptCatalog.scripts.contains { $0.title == "phase2-shared-script" }
+        }
+        try type("phase2-shared", into: app)
+        try await until("both file image and script matched the shared query") {
+            model.hits.contains { $0.path == imagePath } &&
+                app.commands.executableMatches.contains { $0.action.english == "phase2-shared-script" }
+        }
+        guard let scriptAction = app.commands.executableMatches.first(where: { $0.action.english == "phase2-shared-script" })?.action else {
+            throw Failure("missing phase2 script action")
+        }
+        model.selectedID = imagePath
+        try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
+        try await until("inline image preview opened and widened panel to 860pt") {
+            app.inlinePreview.isOpen && app.panelState.overlay == .inlinePreview(model.selectedHit!) &&
+                app.panel.frame.width == PanelGeometry.previewWidth
+        }
+        // Simulate clicking the script row through the unified selection source.
+        model.selectedID = scriptAction.id
+        try await until("selecting a script row closed stale file inline preview and restored 680pt width") {
+            !app.inlinePreview.isOpen && model.selectedHit == nil &&
+                app.panelState.overlay == .none && app.panel.frame.width == PanelGeometry.defaultWidth
+        }
+        try type("", into: app)
+        print("Phase 2 live interactions passed (Tab folder completion, unified selection closing stale inline preview)")
+    }
+
+    private static func minimalPNG() -> [UInt8] {
+        // 1x1 opaque RGB PNG.
+        [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+         0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+         0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+         0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE,
+         0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54,
+         0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00,
+         0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D, 0xB0,
+         0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44,
+         0xAE, 0x42, 0x60, 0x82]
     }
 
     private func verifyEmbeddingRun(_ app: AppDelegate) async throws {

@@ -19,6 +19,8 @@ struct SearchWindow: View {
     let activateExecution: () -> Void
     let copyOutput: () -> Void
     let cancelExecution: () -> Void
+    let copyDefinition: () -> Void
+    let closeDefinition: () -> Void
     let searchCommandAsFiles: () -> Void
     let closeInlinePreview: () -> Void
     let activateTranslation: () -> Void
@@ -26,64 +28,62 @@ struct SearchWindow: View {
     let showSettings: () -> Void
     let beginIndex: () -> Void
     let open: (LauncherResult) -> Void
-    let browse: () -> Void
+    let selectRow: (LauncherResult, Bool) -> Void
     let moveSelection: (Int) -> Void
     let fileAction: (FileAction, SearchHit) -> Void
 
-    static let headerHeight: CGFloat = 56
-    static let footerHeight: CGFloat = 28
-    static let maximumVisibleRows = 8
+    static let headerHeight: CGFloat = PanelGeometry.headerHeight
+    static let footerHeight: CGFloat = PanelGeometry.footerHeight
+    static let maximumVisibleRows = PanelGeometry.maximumVisibleRows
 
-    static func height(for model: Launcher, contextCount: Int = 0, hasTranslation: Bool = false,
-                       needsAccessibility: Bool = false, commandHeight: CGFloat? = nil, hasPreview: Bool = false,
-                       hasExecutableMatches: Bool = false) -> CGFloat {
-        let shell = headerHeight + footerHeight + (needsAccessibility ? WindowAccessibilityBanner.launcherHeight : 0)
-        if hasTranslation { return shell + 138 }
-        if let commandHeight { return shell + commandHeight }
-        if contextCount > 0 { return shell + CGFloat(min(contextCount, maximumVisibleRows) * 44) }
-        guard model.showsResults || hasExecutableMatches else { return shell }
-        let rows = model.hasQuery ? maximumVisibleRows : min(model.visibleResults.count, maximumVisibleRows)
-        return shell + max(CGFloat(rows * 44), hasPreview ? 176 : 0)
-    }
+    private static func rowHeight(_ hit: SearchHit) -> CGFloat { hit.hasPreview ? PanelGeometry.previewRowHeight : PanelGeometry.standardRowHeight }
 
-    private static func rowHeight(_ hit: SearchHit) -> CGFloat { hit.hasPreview ? 60 : 44 }
-
-    private var showsResults: Bool { model.showsResults || !commands.executableMatches.isEmpty }
+    private var showsResults: Bool { model.showsResults }
 
     var body: some View {
+        let state = PanelState.resolve(
+            model: model,
+            commands: commands,
+            translation: translation,
+            contextActions: contextActions,
+            inlinePreview: inlinePreview
+        )
         VStack(spacing: 0) {
-            if let execution = commands.visibleExecution {
+            switch (state.mode, state.overlay) {
+            case (.scriptOutput(let execution), _):
                 LauncherCommandOutputCard(commands: commands, execution: execution, chinese: model.zh,
                                           run: activateExecution, copy: copyOutput, cancel: cancelExecution)
-            } else if let command = translation.command {
+            case (.translation(let command), _):
                 TranslationResultCard(model: translation, command: command, chinese: model.zh,
                                       activate: activateTranslation)
-            } else if commands.isImageCommand && !model.isImageSearch {
+            case (.imageSetup, _):
                 VStack(alignment: .leading, spacing: 8) {
                     Label(model.t("图像搜索", "Image Search"), systemImage: "photo")
                         .font(.headline)
                     Text(imageSearch.loading
                          ? model.t("正在读取图像设置…", "Checking image settings…")
-                         : model.t("在「索引与隐私」选择本地目录和投影器，再建立图像索引。",
-                                   "Choose a local folder and projector in Index & Privacy, then build the image index."))
+                         : model.t("在「索引与隐私」选择本地目录和图像模型，再建立图像索引。",
+                                   "Choose a local folder and image model in Index & Privacy, then build the image index."))
                         .foregroundStyle(.secondary)
                     Button(model.t("打开图像设置…", "Open Image Settings…"), action: showSettings)
                     Spacer(minLength: 0)
                 }
                 .padding(.horizontal, 16).padding(.vertical, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            } else if commands.isClipboardCommand {
-                if contextActions.isOpen { contextRows }
-                else {
-                    ClipboardHistoryView(commands: commands, clipboard: clipboard, chinese: model.zh,
-                                         select: selectClipboard, copy: activateCommand, openSettings: showSettings)
-                }
-            } else if commands.showsCard {
+            case (.clipboard, .contextMenu):
+                contextRows
+            case (.clipboard, _):
+                ClipboardHistoryView(commands: commands, clipboard: clipboard, chinese: model.zh,
+                                     select: selectClipboard, copy: activateCommand, openSettings: showSettings)
+            case (.commandCard, _):
                 LauncherCommandCard(commands: commands, provider: translation, chinese: model.zh,
                                     activate: activateCommand, openSettings: showSettings)
-            } else if contextActions.isOpen {
+            case (.definition(let word, let text, let loading), _):
+                LauncherDefinitionCard(commands: commands, word: word, text: text, loading: loading,
+                                       chinese: model.zh, copy: copyDefinition, close: closeDefinition)
+            case (.search, .contextMenu):
                 contextRows
-            } else if let hit = inlinePreview.hit, model.selectedHit == hit, model.containsCurrentFile(hit) {
+            case (.search, .inlinePreview(let hit)):
                 HStack(spacing: 0) {
                     results
                     Divider()
@@ -102,15 +102,17 @@ struct SearchWindow: View {
                         Spacer(minLength: 0)
                     }
                     .padding(12)
-                    .frame(width: 295)
+                    .frame(width: 380)
                 }
-            } else if showsResults {
-                results.overlay {
-                    if model.visibleResults.isEmpty && commands.executableMatches.isEmpty {
-                        Text(emptyResultsLabel)
-                            .font(.callout).foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                            .padding(16)
+            case (.search, .localQuickLook), (.search, .none):
+                if showsResults {
+                    results.overlay {
+                        if model.visibleResults.isEmpty {
+                            Text(emptyResultsLabel)
+                                .font(.callout).foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                                .padding(16)
+                        }
                     }
                 }
             }
@@ -118,20 +120,24 @@ struct SearchWindow: View {
                 WindowAccessibilityBanner(model: model, openSettings: windowManagement.openAccessibilitySettings)
                     .frame(height: WindowAccessibilityBanner.launcherHeight)
             }
-            footer
+            footer(for: state)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
     }
 
-    private var footer: some View {
-        HStack(spacing: 12) {
-            if let execution = commands.visibleExecution {
+    private func footer(for state: PanelState) -> some View {
+        let isTranslation: Bool
+        if case .translation = state.mode { isTranslation = true }
+        else { isTranslation = false }
+        return HStack(spacing: 12) {
+            switch state.mode {
+            case .scriptOutput(let execution):
                 keyHint("esc", execution.running ? model.t("取消", "Cancel") : model.t("关闭结果", "Close Result"))
                 if execution.command.mode == .fullOutput && execution.hasOutput {
                     keyHint("PgUp/PgDn", model.t("翻页", "Scroll"))
                 }
                 Spacer(minLength: 8)
-            } else if translation.command != nil {
+            case .translation:
                 if translation.activity == .translating {
                     keyHint("esc", model.t("取消", "Cancel"))
                 } else if !translation.output.isEmpty {
@@ -141,18 +147,26 @@ struct SearchWindow: View {
                     keyHint("↵", model.t("翻译", "Translate"))
                 }
                 Spacer(minLength: 8)
-            } else if commands.showsCard || commands.isImageCommand && !model.isImageSearch {
-                commandFooter
-            } else {
-                searchFooter
+            case .definition(_, let text, let loading):
+                keyHint("esc", model.t("关闭", "Close"))
+                if !loading, let text, !text.isEmpty {
+                    keyHint("↵", model.t("复制", "Copy"))
+                    keyHint("PgUp/PgDn", model.t("翻页", "Scroll"))
+                    if commands.definitionCopied { Text(model.t("已复制", "Copied")) }
+                }
+                Spacer(minLength: 8)
+            case .imageSetup, .clipboard, .commandCard:
+                commandFooter(overlay: state.overlay)
+            case .search:
+                searchFooter(overlay: state.overlay)
             }
             Button(action: showSettings) {
                 Image(systemName: "gearshape").font(.system(size: 12))
             }
             .buttonStyle(.borderless)
             .accessibilityLabel(model.t("设置", "Settings"))
-            .help(translation.command == nil ? model.t("设置与索引详情", "Settings and index details")
-                  : model.t("翻译设置", "Translation Settings"))
+            .help(isTranslation ? model.t("翻译设置", "Translation Settings")
+                  : model.t("设置与索引详情", "Settings and index details"))
         }
         .font(.system(size: 11, weight: .medium))
         .foregroundStyle(.secondary)
@@ -162,19 +176,19 @@ struct SearchWindow: View {
         .overlay(alignment: .top) { Divider() }
     }
 
-    @ViewBuilder private var commandFooter: some View {
+    @ViewBuilder private func commandFooter(overlay: PanelOverlay) -> some View {
         switch commands.resolution {
         case .discovery:
             keyHint("↑↓", model.t("选择", "Select"))
             keyHint("↵", model.t("填入命令", "Fill Command"))
         case .clipboard:
-            if contextActions.isOpen {
+            if case .contextMenu = overlay {
                 keyHint("↑↓", model.t("选择操作", "Select Action"))
                 keyHint("↵", model.t("执行", "Run"))
             } else if commands.selectedClipboardItem != nil {
                 keyHint("↑↓", model.t("选择", "Select"))
                 keyHint("↵", model.t("复制", "Copy"))
-                Button(action: toggleContextActions) { keyHint("⇧↵", model.t("操作", "Actions")) }
+                Button(action: toggleContextActions) { keyHint("⌘K", model.t("操作", "Actions")) }
                     .buttonStyle(.borderless)
             }
         case .question:
@@ -194,14 +208,14 @@ struct SearchWindow: View {
             .buttonStyle(.borderless)
     }
 
-    @ViewBuilder private var searchFooter: some View {
+    @ViewBuilder private func searchFooter(overlay: PanelOverlay) -> some View {
         if model.isImageSearch {
             Label(model.t("图像内容", "Image Content"), systemImage: "photo")
         }
         if showsResults {
             keyHint("↑↓", model.t("选择", "Select"))
             keyHint("↵", model.t("打开", "Open"))
-            if case .file(let file) = commands.selectedResult(in: model) {
+            if case .file(let file) = model.selectedResult {
                 keyHint("⌘↵", model.t("在 Finder 中显示", "Show in Finder"))
                 if file.kind == "file" {
                     keyHint(model.t("空格 / ⌘Y", "Space / ⌘Y"), model.t("预览", "Preview"))
@@ -231,14 +245,21 @@ struct SearchWindow: View {
                 .buttonStyle(.borderless).fontWeight(.semibold)
                 .accessibilityIdentifier("build-index")
         } else {
-            keyHint("esc", inlinePreview.isOpen ? model.t("关闭预览", "Close Preview") : model.t("关闭", "Close"))
+            keyHint("esc", escapeHintLabel(overlay: overlay))
         }
-        if commands.selectedResult(in: model) != nil {
+        if model.selectedResult != nil {
             Button(action: toggleContextActions) {
                 keyHint("⌘K", model.t("操作", "Actions"))
             }
             .buttonStyle(.borderless)
         }
+    }
+
+    private func escapeHintLabel(overlay: PanelOverlay) -> String {
+        if case .inlinePreview = overlay { return model.t("关闭预览", "Close Preview") }
+        if case .contextMenu = overlay { return model.t("关闭操作", "Close Actions") }
+        if model.hasQuery { return model.t("清除", "Clear") }
+        return model.t("关闭", "Close")
     }
 
     private func keyHint(_ key: String, _ action: String) -> some View {
@@ -254,11 +275,11 @@ struct SearchWindow: View {
 
     private var results: some View {
         let highlight = LauncherHighlight(model.query)
-        let selection = commands.selection(in: model)
+        let selection = model.selectedID
         return ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(commands.results(in: model)) { result in
+                    ForEach(model.visibleResults) { result in
                         let selected = selection == result.id
                         switch result {
                         case .file(let hit): resultRow(hit, highlight: highlight, selected: selected).id(result.id)
@@ -280,7 +301,7 @@ struct SearchWindow: View {
             .onKeyPress(.upArrow) { moveSelection(-1); return .handled }
             .onKeyPress(.downArrow) { moveSelection(1); return .handled }
             .onKeyPress(keys: [.return]) { press in
-                guard press.modifiers.isEmpty, let result = commands.selectedResult(in: model) else { return .ignored }
+                guard press.modifiers.isEmpty, let result = model.selectedResult else { return .ignored }
                 open(result)
                 return .handled
             }
@@ -329,24 +350,16 @@ struct SearchWindow: View {
         .padding(.horizontal, 8)
         .frame(height: 44)
         .modifier(ResultRowChrome(selected: selected))
-        .onTapGesture { clickRow(result) }
+        .overlay { ActionRowClickView { selectRow(result, $0 == 2) }.accessibilityHidden(true) }
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(selected ? .isSelected : [])
         .accessibilityAction(named: Text(model.t("执行", "Run"))) { open(result) }
     }
 
-    private func clickRow(_ result: LauncherResult, count: Int? = nil) {
-        browse()
-        commands.choose(result, in: model)
-        // Select on mouseUp without waiting to see if it becomes a double click.
-        let event = NSApp.currentEvent
-        if (count ?? (event?.type == .leftMouseUp ? event?.clickCount : nil)) == 2 { open(result) }
-    }
-
     private var emptyResultsLabel: String {
         if let notice = model.searchNotice {
             if model.isImageSearch {
-                return model.t("图像搜索失败。请检查本机模型和投影器。", "Image search failed. Check the local model and projector.")
+                return model.t("图像搜索失败。请检查本机图像模型。", "Image search failed. Check the local image model.")
             }
             return model.title(for: notice)
         }
@@ -403,7 +416,7 @@ struct SearchWindow: View {
         .padding(.horizontal, 8)
         .frame(height: 44)
         .modifier(ResultRowChrome(selected: selected))
-        .overlay { ActionRowClickView { clickRow(.action(action), count: $0) }.accessibilityHidden(true) }
+        .overlay { ActionRowClickView { selectRow(.action(action), $0 == 2) }.accessibilityHidden(true) }
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(selected ? .isSelected : [])
         .accessibilityAction(named: Text(model.t("打开", "Open"))) { open(.action(action)) }
@@ -422,7 +435,7 @@ struct SearchWindow: View {
     private func fileRow(_ hit: SearchHit, highlight: LauncherHighlight, selected: Bool) -> some View {
         let folder = hit.kind == "directory"
         return HStack(spacing: 10) {
-            FileTypeIcon(name: hit.name, directory: folder)
+            FileTypeIcon(hit: hit, directory: folder)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 8) {
                     Text(highlight.text(hit.name, size: 13, colorScheme: colorScheme, mode: .name))
@@ -454,7 +467,8 @@ struct SearchWindow: View {
         .padding(.horizontal, 8)
         .frame(height: Self.rowHeight(hit))
         .modifier(ResultRowChrome(selected: selected))
-        .onTapGesture { clickRow(.file(hit)) }
+        .onTapGesture { selectRow(.file(hit), false) }
+        .simultaneousGesture(TapGesture(count: 2).onEnded { selectRow(.file(hit), true) })
         .accessibilityElement(children: .contain)
         .accessibilityAddTraits(selected ? .isSelected : [])
         .accessibilityAction(named: Text(model.t("打开", "Open"))) { open(.file(hit)) }
@@ -548,15 +562,63 @@ final class ActionRowClickTarget: NSView {
     }
 }
 
-// Use type artwork without opening or requesting an icon from the indexed path.
+private actor FileIconCache {
+    static let shared = FileIconCache()
+
+    private enum Entry {
+        case image(CGImage), unavailable
+    }
+
+    private let capacity = 128
+    private var entries: [String: Entry] = [:]
+    private var recent: [String] = []
+
+    func icon(for path: String, directory: Bool) async -> CGImage? {
+        if let existing = entries[path] {
+            touch(path)
+            if case .image(let image) = existing { return image }
+            return nil
+        }
+        guard !Task.isCancelled else { return nil }
+        let loaded: CGImage? = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                let image = withNoDatalessMaterialization { () -> CGImage? in
+                    guard SearchHit.existsOnDisk(at: path, kind: directory ? "directory" : "file",
+                                                 permitsDatalessLeaf: false) else { return nil }
+                    let url = URL(fileURLWithPath: path, isDirectory: directory)
+                    guard !LocalFile.isUbiquitousPlaceholder(url) else { return nil }
+                    let icon = NSWorkspace.shared.icon(forFile: path)
+                    var rect = NSRect(x: 0, y: 0, width: 64, height: 64)
+                    return icon.cgImage(forProposedRect: &rect, context: nil, hints: nil)
+                }
+                continuation.resume(returning: image)
+            }
+        }
+        guard !Task.isCancelled else { return nil }
+        entries[path] = loaded.map(Entry.image) ?? .unavailable
+        touch(path)
+        return loaded
+    }
+
+    private func touch(_ path: String) {
+        recent.removeAll { $0 == path }
+        recent.append(path)
+        if recent.count > capacity {
+            entries.removeValue(forKey: recent.removeFirst())
+        }
+    }
+}
+
+// Render instant UTType artwork first; resolve native icons asynchronously only for resident files under NoMaterialization.
 @MainActor
 private struct FileTypeIcon: View {
-    let name: String
+    let hit: SearchHit
     let directory: Bool
+    @State private var resolved: CGImage?
     private static var icons: [UTType: NSImage] = [:]
 
     private var artwork: NSImage {
-        let ext = (name as NSString).pathExtension
+        let ext = (hit.name as NSString).pathExtension
         let type: UTType = directory ? .folder
             : (ext.isEmpty ? .data : UTType(filenameExtension: ext) ?? .data)
         if let cached = Self.icons[type] { return cached }
@@ -565,10 +627,23 @@ private struct FileTypeIcon: View {
         return icon
     }
 
+    private var canLoadNativeIcon: Bool { hit.isResident && !hit.isPlaceholder }
+
     var body: some View {
-        Image(nsImage: artwork).resizable().scaledToFit()
-            .frame(width: 28, height: 28)
-            .accessibilityHidden(true)
+        Group {
+            if let resolved {
+                Image(decorative: resolved, scale: 2)
+                    .renderingMode(.original).resizable().interpolation(.high).scaledToFit()
+            } else {
+                Image(nsImage: artwork).resizable().scaledToFit()
+            }
+        }
+        .frame(width: 28, height: 28)
+        .accessibilityHidden(true)
+        .task(id: canLoadNativeIcon ? hit.path : "") {
+            guard canLoadNativeIcon else { resolved = nil; return }
+            resolved = await FileIconCache.shared.icon(for: hit.path, directory: directory)
+        }
     }
 }
 
@@ -582,21 +657,25 @@ private struct ActionResultIcon: View {
         Group {
             if let image {
                 Image(decorative: image, scale: 1).renderingMode(.original).resizable().interpolation(.high).scaledToFit()
-                    .frame(width: 26, height: 26)
-            } else if let symbol = NSImage(systemSymbolName: action.symbol, accessibilityDescription: nil)
-                ?? NSImage(systemSymbolName: isApplication ? "app" : "gearshape", accessibilityDescription: nil) {
-                Image(nsImage: symbol)
-                    .renderingMode(.template).resizable().scaledToFit()
-                    .frame(width: 16, height: 16)
+                    .frame(width: 28, height: 28)
             } else {
-                Text(isApplication ? "▣" : "⚙").font(.system(size: 14, weight: .medium))
+                Group {
+                    if let symbol = NSImage(systemSymbolName: action.symbol, accessibilityDescription: nil)
+                        ?? NSImage(systemSymbolName: isApplication ? "app" : "gearshape", accessibilityDescription: nil) {
+                        Image(nsImage: symbol)
+                            .renderingMode(.template).resizable().scaledToFit()
+                            .frame(width: 16, height: 16)
+                    } else {
+                        Text(isApplication ? "▣" : "⚙").font(.system(size: 14, weight: .medium))
+                    }
+                }
+                .foregroundStyle(selected ? Color.accentColor : .secondary)
+                .frame(width: 28, height: 28)
+                .background(.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 6))
             }
         }
-        .foregroundStyle(selected ? Color.accentColor : .secondary)
         .frame(width: 28, height: 28)
-        .background(.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 6))
         .accessibilityHidden(true)
-
     }
 }
 
@@ -787,7 +866,7 @@ final class SettingsSession: ObservableObject {
     }
 }
 
-private struct WindowAccessibilityBanner: View {
+struct WindowAccessibilityBanner: View {
     static let launcherHeight: CGFloat = 66
     let model: Launcher
     let openSettings: () -> Void
@@ -989,13 +1068,11 @@ struct LauncherSettings: View {
             if scriptCatalog.shortcutLoading { note(model.t("正在读取快捷指令…", "Loading Shortcuts…")) }
             else if scriptCatalog.shortcutFailed { note(model.t("无法读取快捷指令。", "Could not list Shortcuts.")) }
             else { note(model.t("\(scriptCatalog.shortcuts.count) 个快捷指令", "Shortcuts available: \(scriptCatalog.shortcuts.count)")) }
-            note(model.t("列表仅保存在内存中。重新启动 Lumen 后，请手动刷新。",
-                         "The list is kept in memory only. Refresh it after restarting Lumen."))
         }
     }
 
     @ViewBuilder private var general: some View {
-        if windowManagement.isTrusted == false {
+        if windowManagement.issue == .permissionRequired {
             WindowAccessibilityBanner(model: model, openSettings: windowManagement.openAccessibilitySettings)
         }
         group(model.t("启动", "Startup")) {
@@ -1203,9 +1280,9 @@ struct LauncherSettings: View {
             if let report = model.indexReport {
                 count(model.t("索引项目", "Indexed Items"), report.items)
                 if let value = report.documents { count(model.t("已索引正文", "Documents with Indexed Text"), value) }
-                if let value = report.placeholders { count(model.t("云端占位项目", "Online-Only Items"), value) }
+                if let value = report.placeholders { count(model.t("仅在线文件", "Online-Only Files"), value) }
                 if let value = report.entries_unreadable, value > 0 { count(model.t("无法访问", "Inaccessible Entries"), value) }
-                if let value = report.unverified, value > 0 { count(model.t("待验证项目", "Unverified Items"), value) }
+                if let value = report.unverified, value > 0 { count(model.t("暂不可访问", "Unavailable Items"), value) }
                 if let value = report.documents_not_read, value > 0 { count(model.t("正文未读取", "Documents Without Readable Text"), value) }
             } else {
                 note(model.indexPhase == .checking ? model.activityTitle

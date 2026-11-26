@@ -1,7 +1,7 @@
 import AppKit
+import ApplicationServices
 import Carbon
 import Combine
-import QuartzCore
 import SwiftUI
 
 @main
@@ -25,22 +25,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     let contextActions = ContextActions()
     let commands = LauncherCommands()
     let windowManagement: WindowManagement
-    private var windowIssueUpdates: AnyCancellable?
     let scriptCatalog: LauncherScriptCatalog
-    private var executableActions: [LaunchAction] = []
-    private var executableUpdates: AnyCancellable?
-    private var executionUpdates: AnyCancellable?
     let inlinePreview: LauncherInlinePreview
     let imageSearch: LauncherImageSearch
     let clipboard: ClipboardManager
-    private var clipboardUpdates: AnyCancellable?
-    private var imageUpdates: AnyCancellable?
     private var literalCommand: String?
-    private var providerUpdates: AnyCancellable?
-    private var shortcutUpdates: AnyCancellable?
     private var catalog = LumenCommandCatalog()
-    private var contextUpdates: AnyCancellable?
-    private var contextResultID: String?
+    private var cancellables: Set<AnyCancellable> = []
     private let defaults: UserDefaults?
     private(set) lazy var globalHotKey = GlobalHotKey { [weak self] in
         guard let self else { return }
@@ -53,10 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var activityItem: NSMenuItem?
     private var metricsItem: NSMenuItem?
     private var buildIndexItem: NSMenuItem?
-    private var languageChange: AnyCancellable?
-    private var presentationChange: AnyCancellable?
     private var presentationScheduled = false
-    private var volumeChanges: AnyCancellable?
     let externalVolumes: ExternalVolumeCatalog
     let translation: TranslationPanelModel
     private(set) var settings: NSPanel?
@@ -74,6 +62,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private(set) var localPreview: LocalPreviewPanel?
     private(set) var searchPresented = false
     private var searchPresentationGeneration: UInt64 = 0
+
+    var panelState: PanelState {
+        PanelState.resolve(
+            model: model,
+            commands: commands,
+            translation: translation,
+            contextActions: contextActions,
+            inlinePreview: inlinePreview,
+            hasLocalPreview: localPreview != nil
+        )
+    }
+
+    private var executableActions: [LaunchAction] {
+        (scriptCatalog.scripts + scriptCatalog.shortcuts).map(\.action)
+    }
 
     lazy var searchField: SearchField = {
         let field = SearchField()
@@ -119,16 +122,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             return field.bounds.contains(field.convert(point, from: nil))
         }
         panel.onSpace = { [weak self] in
-            guard let self, self.panel.browsing, self.translation.command == nil, !self.commands.showsCard,
-                  self.commands.visibleExecution == nil, !self.contextActions.isOpen,
-                  case .file(let hit) = self.commands.selectedResult(in: self.model) else { return false }
+            guard let self, self.panel.browsing else { return false }
+            let state = self.panelState
+            guard state.mode == .search else { return false }
+            if case .contextMenu = state.overlay { return false }
+            guard case .file(let hit) = self.model.selectedResult else { return false }
             self.togglePreview(hit, native: true)
             return true
         }
         panel.onFileAction = { [weak self] action in
-            guard let self, self.translation.command == nil, !self.commands.showsCard,
-                  self.commands.visibleExecution == nil, !self.contextActions.isOpen,
-                  case .file(let hit) = self.commands.selectedResult(in: self.model) else { return }
+            guard let self else { return }
+            let state = self.panelState
+            guard state.mode == .search else { return }
+            if case .contextMenu = state.overlay { return }
+            guard case .file(let hit) = self.model.selectedResult else { return }
             if action == .preview { self.togglePreview(hit, allowCloudDownload: true) }
             else { self.perform(action, on: hit) }
         }
@@ -169,6 +176,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             activateExecution: { [weak self] in self?.activateExecution() },
             copyOutput: { [weak self] in self?.copyCommandOutput() },
             cancelExecution: { [weak self] in self?.closeExecutionCard() },
+            copyDefinition: { [weak self] in self?.copyDefinition() },
+            closeDefinition: { [weak self] in self?.closeDefinitionCard() },
             searchCommandAsFiles: { [weak self] in self?.searchCommandAsFiles() },
             closeInlinePreview: { [weak self] in self?.closeInlinePreview() },
             activateTranslation: { [weak self] in self?.activateTranslation() },
@@ -176,7 +185,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             showSettings: { [weak self] in self?.showSearchSettings() },
             beginIndex: { [weak self] in self?.startBackgroundIndex() },
             open: { [weak self] in self?.open($0) },
-            browse: { [weak self] in self?.panel.browsing = true },
+            selectRow: { [weak self] result, doubleClick in self?.selectRow(result, doubleClick: doubleClick) },
             moveSelection: { [weak self] in self?.moveCurrentSelection($0) },
             fileAction: { [weak self] action, hit in self?.perform(action, on: hit) }
         ))
@@ -187,7 +196,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         content.addSubview(close)
         content.addSubview(results)
         panel.contentView = content
-        panel.invalidateShadow()
         panel.initialFirstResponder = searchField
         NSLayoutConstraint.activate([
             searchField.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
@@ -237,74 +245,111 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             statusItem?.button?.imagePosition = .imageLeading
             loadShortcut()
         }
-        languageChange = model.$language.dropFirst().sink { [weak self] _ in
+        model.$language.dropFirst().sink { [weak self] _ in
             DispatchQueue.main.async { [weak self] in self?.updateLanguage() }
-        }
-        presentationChange = model.objectWillChange.sink { [weak self] _ in
-            guard let self, !self.presentationScheduled else { return }
-            self.presentationScheduled = true
+        }.store(in: &cancellables)
+        model.objectWillChange.sink { [weak self] _ in
+            self?.schedulePresentationUpdate()
+        }.store(in: &cancellables)
+        model.$selectedID.removeDuplicates().dropFirst().sink { [weak self] _ in
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                self.presentationScheduled = false
+                if self.contextActions.isOpen, self.panelState.mode == .search { self.contextActions.close() }
                 self.updatePresentation()
             }
-        }
-        clipboardUpdates = clipboard.$items.dropFirst().sink { [weak self] items in
-            guard let self, self.commands.isClipboardCommand else { return }
-            self.commands.updateClipboard(items)
-            self.updatePresentation()
-        }
+        }.store(in: &cancellables)
+        commands.$clipboardSelection.removeDuplicates().dropFirst().sink { [weak self] _ in
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if self.contextActions.isOpen, self.panelState.mode == .clipboard { self.contextActions.close() }
+                self.updatePresentation()
+            }
+        }.store(in: &cancellables)
+        clipboard.$items.dropFirst().sink { [weak self] items in
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.commands.isClipboardCommand else { return }
+                self.commands.updateClipboard(items)
+                self.updatePresentation()
+            }
+        }.store(in: &cancellables)
         clipboard.start()
-        windowIssueUpdates = windowManagement.$issue.removeDuplicates().dropFirst().sink { [weak self] _ in
-            DispatchQueue.main.async { [weak self] in self?.updatePresentation() }
-        }
-        contextUpdates = contextActions.$items.dropFirst().sink { [weak self] _ in
-            DispatchQueue.main.async { [weak self] in self?.updatePresentation() }
-        }
-        providerUpdates = translation.$providers.combineLatest(translation.$selected)
+        windowManagement.$issue.removeDuplicates().dropFirst().sink { [weak self] _ in
+            self?.schedulePresentationUpdate()
+        }.store(in: &cancellables)
+        contextActions.$items.dropFirst().sink { [weak self] _ in
+            self?.schedulePresentationUpdate()
+        }.store(in: &cancellables)
+        commands.$execution.dropFirst().sink { [weak self] _ in
+            self?.schedulePresentationUpdate()
+        }.store(in: &cancellables)
+        commands.$answer.dropFirst().sink { [weak self] _ in
+            self?.schedulePresentationUpdate()
+        }.store(in: &cancellables)
+        commands.$definition.dropFirst().sink { [weak self] _ in
+            self?.schedulePresentationUpdate()
+        }.store(in: &cancellables)
+        inlinePreview.$state.dropFirst().sink { [weak self] _ in
+            self?.schedulePresentationUpdate()
+        }.store(in: &cancellables)
+        translation.$output.dropFirst().sink { [weak self] _ in
+            self?.schedulePresentationUpdate()
+        }.store(in: &cancellables)
+        translation.$providers.combineLatest(translation.$selected)
             .map { providers, selected in providers.first { $0.id == selected } }
-            .removeDuplicates().dropFirst().sink { [weak self] _ in self?.commands.invalidateAnswer() }
-        shortcutUpdates = model.shortcuts.$entries.combineLatest(model.shortcuts.$includeOptionalLinks)
+            .removeDuplicates().dropFirst().sink { [weak self] _ in
+                DispatchQueue.main.async { [weak self] in self?.commands.invalidateAnswer() }
+            }.store(in: &cancellables)
+        model.shortcuts.$entries.combineLatest(model.shortcuts.$includeOptionalLinks)
             .sink { [weak self] entries, includeOptionalLinks in
                 guard let self else { return }
                 self.catalog = LumenCommandCatalog(includeOptionalLinks: includeOptionalLinks,
                                                    additionalLinks: entries.compactMap(\.queryLink))
                 if self.searchPresented { self.searchFieldAction() }
-            }
-        imageUpdates = imageSearch.objectWillChange.sink { [weak self] _ in
+            }.store(in: &cancellables)
+        imageSearch.objectWillChange.sink { [weak self] _ in
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.searchPresented, self.commands.isImageCommand else { return }
                 self.searchFieldAction()
                 self.updatePresentation()
             }
-        }
-        executableUpdates = scriptCatalog.$scripts.combineLatest(scriptCatalog.$shortcuts).sink { [weak self] scripts, shortcuts in
-            guard let self else { return }
-            self.executableActions = (scripts + shortcuts).map(\.action)
-            self.commands.matchExecutables(self.executableActions)
-            if let execution = self.commands.execution, !(scripts + shortcuts).contains(execution.command) {
-                if self.commands.visibleExecution != nil { self.closeExecutionCard() }
-                else { self.commands.cancelExecution() }
+        }.store(in: &cancellables)
+        scriptCatalog.$scripts.combineLatest(scriptCatalog.$shortcuts).dropFirst().sink { [weak self] scripts, shortcuts in
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                let all = scripts + shortcuts
+                self.commands.matchExecutables(all.map(\.action), in: self.model)
+                if let execution = self.commands.execution, !all.contains(execution.command) {
+                    if self.commands.visibleExecution != nil { self.closeExecutionCard() }
+                    else { self.commands.cancelExecution() }
+                }
+                self.updatePresentation()
             }
-            self.updatePresentation()
-        }
-        executionUpdates = commands.$execution.dropFirst().sink { [weak self] _ in
-            // Published values are delivered before the stored property changes.
-            DispatchQueue.main.async { [weak self] in self?.updatePresentation() }
-        }
+        }.store(in: &cancellables)
         scriptCatalog.reloadScripts()
+        if scriptCatalog.shortcutsEnabled { scriptCatalog.refreshShortcuts() }
         updateLanguage()
         model.start(automaticallyIndex: smoke == nil || smoke?.automaticIndexScenario == true)
         if smoke == nil {
             let workspace = NSWorkspace.shared.notificationCenter
-            volumeChanges = workspace.publisher(for: NSWorkspace.didMountNotification)
+            workspace.publisher(for: NSWorkspace.didMountNotification)
                 .merge(with: workspace.publisher(for: NSWorkspace.didUnmountNotification),
                        workspace.publisher(for: NSWorkspace.didRenameVolumeNotification))
                 .receive(on: DispatchQueue.main)
                 .sink { [weak self] _ in self?.externalVolumeStateChanged() }
+                .store(in: &cancellables)
         }
         loadApplicationCatalog()
         if let smoke { Task { @MainActor in await smoke.run(self) } }
+    }
+
+    private func schedulePresentationUpdate() {
+        guard !presentationScheduled else { return }
+        presentationScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.presentationScheduled = false
+            self.updatePresentation()
+        }
     }
 
     private func loadApplicationCatalog() {
@@ -387,17 +432,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         updatePresentation()
         (panel.contentView as? SearchBackdrop)?.refreshTransparency()
         if self.smoke == nil {
-            let reveal = firstShow && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-            if firstShow { panel.alphaValue = reveal ? 0 : 1 }
+            panel.alphaValue = 1
             panel.makeKeyAndOrderFront(nil)
-            panel.invalidateShadow()
-            if reveal {
-                NSAnimationContext.runAnimationGroup { context in
-                    context.duration = 0.14
-                    context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                    panel.animator().alphaValue = 1
-                }
-            }
         }
         focusSearch()
         if firstShow {
@@ -451,9 +487,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         localPreview?.close()
         translation.setCommand(nil)
         inlinePreview.close()
+        commands.closeDefinition()
         if commands.visibleExecution != nil { commands.cancelExecution() }
         commands.update(.search, raw: "", catalog: catalog)
-        commands.matchExecutables([], resetSelection: true)
+        commands.matchExecutables([], in: model, resetSelection: true)
         commands.updateClipboard([])
         literalCommand = nil
         contextActions.close()
@@ -495,13 +532,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             return
         }
         if literalCommand != text { literalCommand = nil }
+        let previousState = panelState
         let previousCommand = commands.resolution
         let priorRaw = commands.raw
-        let hadCommandCard = commands.showsCard
-        let hadClipboard = commands.isClipboardCommand
         if commands.visibleExecution != nil {
             if priorRaw == text { return }
             commands.cancelExecution()
+        }
+        if commands.definition != nil {
+            if priorRaw == text { return }
+            commands.closeDefinition()
         }
         let translationCommand = literalCommand == nil ? TranslationCommand.parse(text) : nil
         let next = literalCommand == nil
@@ -511,7 +551,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             inlinePreview.close()
         }
         commands.update(next, raw: text, catalog: catalog)
-        if priorRaw != text || previousCommand != next { commands.matchExecutables(executableActions, resetSelection: true) }
+        if priorRaw != text || previousCommand != next {
+            commands.matchExecutables(executableActions, in: model, resetSelection: true)
+        }
         translation.setCommand(translationCommand)
         if previousCommand != next {
             if commands.isClipboardCommand { clipboard.loadHistory() }
@@ -529,9 +571,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         } else if previousCommand == .search || model.isImageSearch {
             model.clear()
         }
-        if hadCommandCard != commands.showsCard || hadClipboard != commands.isClipboardCommand ||
-            previousCommand != next && commands.isImageCommand ||
-            (previousCommand == .translation) != (next == .translation) {
+        if panelState != previousState || priorRaw != text || previousCommand != next {
             updatePresentation()
         }
     }
@@ -574,6 +614,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         case #selector(NSResponder.moveLeft(_:)), #selector(NSResponder.moveRight(_:)):
             panel.browsing = false
             return false
+        case #selector(NSResponder.insertTab(_:)):
+            handleTabCompletion(in: textView)
         case #selector(NSResponder.insertNewline(_:)):
             searchFieldAction()
             openSelection()
@@ -583,20 +625,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         return true
     }
 
-    private func moveCurrentSelection(_ delta: Int) {
-        if commands.visibleExecution != nil { return }
-        if commands.resolution == .discovery { commands.move(delta); return }
-        if commands.isClipboardCommand {
-            if contextActions.isOpen { contextActions.move(delta) }
-            else { commands.moveClipboard(delta) }
+    private func handleTabCompletion(in textView: NSTextView) {
+        let state = panelState
+        if state.mode == .commandCard, commands.resolution == .discovery,
+           let item = commands.selectedEntry, item.keyword != "?" {
+            textView.insertText(item.keyword + " ",
+                                replacementRange: NSRange(location: 0, length: textView.string.utf16.count))
             return
         }
-        guard translation.command == nil, !commands.showsCard,
-              !commands.isImageCommand || model.isImageSearch else { return }
-        if contextActions.isOpen { contextActions.move(delta) }
-        else {
+        if case .contextMenu = state.overlay { return }
+        let raw = textView.string
+        if case .translation(let command) = state.mode {
+            if !raw.isEmpty, command.text.isEmpty,
+               !raw.contains(where: { $0.isWhitespace || $0 == "/" || $0 == "\\" }) {
+                let completed = raw.allSatisfy(\.isASCII) ? raw.lowercased() + " " : raw + " "
+                textView.insertText(completed, replacementRange: NSRange(location: 0, length: raw.utf16.count))
+            }
+            return
+        }
+        guard state.mode == .search || state.mode == .clipboard else { return }
+        let selectedFolder: String? = {
+            guard state.mode == .search, let selected = model.selectedResult else { return nil }
+            switch selected {
+            case .file(let hit) where hit.kind == "directory": return hit.path
+            case .shortcut(let shortcut):
+                if case .folder(let path) = shortcut.target { return path }
+                return nil
+            default: return nil
+            }
+        }()
+        if panel.browsing, let folder = selectedFolder {
+            let replacement = folder.hasSuffix("/") ? folder : folder + "/"
+            textView.insertText(replacement, replacementRange: NSRange(location: 0, length: raw.utf16.count))
+            return
+        }
+        if !raw.isEmpty, !raw.contains(where: { $0.isWhitespace || $0 == "/" || $0 == "\\" }) {
+            let lower = raw.lowercased()
+            let keywords = catalog.entries.map(\.keyword).filter { $0 != "?" }
+            if let exact = keywords.first(where: { $0 == lower }) {
+                textView.insertText(exact + " ", replacementRange: NSRange(location: 0, length: raw.utf16.count))
+                return
+            }
+            if state.mode == .clipboard && lower == "clip" {
+                textView.insertText("clip ", replacementRange: NSRange(location: 0, length: raw.utf16.count))
+                return
+            }
+            if lower.count >= 2 || selectedFolder == nil,
+               let prefix = keywords.first(where: { $0.hasPrefix(lower) }) {
+                textView.insertText(prefix + " ", replacementRange: NSRange(location: 0, length: raw.utf16.count))
+                return
+            }
+        }
+        if let folder = selectedFolder {
+            let replacement = folder.hasSuffix("/") ? folder : folder + "/"
+            textView.insertText(replacement, replacementRange: NSRange(location: 0, length: raw.utf16.count))
+        }
+    }
+
+    private func selectRow(_ result: LauncherResult, doubleClick: Bool) {
+        panel.browsing = true
+        model.selectedID = result.id
+        updatePresentation()
+        if doubleClick { open(result) }
+    }
+
+    private func moveCurrentSelection(_ delta: Int) {
+        let state = panelState
+        switch (state.mode, state.overlay) {
+        case (.scriptOutput, _), (.translation, _), (.imageSetup, _), (.definition, _):
+            return
+        case (.commandCard, _):
+            if commands.resolution == .discovery { commands.move(delta) }
+        case (.clipboard, .contextMenu), (.search, .contextMenu):
+            contextActions.move(delta)
+        case (.clipboard, _):
+            commands.moveClipboard(delta)
+        case (.search, _):
             panel.browsing = true
-            commands.moveResults(delta, in: model)
+            model.moveSelection(delta)
             updatePresentation()
         }
     }
@@ -607,38 +713,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         return true
     }
 
-    private func cancelCurrentPanelAction() {
-        if commands.visibleExecution != nil { closeExecutionCard(); return }
-        if commands.execution?.running == true, let execution = commands.cancelExecution() {
-            let generation = searchPresentationGeneration
-            Task { [weak self] in
-                await execution.value
-                guard let self, self.searchPresentationGeneration == generation else { return }
-                self.dismissSearch()
-            }
-            return
+    private func clearSearchField() {
+        panel.browsing = false
+        if let editor = searchField.currentEditor() as? NSTextView {
+            editor.string = ""
         }
-        if localPreview != nil { closeLocalPreview(); return }
-        if closeInlinePreview() { return }
-        if commands.answer == .loading { commands.invalidateAnswer() }
-        else if translation.activity == .translating { translation.cancel() }
-        else if contextActions.isOpen { contextActions.close() }
-        else { dismissSearch() }
+        searchField.stringValue = ""
+        searchFieldAction()
+        focusSearch()
+    }
+
+    private func cancelCurrentPanelAction() {
+        let state = panelState
+        switch state.overlay {
+        case .localQuickLook:
+            closeLocalPreview()
+            return
+        case .contextMenu:
+            contextActions.close()
+            updatePresentation()
+            return
+        case .inlinePreview:
+            closeInlinePreview()
+            return
+        case .none:
+            break
+        }
+        switch state.mode {
+        case .scriptOutput:
+            closeExecutionCard()
+            return
+        case .definition:
+            closeDefinitionCard()
+            return
+        case .commandCard:
+            if commands.answer == .loading {
+                commands.invalidateAnswer()
+                return
+            }
+        case .translation:
+            if translation.activity == .translating {
+                translation.cancel()
+                return
+            }
+        case .imageSetup, .clipboard, .search:
+            break
+        }
+        if !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            clearSearchField()
+        } else {
+            dismissSearch()
+        }
     }
 
     private func copyClipboardItem(_ id: Int64) {
         guard searchPresented, commands.isClipboardCommand, commands.clipboardSelection == id else { return }
-        if clipboard.copy(id: id) { dismissSearch() }
+        if clipboard.copy(id: id) {
+            dismissSearch()
+            if smoke == nil { pasteIntoPreviousAppIfPermitted() }
+        }
     }
 
-    private var selectedContextID: String? {
-        if commands.isClipboardCommand { return commands.clipboardSelection.map { "clipboard:\($0)" } }
-        return commands.selectedResult(in: model)?.id
+    private func pasteIntoPreviousAppIfPermitted() {
+        guard AXIsProcessTrusted() else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
+            guard let source = CGEventSource(stateID: .combinedSessionState),
+                  let down = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: true),
+                  let up = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: false) else {
+                return
+            }
+            down.flags = .maskCommand
+            up.flags = .maskCommand
+            down.post(tap: .cgAnnotatedSessionEventTap)
+            up.post(tap: .cgAnnotatedSessionEventTap)
+        }
     }
 
     private func showClipboardActions() {
         guard let clip = commands.selectedClipboardItem else { return }
-        contextResultID = selectedContextID
         contextActions.show([
             .init(id: "copy-clip", title: model.t("复制", "Copy"), symbol: "doc.on.doc") { [weak self] in
                 self?.copyClipboardItem(clip.id)
@@ -652,21 +804,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func toggleContextActions() {
-        guard commands.visibleExecution == nil else { return }
-        if commands.isClipboardCommand {
-            if contextActions.isOpen { contextActions.close() }
-            else { showClipboardActions() }
+        let state = panelState
+        if case .contextMenu = state.overlay {
+            contextActions.close()
+            updatePresentation()
             return
         }
-        guard translation.command == nil, !commands.showsCard,
-              !commands.isImageCommand || model.isImageSearch else { return }
-        if contextActions.isOpen { contextActions.close(); return }
-        guard let selected = commands.selectedResult(in: model) else { return }
-        contextResultID = selected.id
+        switch state.mode {
+        case .clipboard:
+            showClipboardActions()
+        case .search:
+            showSearchContextActions()
+        case .scriptOutput, .translation, .imageSetup, .commandCard, .definition:
+            break
+        }
+    }
+
+    private func showSearchContextActions() {
+        guard let selected = model.selectedResult else { return }
         var items: [ContextActions.Item] = []
         func item(_ id: String, _ zh: String, _ en: String, _ symbol: String, _ callback: @escaping () -> Void) {
             items.append(.init(id: id, title: model.t(zh, en), symbol: symbol) { [weak self] in
-                guard let self, self.commands.selectedResult(in: self.model)?.id == selected.id else { return }
+                guard let self, self.model.selectedResult?.id == selected.id else { return }
                 callback()
             })
         }
@@ -733,29 +892,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func openSelection() {
-        if commands.visibleExecution != nil { activateExecution(); return }
-        if commands.isImageCommand && !model.isImageSearch { return }
-        if commands.isClipboardCommand && contextActions.isOpen {
-            if selectedContextID == contextResultID { contextActions.run() }
-            else { contextActions.close() }
-            return
-        }
-        if commands.showsCard { activateCommand(); return }
-        if translation.command != nil {
+        let state = panelState
+        switch (state.mode, state.overlay) {
+        case (.scriptOutput, _):
+            activateExecution()
+        case (.definition(_, let text, false), _):
+            if let text, !text.isEmpty { copyDefinition() }
+        case (.definition(_, _, true), _), (.imageSetup, _):
+            break
+        case (.clipboard, .contextMenu), (.search, .contextMenu):
+            contextActions.run()
+        case (.clipboard, _), (.commandCard, _):
+            activateCommand()
+        case (.translation, _):
             activateTranslation()
-            return
+        case (.search, _):
+            if let selected = model.selectedResult { open(selected) }
         }
-        if contextActions.isOpen {
-            if commands.selectedResult(in: model)?.id == contextResultID { contextActions.run() }
-            else { contextActions.close() }
-            return
-        }
-        if let selected = commands.selectedResult(in: model) { open(selected) }
     }
 
     private func open(_ result: LauncherResult) {
-        guard commands.visibleExecution == nil, translation.command == nil, !commands.showsCard,
-              !commands.isImageCommand || model.isImageSearch else { return }
+        guard case .search = panelState.mode else { return }
         switch result {
         case .file(let hit): openFile(hit)
         case .action(let action): runAction(action)
@@ -838,6 +995,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if searchPresented { focusSearch(); updatePresentation() }
     }
 
+    private func copyDefinition() {
+        commands.copyDefinition(to: smoke?.filePasteboard ?? .general)
+    }
+
+    private func closeDefinitionCard() {
+        guard commands.definition != nil else { return }
+        commands.closeDefinition()
+        if searchPresented { focusSearch(); updatePresentation() }
+    }
+
     private func runAction(_ action: LaunchAction, shortcut: SavedShortcut? = nil) {
         if case .executable(let command) = action.destination { prepareExecution(command); return }
         let current = shortcut.map { saved in
@@ -847,6 +1014,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
         } ?? model.containsCurrentAction(action)
         guard searchPresented, current, !actionInFlight else { return }
+        if case .system(.define(let word)) = action.destination {
+            contextActions.close()
+            inlinePreview.close()
+            let fetcher: @Sendable (String) -> String? = smoke?.definitionProvider ?? { @Sendable in LauncherSystemActions.dictionaryDefinition($0) }
+            commands.lookupDefinition(word, fetcher: fetcher)
+            updatePresentation()
+            return
+        }
         actionInFlight = true
         let query = model.query
         let raw = commands.raw
@@ -933,8 +1108,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private func refreshInlinePreview() {
         guard let previewed = inlinePreview.hit else { return }
-        guard commands.visibleExecution == nil, !model.scopePending else { inlinePreview.close(); return }
-        let selected = commands.selectedResult(in: model)
+        guard commands.visibleExecution == nil, commands.definition == nil, !model.scopePending else {
+            inlinePreview.close()
+            return
+        }
+        let selected = model.selectedResult
         if case .file(let hit) = selected, model.containsCurrentFile(hit) {
             inlinePreview.retainPreview(for: hit)
             if case .ready(let item, _) = inlinePreview.state, item.kind == .quickLook {
@@ -943,7 +1121,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 catch { model.previewFailed() }
             }
         } else if !(selected == nil && previewed.isCloudReference && model.searching &&
-                    model.selection == previewed.id && model.hits.contains(previewed)) {
+                    model.selectedID == previewed.id && model.hits.contains(previewed)) {
             inlinePreview.close()
         }
         // Hydration itself can trigger a watch refresh. If the selected row is
@@ -969,16 +1147,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         guard searchPresented, !model.scopePending, model.containsCurrentFile(hit) else { return }
         if !forceWindow, let kind = LauncherInlinePreview.kind(hit) {
             guard hit.isResident || hit.isPlaceholder else { return }
-            commands.choose(.file(hit), in: model)
+            model.selectedID = hit.id
             if inlinePreview.hit == hit { inlinePreview.close() }
             else { inlinePreview.show(hit, kind: kind, allowCloudDownload: allowCloudDownload) }
             updatePresentation()
             return
         }
-        commands.choose(.file(hit), in: model)
+        model.selectedID = hit.id
         model.resolve(hit, action: .preview) { [weak self] url in
             guard let self, self.searchPresented, !self.model.scopePending, self.model.containsCurrentFile(hit),
-                  self.commands.selectedResult(in: self.model)?.id == hit.id else { return }
+                  self.model.selectedResult?.id == hit.id else { return }
             do {
                 try self.showLocalPreview(hit, at: url)
             } catch is LocalFile.Placeholder where allowCloudDownload {
@@ -1059,8 +1237,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func showSearchSettings() {
-        if commands.isClipboardCommand { presentSettings(page: .general); return }
-        presentSettings(page: commands.isImageCommand ? .index : (translation.command != nil || isQuestion ? .translation : nil))
+        switch panelState.mode {
+        case .clipboard: presentSettings(page: .general)
+        case .imageSetup: presentSettings(page: .index)
+        case .translation: presentSettings(page: .translation)
+        case .commandCard: presentSettings(page: isQuestion ? .translation : nil)
+        case .search: presentSettings(page: model.isImageSearch ? .index : nil)
+        case .scriptOutput, .definition: presentSettings(page: nil)
+        }
     }
 
     private func presentSettings(page: SettingsPage?) {
@@ -1101,7 +1285,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         settings?.title = model.t("Lumen 设置", "Lumen Settings")
         model.setSettingsPresented(true)
         if smoke == nil { settings?.makeKeyAndOrderFront(nil) }
+        let preservePermissionIssue = windowManagement.issue == .permissionRequired
         if searchPresented { dismissSearch() }
+        if preservePermissionIssue && windowManagement.isTrusted != true {
+            windowManagement.issue = .permissionRequired
+        }
     }
 
     func chooseImageResource(folder: Bool) {
@@ -1313,24 +1501,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if model.scopePending, imageSearch.building { imageSearch.stop() }
         guard searchPresented else { return }
         refreshInlinePreview()
-        if contextActions.isOpen, selectedContextID != contextResultID { contextActions.close() }
+        let state = panelState
+        let target = PanelGeometry.size(
+            for: state,
+            rows: model.visibleResults,
+            showsResults: model.showsResults,
+            needsAccessibility: windowManagement.issue == .permissionRequired
+        )
         var frame = panel.frame
-        let commandHeight: CGFloat?
-        if let execution = commands.visibleExecution {
-            commandHeight = execution.command.mode == .fullOutput && execution.hasOutput ? 316 : 100
-        } else if commands.isClipboardCommand { commandHeight = ClipboardHistoryView.height }
-        else { commandHeight = commands.showsCard || (commands.isImageCommand && !model.isImageSearch) ? 162 : nil }
-        let height = SearchWindow.height(for: model, contextCount: contextActions.items.count,
-                                         hasTranslation: translation.command != nil,
-                                         needsAccessibility: windowManagement.issue == .permissionRequired,
-                                         commandHeight: commandHeight,
-                                         hasPreview: inlinePreview.isOpen,
-                                         hasExecutableMatches: !commands.executableMatches.isEmpty)
-        guard frame.height != height else { return }
-        frame.origin.y += frame.height - height
-        frame.size.height = height
-        panel.setFrame(frame, display: true)
-        panel.invalidateShadow()
+        let widthDelta = target.width - frame.width
+        let heightDelta = target.height - frame.height
+        guard widthDelta != 0 || heightDelta != 0 else { return }
+        frame.origin.x -= widthDelta / 2
+        frame.origin.y -= heightDelta
+        frame.size = target
+        if let visible = NSScreen.screens.first(where: { $0.frame.intersects(panel.frame) })?.visibleFrame {
+            frame.size.width = min(frame.size.width, visible.width)
+            frame.origin.x = min(max(frame.origin.x, visible.minX), max(visible.minX, visible.maxX - frame.width))
+            if frame.minY < visible.minY { frame.origin.y = visible.minY }
+            if frame.maxY > visible.maxY { frame.origin.y = visible.maxY - frame.height }
+        }
+        if frame != panel.frame {
+            panel.setFrame(frame, display: true)
+        }
     }
 
     private func installEditMenu() {
@@ -1426,8 +1619,11 @@ final class SearchBackdrop: NSView {
 
     func refreshTransparency() {
         let reduced = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
-        effect.material = reduced ? .windowBackground : .popover
-        effect.blendingMode = reduced ? .withinWindow : .behindWindow
+        let material: NSVisualEffectView.Material = reduced ? .windowBackground : .popover
+        let blending: NSVisualEffectView.BlendingMode = reduced ? .withinWindow : .behindWindow
+        guard effect.material != material || effect.blendingMode != blending else { return }
+        effect.material = material
+        effect.blendingMode = blending
         effect.maskImage = Self.roundedMask(radius: Self.cornerRadius)
         window?.invalidateShadow()
     }

@@ -1,6 +1,146 @@
 import AppKit
 import SwiftUI
 
+struct DictionaryDefinition: Equatable {
+    let word: String
+    let text: String?
+    let loading: Bool
+}
+
+enum PanelMode: Equatable {
+    case scriptOutput(CommandExecution)
+    case translation(TranslationCommand)
+    case imageSetup
+    case clipboard
+    case commandCard
+    case definition(word: String, text: String?, loading: Bool)
+    case search
+}
+
+enum PanelOverlay: Equatable {
+    case localQuickLook
+    case contextMenu(count: Int)
+    case inlinePreview(SearchHit)
+    case none
+}
+
+struct PanelState: Equatable {
+    let mode: PanelMode
+    let overlay: PanelOverlay
+
+    @MainActor
+    static func resolve(
+        model: Launcher,
+        commands: LauncherCommands,
+        translation: TranslationPanelModel,
+        contextActions: ContextActions,
+        inlinePreview: LauncherInlinePreview,
+        hasLocalPreview: Bool = false
+    ) -> PanelState {
+        let mode: PanelMode
+        if let execution = commands.visibleExecution {
+            mode = .scriptOutput(execution)
+        } else if let command = translation.command {
+            mode = .translation(command)
+        } else if commands.isImageCommand && !model.isImageSearch {
+            mode = .imageSetup
+        } else if commands.isClipboardCommand {
+            mode = .clipboard
+        } else if commands.showsCard {
+            mode = .commandCard
+        } else if let definition = commands.definition {
+            mode = .definition(word: definition.word, text: definition.text, loading: definition.loading)
+        } else {
+            mode = .search
+        }
+
+        let overlay: PanelOverlay
+        if hasLocalPreview {
+            overlay = .localQuickLook
+        } else if contextActions.isOpen, mode == .search || mode == .clipboard {
+            overlay = .contextMenu(count: contextActions.items.count)
+        } else if mode == .search,
+                  let hit = inlinePreview.hit,
+                  case .file(let selected) = model.selectedResult,
+                  selected == hit,
+                  model.containsCurrentFile(hit) {
+            overlay = .inlinePreview(hit)
+        } else {
+            overlay = .none
+        }
+
+        return PanelState(mode: mode, overlay: overlay)
+    }
+}
+
+enum PanelGeometry {
+    static let defaultWidth: CGFloat = 680
+    static let previewWidth: CGFloat = 860
+    static let headerHeight: CGFloat = 56
+    static let footerHeight: CGFloat = 28
+    static let maximumVisibleRows = 8
+    static let standardRowHeight: CGFloat = 44
+    static let previewRowHeight: CGFloat = 60
+    static let emptyResultsHeight: CGFloat = 56
+    static let inlinePreviewMinimumHeight: CGFloat = 176
+
+    static func rowHeight(for result: LauncherResult) -> CGFloat {
+        if case .file(let hit) = result, hit.hasPreview { return previewRowHeight }
+        return standardRowHeight
+    }
+
+    @MainActor
+    static func size(
+        for state: PanelState,
+        rows: [LauncherResult],
+        showsResults: Bool,
+        needsAccessibility: Bool = false
+    ) -> CGSize {
+        let width: CGFloat
+        if case .inlinePreview = state.overlay { width = previewWidth }
+        else { width = defaultWidth }
+
+        let shell = headerHeight + footerHeight
+            + (needsAccessibility ? WindowAccessibilityBanner.launcherHeight : 0)
+
+        let bodyHeight: CGFloat
+        switch state.mode {
+        case .scriptOutput(let execution):
+            bodyHeight = execution.command.mode == .fullOutput && execution.hasOutput ? 316 : 100
+        case .translation:
+            bodyHeight = 138
+        case .imageSetup, .commandCard:
+            bodyHeight = 162
+        case .definition:
+            bodyHeight = 220
+        case .clipboard:
+            if case .contextMenu(let count) = state.overlay {
+                bodyHeight = CGFloat(min(count, maximumVisibleRows)) * standardRowHeight
+            } else {
+                bodyHeight = ClipboardHistoryView.height
+            }
+        case .search:
+            if case .contextMenu(let count) = state.overlay {
+                bodyHeight = CGFloat(min(count, maximumVisibleRows)) * standardRowHeight
+            } else if !showsResults {
+                bodyHeight = 0
+            } else if rows.isEmpty {
+                bodyHeight = emptyResultsHeight
+            } else {
+                let visibleHeight = rows.prefix(maximumVisibleRows).reduce(CGFloat(0)) { total, row in
+                    total + rowHeight(for: row)
+                }
+                if case .inlinePreview = state.overlay {
+                    bodyHeight = max(visibleHeight, inlinePreviewMinimumHeight)
+                } else {
+                    bodyHeight = visibleHeight
+                }
+            }
+        }
+        return CGSize(width: width, height: shell + bodyHeight)
+    }
+}
+
 @MainActor
 final class LauncherCommands: ObservableObject {
     @Published private(set) var resolution: LumenCommandResolution = .search
@@ -14,14 +154,16 @@ final class LauncherCommands: ObservableObject {
     @Published private(set) var webFailed = false
     @Published private(set) var answerPage = 0
     @Published private(set) var executableMatches: [ActionMatch] = []
-    @Published private var selectedExecutableID: String?
-    @Published private var manuallySelected = false
     @Published private(set) var execution: CommandExecution?
     @Published var executionArgument = ""
     @Published private(set) var outputCopied = false
     @Published private(set) var outputPage = 0
+    @Published private(set) var definition: DictionaryDefinition?
+    @Published private(set) var definitionCopied = false
+    @Published private(set) var definitionPage = 0
     private var executionTask: Task<Void, Never>?
     private var feedbackTask: Task<Void, Never>?
+    private var definitionTask: Task<Void, Never>?
     private(set) var raw = ""
     private lazy var request: LumenQuickAnswer = {
         let request = LumenQuickAnswer()
@@ -36,7 +178,12 @@ final class LauncherCommands: ObservableObject {
     var isImageCommand: Bool { if case .image = resolution { return true }; return false }
     var isClipboardCommand: Bool { if case .clipboard = resolution { return true }; return false }
     var selectedClipboardItem: ClipboardItem? { clipboardRows.first { $0.id == clipboardSelection } }
-    var showsCard: Bool { resolution != .search && resolution != .translation && !isImageCommand }
+    var showsCard: Bool {
+        switch resolution {
+        case .discovery, .question, .web, .missingArgument, .argumentTooLong: return true
+        case .search, .translation, .image, .clipboard: return false
+        }
+    }
     var selectedEntry: LumenCommandCatalog.Entry? { entries.indices.contains(selection) ? entries[selection] : nil }
 
     func update(_ next: LumenCommandResolution, raw: String, catalog: LumenCommandCatalog) {
@@ -52,73 +199,48 @@ final class LauncherCommands: ObservableObject {
         if resolution != next { resolution = next }
     }
 
-    func matchExecutables(_ actions: [LaunchAction], resetSelection: Bool = false) {
+    func matchExecutables(_ actions: [LaunchAction], in model: Launcher, resetSelection: Bool = false) {
         let matches = resolution == .search && !actions.isEmpty && !LauncherFileQuery(raw).isFiltered
             ? LaunchCatalog.matches(raw, actions: actions, includeDictionary: false) : []
         if matches != executableMatches { executableMatches = matches }
-        if resetSelection || !matches.contains(where: { $0.action.id == selectedExecutableID }) {
-            if selectedExecutableID != nil { selectedExecutableID = nil }
-            if resetSelection && manuallySelected { manuallySelected = false }
-        }
+        model.setExecutableMatches(matches, resetSelection: resetSelection)
     }
 
-    // Merge opt-in commands here without adding I/O or catalog state to file search.
-    func results(in model: Launcher) -> [LauncherResult] {
-        var rows = model.visibleResults
-        guard !executableMatches.isEmpty else { return rows }
-        let native = Dictionary(uniqueKeysWithValues: model.launchMatches.map { ($0.action.id, $0.score) })
-        let links = Dictionary(uniqueKeysWithValues: model.shortcuts.matches(model.query).map { ($0.record.rowID, $0.score) })
-        func score(_ row: LauncherResult) -> Int {
-            switch row {
-            case .file: return 79
-            case .calculation: return .max
-            case .shortcut: return links[row.id] ?? 0
-            case .action: return native[row.id] ?? .max // Already inserted opt-in command.
+    func results(in model: Launcher) -> [LauncherResult] { model.visibleResults }
+    func selection(in model: Launcher) -> String? { model.selectedID }
+    func selectedResult(in model: Launcher) -> LauncherResult? { model.selectedResult }
+    func choose(_ row: LauncherResult, in model: Launcher) { model.selectedID = row.id }
+    func moveResults(_ delta: Int, in model: Launcher) { model.moveSelection(delta) }
+
+    func lookupDefinition(_ word: String,
+                          fetcher: @escaping @Sendable (String) -> String? = { LauncherSystemActions.dictionaryDefinition($0) }) {
+        definitionTask?.cancel()
+        definitionCopied = false
+        definitionPage = 0
+        definition = DictionaryDefinition(word: word, text: nil, loading: true)
+        definitionTask = Task { [weak self] in
+            let text: String? = await withCheckedContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    continuation.resume(returning: fetcher(word))
+                }
             }
-        }
-        for match in executableMatches {
-            let insertion = rows.firstIndex { score($0) < match.score } ?? rows.firstIndex {
-                // Keep partial commands accessible without interleaving file matches.
-                if case .file = $0 { return match.score >= 55 }
-                return false
-            } ?? rows.endIndex
-            rows.insert(.action(match.action), at: insertion)
-        }
-        return rows
-    }
-
-    func selection(in model: Launcher) -> String? {
-        if let selectedExecutableID { return selectedExecutableID }
-        guard !manuallySelected, executableMatches.first?.primary == true,
-              let first = results(in: model).first, first.id == executableMatches.first?.action.id else { return model.selection }
-        return first.id
-    }
-
-    func selectedResult(in model: Launcher) -> LauncherResult? {
-        let id = selection(in: model)
-        return executableMatches.first { $0.action.id == id }.map { .action($0.action) } ?? model.selectedResult
-    }
-
-    func choose(_ row: LauncherResult, in model: Launcher) {
-        if !manuallySelected { manuallySelected = true }
-        if case .action(let action) = row, case .executable = action.destination {
-            selectedExecutableID = row.id
-        } else {
-            selectedExecutableID = nil
-            model.selection = row.id
+            guard !Task.isCancelled, let self, self.definition?.word == word else { return }
+            self.definitionTask = nil
+            self.definition = DictionaryDefinition(word: word, text: text, loading: false)
         }
     }
 
-    func moveResults(_ delta: Int, in model: Launcher) {
-        guard !executableMatches.isEmpty else { model.moveSelection(delta); return }
-        let rows = results(in: model)
-        guard let first = rows.first, let last = rows.last else { return }
-        let id = selection(in: model)
-        if let index = rows.firstIndex(where: { $0.id == id }) {
-            choose(rows[min(max(0, index + delta), rows.count - 1)], in: model)
-        } else {
-            choose(delta > 0 ? first : last, in: model)
-        }
+    func closeDefinition() {
+        definitionTask?.cancel()
+        definitionTask = nil
+        if definition != nil { definition = nil }
+        if definitionCopied { definitionCopied = false }
+        if definitionPage != 0 { definitionPage = 0 }
+    }
+
+    func copyDefinition(to pasteboard: NSPasteboard) {
+        guard let text = definition?.text, !text.isEmpty else { return }
+        definitionCopied = ClipboardManager.writeInternalString(text, to: pasteboard)
     }
 
     var visibleExecution: CommandExecution? {
@@ -214,6 +336,10 @@ final class LauncherCommands: ObservableObject {
             outputPage += delta
             return true
         }
+        if let text = definition?.text, !text.isEmpty {
+            definitionPage += delta
+            return true
+        }
         guard !answerText.isEmpty else { return false }
         answerPage += delta
         return true
@@ -228,8 +354,8 @@ final class LauncherCommands: ObservableObject {
     func recordWebFailure() { webFailed = true }
 }
 
-struct CommandExecution {
-    enum Phase { case argument(String, required: Bool), running, finished(LauncherProcess.Result) }
+struct CommandExecution: Equatable {
+    enum Phase: Equatable { case argument(String, required: Bool), running, finished(LauncherProcess.Result) }
     let command: LauncherExecutable
     let phase: Phase
 
@@ -311,6 +437,51 @@ struct LauncherCommandOutputCard: View {
                 }
             }
             Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 16).padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func t(_ zh: String, _ en: String) -> String { chinese ? zh : en }
+}
+
+@MainActor
+struct LauncherDefinitionCard: View {
+    @ObservedObject var commands: LauncherCommands
+    let word: String
+    let text: String?
+    let loading: Bool
+    let chinese: Bool
+    let copy: () -> Void
+    let close: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label(word, systemImage: "book").font(.headline).lineLimit(1)
+                Spacer(minLength: 8)
+                if loading {
+                    ProgressView().controlSize(.small)
+                } else if let text, !text.isEmpty {
+                    Button(commands.definitionCopied ? t("已复制", "Copied") : t("复制", "Copy"), action: copy)
+                        .accessibilityIdentifier("definition-copy")
+                }
+                Button(t("关闭", "Close"), action: close)
+                    .accessibilityIdentifier("definition-close")
+            }
+            if loading {
+                Text(t("正在查询系统词典…", "Looking up in Dictionary…"))
+                    .font(.callout).foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+            } else if let text, !text.isEmpty {
+                LauncherScrollableText(text: text, label: t("词典释义", "Dictionary Definition"),
+                                       identifier: "definition-scroll", page: commands.definitionPage)
+            } else {
+                Text(t("系统词典中没有找到释义。", "No definition was found in the system dictionaries."))
+                    .font(.callout).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            }
         }
         .padding(.horizontal, 16).padding(.vertical, 10)
         .frame(maxWidth: .infinity, alignment: .leading)

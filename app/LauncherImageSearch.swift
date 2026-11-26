@@ -38,12 +38,12 @@ final class LauncherImageSearch: ObservableObject {
 
     func ensureStatus() {
         guard !readAttempted else { return }
-        readAttempted = true
         refresh()
     }
 
     private func refresh() {
         guard engine.hasDatabase, !loading else { return }
+        readAttempted = true
         loading = true
         _ = engine.run(["image-status"]) { [weak self] response in
             guard let self else { return }
@@ -139,13 +139,13 @@ struct LauncherImageSettings: View {
                     Text(launcher.t("未选择", "Not selected")).foregroundStyle(.secondary)
                 }
             }
-            LabeledContent(launcher.t("本地图像投影器", "Local Image Projector")) {
+            LabeledContent(launcher.t("图像模型", "Image Model")) {
                 Text(images.projector?.lastPathComponent ?? launcher.t("未选择", "Not selected"))
                     .lineLimit(1).truncationMode(.middle)
             }
             HStack {
                 Button(launcher.t("选目录…", "Choose Folder…"), action: chooseFolder)
-                Button(launcher.t("选投影器…", "Choose Projector…"), action: chooseProjector)
+                Button(launcher.t("选择图像模型…", "Choose Image Model…"), action: chooseProjector)
                 if images.scope?.root != nil {
                     Button(launcher.t("移除", "Remove")) { images.setFolder(nil) }
                 }
@@ -164,7 +164,7 @@ struct LauncherImageSettings: View {
                                   !launcher.canSearch || launcher.scopePending || launcher.indexWork != nil)
                 }
             }
-            if images.failed { Text(launcher.t("操作失败。检查目录、模型和投影器。", "Check the folder, model, and projector, then retry.")).foregroundStyle(.secondary) }
+            if images.failed { Text(launcher.t("操作失败。请检查目录和图像模型。", "Check the folder and image model, then retry.")).foregroundStyle(.secondary) }
             if images.limited { Text(launcher.t("已达图像索引容量上限。", "The image index is at its storage limit.")).foregroundStyle(.secondary) }
         }
     }

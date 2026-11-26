@@ -32,6 +32,26 @@ public struct MacInlinePreviewView: View {
                     Text(label("正在加载本地预览", "Loading local preview"))
                 }
                 .foregroundStyle(.secondary)
+            case .downloading(_, let fraction):
+                HStack(spacing: 8) {
+                    if let fraction {
+                        ZStack {
+                            Circle().strokeBorder(.quaternary, lineWidth: 2)
+                            Circle().inset(by: 1).trim(from: 0, to: fraction)
+                                .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                                .rotationEffect(.degrees(-90))
+                        }
+                        .frame(width: 16, height: 16)
+                        .accessibilityHidden(true)
+                        let percent = Int((fraction * 100).rounded())
+                        Text(label("正在从云端同步 \(percent)%", "Downloading from cloud \(percent)%"))
+                            .monospacedDigit()
+                    } else {
+                        ProgressView().controlSize(.small).accessibilityHidden(true)
+                        Text(label("正在从云端同步…", "Downloading from cloud…"))
+                    }
+                }
+                .foregroundStyle(.secondary)
             case .unavailable(_, let error):
                 Label(reason(error), systemImage: "doc.questionmark")
                     .foregroundStyle(.secondary)
@@ -81,11 +101,11 @@ public struct MacInlinePreviewView: View {
     private func reason(_ error: PreviewFailure) -> String {
         switch error {
         case .notLocal:
-            return label("仅预览已确认的本地文件，不下载云端文件", "Preview is available only for verified local files. Cloud files are not downloaded.")
+            return label("文件尚未保存在本机", "The file is not available locally.")
         case .missing:
             return label("文件已移动、被删除或无法访问", "The file was moved, deleted, or could not be accessed.")
-        case .overLimit:
-            return label("文件过大，无法内嵌预览", "The file is too large for inline preview.")
+        case .downloadFailed:
+            return label("无法从云端同步此文件", "Could not download this file from the cloud.")
         case .invalidContent:
             return label("这个文件无法内嵌预览", "This file does not support inline preview.")
         case .unavailablePage:

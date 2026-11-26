@@ -15,82 +15,60 @@ enum FileAction: Equatable {
     }
 }
 
-struct PreviewSnapshot {
-    let directory: URL
-    let url: URL
+enum LocalFile {
+    struct Placeholder: Error {}
 
-    enum Failure: Error { case unavailable, tooLarge }
-
-    static func make(for hit: SearchHit, maximum: Int64 = 128 * 1024 * 1024,
-                     expectedStamp: String? = nil, requiresResidentMetadata: Bool = false) throws -> PreviewSnapshot {
-        guard hit.isLocal, hit.kind == "file", let current = hit.pathStamp(),
-              expectedStamp == nil || expectedStamp == current,
-              !hit.hasPreview || hit.document_stamp == current else { throw Failure.unavailable }
-
+    static func withMaterializationDisabled<T>(_ work: () throws -> T) throws -> T {
         let policy = IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES
         let scope = IOPOL_SCOPE_THREAD
         let prior = getiopolicy_np(policy, scope)
         guard prior >= 0, setiopolicy_np(policy, scope, IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0
-        else { throw Failure.unavailable }
+        else { throw PreviewFailure.notLocal }
         defer { _ = setiopolicy_np(policy, scope, prior) }
-
-        if requiresResidentMetadata {
-            let url = URL(fileURLWithPath: hit.path)
-            guard let values = try? url.resourceValues(forKeys: [.isUbiquitousItemKey, .volumeIsLocalKey]),
-                  values.isUbiquitousItem != true, values.volumeIsLocal == true else { throw Failure.unavailable }
-        }
-
-        guard let descriptor = LocalFile.openReadOnly(hit.path) else { throw Failure.unavailable }
-        let input = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
-        defer { try? input.close() }
-        var attributes = stat()
-        var volume = statfs()
-        guard fstatfs(descriptor, &volume) == 0, volume.f_flags & UInt32(MNT_LOCAL) != 0,
-              fstat(descriptor, &attributes) == 0, matches(attributes, stamp: current) else {
-            throw Failure.unavailable
-        }
-        let length = Int64(attributes.st_size)
-        guard length >= 0 && length <= maximum else { throw Failure.tooLarge }
-
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("lumen-preview-" + UUID().uuidString, isDirectory: true)
-        let filename = URL(fileURLWithPath: hit.path).lastPathComponent
-        guard !filename.isEmpty else { throw Failure.unavailable }
-        let snapshot = PreviewSnapshot(directory: directory, url: directory.appendingPathComponent(filename, isDirectory: false))
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
-                                                attributes: [.posixPermissions: 0o700])
-        var complete = false
-        defer { if !complete { snapshot.remove() } }
-
-        let target = Darwin.open(snapshot.url.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0o600)
-        guard target >= 0 else { throw Failure.unavailable }
-        let output = FileHandle(fileDescriptor: target, closeOnDealloc: true)
-        defer { try? output.close() }
-
-        var copied: Int64 = 0
-        while let bytes = try input.read(upToCount: 256 * 1024), !bytes.isEmpty {
-            try Task.checkCancellation()
-            copied += Int64(bytes.count)
-            guard copied <= length else { throw Failure.unavailable }
-            try output.write(contentsOf: bytes)
-        }
-        try output.close()
-        guard copied == length, fstat(descriptor, &attributes) == 0, matches(attributes, stamp: current),
-              hit.pathStamp() == current else { throw Failure.unavailable }
-
-        // Quick Look may open its input from another process. Give it only the private local snapshot.
-        complete = true
-        return snapshot
+        return try work()
     }
 
-    func remove() { try? FileManager.default.removeItem(at: directory) }
-
-    private static func matches(_ info: stat, stamp: String) -> Bool {
-        info.st_mode & S_IFMT == S_IFREG && info.st_flags & UInt32(SF_DATALESS) == 0 &&
-            SearchHit.filesystemStamp(info) == stamp
+    static func isUbiquitousPlaceholder(_ url: URL) -> Bool {
+        let values = try? URL(fileURLWithPath: url.path).resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey])
+        return values?.ubiquitousItemDownloadingStatus == .notDownloaded
     }
-}
 
-enum LocalFile {
+    static func withResidentFile<T>(_ url: URL, expectedStamp: String?,
+                                    isPending: (URL) -> Bool = isUbiquitousPlaceholder,
+                                    _ work: () throws -> T) throws -> T {
+        try withMaterializationDisabled {
+            guard url.isFileURL, url.host == nil || url.host == "" || url.host == "localhost" else {
+                throw PreviewFailure.notLocal
+            }
+            let path = url.path
+            guard !path.split(separator: "/").contains(where: { $0 == "." || $0 == ".." }),
+                  let info = SearchHit.pathAttributes(at: path, kind: "file", permitsDatalessLeaf: true) else {
+                throw PreviewFailure.missing
+            }
+            let stamp = SearchHit.filesystemStamp(info)
+            guard expectedStamp == nil || expectedStamp == stamp else { throw PreviewFailure.missing }
+            if info.st_flags & UInt32(SF_DATALESS) != 0 || isPending(url) {
+                guard try url.resourceValues(forKeys: [.volumeIsLocalKey]).volumeIsLocal == true else {
+                    throw PreviewFailure.notLocal
+                }
+                throw Placeholder()
+            }
+            guard let fd = openReadOnly(path) else { throw PreviewFailure.missing }
+            defer { _ = Darwin.close(fd) }
+            var opened = stat()
+            var volume = statfs()
+            guard fstatfs(fd, &volume) == 0, volume.f_flags & UInt32(MNT_LOCAL) != 0 else {
+                throw PreviewFailure.notLocal
+            }
+            guard fstat(fd, &opened) == 0, opened.st_flags & UInt32(SF_DATALESS) == 0,
+                  SearchHit.filesystemStamp(opened) == stamp,
+                  SearchHit.pathStamp(at: path, kind: "file") == stamp else { throw PreviewFailure.missing }
+            let result = try work()
+            guard SearchHit.pathStamp(at: path, kind: "file") == stamp else { throw PreviewFailure.missing }
+            return result
+        }
+    }
+
     static func dragURL(for hit: SearchHit, resourceValues: (URL, [URLResourceKey]) throws -> [URLResourceKey: Any] = {
         try ($0 as NSURL).resourceValues(forKeys: $1)
     }) -> URL? {
@@ -112,7 +90,7 @@ enum LocalFile {
         let components = path.split(separator: "/")
         guard path.hasPrefix("/"), !components.isEmpty,
               components.allSatisfy({ $0 != "." && $0 != ".." }) else { return nil }
-        let options = O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+        let options = O_RDONLY | O_NOFOLLOW_ANY | O_NONBLOCK | O_CLOEXEC
         var parent = Darwin.open("/", options | O_DIRECTORY)
         guard parent >= 0 else { return nil }
         defer { if parent >= 0 { Darwin.close(parent) } }
@@ -136,16 +114,16 @@ enum LocalFile {
 final class LocalPreviewPanel: NSPanel {
     private let preview: QLPreviewView?
     private let pdf: PDFView?
-    private let snapshot: PreviewSnapshot
+    private let url: URL
     private var closed = false
 
-    init?(snapshot: PreviewSnapshot, title: String, page: Int? = nil) {
+    init?(url: URL, title: String, page: Int? = nil) {
         let frame = NSRect(x: 0, y: 0, width: 680, height: 520)
         let view: NSView
         var destination: PDFPage?
         if let page {
             let display = PDFView(frame: frame)
-            guard page > 0, let document = PDFDocument(url: snapshot.url), !document.isLocked,
+            guard page > 0, let document = PDFDocument(url: url), !document.isLocked,
                   page <= document.pageCount, let target = document.page(at: page - 1) else { return nil }
             display.displayMode = .singlePage
             display.autoScales = true
@@ -158,12 +136,12 @@ final class LocalPreviewPanel: NSPanel {
             guard let display = QLPreviewView(frame: frame, style: .normal) else { return nil }
             display.shouldCloseWithWindow = false
             display.autostarts = true
-            display.previewItem = snapshot.url as NSURL
+            display.previewItem = url as NSURL
             preview = display
             pdf = nil
             view = display
         }
-        self.snapshot = snapshot
+        self.url = url
         super.init(contentRect: frame, styleMask: [.titled, .closable, .resizable],
                    backing: .buffered, defer: false)
         self.title = title
@@ -184,7 +162,6 @@ final class LocalPreviewPanel: NSPanel {
         preview?.close()
         pdf?.document = nil
         super.close()
-        snapshot.remove()
     }
 
     var onToggle: (() -> Void)?
@@ -201,7 +178,11 @@ final class LocalPreviewPanel: NSPanel {
         super.sendEvent(event)
     }
 
-    var previewURL: URL? { closed ? nil : snapshot.url }
+    var previewURL: URL? {
+        guard !closed else { return nil }
+        if let preview { return (preview.previewItem as? NSURL).map { $0 as URL } }
+        return url
+    }
     var displayedPDFPage: Int? {
         guard let view = pdf, let page = view.currentPage, let document = view.document else { return nil }
         let index = document.index(for: page)

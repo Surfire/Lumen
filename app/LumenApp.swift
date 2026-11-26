@@ -30,7 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var executableActions: [LaunchAction] = []
     private var executableUpdates: AnyCancellable?
     private var executionUpdates: AnyCancellable?
-    let inlinePreview = LauncherInlinePreview()
+    let inlinePreview: LauncherInlinePreview
     let imageSearch: LauncherImageSearch
     let clipboard: ClipboardManager
     private var clipboardUpdates: AnyCancellable?
@@ -71,7 +71,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
     private var configuredKey: HotKey?
     private var actionInFlight = false
-    private var previewPreparing = false
     private(set) var localPreview: LocalPreviewPanel?
     private(set) var searchPresented = false
     private var searchPresentationGeneration: UInt64 = 0
@@ -130,7 +129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             guard let self, self.translation.command == nil, !self.commands.showsCard,
                   self.commands.visibleExecution == nil, !self.contextActions.isOpen,
                   case .file(let hit) = self.commands.selectedResult(in: self.model) else { return }
-            if action == .preview { self.togglePreview(hit) }
+            if action == .preview { self.togglePreview(hit, allowCloudDownload: true) }
             else { self.perform(action, on: hit) }
         }
         let content = SearchBackdrop()
@@ -214,6 +213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     init(smoke: LauncherSmoke?) {
         self.smoke = smoke
+        inlinePreview = LauncherInlinePreview(downloads: smoke?.previewDownloads ?? .system)
         windowManagement = smoke?.makeWindowManagement() ?? WindowManagement()
         defaults = smoke != nil ? smoke?.shortcutFixturePreferences : .standard
         scriptCatalog = smoke?.makeScriptCatalog() ?? LauncherScriptCatalog(defaults: defaults)
@@ -594,7 +594,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         else {
             panel.browsing = true
             commands.moveResults(delta, in: model)
-            refreshInlinePreview()
+            updatePresentation()
         }
     }
 
@@ -927,11 +927,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func refreshInlinePreview() {
-        guard inlinePreview.isOpen else { return }
-        guard commands.visibleExecution == nil, !model.scopePending,
-              case .file(let hit) = commands.selectedResult(in: model), model.containsCurrentFile(hit),
-              LauncherInlinePreview.kind(hit) != nil else { inlinePreview.close(); return }
-        inlinePreview.show(hit)
+        guard let previewed = inlinePreview.hit else { return }
+        guard commands.visibleExecution == nil, !model.scopePending else { inlinePreview.close(); return }
+        let selected = commands.selectedResult(in: model)
+        if case .file(let hit) = selected, model.containsCurrentFile(hit) {
+            inlinePreview.retainPreview(for: hit)
+        } else if !(selected == nil && previewed.isCloudReference && model.searching &&
+                    model.selection == previewed.id && model.hits.contains(previewed)) {
+            inlinePreview.close()
+        }
+        // Hydration itself can trigger a watch refresh. If the selected row is
+        // unchanged, wait for its refreshed metadata instead of cancelling sync.
     }
 
     private func closeLocalPreview() {
@@ -943,52 +949,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         localPreview.close()
     }
 
-    private func togglePreview(_ hit: SearchHit, native: Bool = false) {
+    private func togglePreview(_ hit: SearchHit, native: Bool = false, allowCloudDownload: Bool = false) {
         if localPreview != nil { closeLocalPreview(); return }
         if closeInlinePreview() { return }
-        previewFile(hit, forceWindow: native)
+        previewFile(hit, forceWindow: native, allowCloudDownload: allowCloudDownload)
     }
 
-    private func previewFile(_ hit: SearchHit, forceWindow: Bool = false) {
+    private func previewFile(_ hit: SearchHit, forceWindow: Bool = false, allowCloudDownload: Bool = false) {
         if !forceWindow, LauncherInlinePreview.kind(hit) != nil {
             guard searchPresented, !model.scopePending, model.containsCurrentFile(hit),
                   hit.isLocal || hit.isCloudReference else { return }
             commands.choose(.file(hit), in: model)
             if inlinePreview.hit == hit { inlinePreview.close() }
-            else { inlinePreview.show(hit) }
+            else { inlinePreview.show(hit, allowCloudDownload: allowCloudDownload) }
             updatePresentation()
             return
         }
-        guard !previewPreparing else { return }
-        model.resolve(hit, action: .preview) { [weak self] _ in
-            guard let self, self.searchPresented else { return }
-            self.previewPreparing = true
-            let query = self.model.query
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                let snapshot = try? PreviewSnapshot.make(for: hit)
-                DispatchQueue.main.async { [weak self] in
-                    guard let self else { snapshot?.remove(); return }
-                    self.previewPreparing = false
-                    guard self.searchPresented, self.model.query == query, self.model.containsCurrentFile(hit) else {
-                        snapshot?.remove()
-                        return
-                    }
-                    guard let snapshot, let panel = LocalPreviewPanel(snapshot: snapshot, title: hit.name, page: hit.pdf_page) else {
-                        snapshot?.remove()
-                        self.model.previewFailed()
-                        return
-                    }
-                    self.localPreview?.close()
-                    self.localPreview = panel
-                    panel.onToggle = { [weak self] in self?.closeLocalPreview() }
-                    panel.delegate = self
-                    if self.smoke == nil {
-                        panel.center()
-                        self.makeLocalPreviewKey()
-                    } else {
-                        panel.setFrameOrigin(NSPoint(x: -12_000, y: -12_000))
-                    }
-                }
+        model.resolve(hit, action: .preview) { [weak self] url in
+            guard let self, self.searchPresented, self.model.containsCurrentFile(hit) else { return }
+            guard let panel = try? LocalFile.withResidentFile(url, expectedStamp: hit.document_stamp, {
+                LocalPreviewPanel(url: url, title: hit.name, page: hit.pdf_page)
+            }) else {
+                self.model.openingFailed()
+                return
+            }
+            self.localPreview?.close()
+            self.localPreview = panel
+            panel.onToggle = { [weak self] in self?.closeLocalPreview() }
+            panel.delegate = self
+            if self.smoke == nil {
+                panel.center()
+                self.makeLocalPreviewKey()
+            } else {
+                panel.setFrameOrigin(NSPoint(x: -12_000, y: -12_000))
             }
         }
     }

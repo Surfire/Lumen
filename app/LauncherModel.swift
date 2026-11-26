@@ -48,10 +48,6 @@ struct EmbeddingBatch: Decodable {
     let has_more: Bool
 }
 
-private struct HitValidation: Decodable {
-    let valid: Bool
-}
-
 private struct WatchEvent: Decodable {
     enum Kind: String, Decodable { case cached, ready, updated }
     let event: Kind
@@ -162,7 +158,13 @@ final class Launcher: ObservableObject {
     private var relatedRevision: UInt64?
     private var modelCheck: Process?
     private var modelCheckGeneration: UInt64 = 0
-    private var actionProcess: Process?
+    private(set) var isSearchPresented = false
+    private(set) var isSettingsPresented = false
+    private var silentRefreshTask: Task<Void, Never>?
+    private var silentRefreshRunning = false
+    private var silentRefreshPending = false
+    private var silentRefreshGeneration: UInt64 = 0
+    private var lastSettingsCoverageRefresh: ContinuousClock.Instant?
     private var actionIntent: UInt64 = 0
     private var actionValidating = false
     private var closed = false
@@ -213,12 +215,12 @@ final class Launcher: ObservableObject {
         let commands = native + saved
         let result = calculation.map { [LauncherResult.calculation($0)] } ?? []
         guard !commands.isEmpty else { return result + hits.map(LauncherResult.file) }
-        let files: [(LauncherResult, Int)] = resultsRevision == revision ? hits.map { hit in
+        let files: [(LauncherResult, Int)] = hits.map { hit in
             // Keep lexical order on ties. Regular use can move a direct file above a partial command match.
             let direct = hit.matched_by != "path" && !hit.isSemanticCandidate
             let rank = direct ? 79 + frecency.boost(LauncherFrecency.fileID(hit.path)) : 78
             return (.file(hit), rank)
-        } : []
+        }
         return result + (commands + files).sorted { $0.1 > $1.1 }.map(\.0)
     }
 
@@ -295,8 +297,24 @@ final class Launcher: ObservableObject {
         }
     }
 
+    func setSearchPresented(_ presented: Bool) {
+        guard isSearchPresented != presented else { return }
+        isSearchPresented = presented
+        if !presented { cancelSilentRefresh() }
+    }
+
+    func setSettingsPresented(_ presented: Bool) {
+        guard isSettingsPresented != presented else { return }
+        isSettingsPresented = presented
+        if presented, canSearch, !scopePending {
+            lastSettingsCoverageRefresh = .now
+            refreshCoverage()
+        }
+    }
+
     func close() {
         closed = true
+        cancelSilentRefresh()
         textDebounce?.cancel()
         semanticDebounce?.cancel()
         cancelCoverageRead()
@@ -304,7 +322,7 @@ final class Launcher: ObservableObject {
         clearFileDiagnosis()
         if modelInspection?.isRunning == true { modelInspection?.terminate() }
         engine.close()
-        for process in [watcher, writer, contentWriter, actionProcess].compactMap({ $0 }) where process.isRunning {
+        for process in [watcher, writer, contentWriter].compactMap({ $0 }) where process.isRunning {
             process.terminate()
         }
     }
@@ -432,6 +450,7 @@ final class Launcher: ObservableObject {
 
     private func invalidateSearch(clearRows: Bool = true, keepAction: Bool = false) {
         revision &+= 1
+        cancelSilentRefresh()
         rejectedPaths.removeAll()
         textDebounce?.cancel()
         cancelRelatedExcerpts()
@@ -440,8 +459,6 @@ final class Launcher: ObservableObject {
         if !keepAction {
             actionIntent &+= 1
             actionValidating = false
-            if actionProcess?.isRunning == true { actionProcess?.terminate() }
-            actionProcess = nil
         }
         searching = false
         if clearRows {
@@ -562,7 +579,7 @@ final class Launcher: ObservableObject {
     }
 
     private func validateImageHits(_ results: [SearchHit], query: String, revision: UInt64) {
-        let candidates = results.prefix(5).filter { $0.isImageMatch && $0.isLocal }
+        let candidates = results.prefix(5).filter { $0.isImageMatch && $0.isResident }
         validatePreviews(candidates, revision: revision) { [weak self] available in
             guard let self, !self.closed, self.revision == revision, !self.scopePending else { return }
             self.searching = false
@@ -573,30 +590,24 @@ final class Launcher: ObservableObject {
         }
     }
 
-    private func validatePreviews(_ hits: [SearchHit], revision: UInt64, complete: @escaping ([SearchHit]) -> Void) {
-        let requiresStamp: (SearchHit) -> Bool = { $0.hasPreview || $0.isImageMatch }
-        let candidates = hits.filter { requiresStamp($0) && $0.document_stamp != nil }
-        guard !candidates.isEmpty else { complete(hits.filter { !requiresStamp($0) }); return }
-        let deliver: (Set<String>) -> Void = { [weak self] valid in
-            guard let self, !self.closed, self.revision == revision else { return }
-            complete(hits.filter { !requiresStamp($0) || valid.contains($0.path) })
-        }
-        engine.validate(candidates) { result in
-            switch result {
-            case .success(.some(let valid)):
-                deliver(Set(zip(candidates, valid).compactMap { $0.1 ? $0.0.path : nil }))
-            case .success(nil):
-                // M1: verify document identity locally; an explicit action still checks the catalog.
-                // Never spawn validate-hit once per result as the query changes.
-                DispatchQueue.global(qos: .userInitiated).async {
-                    let paths = Set(candidates.compactMap { hit in
-                        hit.pathStamp() == hit.document_stamp ? hit.path : nil
-                    })
-                    DispatchQueue.main.async { deliver(paths) }
-                }
-            case .failure:
-                deliver([])
+    private func filterExistingPreviews(_ hits: [SearchHit], complete: @escaping ([SearchHit]) -> Void) {
+        let requiresDiskCheck: (SearchHit) -> Bool = { $0.hasPreview || $0.isImageMatch }
+        let candidates = hits.filter(requiresDiskCheck)
+        guard !candidates.isEmpty else { complete(hits); return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let valid = Set(candidates.compactMap { hit in
+                SearchHit.existsOnDisk(at: hit.path, kind: hit.kind, permitsDatalessLeaf: false) ? hit.path : nil
+            })
+            DispatchQueue.main.async {
+                complete(hits.filter { !requiresDiskCheck($0) || valid.contains($0.path) })
             }
+        }
+    }
+
+    private func validatePreviews(_ hits: [SearchHit], revision: UInt64, complete: @escaping ([SearchHit]) -> Void) {
+        filterExistingPreviews(hits) { [weak self] available in
+            guard let self, !self.closed, self.revision == revision else { return }
+            complete(available)
         }
     }
 
@@ -636,7 +647,7 @@ final class Launcher: ObservableObject {
     }
 
     var selectedHit: SearchHit? {
-        guard resultsRevision == revision else { return nil }
+        guard resultsRevision == revision || presentedQuery == query else { return nil }
         return hits.first { $0.path == selection }
     }
 
@@ -658,79 +669,35 @@ final class Launcher: ObservableObject {
     }
 
     func containsCurrentFile(_ hit: SearchHit) -> Bool {
-        !closed && canSearch && resultsRevision == revision && hits.contains(hit)
+        !closed && canSearch && (resultsRevision == revision || presentedQuery == query) && hits.contains(hit)
     }
 
     func resolve(_ hit: SearchHit, action: FileAction, complete: @escaping (URL) -> Void) {
-        guard containsCurrentFile(hit), !actionValidating else { return }
+        guard containsCurrentFile(hit) else { return }
         guard !hit.isSemanticCandidate || localModelState == .ready else { return }
         if action == .preview && hit.kind != "file" { return }
-        guard hit.isLocal || (action.allowsCloudReference && hit.isCloudReference) else {
-            if hit.isCloudReference { searchNotice = LauncherNotice(.online) }
+        if action == .copyName || action == .copyPath {
+            complete(URL(fileURLWithPath: hit.path))
             return
         }
-        revalidate(hit, retry: true, complete: complete)
-    }
-
-    private func revalidate(_ hit: SearchHit, retry: Bool, complete: @escaping (URL) -> Void) {
-        let current = revision
+        guard !actionValidating else { return }
         let intent = actionIntent
-        let requiresStamp = hit.matched_by == "text" || hit.hasPreview || hit.isImageMatch
-        guard !requiresStamp || hit.document_stamp != nil else { rejectStaleResult(hit); return }
         actionValidating = true
-        let permitsDelivery = { [weak self] in
-            guard let self, !self.closed, self.actionIntent == intent, self.canSearch else { return false }
-            if self.revision == current { return true }
-            // A watcher can refresh unrelated files while an explicit action is in flight.
-            // Recheck its original source once after the new index revision.
-            self.actionProcess = nil
-            self.actionValidating = false
-            if retry, self.hits.contains(hit) {
-                self.revalidate(hit, retry: false, complete: complete)
-            }
-            return false
-        }
-        let finish: (Bool) -> Void = { [weak self] confirmed in
-            guard let self, permitsDelivery() else { return }
-            guard confirmed else { self.rejectStaleResult(hit); return }
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                let stamp = hit.pathStamp()
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, permitsDelivery() else { return }
-                    guard let stamp, !requiresStamp || hit.document_stamp == stamp else {
-                        self.rejectStaleResult(hit)
-                        return
-                    }
-                    self.actionProcess = nil
-                    self.actionValidating = false
-                    complete(URL(fileURLWithPath: hit.path))
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let exists = SearchHit.existsOnDisk(at: hit.path, kind: hit.kind, permitsDatalessLeaf: true)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.closed, self.actionIntent == intent, self.canSearch else { return }
+                self.actionValidating = false
+                guard exists else {
+                    self.removeMissingResult(hit)
+                    return
                 }
-            }
-        }
-        engine.validate([hit], explicit: true) { [weak self] result in
-            guard let self, permitsDelivery() else { return }
-            switch result {
-            case .success(.some(let valid)): finish(valid.first == true)
-            case .failure: finish(false)
-            case .success(nil):
-                var arguments = ["validate-hit", "--kind", hit.kind, "--availability", hit.availability]
-                if let stamp = hit.document_stamp {
-                    arguments += ["--document-stamp", stamp]
-                    let ext = (hit.path as NSString).pathExtension.lowercased()
-                    // Images need typed validation even for OCR hits; old engines can only validate other documents.
-                    if hit.isImageMatch || ["png", "jpg", "jpeg", "heic", "heif", "webp"].contains(ext) {
-                        arguments += ["--matched-by", hit.matched_by]
-                    }
-                }
-                self.actionProcess = self.engine.run(arguments + ["--", hit.path], priority: .userInitiated) { response in
-                    finish(response.succeeded && (try? JSONDecoder().decode(HitValidation.self, from: response.output))?.valid == true)
-                }
+                complete(URL(fileURLWithPath: hit.path))
             }
         }
     }
 
-    private func rejectStaleResult(_ hit: SearchHit) {
-        actionProcess = nil
+    private func removeMissingResult(_ hit: SearchHit) {
         actionValidating = false
         rejectedPaths.insert(hit.path)
         if hit.isSemanticCandidate {
@@ -1023,8 +990,8 @@ final class Launcher: ObservableObject {
                 self.refreshCoverage()
                 return
             }
-            if batch.indexed > 0 {
-                self.scheduleSearch(keepAction: true)
+            if batch.indexed > 0 && self.isSearchPresented && self.hasQuery {
+                self.scheduleSilentRefresh()
             }
             if batch.processed == 0 && batch.pending > 0 { self.contentFailed = true }
             self.refreshCoverage(after: .milliseconds(100))
@@ -1100,7 +1067,12 @@ final class Launcher: ObservableObject {
                     self.finishEmbeddings(.idle)
                     self.startContentIfReady()
                 } else {
-                    if self.gemmaCoverage?.hasResults != true { self.refreshCoverage() }
+                    let needsSettingsRefresh = self.isSettingsPresented &&
+                        (self.lastSettingsCoverageRefresh.map { $0.duration(to: .now) >= .seconds(2) } ?? true)
+                    if self.gemmaCoverage?.hasResults != true || needsSettingsRefresh {
+                        if self.isSettingsPresented { self.lastSettingsCoverageRefresh = .now }
+                        self.refreshCoverage()
+                    }
                     self.embedNextBatch()
                 }
             } else {
@@ -1231,10 +1203,11 @@ final class Launcher: ObservableObject {
             engine.setCachedHitAccess(true)
             scopeTrustedForLookup = true
             indexPhase = .ready
-            scheduleSearch(keepAction: true)
+            if hasQuery { scheduleSearch(keepAction: true) }
             return
         }
         let accessPhaseChanged = notice.event == .ready && engine.checksCachedHitAccess
+        let becameReady = notice.event == .ready && !canSearch
         if notice.event == .ready {
             engine.setCachedHitAccess(false)
             scopeTrustedForLookup = true
@@ -1242,14 +1215,117 @@ final class Launcher: ObservableObject {
             watchState = .running
         }
         watchProgress = nil
-        refreshCoverage(after: .milliseconds(400))
-        scheduleSearch(keepAction: !accessPhaseChanged)
-        let current = revision
-        // Discard previews invalidated by the watch event even if a new query is still in flight.
-        let previous = hits
-        validatePreviews(previous, revision: current) { [weak self] available in
-            guard let self, self.resultsRevision != current, available != previous else { return }
-            self.publishHits(available)
+        let setupIncomplete = indexReport == nil || savedScope == nil ||
+            (contentCoverage?.pending ?? 0) > 0 ||
+            (gemmaCoverage?.documents_enabled == true && gemmaCoverage?.pending == true)
+        if isSettingsPresented || setupIncomplete || notice.event == .ready {
+            refreshCoverage(after: .milliseconds(400))
+        }
+        if becameReady {
+            if hasQuery { scheduleSearch(keepAction: !accessPhaseChanged) }
+            return
+        }
+        guard isSearchPresented, hasQuery else { return }
+        scheduleSilentRefresh(delay: accessPhaseChanged ? .zero : .milliseconds(1200))
+    }
+
+    private func cancelSilentRefresh() {
+        silentRefreshTask?.cancel()
+        silentRefreshTask = nil
+        silentRefreshRunning = false
+        silentRefreshPending = false
+        silentRefreshGeneration &+= 1
+    }
+
+    private func scheduleSilentRefresh(delay: Duration = .milliseconds(1200)) {
+        guard !closed, isSearchPresented, hasQuery, canSearch, !scopePending, !isImageSearch else { return }
+        if silentRefreshRunning {
+            silentRefreshPending = true
+            return
+        }
+        guard silentRefreshTask == nil else { return }
+        let generation = silentRefreshGeneration
+        silentRefreshTask = Task { @MainActor [weak self] in
+            if delay > .zero { try? await Task.sleep(for: delay) }
+            guard !Task.isCancelled, let self, !self.closed, self.silentRefreshGeneration == generation else { return }
+            self.silentRefreshTask = nil
+            self.performSilentRefresh()
+        }
+    }
+
+    private func performSilentRefresh() {
+        guard !closed, isSearchPresented, hasQuery, canSearch, !scopePending, !isImageSearch else { return }
+        silentRefreshRunning = true
+        silentRefreshPending = false
+        silentRefreshGeneration &+= 1
+        let generation = silentRefreshGeneration
+        let currentRevision = revision
+        let term = query
+        let fileQuery = LauncherFileQuery(term)
+        let searchesText = fileQuery.kind != "folder" && fileQuery.words.count >= 2 &&
+            gemmaCoverage?.documents_enabled != false
+        var names: Result<[SearchHit], SearchFailure>?
+        var text: Result<[SearchHit], SearchFailure>? = searchesText ? nil : .success([])
+
+        let finish = { [weak self] in
+            guard let self, !self.closed, self.silentRefreshGeneration == generation,
+                  self.revision == currentRevision, self.isSearchPresented, self.query == term else { return }
+            guard names != nil && text != nil else { return }
+            self.silentRefreshRunning = false
+            if case .failure = names, (try? text?.get())?.isEmpty != false {
+                if self.silentRefreshPending { self.scheduleSilentRefresh() }
+                return
+            }
+            let nameHits = (try? names?.get()) ?? []
+            let strongNames = nameHits.filter { $0.matched_by != "path" }
+            let bodyHits = (try? text?.get()) ?? []
+            let weakPaths = nameHits.filter { $0.matched_by == "path" }
+            var seen = Set<String>()
+            let ranked = [strongNames, bodyHits, weakPaths].flatMap { self.frecency.rankFiles($0) }
+            let lexical = Array(ranked.filter { seen.insert($0.path).inserted }.prefix(60))
+            let wantsRelated = self.localModelState == .ready && self.shouldFindRelatedExcerpts(directCount: lexical.count)
+            let existingRelated = wantsRelated ? self.hits.filter(\.isSemanticCandidate) : []
+            self.presentedQuery = term
+            self.directHits = lexical
+            self.resultsRevision = currentRevision
+            self.publishWithRelated(existingRelated)
+            if wantsRelated {
+                self.engine.searchSemantic(term) { [weak self] reply in
+                    guard let self, !self.closed, self.silentRefreshGeneration == generation,
+                          self.revision == currentRevision, self.isSearchPresented, self.query == term else { return }
+                    guard case .success(let related) = reply else { return }
+                    self.filterExistingPreviews(related.filter(\.isSemanticCandidate)) { [weak self] available in
+                        guard let self, !self.closed, self.silentRefreshGeneration == generation,
+                              self.revision == currentRevision, self.isSearchPresented, self.query == term else { return }
+                        self.publishWithRelated(available)
+                    }
+                }
+            }
+            if self.silentRefreshPending { self.scheduleSilentRefresh() }
+        }
+
+        engine.search(fileQuery.engineQuery, mode: "name") { [weak self] result in
+            guard let self, !self.closed, self.silentRefreshGeneration == generation,
+                  self.revision == currentRevision, self.isSearchPresented, self.query == term else { return }
+            names = result.map { $0.filter { !$0.hasPreview } }
+            finish()
+        }
+        guard searchesText else { return }
+        engine.search(fileQuery.engineQuery, mode: "text") { [weak self] response in
+            guard let self, !self.closed, self.silentRefreshGeneration == generation,
+                  self.revision == currentRevision, self.isSearchPresented, self.query == term else { return }
+            switch response {
+            case .success(let hits):
+                self.filterExistingPreviews(hits) { [weak self] available in
+                    guard let self, !self.closed, self.silentRefreshGeneration == generation,
+                          self.revision == currentRevision, self.isSearchPresented, self.query == term else { return }
+                    text = .success(available)
+                    finish()
+                }
+            case .failure(let failure):
+                text = .failure(failure)
+                finish()
+            }
         }
     }
 

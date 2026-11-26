@@ -11,11 +11,13 @@ struct SearchHit: Decodable, Equatable, Identifiable {
     let document_stamp: String?
     let pdf_page: Int?
     var id: String { path }
-    var isLocal: Bool { availability == "local" }
+    var isPlaceholder: Bool { availability == "placeholder" }
+    var isResident: Bool { availability == "local" || availability == "provider_metadata_only" }
+    var isLocal: Bool { isResident }
     var isCloudReference: Bool { availability == "placeholder" || availability == "provider_metadata_only" }
     var isImageMatch: Bool { matched_by == "image_embedding" }
     var isSemanticCandidate: Bool { matched_by == "semantic_candidate" }
-    var hasPreview: Bool { isLocal && snippet != nil }
+    var hasPreview: Bool { isResident && snippet != nil }
 
     func pathStamp() -> String? {
         Self.pathStamp(at: path, kind: kind, permitsDatalessLeaf: isCloudReference)
@@ -23,6 +25,39 @@ struct SearchHit: Decodable, Equatable, Identifiable {
 
     static func pathStamp(at path: String, kind: String, permitsDatalessLeaf: Bool = false) -> String? {
         pathAttributes(at: path, kind: kind, permitsDatalessLeaf: permitsDatalessLeaf).map(filesystemStamp)
+    }
+
+    static func existsOnDisk(at path: String, kind: String, permitsDatalessLeaf: Bool = false) -> Bool {
+        statOnDisk(at: path, kind: kind, permitsDatalessLeaf: permitsDatalessLeaf) != nil
+    }
+
+    static func statOnDisk(at path: String, kind: String, permitsDatalessLeaf: Bool = false) -> stat? {
+        guard path.hasPrefix("/"),
+              !path.split(separator: "/").contains(where: { $0 == "." || $0 == ".." }) else { return nil }
+        let policy = IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES
+        let scope = IOPOL_SCOPE_THREAD
+        let prior = getiopolicy_np(policy, scope)
+        guard prior >= 0, setiopolicy_np(policy, scope, IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0 else {
+            return nil
+        }
+        defer { _ = setiopolicy_np(policy, scope, prior) }
+
+        let expected: mode_t = kind == "directory" ? S_IFDIR : S_IFREG
+        var info = Darwin.stat()
+        guard lstat(path, &info) == 0 else { return nil }
+        let mode = info.st_mode & S_IFMT
+        if mode == S_IFLNK {
+            var target = Darwin.stat()
+            guard fstatat(AT_FDCWD, path, &target, 0) == 0,
+                  target.st_mode & S_IFMT == expected,
+                  permitsDatalessLeaf || (info.st_flags & UInt32(SF_DATALESS) == 0 && target.st_flags & UInt32(SF_DATALESS) == 0)
+            else { return nil }
+            return target
+        }
+        guard mode == expected,
+              permitsDatalessLeaf || info.st_flags & UInt32(SF_DATALESS) == 0
+        else { return nil }
+        return info
     }
 
     static func pathAttributes(at path: String, kind: String, permitsDatalessLeaf: Bool = false) -> stat? {
@@ -58,8 +93,14 @@ struct SearchHit: Decodable, Equatable, Identifiable {
         let device = UInt64(bitPattern: Int64(stat.st_dev))
         let size = UInt64(bitPattern: Int64(stat.st_size))
         let modified = stat.st_mtimespec
-        let changed = stat.st_ctimespec
-        return "\(device):\(stat.st_ino):\(size):\(modified.tv_sec):\(modified.tv_nsec):\(changed.tv_sec):\(changed.tv_nsec)"
+        return "\(device):\(stat.st_ino):\(size):\(modified.tv_sec):\(modified.tv_nsec)"
+    }
+
+    static func stampsMatch(_ stored: String, _ live: String) -> Bool {
+        let left = stored.split(separator: ":", omittingEmptySubsequences: false)
+        let right = live.split(separator: ":", omittingEmptySubsequences: false)
+        guard left.count >= 5, right.count >= 5 else { return stored == live }
+        return left.prefix(5).elementsEqual(right.prefix(5))
     }
 }
 

@@ -1011,6 +1011,7 @@ final class LauncherSmoke {
         try await verifyCatalogRegressions()
         try await verifyEngineRegressions()
         try await verifyBackgroundEmbeddingInterleavesContent()
+        try await verifyPhase1Regressions()
         try check(model.indexPhase == .needsIndex && !model.canSearch, "action smoke unexpectedly had a file index")
         func chosen() -> LaunchAction? {
             if case .action(let action)? = model.selectedResult { return action }
@@ -1196,9 +1197,12 @@ final class LauncherSmoke {
                       availability: availability, matched_by: "name", snippet: nil, document_stamp: nil, pdf_page: nil)
         }
         let resident = dragHit(availability: "local")
+        let residentCloud = dragHit(availability: "provider_metadata_only")
+        let placeholderCloud = dragHit(availability: "placeholder")
         try check(LocalFile.dragURL(for: resident)?.path == residentPath &&
-                  LocalFile.dragURL(for: dragHit(availability: "provider_metadata_only")) == nil,
-                  "drag eligibility followed the spelling of a local path instead of its residency")
+                  LocalFile.dragURL(for: residentCloud)?.path == residentPath &&
+                  LocalFile.dragURL(for: placeholderCloud) == nil,
+                  "drag eligibility did not allow resident cloud files while blocking placeholders")
         // Supply provider metadata without relying on a signed-in iCloud account.
         let ubiquitous = LocalFile.dragURL(for: resident) { _, _ in
             [.isUbiquitousItemKey: true, .volumeIsLocalKey: true]
@@ -1930,7 +1934,7 @@ final class LauncherSmoke {
         def stamp(path):
             stat = path.stat()
             return ':'.join(map(str, (stat.st_dev % 2**64, stat.st_ino, stat.st_size,
-                                     *divmod(stat.st_mtime_ns, 10**9), *divmod(stat.st_ctime_ns, 10**9))))
+                                     *divmod(stat.st_mtime_ns, 10**9))))
         def hold(name):
             def stopped(*_):
                 mark(name + '-terminated')
@@ -2003,8 +2007,9 @@ final class LauncherSmoke {
                     tokens = shlex.split(query)
                     mode, limit = request['mode'], request['limit']
                     assert limit == {'name': 60, 'text': 24}[mode]
+                    scope_dir = str(root.resolve() / 'scope with spaces') + '/'
                     assert tokens in (['limit-probe'], ['kind:folder', 'limit-probe'],
-                                      ['/scope with spaces/', 'kind:doc', 'ext:txt', 'limit-probe']), tokens
+                                      [scope_dir, 'kind:doc', 'ext:txt', 'limit-probe']), tokens
                     def hit(path, kind='file'):
                         return dict(path=path, name=Path(path).name, kind=kind, availability='local',
                                     matched_by=mode, **(dict(snippet='limit-probe', document_stamp='fixture')
@@ -2014,7 +2019,7 @@ final class LauncherSmoke {
                         hits += [hit('/other/limit-probe-folder', 'directory')]
                     else:
                         hits = [hit(f'/other/global-{i}.txt') for i in range(25)]
-                        hits += [hit('/scope with spaces/keep.md'), hit('/scope with spaces/keep.txt')]
+                        hits += [hit(scope_dir + 'keep.md'), hit(scope_dir + 'keep.txt')]
                     # Mirror the M2 wire contract; apply all constraints before slicing the fixture ranking.
                     if 'kind:folder' in tokens:
                         hits = [h for h in hits if h['kind'] == 'directory']
@@ -2022,8 +2027,8 @@ final class LauncherSmoke {
                         hits = [h for h in hits if h['path'].endswith(('.txt', '.md'))]
                     if 'ext:txt' in tokens:
                         hits = [h for h in hits if h['path'].endswith('.txt')]
-                    if '/scope with spaces/' in tokens:
-                        hits = [h for h in hits if h['path'].startswith('/scope with spaces/')]
+                    if scope_dir in tokens:
+                        hits = [h for h in hits if h['path'].startswith(scope_dir)]
                         mark('scoped-' + mode)
                     print(json.dumps(dict(id=request['id'], hits=hits[:limit])), flush=True)
                     continue
@@ -2045,20 +2050,12 @@ final class LauncherSmoke {
         elif command == 'image-serve':
             for line in sys.stdin:
                 request = json.loads(line)
+                if request['query'].startswith('hold-'):
+                    hold(request['query'])
                 names = ['keep.jpg', 'drop.jpg'] if request['query'] == 'accept' else [request['query'] + '.jpg']
-                hits = [dict(path=str(root / name), name=name, kind='file', availability='local',
+                hits = [dict(path=str(root / name), name=name, kind='file', availability='provider_metadata_only',
                              matched_by='image_embedding', document_stamp='fixture') for name in names]
                 print(json.dumps(dict(id=request['id'], hits=hits)), flush=True)
-        elif command == 'validate-hit' and Path(db).name == 'legacy':
-            path = Path(args[-1])
-            expected = ['--kind', 'file', '--availability', 'local', '--document-stamp', stamp(path)]
-            if '--matched-by' in args:
-                assert args == expected + ['--matched-by', 'text', '--', str(path)], args
-                mark(path.name + '-typed-rejected')
-                sys.exit(2)
-            assert args == expected + ['--', str(path)], args
-            # Untyped validation accepts either current stamp, even for the OCR hit.
-            print('{"valid":true}')
         elif command in ('query', 'validate-hit'):
             mark('unexpected-standalone-query')
             sys.exit(1)
@@ -2117,7 +2114,12 @@ final class LauncherSmoke {
 
         // This branch still bundles the M1 engine. Exercise the Swift launcher against a
         // fixture serving the M2 query contract, with the matching rows ranked below each cap.
-        for (mode, limit, wanted) in [("name", 60, "/other/limit-probe-folder"), ("text", 24, "/scope with spaces/keep.txt")] {
+        let scopedRoot = URL(fileURLWithPath: IndexScope.folderPath(root), isDirectory: true)
+            .appendingPathComponent("scope with spaces", isDirectory: true)
+        try FileManager.default.createDirectory(at: scopedRoot, withIntermediateDirectories: true)
+        let scopedKeep = scopedRoot.appendingPathComponent("keep.txt")
+        try Data("limit probe fixture".utf8).write(to: scopedKeep)
+        for (mode, limit, wanted) in [("name", 60, "/other/limit-probe-folder"), ("text", 24, scopedKeep.path)] {
             var baseline: Result<[SearchHit], SearchFailure>?
             engine.search("limit-probe", mode: mode) { baseline = $0 }
             try await until("the unfiltered \(mode) request did not finish") { baseline != nil }
@@ -2129,10 +2131,10 @@ final class LauncherSmoke {
         try await until("the folder behind 60 file names was not returned") {
             !model.searching && model.hits.map(\.path) == ["/other/limit-probe-folder"]
         }
-        model.setQuery("kind:doc EXT:.TXT path:\"/scope with spaces/\" limit-probe")
+        model.setQuery("kind:doc EXT:.TXT path:\"\(scopedRoot.path)/\" limit-probe")
         try await until("the in-scope text result behind 24 global hits was not returned") {
             !model.searching && marked("scoped-name") && marked("scoped-text") &&
-                model.hits.map(\.path) == ["/scope with spaces/keep.txt"] && model.hits.first?.hasPreview == true
+                model.hits.map(\.path) == [scopedKeep.path] && model.hits.first?.hasPreview == true
         }
         model.clear()
 
@@ -2177,18 +2179,20 @@ final class LauncherSmoke {
         try check(pipes?.output.count == 131083 && pipes?.errors.count == 65_536 &&
                   pipes?.diagnostic.hasSuffix("error tail") == true, "pipe draining lost output or stderr tail")
 
+        let keepImage = root.appendingPathComponent("keep.jpg")
+        try Data("resident cloud image fixture".utf8).write(to: keepImage)
         let projector = root.appendingPathComponent("projector")
         model.setImageQuery("hold-query", projector: projector)
-        try await until("image hit validation did not start") { marked("hold-query-started") }
+        try await until("image query did not start") { marked("hold-query-started") }
         model.setImageQuery("accept", projector: projector)
-        try await until("timed-out image batch did not terminate or replacement hits were wrong") {
-            marked("hold-query-terminated") && marked("one-image-batch") && !model.searching && model.hits.map(\.name) == ["keep.jpg"]
+        try await until("timed-out image search did not recover or filter missing files") {
+            marked("hold-query-terminated") && !model.searching && model.hits.map(\.name) == ["keep.jpg"]
         }
         try check(!marked("unexpected-standalone-query"), "search or batch validation spawned a standalone CLI")
         model.setImageQuery("hold-close", projector: projector)
-        try await until("image hit validation did not restart") { marked("hold-close-started") }
+        try await until("image search did not restart") { marked("hold-close-started") }
         model.close()
-        try await until("closing the launcher leaked image hit validation") { marked("hold-close-terminated") }
+        try await until("closing the launcher leaked image search worker") { marked("hold-close-terminated") }
 
         let legacy = Launcher(engine: try testEngine("legacy"), defaults: nil)
         defer { legacy.close() }
@@ -2206,16 +2210,23 @@ final class LauncherSmoke {
               let imageHit = legacy.hits.first(where: { $0.path == imageFile.path }) else {
             throw Failure("missing legacy validation fixtures")
         }
+        // Editing a file on disk must not block open/copy or spawn validate-hit.
+        try Data("legacy probe edited after indexing".utf8).write(to: textFile, options: .atomic)
         var resolved: URL?
         legacy.resolve(textHit, action: .open) { resolved = $0 }
-        try await until("legacy text validation did not finish") { resolved != nil || legacy.searchNotice?.problem == .stale }
-        try check(resolved == textFile, "legacy validate-hit rejected an unchanged stamped .txt hit")
+        try await until("edited text resolve did not finish") { resolved != nil || legacy.searchNotice?.problem == .stale }
+        try check(resolved == textFile && !marked("unexpected-standalone-query"),
+                  "resolving an edited text hit failed or spawned validate-hit")
 
         resolved = nil
         legacy.resolve(imageHit, action: .open) { resolved = $0 }
-        try await until("legacy image validation did not finish") { resolved != nil || legacy.searchNotice?.problem == .stale }
-        try check(marked("legacy.PNG-typed-rejected") && resolved == nil && !legacy.hits.contains(imageHit),
-                  "a stamped OCR image did not fail safely when legacy validate-hit rejected --matched-by")
+        try await until("image resolve did not finish") { resolved != nil || legacy.searchNotice?.problem == .stale }
+        try check(resolved == imageFile && !marked("unexpected-standalone-query"),
+                  "resolving an OCR image hit failed or spawned validate-hit")
+
+        var copiedURL: URL?
+        legacy.resolve(textHit, action: .copyName) { copiedURL = $0 }
+        try check(copiedURL == textFile, "copyName did not invoke completion synchronously on main thread")
         legacy.close()
 
         // libdispatch reads this setting at process startup. One cooperative worker is
@@ -2931,11 +2942,10 @@ final class LauncherSmoke {
         }
         let enter: ContinuousClock.Instant = .now
         try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
-        try check(revealed == nil, "Finder dispatched without validating on the shared server")
-        try signal("finish-han-body")
-        try await until("Finder dispatched the validated filename") {
-            self.revealed?.lastPathComponent == "鹿鸣.md" && self.exists("han-validation-started")
+        try await until("Finder dispatched the filename without blocking on body search") {
+            self.revealed?.lastPathComponent == "鹿鸣.md"
         }
+        try signal("finish-han-body")
         guard let firstName, let revealDispatch else { throw Failure("missing search or Finder timestamps") }
         print(String(format: "Han control-path timing: input to first name %.1f ms, Command–Return to dispatch %.1f ms",
                      milliseconds(began.duration(to: firstName)), milliseconds(enter.duration(to: revealDispatch))))
@@ -2948,13 +2958,13 @@ final class LauncherSmoke {
         let stableHanRows = model.hits
         try signal("hold-han-refresh-body")
         try signal("update-watch")
-        try await until("watch started rechecking the visible Han body result") { self.exists("han-refresh-body-started") }
-        try check(model.hits == stableHanRows && model.selectedHit == nil,
-                  "the same query flashed its old rows or left the prior revision actionable during watch refresh")
+        try await until("watch started silently refreshing the visible Han body result") { self.exists("han-refresh-body-started") }
+        try check(model.hits == stableHanRows && !model.searching && model.selectedHit?.name == "鹿鸣.md",
+                  "background watch refresh flickered searching, cleared rows, or dropped selection")
         try signal("finish-han-refresh-body")
-        try await until("watch published the same complete rows") {
-            !model.searching && model.hits == stableHanRows && model.selectedHit?.name == "鹿鸣.md"
-        }
+        try await Task.sleep(for: .milliseconds(120))
+        try check(!model.searching && model.hits == stableHanRows && model.selectedHit?.name == "鹿鸣.md",
+                  "completed silent watch refresh disturbed rows or selection")
 
         try type("late lexical delivery", into: app)
         try await until("the lexical name lane was held") { self.exists("late-name-started") }
@@ -2994,12 +3004,22 @@ final class LauncherSmoke {
                   "a weaker path match outranked text or a strong name")
         model.selection = model.hits[body].path
         try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
-        try await until("body hit revalidated in its source lane") {
-            self.revealed?.lastPathComponent == "body-match.md" && self.exists("body-validation-started")
+        try await until("body hit revealed in Finder") {
+            self.revealed?.lastPathComponent == "body-match.md"
         }
         revealed = nil
         try check(app.panel.frame == frame && app.panel.contentView === chrome && resizeCount == 0,
                   "typing or result lane delivery resized or replaced the launcher")
+
+        // Verify background watch refresh does not close an open Command–K context menu.
+        try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+        try check(app.contextActions.isOpen, "Command–K did not open context actions")
+        try signal("update-watch")
+        try await Task.sleep(for: .milliseconds(1500))
+        try check(app.contextActions.isOpen && !model.searching && model.selectedHit?.name == "body-match.md",
+                  "background watch refresh closed an open Command–K menu or disturbed selection")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try check(!app.contextActions.isOpen && app.searchPresented, "Escape did not close Cmd+K menu")
     }
 
     private func measureBundledHan(_ app: AppDelegate) async throws {
@@ -3429,8 +3449,23 @@ final class LauncherSmoke {
         }
         try escape()
 
+        // Right-click Quick Look on an UNSELECTED row must select it and hydrate if placeholder.
+        guard let placeholderHit = model.hits.first(where: { $0.path == placeholder.path }) else {
+            throw Failure("missing provider text placeholder hit")
+        }
+        try check(model.selectedHit?.path == resident.path, "resident row was not selected before unselected right-click preview")
+        app.perform(.preview, on: placeholderHit)
+        try await until("right-click Quick Look on an unselected placeholder did not select and start download") {
+            if case .downloading(let item, 0.4) = app.inlinePreview.state {
+                return item.url == placeholder && model.selectedHit?.path == placeholder.path
+            }
+            return false
+        }
+        try escape()
+        try await until("Escape did not cancel the right-click Quick Look download") { self.previewDownloadsCancelled == cancelled + 1 }
+
         try select(placeholder)
-        try check(app.inlinePreview.state == .closed && app.localPreview == nil && previewDownloadsStarted == started,
+        try check(app.inlinePreview.state == .closed && app.localPreview == nil && previewDownloadsStarted == started + 1,
                   "selecting a cloud text file requested a preview without a shortcut")
         func startDownload() async throws {
             try cmdY()
@@ -3443,7 +3478,7 @@ final class LauncherSmoke {
         }
         try await startDownload()
         try escape()
-        try await until("Escape did not cancel the Quick Look download") { self.previewDownloadsCancelled == cancelled + 1 }
+        try await until("Escape did not cancel the Quick Look download") { self.previewDownloadsCancelled == cancelled + 2 }
         try check(app.inlinePreview.state == .closed && app.localPreview == nil && app.searchPresented &&
                   !FileManager.default.fileExists(atPath: Self.previewHydrated(placeholder, in: directory).path),
                   "Escape hydrated the text placeholder, left a preview open, or dismissed search")
@@ -3452,10 +3487,21 @@ final class LauncherSmoke {
         try await until("hydrated cloud text did not replace the download ring with Quick Look") {
             app.localPreview?.previewURL == placeholder && app.inlinePreview.state == .closed
         }
-        try check(previewDownloadsStarted == started + 2 && previewDownloadsCancelled == cancelled + 1,
-                  "Quick Look started extra downloads or did not cancel exactly once")
+        try check(previewDownloadsStarted == started + 3 && previewDownloadsCancelled == cancelled + 2,
+                  "Quick Look started extra downloads or did not cancel exactly twice")
         try escape()
-        print("Cloud text Quick Look passed (resident, progress, Escape, hydrated handoff)")
+
+        // Pressing Return on a cloud placeholder must open via NSWorkspace (no .online block).
+        opened = nil
+        try select(placeholder)
+        try key(kVK_Return, "\r", in: app)
+        try await until("Return did not open the cloud placeholder") {
+            self.opened?.path == placeholder.path && !app.searchPresented
+        }
+        try check(model.searchNotice == nil, "opening a cloud placeholder raised an online-only error notice")
+        opened = nil
+        app.showSearch()
+        print("Cloud text Quick Look passed (resident, unselected right-click, progress, Escape, hydrated handoff, Return open)")
     }
 
     private func writeSparsePreviewPDF(to url: URL) throws {
@@ -3586,9 +3632,10 @@ final class LauncherSmoke {
         settings.close()
         if case .idle = model.fileDiagnosis {} else { throw Failure("closing settings retained a selected file report") }
         try signal("fail-watch")
-        try await until("the launcher still has an activity notice when watching fails") {
+        try await until("Settings and menu still report when watching fails while launcher stays calm") {
             model.watchState == .failed &&
-                model.launcherActivityTitle == model.t("文件监听已停止", "File watching stopped")
+                model.activityTitle == model.t("文件监听已停止", "File watching stopped") &&
+                model.launcherActivityTitle == nil
         }
         print("Settings smoke passed (shared window, shortcut, draft, exact-scope rebuild, Apply, and file diagnostics)")
     }
@@ -3678,9 +3725,11 @@ final class LauncherSmoke {
         if controlledTiming {
             try signal("hold-watch-progress")
             try signal("update-watch")
-            try await until("watch progress streamed independently of stdout") {
+            try await until("watch progress streamed independently without leaking into search footer or menu bar") {
                 model.watchProgress?.entries == 6 && model.watchState == .running && model.hits.isEmpty &&
-                    model.launcherActivityTitle == model.t("正在扫描文件…", "Scanning files…")
+                    model.activityTitle == model.t("正在扫描文件…", "Scanning files…") &&
+                    model.launcherActivityTitle == nil &&
+                    app.statusBarSymbol == "magnifyingglass" && app.statusBarTitle == ""
             }
             try signal("finish-watch-progress")
         }
@@ -3700,37 +3749,36 @@ final class LauncherSmoke {
             model.selectedHit?.availability == "provider_metadata_only" && !model.searching
         }
         guard let hit = model.selectedHit else { throw Failure("missing cloud result") }
-        try check(LocalFile.dragURL(for: hit) == nil, "a cloud-only row exported a file drag URL")
-        try key(kVK_Return, "\r", in: app)
-        try check(model.searchNotice?.problem == .online && opened == nil && revealed == nil,
-                  "Return activated a cloud reference")
+        try check(hit.isResident && !hit.isPlaceholder, "resident cloud file was misclassified as placeholder")
+        try check(LocalFile.dragURL(for: hit)?.path == hit.path, "a resident cloud row did not export a file drag URL")
+        try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+        try check(app.contextActions.items.map(\.id) == ["open", "reveal", "preview", "copy-name", "copy-path"],
+                  "resident cloud Cmd+K actions were incomplete: \(app.contextActions.items.map(\.id))")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
         try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
         try await until("Quick Look did not open the resident provider file") { app.localPreview?.previewURL?.path == hit.path }
         try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
-        if controlledTiming { try signal("hold-cloud-reveal") }
+        revealed = nil
         try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
-        if controlledTiming {
-            try await until("Finder action held for a concurrent watch event") { self.exists("cloud-reveal-started") }
-            var refreshed = false
-            let refresh = model.$searching.sink { if $0 { refreshed = true } }
-            defer { refresh.cancel() }
-            try signal("update-watch")
-            try await until("watch invalidated the current query during Finder validation") {
-                refreshed && model.selectedHit == nil
-            }
-            try check(revealed == nil, "Finder received a result from the superseded watch revision")
-            try signal("finish-cloud-reveal")
-            try await until("shared serve finished the watch refresh") { !model.searching }
-        }
-        try await until("Command–Return revealed the cloud reference") { self.revealed?.path == hit.path }
+        try await until("Command–Return revealed the resident cloud file") { self.revealed?.path == hit.path }
         try check(opened == nil && model.query == "cloudledger", "Finder action opened the file or closed search")
+        revealed = nil
+        try key(kVK_Return, "\r", in: app)
+        try await until("Return opened the resident cloud file without .online blocking") {
+            self.opened?.path == hit.path && !app.searchPresented
+        }
+        try check(model.searchNotice == nil, "opening a resident cloud file raised an unexpected notice")
+        opened = nil
+        app.showSearch()
     }
 
     private func verifySemanticInvalidation(_ app: AppDelegate) async throws {
         let model = app.model
-        let frame = app.panel.frame
         try type("health examination", into: app)
-        try await until("related excerpts started automatically after direct results") { self.exists("semantic-enrichment-started") }
+        try await until("related excerpts started automatically after direct results") {
+            self.exists("semantic-enrichment-started") && app.panel.frame.height == 436
+        }
+        let frame = app.panel.frame
         let direct = model.hits.map(\.path)
         try check(direct.count == 2 && model.hits.allSatisfy { !$0.isSemanticCandidate },
                   "direct hits were delayed or replaced by the optional lane")
@@ -3774,14 +3822,16 @@ final class LauncherSmoke {
         try await until("obsolete related query could not attach to newly typed text") {
             model.hits.count == 1 && model.selectedHit?.name == "青山月报.md" && !model.semanticBusy
         }
-        try check(lineCount("semantic-serve-launches") == 1 && exists("semantic-batch-validated"),
-                  "refinements did not reuse one worker or semantic result skipped batch validation")
+        try check(lineCount("semantic-serve-launches") == 1,
+                  "refinements did not reuse one semantic worker")
 
         try signal("gemma-cap")
-        try signal("update-watch")
-        try await until("watch reported the Gemma storage limit") {
+        app.showSettings()
+        try await until("Settings refreshed the Gemma storage limit") {
             model.gemmaCoverage?.limited == true && model.gemmaCoverage?.hasResults == true
         }
+        app.settings?.close()
+        app.showSearch()
         try check(!model.canBuildEmbeddings, "capped coverage would start more embedding batches")
         try type("health examination", into: app)
         try await until("stored Gemma vectors remained searchable at the storage cap") {
@@ -3804,49 +3854,82 @@ final class LauncherSmoke {
 
         if controlledTiming {
             try type("preview-safety", into: app)
-            try await until("a local result was visible before symlink replacement") {
+            try await until("a local result was visible before symlink and deletion checks") {
                 model.selectedHit?.name == "preview-safety.txt"
             }
             let replaced = corpus.appendingPathComponent("preview-safety.txt")
+            let replacedPath = IndexScope.folderPath(replaced)
             try FileManager.default.removeItem(at: replaced)
             try FileManager.default.createSymbolicLink(at: replaced, withDestinationURL: corpus.appendingPathComponent("notes.md"))
             try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
-            try await until("Quick Look rejected the replacement before the watcher ran") {
+            try await until("Quick Look allowed a 1-level symlinked resident file") {
+                app.localPreview?.previewURL?.path == replacedPath
+            }
+            try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+            try FileManager.default.removeItem(at: replaced)
+            try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
+            try await until("Quick Look rejected a genuinely missing file before the watcher ran") {
                 model.searchNotice?.problem == .stale
             }
             try check(app.localPreview == nil && !model.hits.contains { $0.name == "preview-safety.txt" },
-                      "a stale result could preview a replacement symlink")
+                      "a missing file remained actionable for preview")
         }
     }
 
     private func verifyReplacedDocument(_ app: AppDelegate) async throws {
         let model = app.model
         try type("safety original paragraph", into: app)
-        try await until("preview visible before replacing a same-name file") {
+        try await until("preview visible before editing a file on disk") {
             model.selectedHit?.snippet?.contains("safety original paragraph") == true
         }
         let file = corpus.appendingPathComponent("content-safety-source.md")
+        let filePath = IndexScope.folderPath(file)
         try Data("Different file at the same path.".utf8).write(to: file, options: .atomic)
+        try key(kVK_ANSI_C, "C", in: app, throughPanel: true, flags: [.command, .shift])
+        try await until("copyName succeeded for an edited file without stale rejection") {
+            self.filePasteboard.string(forType: .string) == "content-safety-source.md"
+        }
+        try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
+        try await until("inline preview succeeded for an edited file without stale rejection") {
+            if case .ready(let selection, _) = app.inlinePreview.state { return selection.url.path == filePath }
+            return false
+        }
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        opened = nil
         try key(kVK_Return, "\r", in: app)
-        try await until("same-name replacement was refused before the watcher event") { model.searchNotice?.problem == .stale }
-        try check(opened == nil && model.selection == nil, "the old preview opened a replacement file")
+        try await until("Return opened the edited file without stale rejection") {
+            self.opened?.path == filePath && !app.searchPresented
+        }
+        try check(model.searchNotice == nil, "opening an edited file raised a stale notice")
+        opened = nil
+        app.showSearch()
     }
 
     private func verifyStaleBeforeDisplay(_ app: AppDelegate) async throws {
         let model = app.model
         try type("before render original", into: app)
-        try await until("old preview and its indexed stamp held before first display") { self.exists("before-render-started") }
+        try await until("old preview held before first display") { self.exists("before-render-started") }
         let file = corpus.appendingPathComponent("before-render.md")
+        let filePath = IndexScope.folderPath(file)
         try Data("A new file at the same path.".utf8).write(to: file, options: .atomic)
         try signal("finish-before-render")
-        try await until("stale preview discarded before first display") { !model.searching }
-        try check(model.hits.isEmpty && model.selection == nil, "stale snippet was displayed for the replacement file")
+        try await until("modified file was kept rather than dropped on mtime drift") {
+            !model.searching && model.selectedHit?.name == "before-render.md"
+        }
+        opened = nil
         try key(kVK_Return, "\r", in: app)
-        try check(opened == nil, "stale result authorized opening the replacement")
+        try await until("modified file opened cleanly after display") {
+            self.opened?.path == filePath && !app.searchPresented
+        }
+        opened = nil
+        app.showSearch()
 
+        // A genuinely deleted file must still be filtered out before display.
+        let missing = corpus.appendingPathComponent("missing-stamp.md")
+        try FileManager.default.removeItem(at: missing)
         try type("missing stamp original", into: app)
-        try await until("preview without a stamp was rejected") { !model.searching }
-        try check(model.hits.isEmpty && model.selection == nil, "an unstamped snippet appeared as an actionable result")
+        try await until("deleted file was dropped before display") { !model.searching }
+        try check(model.hits.isEmpty && model.selection == nil, "a deleted file appeared as an actionable preview")
     }
 
     private func verifyBackgroundEmbeddingInterleavesContent() async throws {
@@ -3930,12 +4013,186 @@ final class LauncherSmoke {
                   "silent background embedding changed pause preferences or raised a notice")
     }
 
+    private func verifyPhase1Regressions() async throws {
+        // 1. 5-field stamp compatibility & resident vs placeholder semantics.
+        try check(SearchHit.stampsMatch("10:20:30:40:50:60:70", "10:20:30:40:50"),
+                  "stampsMatch did not accept a legacy 7-field stamp against a 5-field stamp")
+        try check(!SearchHit.stampsMatch("10:20:30:40:50", "10:20:31:40:50"),
+                  "stampsMatch accepted a mismatched file size")
+        for action in [FileAction.open, .reveal, .preview, .copyName, .copyPath] {
+            try check(action.allowsCloudReference, "FileAction.\(action) blocked cloud references")
+        }
+
+        let root = URL(fileURLWithPath: IndexScope.folderPath(directory), isDirectory: true)
+            .appendingPathComponent("phase1-regressions", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let realDir = root.appendingPathComponent("real-project", isDirectory: true)
+        try FileManager.default.createDirectory(at: realDir, withIntermediateDirectories: true)
+        let symlinkDir = root.appendingPathComponent("symlink-project")
+        try FileManager.default.createSymbolicLink(at: symlinkDir, withDestinationURL: realDir)
+        let realFile = realDir.appendingPathComponent("doc.txt")
+        try Data("resident content".utf8).write(to: realFile)
+        let symlinkFile = root.appendingPathComponent("doc-link.txt")
+        try FileManager.default.createSymbolicLink(at: symlinkFile, withDestinationURL: realFile)
+
+        // Resident cloud hit parity & snippet preview.
+        let cloudResident = SearchHit(path: realFile.path, name: "doc.txt", kind: "file",
+                                      availability: "provider_metadata_only", matched_by: "text",
+                                      snippet: "resident content", document_stamp: "1:2:3:4:5", pdf_page: nil)
+        let cloudPlaceholder = SearchHit(path: realFile.path, name: "doc.txt", kind: "file",
+                                         availability: "placeholder", matched_by: "name",
+                                         snippet: "ignored", document_stamp: nil, pdf_page: nil)
+        try check(cloudResident.isResident && !cloudResident.isPlaceholder && cloudResident.hasPreview,
+                  "resident cloud hit did not advertise resident + preview capability")
+        try check(!cloudPlaceholder.isResident && cloudPlaceholder.isPlaceholder && !cloudPlaceholder.hasPreview,
+                  "placeholder hit was misclassified as resident or previewable")
+        try check(SearchHit.existsOnDisk(at: symlinkDir.path, kind: "directory") &&
+                  SearchHit.existsOnDisk(at: symlinkFile.path, kind: "file") &&
+                  !SearchHit.existsOnDisk(at: root.appendingPathComponent("missing.txt").path, kind: "file"),
+                  "existsOnDisk failed 1-level symlink or missing-file check")
+
+        // LocalFile.withResidentFile ignores stale stamp drift and supports 1-level symlinks, while still throwing Placeholder.
+        let readModified = try LocalFile.withResidentFile(symlinkFile, expectedStamp: "0:0:0:0:0", isPending: { _ in false }) {
+            try String(contentsOf: symlinkFile, encoding: .utf8)
+        }
+        try check(readModified == "resident content", "withResidentFile rejected a symlink or mismatched stamp")
+        var threwPlaceholder = false
+        do {
+            _ = try LocalFile.withResidentFile(realFile, expectedStamp: nil, isPending: { _ in true }) {
+                throw Failure("withResidentFile executed work on a cloud placeholder")
+            }
+        } catch is LocalFile.Placeholder {
+            threwPlaceholder = true
+        }
+        try check(threwPlaceholder, "withResidentFile did not throw Placeholder for a pending cloud item")
+
+        // Pinned symlinked folder shortcuts are accepted.
+        let shortcuts = ShortcutLibrary(defaults: nil)
+        let folderShortcut = SavedShortcut(id: UUID(), title: "Linked Project", alias: "lp",
+                                           target: .folder(symlinkDir.path), pinned: true)
+        try check(shortcuts.saveResult(folderShortcut) == .saved, "ShortcutLibrary rejected a 1-level symlinked folder")
+
+        // 2. Idle watch suppression, contentRunning activityTitle, and zero-flicker silent watch refresh.
+        let executable = root.appendingPathComponent("engine")
+        let database = root.appendingPathComponent("index.sqlite")
+        let source = #"""
+        #!/usr/bin/python3
+        import json, sys, time
+        from pathlib import Path
+        root = Path(__file__).parent
+        command, *args = sys.argv[3:]
+        def log(name):
+            with (root / name).open('a') as f:
+                print('1', file=f)
+        if command == 'status':
+            log('status-calls')
+            pending = 0 if (root / 'content-done').exists() else 1
+            print(json.dumps(dict(
+                items=2, documents=1,
+                scope=dict(roots=[str(root)], allow=[], deny=[], documents=False, content_roots=[]),
+                content=dict(pending=pending, checked=1 - pending, total=1),
+                gemma=dict(documents_enabled=False, embedded_chunks=0, skipped_chunks=0, pending=False, limited=False, chunk_limit=100)
+            )))
+        elif command == 'content':
+            (root / 'content-started').touch()
+            while not (root / 'release-content').exists():
+                time.sleep(0.02)
+            (root / 'content-done').touch()
+            print(json.dumps(dict(processed=1, indexed=1, pending=0)))
+        elif command == 'watch':
+            if '--help' in args:
+                print('--progress')
+            else:
+                print('{"event":"ready"}', flush=True)
+                while True:
+                    for marker in ('emit-idle-watch', 'emit-open-watch'):
+                        p = root / marker
+                        if p.exists():
+                            p.unlink()
+                            print('{"event":"updated"}', flush=True)
+                    time.sleep(0.02)
+        elif command == 'serve':
+            for line in sys.stdin:
+                req = json.loads(line)
+                log('serve-calls')
+                hits = []
+                if req['mode'] == 'name' and req['query'] == 'doc':
+                    hits = [dict(path=str(root / 'real-project' / 'doc.txt'), name='doc.txt', kind='file',
+                                 availability='provider_metadata_only', matched_by='name')]
+                print(json.dumps(dict(id=req['id'], hits=hits)), flush=True)
+        """#
+        try Data(source.utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        try Data().write(to: database)
+        let model = Launcher(engine: LauncherEngine(executable: executable, database: database), defaults: nil, locale: "en")
+        defer { model.close() }
+        model.start(automaticallyIndex: false)
+        try await until("content batch started while canSearch was true") {
+            model.canSearch && model.contentRunning &&
+                FileManager.default.fileExists(atPath: root.appendingPathComponent("content-started").path)
+        }
+        try check(model.activityTitle == "Indexing document content…" && model.launcherActivityTitle == nil,
+                  "contentRunning leaked into launcherActivityTitle or misreported Settings activityTitle: \(model.activityTitle)")
+        try Data().write(to: root.appendingPathComponent("release-content"))
+        try await until("content finished and watch settled") {
+            !model.contentRunning && model.contentCoverage?.pending == 0 && model.watchState == .running
+        }
+        try await Task.sleep(for: .milliseconds(500))
+        let statusBeforeIdle = (try? String(contentsOf: root.appendingPathComponent("status-calls"), encoding: .utf8))?
+            .split(separator: "\n").count ?? 0
+        let serveBeforeIdle = (try? String(contentsOf: root.appendingPathComponent("serve-calls"), encoding: .utf8))?
+            .split(separator: "\n").count ?? 0
+        // Idle watch event with search and Settings closed must spawn zero status or serve work.
+        try Data().write(to: root.appendingPathComponent("emit-idle-watch"))
+        try await Task.sleep(for: .milliseconds(600))
+        let statusAfterIdle = (try? String(contentsOf: root.appendingPathComponent("status-calls"), encoding: .utf8))?
+            .split(separator: "\n").count ?? 0
+        let serveAfterIdle = (try? String(contentsOf: root.appendingPathComponent("serve-calls"), encoding: .utf8))?
+            .split(separator: "\n").count ?? 0
+        try check(statusAfterIdle == statusBeforeIdle && serveAfterIdle == serveBeforeIdle,
+                  "idle watch event spawned status (\(statusAfterIdle - statusBeforeIdle)) or serve (\(serveAfterIdle - serveBeforeIdle))")
+
+        // Visible search with active query: watch refresh stays silent (no searching=true, no selectedHit drop).
+        model.setSearchPresented(true)
+        model.setQuery("doc")
+        try await until("initial search hit arrived") { !model.searching && model.selectedHit?.name == "doc.txt" }
+        var sawSearching = false
+        var sawSelectionDrop = false
+        let searchSub = model.$searching.dropFirst().sink { if $0 { sawSearching = true } }
+        let hitSub = model.$hits.dropFirst().sink { _ in if model.selectedHit == nil { sawSelectionDrop = true } }
+        defer { searchSub.cancel(); hitSub.cancel() }
+        let serveBeforeOpen = (try? String(contentsOf: root.appendingPathComponent("serve-calls"), encoding: .utf8))?
+            .split(separator: "\n").count ?? 0
+        try Data().write(to: root.appendingPathComponent("emit-open-watch"))
+        try await until("coalesced silent watch refresh completed", seconds: 4) {
+            let count = (try? String(contentsOf: root.appendingPathComponent("serve-calls"), encoding: .utf8))?
+                .split(separator: "\n").count ?? 0
+            return count > serveBeforeOpen
+        }
+        try check(!sawSearching && !sawSelectionDrop && model.selectedHit?.name == "doc.txt",
+                  "silent watch refresh flipped searching or dropped selectedHit")
+
+        // Mixed commands + files: typing a refinement must not blank prior file rows in visibleResults while searching.
+        try check(model.shortcuts.save(.init(id: UUID(), title: "Lock Quicklink", alias: "lock",
+                                             target: .folder(realDir.path), pinned: false)),
+                  "failed to save mixed-command shortcut fixture")
+        model.setQuery("lock")
+        let mixedDuringSearch = model.visibleResults
+        try check(mixedDuringSearch.contains(where: { if case .file(let h) = $0 { return h.name == "doc.txt" }; return false }),
+                  "visibleResults blanked prior file rows while commands matched and search was pending")
+        print("Phase 1 regressions passed (cloud parity, 5-field stamps, symlinks, zero idle status, silent refresh)")
+    }
+
     private func verifyEmbeddingRun(_ app: AppDelegate) async throws {
         let model = app.model
         try await until("document coverage permits an intentional build") { model.canBuildEmbeddings }
         try check(!exists("embeddings-started"), "first use enabled semantic indexing without consent")
         model.buildEmbeddings()
         try await waitForEmbeddingBatch(1)
+        try check(model.launcherActivityTitle == nil &&
+                  model.activityTitle == model.t("正在生成语义索引…", "Building semantic index…") &&
+                  app.statusBarSymbol == "magnifyingglass" && app.statusBarTitle == "",
+                  "background embeddings leaked into search footer or menu bar")
         try type("duringbatch", into: app)
         try Data().write(to: corpus.appendingPathComponent("duringbatch.txt"))
         try signal("update-watch")
@@ -3966,8 +4223,10 @@ final class LauncherSmoke {
         try await until("coverage reports current indexed text") { model.gemmaCoverage?.complete == true }
         try check(!model.canBuildEmbeddings, "completed coverage offered another full build")
         try signal("gemma-pending")
-        try signal("update-watch")
-        try await until("new text became eligible for embedding") { model.canBuildEmbeddings }
+        app.showSettings()
+        try await until("new text became eligible for embedding in Settings") { model.canBuildEmbeddings }
+        app.settings?.close()
+        app.showSearch()
         model.buildEmbeddings()
         try await waitForEmbeddingBatch(5)
         try signal("finish-embedding-5")

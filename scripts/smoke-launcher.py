@@ -155,8 +155,7 @@ def save_document_stamps():
             continue
         stat = path.stat()
         mtime = divmod(stat.st_mtime_ns, 10**9)
-        ctime = divmod(stat.st_ctime_ns, 10**9)
-        fields = (stat.st_dev % 2**64, stat.st_ino, stat.st_size, *mtime, *ctime)
+        fields = (stat.st_dev % 2**64, stat.st_ino, stat.st_size, *mtime)
         documents[str(path)] = {"stamp": ":".join(map(str, fields)), "text": path.read_text()}
     temporary = work / "document-stamps.tmp"
     temporary.write_text(json.dumps(documents))

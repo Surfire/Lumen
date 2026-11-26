@@ -134,7 +134,7 @@ final class ShortcutLibrary: ObservableObject {
         else { return .invalid }
         switch shortcut.target {
         case .application(let identifier): guard identifier.hasPrefix("app:") else { return .invalid }
-        case .folder(let path): guard SearchHit.pathStamp(at: path, kind: "directory") != nil else { return .invalid }
+        case .folder(let path): guard SearchHit.existsOnDisk(at: path, kind: "directory") else { return .invalid }
         case .web(let url): guard SavedShortcut.webURL(url.absoluteString) == url else { return .invalid }
         }
         if shortcut.queryParameter != nil {

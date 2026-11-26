@@ -203,20 +203,15 @@ struct SearchWindow: View {
             keyHint("↵", model.t("打开", "Open"))
             if case .file(let file) = commands.selectedResult(in: model) {
                 keyHint("⌘↵", model.t("在 Finder 中显示", "Show in Finder"))
-                if file.isLocal && file.kind == "file" {
+                if file.kind == "file" {
                     keyHint(model.t("空格 / ⌘Y", "Space / ⌘Y"), model.t("预览", "Preview"))
                 }
             }
         }
-        if let title = model.launcherActivityTitle,
-           !model.showsResults || model.activityBusy || model.watchState == .failed || model.scopePending {
-            if model.activityBusy || !model.canSearch {
-                Label(title, systemImage: model.activityBusy ? "arrow.triangle.2.circlepath" : "internaldrive")
-                    .lineLimit(1)
-                if let metrics = model.activityMetrics { Text(metrics).monospacedDigit().lineLimit(1) }
-            } else {
-                Text(title).lineLimit(1)
-            }
+        if !model.canSearch, let title = model.launcherActivityTitle {
+            Label(title, systemImage: "internaldrive")
+                .lineLimit(1)
+            if let metrics = model.activityMetrics { Text(metrics).monospacedDigit().lineLimit(1) }
         }
         if let issue = windowManagement.issue, issue != .permissionRequired {
             Text(issue.title(model)).lineLimit(1).help(issue.title(model))
@@ -225,7 +220,7 @@ struct SearchWindow: View {
                 .accessibilityIdentifier("launcher-notice")
         }
         Spacer(minLength: 8)
-        if !showsResults && !model.activityBusy {
+        if !showsResults {
             Label(model.t("筛选", "Filters"), systemImage: "line.3.horizontal.decrease")
                 .help(model.t("kind:folder、ext:pdf 或 path:\"/Users/…/My Files/\"；也可直接输入绝对路径。",
                               "Try kind:folder, ext:pdf, or path:\"/Users/…/My Files/\". You can also type an absolute path."))
@@ -415,13 +410,13 @@ struct SearchWindow: View {
         .accessibilityIdentifier(action.id)
     }
 
-    @ViewBuilder private func resultRow(_ hit: SearchHit, highlight: LauncherHighlight, selected: Bool) -> some View {
-        if hit.isLocal && model.containsCurrentFile(hit) {
-            fileRow(hit, highlight: highlight, selected: selected).onDrag {
-                guard model.containsCurrentFile(hit), let url = LocalFile.dragURL(for: hit) else { return NSItemProvider() }
-                return NSItemProvider(object: url as NSURL)
+    private func resultRow(_ hit: SearchHit, highlight: LauncherHighlight, selected: Bool) -> some View {
+        fileRow(hit, highlight: highlight, selected: selected).onDrag {
+            guard hit.isResident, model.containsCurrentFile(hit), let url = LocalFile.dragURL(for: hit) else {
+                return NSItemProvider()
             }
-        } else { fileRow(hit, highlight: highlight, selected: selected) }
+            return NSItemProvider(object: url as NSURL)
+        }
     }
 
     private func fileRow(_ hit: SearchHit, highlight: LauncherHighlight, selected: Bool) -> some View {
@@ -432,7 +427,7 @@ struct SearchWindow: View {
                 HStack(spacing: 8) {
                     Text(highlight.text(hit.name, size: 13, colorScheme: colorScheme, mode: .name))
                         .font(.system(size: 13, weight: .medium)).lineLimit(1)
-                    if !hit.isCloudReference {
+                    if hit.isResident {
                         Spacer(minLength: 2)
                         fileCategory(hit, folder: folder)
                     }
@@ -451,14 +446,9 @@ struct SearchWindow: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            if hit.isCloudReference {
-                Label(hit.availability == "placeholder"
-                      ? model.t("仅在线", "Online only")
-                      : model.t("云盘 · 仅名称", "Cloud · Name only"), systemImage: "icloud")
+            if hit.isPlaceholder {
+                Label(model.t("仅在线", "Online only"), systemImage: "icloud")
                     .font(.caption).foregroundStyle(.secondary).fixedSize()
-                Button(model.t("在 Finder 中显示", "Show in Finder")) { fileAction(.reveal, hit) }
-                    .buttonStyle(.borderless).font(.caption).fixedSize()
-                    .accessibilityIdentifier("reveal-cloud-result")
             }
         }
         .padding(.horizontal, 8)
@@ -470,17 +460,17 @@ struct SearchWindow: View {
         .accessibilityAction(named: Text(model.t("打开", "Open"))) { open(.file(hit)) }
         .accessibilityAction(named: Text(model.t("在 Finder 中显示", "Show in Finder"))) { fileAction(.reveal, hit) }
         .accessibilityActions {
-            if hit.isLocal && hit.kind == "file" {
+            if hit.kind == "file" {
                 Button(model.t("快速查看", "Quick Look")) { fileAction(.preview, hit) }
             }
             Button(model.t("复制名称", "Copy Name")) { fileAction(.copyName, hit) }
             Button(model.t("复制路径", "Copy Path")) { fileAction(.copyPath, hit) }
         }
         .contextMenu {
-            Button(model.t("打开", "Open")) { fileAction(.open, hit) }.disabled(!hit.isLocal)
+            Button(model.t("打开", "Open")) { fileAction(.open, hit) }
             Button(model.t("在 Finder 中显示", "Show in Finder")) { fileAction(.reveal, hit) }
             Button(model.t("快速查看 · ⌘Y", "Quick Look · ⌘Y")) { fileAction(.preview, hit) }
-                .disabled(!hit.isLocal || hit.kind != "file")
+                .disabled(hit.kind != "file")
             Divider()
             Button(model.t("复制名称 · ⇧⌘C", "Copy Name · ⇧⌘C")) { fileAction(.copyName, hit) }
             Button(model.t("复制路径 · ⌥⌘C", "Copy Path · ⌥⌘C")) { fileAction(.copyPath, hit) }
@@ -618,7 +608,7 @@ extension Launcher {
     }
 
     var launcherActivityTitle: String? {
-        if canSearch && !activityBusy && watchState == .running { return nil }
+        guard !canSearch else { return nil }
         return activityTitle
     }
 
@@ -631,6 +621,7 @@ extension Launcher {
             default: return t("正在后台更新索引…", "Indexing in background…")
             }
         }
+        if contentRunning { return t("正在索引文档内容…", "Indexing document content…") }
         if indexWork == .embeddings { return t("正在生成语义索引…", "Building semantic index…") }
         if scopePending || indexPhase == .unreadable { return t("索引需要更新", "Index needs attention") }
         switch indexPhase {
@@ -1062,8 +1053,8 @@ struct LauncherSettings: View {
     @ViewBuilder private var indexAndPrivacy: some View {
         group(model.t("正文索引", "Document Text")) {
             folderRows(.content, empty: model.t("请选择要建立正文和语义索引的目录。", "Choose folders to index for text and semantic search."))
-            note(model.t("所选目录内的 TXT、Markdown、DOCX 和 PDF 文本层可检索。云端文件仍只索引名称。",
-                         "Search TXT, Markdown, DOCX, and PDF text in selected folders. Cloud files remain name-only."))
+            note(model.t("所选目录内的 TXT、Markdown、DOCX 和 PDF 文本层可检索（包括已下载到本机的云盘文件；仅在线占位文件仍只索引名称）。",
+                         "Search TXT, Markdown, DOCX, and PDF text in selected folders, including downloaded cloud files. Online-only placeholders remain name-only."))
             if let coverage = model.contentCoverage, coverage.total > 0 {
                 ProgressView(value: Double(coverage.checked), total: Double(coverage.total)) {
                     Text(model.t("已处理 \(coverage.checked) / \(coverage.total) 份文档", "\(coverage.checked) of \(coverage.total) documents checked"))

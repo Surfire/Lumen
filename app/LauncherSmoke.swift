@@ -1211,6 +1211,9 @@ final class LauncherSmoke {
               visibleFrame: CGRect(x: -300, y: -780, width: 1280, height: 750)),
     ])
 
+    private static let spanningWindowFrame = CGRect(x: -450, y: 200, width: 600, height: 400)
+    private static let maximizedSpanningFrame = CGRect(x: -1250, y: -100, width: 1250, height: 1000)
+
     private func verifyWindowGeometry() throws {
         let planner = Self.windowPlanner
         let roundTrips: [(CGRect, CGRect)] = [
@@ -1247,8 +1250,7 @@ final class LauncherSmoke {
                   planner.placement(for: .previousDisplay, currentAX: corner)?.frame == below &&
                   planner.placement(for: .nextDisplay, currentAX: below)?.frame == corner,
                   "display cycling did not preserve point size and relative placement across insets")
-        let spanning = CGRect(x: -450, y: 200, width: 600, height: 400)
-        try check(planner.placement(for: .maximize, currentAX: spanning)?.frame == CGRect(x: -1250, y: -100, width: 1250, height: 1000),
+        try check(planner.placement(for: .maximize, currentAX: Self.spanningWindowFrame)?.frame == Self.maximizedSpanningFrame,
                   "a spanning window did not use the display with the largest overlap")
         let large = CGRect(x: 0, y: 38, width: 1440, height: 822)
         try check(planner.placement(for: .nextDisplay, currentAX: large)?.frame == CGRect(x: -1250, y: -11, width: 1250, height: 822),
@@ -1258,6 +1260,10 @@ final class LauncherSmoke {
                   one.placement(for: .restore, currentAX: original, previousAX: left)?.frame == CGRect(x: 0, y: 38, width: 600, height: 400) &&
                   one.placement(for: .nextDisplay, currentAX: original) == nil,
                   "restore did not honor the prior display or clamp after disconnection")
+        let acrossGap = CGRect(x: 100, y: 790, width: 600, height: 200)
+        try check(planner.placement(for: .restore, currentAX: original, previousAX: acrossGap)?.frame ==
+                    CGRect(x: 100, y: 660, width: 600, height: 200),
+                  "restore treated the gap between visible display edges as covered")
     }
 
     private func verifyWindowAccess() throws {
@@ -1301,6 +1307,22 @@ final class LauncherSmoke {
         adapter.states[1]?.minimumWidth = 0
         try check(access.perform(.restore, targetPID: 42_001, planner: planner) == nil && adapter.states[1]?.frame == initial.frame,
                   "partial move was not undoable")
+
+        let primaryOnly = WindowLayoutPlanner(displays: [planner.displays[0]])
+        for (restoreLayout, expected, scenario) in [
+            (planner, Self.spanningWindowFrame, "with both displays connected"),
+            (primaryOnly, CGRect(x: 0, y: 200, width: 600, height: 400), "after the left display disconnected"),
+        ] {
+            adapter.states[1] = .init(frame: Self.spanningWindowFrame)
+            try check(access.perform(.maximize, targetPID: 42_001, planner: planner) == nil &&
+                      adapter.states[1]?.frame == Self.maximizedSpanningFrame,
+                      "could not maximize the spanning window on the left display")
+            try check(access.perform(.restore, targetPID: 42_001, planner: restoreLayout) == nil &&
+                      adapter.states[1]?.frame == expected,
+                      "did not restore the spanning window to \(expected) \(scenario); got \(String(describing: adapter.states[1]?.frame))")
+            try check(access.perform(.restore, targetPID: 42_001, planner: restoreLayout) == .noPreviousFrame,
+                      "restoring the spanning window did not consume history \(scenario)")
+        }
         adapter.main = nil
         for id in 100...132 {
             adapter.focused = id
@@ -1334,9 +1356,11 @@ final class LauncherSmoke {
         }
 
         app.dismissSearch()
+        app.settingsSession.page = .general
         app.showSettings()
         try check(app.windowManagement.isTrusted == false && openedAccessibilitySettings.isEmpty,
                   "opening Settings did not silently check Accessibility trust")
+        try await verifyAccessibilitySettingsButton(in: app)
         app.showSearch()
         try type("left half", into: app)
         let trustChecks = windowAdapter.trustChecks
@@ -1347,12 +1371,8 @@ final class LauncherSmoke {
                 app.panel.frame.height == SearchWindow.height(for: app.model, needsAccessibility: true)
         }
         try check(app.searchPresented && windowAdapter.trustChecks == trustChecks + 1 && windowAdapter.lookups.count == lookups &&
-                  windowAdapter.writes.isEmpty && openedAccessibilitySettings.isEmpty,
+                  windowAdapter.writes.isEmpty && openedAccessibilitySettings.count == 1,
                   "untrusted command opened System Settings, retried trust or contacted a window")
-        app.windowManagement.openAccessibilitySettings()
-        try check(openedAccessibilitySettings.map(\.absoluteString) ==
-                    ["x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"],
-                  "explicit onboarding action did not dispatch the Accessibility deep-link")
 
         windowAdapter.trusted = true
         app.showSettings()
@@ -3595,6 +3615,31 @@ final class LauncherSmoke {
                   "a missing release event suppressed the next shortcut")
     }
 
+    private func verifyAccessibilitySettingsButton(in app: AppDelegate) async throws {
+        guard let window = app.settings, let view = window.contentView else { throw Failure("Settings did not load") }
+        // SwiftUI requires an ordered window for mouse events. Keep it transparent and send the click locally.
+        let frame = window.frame
+        let opacity = window.alphaValue
+        window.alphaValue = 0
+        window.orderBack(nil)
+        defer {
+            window.orderOut(nil)
+            window.setFrame(frame, display: false)
+            window.alphaValue = opacity
+        }
+        view.layoutSubtreeIfNeeded()
+        let bounds = view.convert(view.bounds, to: nil)
+        // The button is on the right side of the banner, just below the General heading.
+        let point = CGPoint(x: bounds.maxX - 90, y: bounds.maxY - 105)
+        for type: NSEvent.EventType in [.leftMouseDown, .leftMouseUp] {
+            window.sendEvent(try mouseEvent(type, count: 1, at: point, in: window))
+        }
+        try await until("the Settings button did not dispatch the Accessibility deep-link") {
+            openedAccessibilitySettings.map(\.absoluteString) ==
+                ["x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"]
+        }
+    }
+
     private func click(count: Int, at point: NSPoint, in window: NSWindow) throws {
         // Hit-test the live row, then deliver AppKit events to that responder. The
         // app-local event does not depend on desktop focus or the global mouse queue.
@@ -3602,15 +3647,20 @@ final class LauncherSmoke {
             throw Failure("the fixture row was not hit-testable")
         }
         for type: NSEvent.EventType in [.leftMouseDown, .leftMouseUp] {
-            guard let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
-                                                 timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
-                                                 context: nil, eventNumber: 0, clickCount: count,
-                                                 pressure: type == .leftMouseDown ? 1 : 0) else {
-                throw Failure("cannot make in-process mouse event")
-            }
+            let event = try mouseEvent(type, count: count, at: point, in: window)
             if type == .leftMouseDown { target.mouseDown(with: event) }
             else { target.mouseUp(with: event) }
         }
+    }
+
+    private func mouseEvent(_ type: NSEvent.EventType, count: Int, at point: NSPoint, in window: NSWindow) throws -> NSEvent {
+        guard let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
+                                             timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                                             context: nil, eventNumber: 0, clickCount: count,
+                                             pressure: type == .leftMouseDown ? 1 : 0) else {
+            throw Failure("cannot make in-process mouse event")
+        }
+        return event
     }
 
     private func type(_ text: String, into app: AppDelegate) throws {

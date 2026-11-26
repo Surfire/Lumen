@@ -69,6 +69,7 @@ final class AXWindowAccess<Adapter: WindowAccessAdapter>: @unchecked Sendable {
         let size = validFrame(of: window)?.size ?? placement.frame.size
         let positioned = adapter.setPosition(placement.position(for: size), of: window)
         let actual = validFrame(of: window)
+        // Verify against the requested frame, including the exact target of a spanning restore.
         let applied = actual.map { approximatelyEqual($0, placement.frame) } ?? false
         if command == .restore {
             if applied { forget(window) }

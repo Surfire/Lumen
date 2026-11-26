@@ -12,11 +12,13 @@ struct WindowLayoutPlanner {
 
     struct Placement {
         let frame: CGRect
-        let bounds: CGRect
+        // Exact restores have no single-display constraint, even after an app adjusts the size.
+        let bounds: CGRect?
 
         // The app may enforce a minimum size; keep as much of it on screen as possible.
         func position(for size: CGSize) -> CGPoint {
-            Self.clamp(CGRect(origin: frame.origin, size: size), to: bounds).origin
+            guard let bounds else { return frame.origin }
+            return Self.clamp(CGRect(origin: frame.origin, size: size), to: bounds).origin
         }
 
         static func clamp(_ frame: CGRect, to bounds: CGRect) -> CGRect {
@@ -38,8 +40,17 @@ struct WindowLayoutPlanner {
 
     func placement(for command: WindowCommand, currentAX: CGRect, previousAX: CGRect? = nil) -> Placement? {
         let current = appKitFrame(currentAX)
-        let reference = command == .restore ? previousAX.map(appKitFrame) : current
-        guard let reference, let index = displayIndex(for: reference) else { return nil }
+        let reference: CGRect
+        if command == .restore {
+            guard let previousAX else { return nil }
+            reference = appKitFrame(previousAX)
+            if isCoveredByVisibleFrames(reference) {
+                return Placement(frame: previousAX, bounds: nil)
+            }
+        } else {
+            reference = current
+        }
+        guard let index = displayIndex(for: reference) else { return nil }
         let visible = displays[index].visibleFrame
         var bounds = visible
         let frame: CGRect
@@ -70,9 +81,28 @@ struct WindowLayoutPlanner {
                            y: bounds.minY + round(y * (bounds.height - size.height)),
                            width: size.width, height: size.height)
         case .restore:
+            // Recover a saved frame that is no longer fully visible on the connected displays.
             frame = CGRect(origin: reference.origin, size: fit(reference.size, in: bounds))
         }
         return Placement(frame: Placement.clamp(axFrame(frame), to: axFrame(bounds)), bounds: axFrame(bounds))
+    }
+
+    private func isCoveredByVisibleFrames(_ frame: CGRect) -> Bool {
+        let intersections = displays.map { $0.visibleFrame.intersection(frame) }
+            .filter { !$0.isEmpty }.sorted { $0.minY < $1.minY }
+        let edges = ([frame.minX, frame.maxX] + intersections.flatMap { [$0.minX, $0.maxX] }).sorted()
+        // Within each vertical strip the covering displays don't change. Merge their Y intervals
+        // rather than counting overlaps twice or treating gaps inside a bounding box as visible.
+        for (left, right) in zip(edges, edges.dropFirst()) where left < right {
+            var coveredY = frame.minY
+            for rect in intersections where rect.minX <= left && rect.maxX >= right {
+                if rect.minY > coveredY { break }
+                coveredY = max(coveredY, rect.maxY)
+                if coveredY >= frame.maxY { break }
+            }
+            if coveredY < frame.maxY { return false }
+        }
+        return !frame.isEmpty
     }
 
     private func displayIndex(for rect: CGRect) -> Int? {

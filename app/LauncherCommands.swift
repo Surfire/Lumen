@@ -45,7 +45,7 @@ final class LauncherCommands: ObservableObject {
 
     func updateClipboard(_ items: [ClipboardItem], resetSelection: Bool = false) {
         let rows: [ClipboardItem]
-        if case .clipboard(let filter) = resolution { rows = items.filter { $0.matches(filter) } }
+        if case .clipboard(let filter) = resolution { rows = ClipboardItem.filtered(items, for: filter) }
         else { rows = [] }
         if clipboardRows != rows { clipboardRows = rows }
         if resetSelection || selectedClipboardItem == nil {

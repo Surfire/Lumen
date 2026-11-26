@@ -2,8 +2,10 @@ import AppKit
 import Carbon
 import Combine
 import Foundation
+import ImageIO
 import SQLite3
 import SwiftUI
+import zlib
 
 // Runs inside the built app with app-local AppKit and Carbon events and an isolated index.
 @MainActor
@@ -454,9 +456,10 @@ final class LauncherSmoke {
     }
 
     private func verifyClipboardHistory(_ app: AppDelegate) async throws {
-        try verifyClipboardSymlinks()
+        try verifyClipboardStorageLinks()
         try verifyClipboardDeduplication()
         try verifyInactiveClipboardStartup()
+        try verifyClipboardFilterLatency()
         try await verifyOriginalClipboardPNG()
         app.showSearch()
         let history = app.clipboard
@@ -647,12 +650,17 @@ final class LauncherSmoke {
     private func verifyInactiveClipboardStartup() throws {
         let session = NotificationCenter()
         let board = NSPasteboard.withUniqueName()
+        var onConsole = true
+        var samples = 0
         let history = ClipboardManager(defaults: translationPreferences!, pasteboard: board,
             directory: clipboardFixtureRoot.appendingPathComponent("inactive-startup/Clipboard"), automaticPolling: false,
-            sessionCenter: session, isConsoleSessionActive: { false })
+            sessionCenter: session, isConsoleSessionActive: { samples += 1; return onConsole })
         defer { history.stop() }
-        try check(history.enabled, "inactive startup fixture was not opted in")
+        try check(history.enabled && samples == 0, "session was sampled before clipboard capture started")
+        // The session can change after construction but before notification registration.
+        onConsole = false
         history.start()
+        try check(samples == 1, "start did not sample the initial session state")
         func write(_ text: String) throws {
             board.clearContents()
             try check(board.setString(text, forType: .string), "could not write startup session fixture")
@@ -684,9 +692,33 @@ final class LauncherSmoke {
         }
     }
 
-    private func verifyClipboardSymlinks() throws {
+    private func verifyClipboardFilterLatency() throws {
+        let text = String(repeating: "A", count: ClipboardStore.maximumTextBytes - 9) + " tail hit"
+        let items = (0..<500).map { id in
+            ClipboardItem(id: Int64(id), text: text, capturedAt: .now, sourceBundleID: "org.lumen.fixture",
+                          sourceAppName: "Fixture Editor", pinned: false)
+        }
+        try check(ClipboardItem.filtered(items, for: "fíxture editor").count == 500 &&
+                  ClipboardItem.filtered(items, for: "tail hit").isEmpty && items.first?.text == text,
+                  "search should fold metadata, index only the text prefix, and preserve the full payload")
+        // Nearly matching substring and fuzzy needles both fail at the last scalar.
+        let query = String(repeating: "a", count: 31) + "z"
+        let clock = ContinuousClock()
+        let samples = try (0..<20).map { _ in
+            let start = clock.now
+            let rows = ClipboardItem.filtered(items, for: query)
+            let elapsed = start.duration(to: clock.now)
+            try check(rows.isEmpty, "worst-case clipboard filter unexpectedly matched")
+            return elapsed
+        }.sorted()
+        let p95 = samples[18]
+        try check(p95 < .milliseconds(15), "500-item clipboard search exceeded 15 ms (p95: \(p95))")
+        print("500-item clipboard no-match search: p95 \(p95)")
+    }
+
+    private func verifyClipboardStorageLinks() throws {
         let fm = FileManager.default
-        let root = clipboardFixtureRoot.appendingPathComponent("symlink-storage")
+        let root = clipboardFixtureRoot.appendingPathComponent("linked-storage")
         let outside = root.appendingPathComponent("outside")
         try fm.createDirectory(at: outside, withIntermediateDirectories: true)
         let sentinel = outside.appendingPathComponent("sentinel")
@@ -707,18 +739,42 @@ final class LauncherSmoke {
         try fm.createSymbolicLink(at: linkedDirectory, withDestinationURL: outside)
         try reject(linkedDirectory)
         try reject(linkedDirectory.appendingPathComponent("nested/Clipboard"))
-        for name in [".history.sqlite", ".history.sqlite-wal", ".history.sqlite-shm", ".history.sqlite-journal"] {
-            let location = root.appendingPathComponent("case-\(name)")
-            let store = ClipboardStore(directory: location)
-            try check(try store.addText("initial", capturedAt: .now, bundleID: nil, appName: nil), "could not seed symlink fixture")
-            let link = location.appendingPathComponent(name)
-            if name == ".history.sqlite" { try fm.removeItem(at: link) }
-            try fm.createSymbolicLink(at: link, withDestinationURL: sentinel)
-            try reject(location)
+        let index = outside.appendingPathComponent("index.sqlite")
+        func makeIndexFixture() throws {
+            var handle: OpaquePointer?
+            defer { sqlite3_close(handle) }
+            try check(sqlite3_open(index.path, &handle) == SQLITE_OK &&
+                      sqlite3_exec(handle, "CREATE TABLE search_index (name TEXT)", nil, nil, nil) == SQLITE_OK,
+                      "could not create the hardlink target database")
         }
-        try check(try Data(contentsOf: sentinel) == original && fm.contentsOfDirectory(atPath: outside.path) == ["sentinel"] &&
-                  (fm.attributesOfItem(atPath: sentinel.path)[.posixPermissions] as? NSNumber)?.intValue == 0o644,
-                  "unsafe storage modified files outside the clipboard directory")
+        try makeIndexFixture()
+        try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: index.path)
+        let indexBytes = try Data(contentsOf: index)
+        for hardlink in [false, true] {
+            for name in [".history.sqlite", ".history.sqlite-wal", ".history.sqlite-shm", ".history.sqlite-journal"] {
+                let location = root.appendingPathComponent("\(hardlink ? "hardlink" : "symlink")-\(name)")
+                let store = ClipboardStore(directory: location)
+                try check(try store.addText("initial", capturedAt: .now, bundleID: nil, appName: nil), "could not seed link fixture")
+                let link = location.appendingPathComponent(name)
+                if name == ".history.sqlite" { try fm.removeItem(at: link) }
+                if hardlink { try fm.linkItem(at: index, to: link) }
+                else { try fm.createSymbolicLink(at: link, withDestinationURL: sentinel) }
+                try reject(location)
+                if hardlink {
+                    // The original connection must also stop before clearing any blobs.
+                    let refusedCleanup: Bool
+                    do { try store.clearAll(); refusedCleanup = false }
+                    catch { refusedCleanup = true }
+                    try check(refusedCleanup && Data(contentsOf: link) == indexBytes,
+                              "clipboard cleanup accepted, changed, or removed the hardlink")
+                }
+            }
+        }
+        try check(try Data(contentsOf: sentinel) == original && Data(contentsOf: index) == indexBytes &&
+                  Set(fm.contentsOfDirectory(atPath: outside.path)) == ["sentinel", "index.sqlite"] &&
+                  [sentinel, index].allSatisfy {
+                      (try fm.attributesOfItem(atPath: $0.path)[.posixPermissions] as? NSNumber)?.intValue == 0o644
+                  }, "unsafe storage modified files outside the clipboard directory")
     }
 
     private func verifyOriginalClipboardPNG() async throws {
@@ -746,17 +802,62 @@ final class LauncherSmoke {
         try check(try history.store.image(id: clip.id) == png && history.copy(id: clip.id) && board.data(forType: .png) == png,
                   "bounded original PNG was resized or re-encoded")
 
+        // A valid, highly compressible PNG just above the pixel budget. Build it from
+        // packed 1-bit scanlines so the fixture itself never allocates a large raster.
+        let oversizedPNG = try makeOversizedClipboardPNG()
+        board.clearContents()
+        try check(board.setData(oversizedPNG, forType: .png), "could not put oversized PNG on pasteboard")
+        await history.poll()?.value
+        try check(history.items == [clip], "oversized PNG was captured or resized instead of being rejected")
+
         var handle: OpaquePointer?
         defer { sqlite3_close(handle) }
         let path = storeDirectory.appendingPathComponent(".history.sqlite").path
         try check(sqlite3_open_v2(path, &handle, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK, "could not open corrupt blob fixture")
         let marker = board.changeCount
-        for blob in ["X'89504e470d0a1a0a'", "zeroblob(\(ClipboardStore.maximumImageBytes + 1))"] {
+        let oversizedHex = oversizedPNG.map { String(format: "%02x", $0) }.joined()
+        for blob in ["X'89504e470d0a1a0a'", "X'\(oversizedHex)'", "zeroblob(\(ClipboardStore.maximumImageBytes + 1))"] {
             try check(sqlite3_exec(handle, "UPDATE clips SET image = \(blob) WHERE id = \(clip.id)", nil, nil, nil) == SQLITE_OK,
                       "could not inject an invalid image row")
             try check(try history.store.image(id: clip.id) == nil && !history.copy(id: clip.id) && board.changeCount == marker,
                       "an invalid stored image could be copied to the pasteboard")
         }
+    }
+
+    private func makeOversizedClipboardPNG() throws -> Data {
+        let width = 8_000, height = 4_001
+        let scanlines = Data(count: (width / 8 + 1) * height) // One filter byte per row.
+        var size = compressBound(uLong(scanlines.count))
+        var compressed = Data(count: Int(size))
+        let status = scanlines.withUnsafeBytes { input in
+            compressed.withUnsafeMutableBytes { output in
+                compress(output.bindMemory(to: UInt8.self).baseAddress, &size,
+                         input.bindMemory(to: UInt8.self).baseAddress, uLong(input.count))
+            }
+        }
+        try check(status == Z_OK, "could not compress oversized PNG fixture")
+        compressed.count = Int(size)
+
+        func bigEndian(_ value: UInt32) -> Data { withUnsafeBytes(of: value.bigEndian) { Data($0) } }
+        var png = Data([137, 80, 78, 71, 13, 10, 26, 10])
+        func appendChunk(_ type: String, _ payload: Data) {
+            let bytes = Data(type.utf8) + payload
+            let checksum = bytes.withUnsafeBytes { crc32(0, $0.bindMemory(to: UInt8.self).baseAddress, uInt($0.count)) }
+            png.append(bigEndian(UInt32(payload.count)))
+            png.append(bytes)
+            png.append(bigEndian(UInt32(checksum)))
+        }
+        appendChunk("IHDR", bigEndian(UInt32(width)) + bigEndian(UInt32(height)) + Data([1, 0, 0, 0, 0]))
+        appendChunk("IDAT", compressed)
+        appendChunk("IEND", Data())
+        guard let source = ClipboardStore.imageSource(png),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] else {
+            throw Failure("could not read oversized PNG fixture metadata")
+        }
+        try check(png.count <= ClipboardStore.maximumImageBytes && CGImageSourceGetStatus(source) == .statusComplete &&
+                  properties[kCGImagePropertyPixelWidth] as? Int == width && properties[kCGImagePropertyPixelHeight] as? Int == height,
+                  "oversized PNG fixture did not have the expected dimensions and byte size")
+        return png
     }
 
     private func verifyActions(_ app: AppDelegate) async throws {

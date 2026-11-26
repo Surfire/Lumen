@@ -237,7 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
         clipboardUpdates = clipboard.$items.dropFirst().sink { [weak self] items in
             guard let self, self.commands.isClipboardCommand else { return }
-            self.updateClipboardCommands(items)
+            self.commands.updateClipboard(items)
             self.updatePresentation()
         }
         clipboard.start()
@@ -441,7 +441,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         translation.setCommand(translationCommand)
         if previousCommand != next {
             if commands.isClipboardCommand { clipboard.loadHistory() }
-            updateClipboardCommands(clipboard.items, resetSelection: true)
+            commands.updateClipboard(clipboard.items, resetSelection: true)
         }
         if case .image(let term) = next {
             imageSearch.ensureStatus()
@@ -460,13 +460,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             (previousCommand == .translation) != (next == .translation) {
             updatePresentation()
         }
-    }
-
-    private func updateClipboardCommands(_ items: [ClipboardItem], resetSelection: Bool = false) {
-        let ranked: [ClipboardItem]
-        if case .clipboard(let filter) = commands.resolution { ranked = ClipboardStore.rank(items, for: filter) }
-        else { ranked = items }
-        commands.updateClipboard(ranked, resetSelection: resetSelection)
     }
 
     private func searchCommandAsFiles() {

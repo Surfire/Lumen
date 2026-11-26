@@ -22,8 +22,9 @@ final class ClipboardManager: ObservableObject {
     private let pasteboard: NSPasteboard
     private let automaticPolling: Bool
     private let sessionCenter: NotificationCenter
+    private let isConsoleSessionActive: () -> Bool
     private var sessionObservers: [AnyCancellable] = []
-    private var sessionActive: Bool
+    private var sessionActive = false
     private var timer: Timer?
     private var lastChangeCount: Int?
     private var imageWork: Task<Void, Never>?
@@ -31,8 +32,8 @@ final class ClipboardManager: ObservableObject {
 
     init(defaults: UserDefaults, pasteboard: NSPasteboard, directory: URL = ClipboardStore.defaultDirectory,
          automaticPolling: Bool = true, sessionCenter: NotificationCenter = NSWorkspace.shared.notificationCenter,
-         isConsoleSessionActive: () -> Bool = ClipboardManager.isOnConsole) {
-        sessionActive = isConsoleSessionActive()
+         isConsoleSessionActive: @escaping () -> Bool = ClipboardManager.isOnConsole) {
+        self.isConsoleSessionActive = isConsoleSessionActive
         self.defaults = defaults
         self.pasteboard = pasteboard
         self.automaticPolling = automaticPolling
@@ -59,6 +60,8 @@ final class ClipboardManager: ObservableObject {
             observeSession(NSWorkspace.sessionDidResignActiveNotification, active: false),
             observeSession(NSWorkspace.sessionDidBecomeActiveNotification, active: true)
         ]
+        // Sample only once the observers can see subsequent session transitions.
+        sessionActive = isConsoleSessionActive()
         configurePolling()
     }
 
@@ -223,7 +226,7 @@ final class ClipboardManager: ObservableObject {
     }
 
     nonisolated private static func encodeImage(_ bytes: Data) -> (png: Data, thumbnail: Data)? {
-        guard let source = CGImageSourceCreateWithData(bytes as CFData, [kCGImageSourceShouldCache: false] as CFDictionary) else { return nil }
+        guard let source = ClipboardStore.imageSource(bytes) else { return nil }
         func png(maximumDimension: Int) -> Data? {
             guard !Task.isCancelled, let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
                 kCGImageSourceCreateThumbnailFromImageAlways: true,
@@ -235,9 +238,13 @@ final class ClipboardManager: ObservableObject {
             CGImageDestinationAddImage(output, image, nil)
             return CGImageDestinationFinalize(output) ? data as Data : nil
         }
-        // Keep an already bounded PNG verbatim, including its original dimensions and metadata.
-        if bytes.count <= ClipboardStore.maximumImageBytes, ClipboardStore.isDecodablePNG(bytes, source: source) {
-            return png(maximumDimension: 240).map { (bytes, $0) }
+        if CGImageSourceGetType(source) == UTType.png.identifier as CFString {
+            // Do not fall back to decoding an invalid or oversized PNG during re-encoding.
+            guard ClipboardStore.isDecodablePNG(source) else { return nil }
+            // Keep a bounded PNG verbatim, including its original dimensions and metadata.
+            if bytes.count <= ClipboardStore.maximumImageBytes {
+                return png(maximumDimension: 240).map { (bytes, $0) }
+            }
         }
         // Other inline image bytes (never file URLs) are resized and re-encoded to fit.
         for dimension in [1600, 896, 512, 320] {

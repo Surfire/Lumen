@@ -13,25 +13,54 @@ struct ClipboardItem: Identifiable, Equatable {
     let sourceAppName: String?
     let pinned: Bool
 
-    private static let searchOptions: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
-    private var searchableFields: [String] { [text, sourceAppName, sourceBundleID].compactMap { $0 } }
+    private static let searchPrefixLength = 2_048
+    private static let maximumFuzzyLength = 32
+    private let searchableFields: [Data]
 
-    func containsSubstring(_ query: String) -> Bool {
-        searchableFields.contains { $0.range(of: query, options: Self.searchOptions) != nil }
+    init(id: Int64, text: String?, capturedAt: Date, sourceBundleID: String?, sourceAppName: String?, pinned: Bool) {
+        self.id = id
+        self.text = text
+        self.capturedAt = capturedAt
+        self.sourceBundleID = sourceBundleID
+        self.sourceAppName = sourceAppName
+        self.pinned = pinned
+        // Only the search index is truncated; copy and preview still use the original text.
+        searchableFields = [text, sourceAppName, sourceBundleID].compactMap { field in
+            field.map { Data(Self.fold(String($0.unicodeScalars.prefix(Self.searchPrefixLength))).utf8) }
+        }
     }
 
-    func matches(_ query: String) -> Bool {
-        if query.isEmpty || containsSubstring(query) { return true }
-        let needle = query.folding(options: Self.searchOptions, locale: nil)
-        guard !needle.isEmpty else { return false }
-        return searchableFields.contains { field in
-            var remaining = needle[...]
-            for character in field.folding(options: Self.searchOptions, locale: nil) where character == remaining.first {
-                remaining.removeFirst()
-                if remaining.isEmpty { return true }
+    private static func fold(_ value: String) -> String {
+        value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+            .precomposedStringWithCanonicalMapping
+    }
+
+    // Visit each item once, keeping recency order within each matching tier.
+    static func filtered(_ items: [ClipboardItem], for query: String) -> [ClipboardItem] {
+        guard !query.isEmpty else { return items }
+        let folded = fold(query)
+        guard !folded.isEmpty else { return [] }
+        let needle = Data(folded.utf8)
+        let scalars = folded.unicodeScalars.prefix(maximumFuzzyLength + 1)
+        let fuzzyNeedles = scalars.count <= maximumFuzzyLength ? scalars.map { Data(String($0).utf8) } : []
+        var substrings: [ClipboardItem] = []
+        var fuzzy: [ClipboardItem] = []
+        for item in items {
+            if item.searchableFields.contains(where: { $0.range(of: needle) != nil }) {
+                substrings.append(item)
+            } else if !fuzzyNeedles.isEmpty, item.searchableFields.contains(where: { field in
+                var offset = field.startIndex
+                // Match complete UTF-8 scalars, not individual bytes from different characters.
+                for scalar in fuzzyNeedles {
+                    guard let match = field.range(of: scalar, in: offset..<field.endIndex) else { return false }
+                    offset = match.upperBound
+                }
+                return true
+            }) {
+                fuzzy.append(item)
             }
-            return false
         }
+        return substrings + fuzzy
     }
 }
 
@@ -70,18 +99,6 @@ final class ClipboardStore {
         let root = directory.path
         func isPrivate(_ path: String) -> Bool { path == root || path.hasPrefix(root + "/") }
         return isPrivate(url.path) || isPrivate(url.resolvingSymlinksInPath().path)
-    }
-
-    // Keep recency order within each tier. The command model then drops nonmatches.
-    static func rank(_ items: [ClipboardItem], for query: String) -> [ClipboardItem] {
-        guard !query.isEmpty else { return items }
-        var substrings: [ClipboardItem] = []
-        var others: [ClipboardItem] = []
-        for item in items {
-            if item.containsSubstring(query) { substrings.append(item) }
-            else { others.append(item) }
-        }
-        return substrings + others
     }
 
     func items() throws -> [ClipboardItem] {
@@ -169,14 +186,14 @@ final class ClipboardStore {
         }
     }
 
-    func image(id: Int64) throws -> Data? {
-        guard let bytes = try imageBytes("image", id: id),
-              let source = CGImageSourceCreateWithData(bytes as CFData, nil),
-              Self.isDecodablePNG(bytes, source: source) else { return nil }
+    func image(id: Int64) throws -> Data? { try validatedPNG("image", id: id) }
+    func thumbnail(id: Int64) throws -> Data? { try validatedPNG("thumbnail", id: id) }
+
+    private func validatedPNG(_ column: String, id: Int64) throws -> Data? {
+        guard let bytes = try imageBytes(column, id: id),
+              let source = Self.imageSource(bytes), Self.isDecodablePNG(source) else { return nil }
         return bytes
     }
-
-    func thumbnail(id: Int64) throws -> Data? { try imageBytes("thumbnail", id: id) }
 
     private func imageBytes(_ column: String, id: Int64) throws -> Data? {
         guard let db = try database() else { return nil }
@@ -188,12 +205,25 @@ final class ClipboardStore {
         }
     }
 
-    nonisolated static func isDecodablePNG(_ bytes: Data, source: CGImageSource) -> Bool {
-        bytes.starts(with: [137, 80, 78, 71, 13, 10, 26, 10]) &&
-            CGImageSourceGetType(source) == UTType.png.identifier as CFString &&
-            CGImageSourceGetStatus(source) == .statusComplete &&
-            CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete &&
-            CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary) != nil
+    nonisolated static func imageSource(_ bytes: Data) -> CGImageSource? {
+        CGImageSourceCreateWithData(bytes as CFData, [kCGImageSourceShouldCache: false] as CFDictionary)
+    }
+
+    nonisolated static func isDecodablePNG(_ source: CGImageSource) -> Bool {
+        guard CGImageSourceGetType(source) == UTType.png.identifier as CFString,
+              CGImageSourceGetCount(source) >= 1,
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int,
+              width > 0, height > 0, width <= 32_000_000 / height,
+              CGImageSourceGetStatus(source) == .statusComplete,
+              CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete else { return false }
+        // Check decoding without asking ImageIO to cache a full-resolution raster.
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, [
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceThumbnailMaxPixelSize: 64
+        ] as CFDictionary) != nil
     }
 
     func noteUsed(id: Int64) throws {
@@ -256,10 +286,14 @@ final class ClipboardStore {
         return child
     }
 
-    private func regularFileExists(_ name: String, in directoryFD: Int32) throws -> Bool {
+    private func isPrivateStorageFile(_ info: stat) -> Bool {
+        info.st_mode & S_IFMT == S_IFREG && info.st_nlink == 1
+    }
+
+    private func storageFileExists(_ name: String, in directoryFD: Int32) throws -> Bool {
         var info = stat()
         if fstatat(directoryFD, name, &info, AT_SYMLINK_NOFOLLOW) == 0 {
-            guard info.st_mode & S_IFMT == S_IFREG else { throw StoreError.unavailable }
+            guard isPrivateStorageFile(info) else { throw StoreError.unavailable }
             return true
         }
         guard errno == ENOENT else { throw StoreError.unavailable }
@@ -269,11 +303,11 @@ final class ClipboardStore {
     private func database(create: Bool = false) throws -> OpaquePointer? {
         guard let directoryFD = try openDirectory(directory, create: create) else { return nil }
         defer { close(directoryFD) }
-        // All payloads are SQLite BLOBs, not separate files. Check the hidden
-        // database and all sidecar paths before letting SQLite use them.
+        // All payloads are SQLite BLOBs, not separate files. Reject links on the
+        // database and sidecars before chmod or any SQLite recovery or cleanup.
         let name = Self.databaseName
-        let exists = try regularFileExists(name, in: directoryFD)
-        for suffix in ["-wal", "-shm", "-journal"] { _ = try regularFileExists(name + suffix, in: directoryFD) }
+        let exists = try storageFileExists(name, in: directoryFD)
+        for suffix in ["-wal", "-shm", "-journal"] { _ = try storageFileExists(name + suffix, in: directoryFD) }
         if let connection {
             guard exists else { throw StoreError.unavailable }
             return connection
@@ -320,7 +354,7 @@ final class ClipboardStore {
         guard fd >= 0 else { throw StoreError.unavailable }
         defer { close(fd) }
         var info = stat()
-        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, fchmod(fd, 0o600) == 0 else {
+        guard fstat(fd, &info) == 0, isPrivateStorageFile(info), fchmod(fd, 0o600) == 0 else {
             throw StoreError.unavailable
         }
     }

@@ -229,11 +229,13 @@ pub(super) fn retire(conn: &Connection, id: i64) -> Result<bool> {
     Ok(remove_document(conn, id)? || job)
 }
 
-#[derive(Default, Serialize)]
+#[derive(Default, Deserialize, Serialize)]
 pub struct ContentBatch {
     pub processed: usize,
     pub indexed: usize,
     pub pending: i64,
+    #[serde(default)]
+    pub skipped: usize,
 }
 
 #[derive(Default, Serialize)]
@@ -325,7 +327,10 @@ pub fn index_content(database: &Path, max: usize) -> Result<ContentBatch> {
             let update =
                 match prepare_update(&conn, &configured, ocr.as_ref(), id, Path::new(&path)) {
                     Ok(Some(update)) => update,
-                    Ok(None) => continue,
+                    Ok(None) => {
+                        batch.skipped += 1;
+                        continue;
+                    }
                     Err(error) if has_io_error(&error, ErrorKind::PermissionDenied) => {
                         Update::Denied
                     }
@@ -350,6 +355,7 @@ pub fn index_content(database: &Path, max: usize) -> Result<ContentBatch> {
                     // Clear it now, but keep the job pending for a later retry.
                     remove_document(&tx, id)?;
                     tx.commit()?;
+                    batch.skipped += 1;
                     continue;
                 }
                 Update::Retire => {
@@ -610,6 +616,7 @@ mod tests {
         let failed = index_content(&database, 1).unwrap();
         assert_eq!(failed.pending, 1);
         assert_eq!(failed.indexed, 0);
+        assert_eq!(failed.skipped, 1);
         let reader = open_read(&database).unwrap();
         let stamped: i64 = reader
             .query_row(
@@ -657,7 +664,9 @@ mod tests {
         fs::set_permissions(&docs, fs::Permissions::from_mode(0o000)).unwrap();
         let failed = index_content(&database, 1);
         fs::set_permissions(&docs, fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(failed.unwrap().pending, 1);
+        let failed = failed.unwrap();
+        assert_eq!(failed.pending, 1);
+        assert_eq!(failed.skipped, 1);
         let recovered = index_content(&database, 1).unwrap();
         assert_eq!(recovered.indexed, 1);
         assert_eq!(recovered.pending, 0);

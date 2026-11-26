@@ -141,7 +141,7 @@ mod macos {
         // Periodic checks cover silently lost notifications, non-journaling
         // volumes, and directories we could not read during a previous pass.
         let policy = MaintenancePolicy {
-            periodic: Duration::from_secs(30 * 60),
+            periodic: Duration::from_secs(6 * 60 * 60),
             recovery_cooldown: Duration::from_secs(30),
             persistent: true,
             guarded_cache,

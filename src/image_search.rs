@@ -8,10 +8,13 @@ use crate::{
     semantic::GemmaQuery,
     vector::{Matrix, MatrixCache, adaptive_floor, pack},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 pub const MODEL_ID: &str = "gemma2/image/imageio512-v1/q8_0/b11457/retrieval/768/l2/0531309472a6bc6f4b146c3736eee7795ec9db1903c25490d3c937490cef6dd8";
 const MAX_VECTORS: i64 = 4096;
@@ -167,6 +170,16 @@ pub struct ImageBatch {
     pub next_after: Option<String>,
 }
 
+trait ImageEncoder {
+    fn encode_image_bytes(&mut self, bytes: &[u8]) -> Result<Vec<f32>>;
+}
+
+impl ImageEncoder for crate::gemma::GemmaWorker {
+    fn encode_image_bytes(&mut self, bytes: &[u8]) -> Result<Vec<f32>> {
+        self.encode_image(bytes)
+    }
+}
+
 pub fn image_batch(
     database: &Path,
     model: &GemmaModel,
@@ -180,8 +193,47 @@ pub fn image_batch(
     );
     let database = absolute(database)?;
     let reader = open_read(&database)?;
+    let mut writer = None;
+    let mut worker = None;
+    let mut connect = Some(|| model.start_images(projector));
+    let (batch, _) = image_batch_step(
+        &database,
+        &reader,
+        &mut writer,
+        &mut connect,
+        &mut worker,
+        after,
+        max,
+        None,
+        None,
+        false,
+    )?;
+    Ok(batch
+        .expect("non-streaming batch always returns a result")
+        .0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn image_batch_step<E: ImageEncoder>(
+    database: &Path,
+    reader: &Connection,
+    writer: &mut Option<Connection>,
+    connect: &mut Option<impl FnOnce() -> Result<E>>,
+    worker: &mut Option<E>,
+    after: Option<&str>,
+    max: usize,
+    expected_rules: Option<&Rules>,
+    stop: Option<&AtomicBool>,
+    yield_on_scope_change: bool,
+) -> Result<(Option<(ImageBatch, Rules)>, bool)> {
     let snapshot = reader.unchecked_transaction()?;
-    let rules = Rules::read(&snapshot)?.context("choose a folder with image-scope first")?;
+    let current_rules = Rules::read(&snapshot)?;
+    if let Some(expected) = expected_rules
+        && current_rules.as_ref() != Some(expected)
+    {
+        return Ok((None, true));
+    }
+    let rules = current_rules.context("choose a folder with image-scope first")?;
     let (lower, upper) = rules.bounds();
     let after = after.unwrap_or("");
     ensure!(
@@ -224,28 +276,43 @@ pub fn image_batch(
         .collect::<rusqlite::Result<Vec<_>>>()?
     };
     drop(snapshot);
+    let total_rows = rows.len();
+    let planned = total_rows.min(max);
     let mut batch = ImageBatch {
         model_id: MODEL_ID,
-        processed: rows.len().min(max),
+        processed: planned,
         indexed: 0,
         reused: 0,
         skipped: 0,
         limited: false,
-        next_after: (rows.len() > max).then(|| rows[max - 1].1.clone()),
+        next_after: (total_rows > max).then(|| rows[max - 1].1.clone()),
     };
-    let mut worker = None;
     let mut encoded = Vec::new();
-    for (id, path, prior, occupied) in rows.into_iter().take(max) {
-        ensure!(
-            Rules::read(&reader)?.as_ref() == Some(&rules),
-            "image or filename scope changed; retry the batch"
-        );
+    let mut stopped = false;
+    let mut last_path = None;
+    for (idx, (id, path, prior, occupied)) in rows.into_iter().take(max).enumerate() {
+        if stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            if idx == 0 {
+                return Ok((None, true));
+            }
+            batch.processed = idx;
+            batch.next_after = last_path.filter(|_| total_rows > idx);
+            stopped = true;
+            break;
+        }
+        if Rules::read(reader)?.as_ref() != Some(&rules) {
+            if yield_on_scope_change {
+                return Ok((None, true));
+            }
+            bail!("image or filename scope changed; retry the batch");
+        }
         let source = Path::new(&path);
         let stamp = rules
             .allows(source)
             .then(|| local_stamp(source, false))
             .flatten();
         let Some(stamp) = stamp else {
+            last_path = Some(path);
             batch.skipped += 1;
             continue;
         };
@@ -253,40 +320,50 @@ pub fn image_batch(
             .as_deref()
             .is_some_and(|prior| crate::index::stamp_matches(prior, &stamp))
         {
+            last_path = Some(path);
             batch.reused += 1;
             continue;
         }
         if !occupied && available <= 0 {
+            last_path = Some(path);
             batch.limited = true;
             batch.skipped += 1;
             continue;
         }
         let Ok(bytes) = platform::read_local_checked(source, MAX_FILE_BYTES, Some(&stamp)) else {
+            last_path = Some(path);
             batch.skipped += 1;
             continue;
         };
         let Some(bytes) = thumbnail(&bytes) else {
+            last_path = Some(path);
             batch.skipped += 1;
             continue;
         };
-        let worker = match &mut worker {
+        let worker = match worker {
             Some(worker) => worker,
-            None => worker.insert(model.start_images(projector)?),
+            None => worker.insert(connect.take().expect("image worker connects once")()?),
         };
-        let vector = worker.encode_image(&bytes)?;
+        let vector = worker.encode_image_bytes(&bytes)?;
         available -= i64::from(!occupied);
+        last_path = Some(path.clone());
         encoded.push((id, path, stamp, pack(&vector)));
     }
     if encoded.is_empty() {
-        return Ok(batch);
+        return Ok((Some((batch, rules)), stopped));
     }
 
-    let (mut conn, _lease) = open_write(&database, false)?;
+    if writer.is_none() {
+        *writer = Some(open_write(database, false)?.0);
+    }
+    let conn = writer.as_mut().expect("opened writer connection");
     let txn = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    ensure!(
-        Rules::read(&txn)?.as_ref() == Some(&rules),
-        "image or filename scope changed; retry the batch"
-    );
+    if Rules::read(&txn)?.as_ref() != Some(&rules) {
+        if yield_on_scope_change {
+            return Ok((None, true));
+        }
+        bail!("image or filename scope changed; retry the batch");
+    }
     let mut total: i64 = txn.query_row("SELECT count(*) FROM image_embedding", [], |r| r.get(0))?;
     for (id, path, stamp, packed) in encoded {
         let still_indexed: bool = txn.query_row(
@@ -321,7 +398,61 @@ pub fn image_batch(
         batch.indexed += 1;
     }
     txn.commit()?;
-    Ok(batch)
+    Ok((Some((batch, rules)), stopped))
+}
+
+fn image_stream_with<E: ImageEncoder>(
+    database: &Path,
+    connect: impl FnOnce() -> Result<E>,
+    after: Option<&str>,
+    max: usize,
+    stop: &AtomicBool,
+    mut emit: impl FnMut(&ImageBatch) -> Result<()>,
+) -> Result<()> {
+    ensure!(
+        (1..=MAX_BATCH).contains(&max),
+        "image batch size must be 1 through {MAX_BATCH}"
+    );
+    let database = absolute(database)?;
+    let reader = open_read(&database)?;
+    let mut writer = None;
+    let mut worker = None;
+    let mut connect = Some(connect);
+    let mut cursor = after.map(str::to_owned);
+    let mut locked_rules = None;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let (step, stopped) = image_batch_step(
+            &database,
+            &reader,
+            &mut writer,
+            &mut connect,
+            &mut worker,
+            cursor.as_deref(),
+            max,
+            locked_rules.as_ref(),
+            Some(stop),
+            true,
+        )?;
+        let Some((batch, rules)) = step else {
+            break;
+        };
+        if locked_rules.is_none() {
+            locked_rules = Some(rules);
+        }
+        let done = stopped
+            || batch.limited
+            || batch.next_after.as_deref() == cursor.as_deref()
+            || batch.next_after.is_none();
+        emit(&batch)?;
+        if done {
+            break;
+        }
+        cursor = batch.next_after;
+    }
+    Ok(())
 }
 
 /// Called by the standard activation validator after current live metadata has matched.
@@ -357,6 +488,25 @@ pub struct ImageSearchSession<'a> {
 }
 
 impl<'a> ImageSearchSession<'a> {
+    pub fn index_stream(
+        database: &Path,
+        model: &GemmaModel,
+        projector: &Path,
+        after: Option<&str>,
+        max: usize,
+        stop: &AtomicBool,
+        emit: impl FnMut(&ImageBatch) -> Result<()>,
+    ) -> Result<()> {
+        image_stream_with(
+            database,
+            || model.start_images(projector),
+            after,
+            max,
+            stop,
+            emit,
+        )
+    }
+
     pub fn open(database: &Path, model: &'a GemmaModel, projector: PathBuf) -> Result<Self> {
         Ok(Self {
             conn: open_read(database)?,
@@ -740,6 +890,140 @@ mod tests {
 
         drop(session);
         drop(writer);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn image_stream_boots_worker_once_and_stops_on_completion_or_signal() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-image-stream-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let images = root.join("images");
+        fs::create_dir_all(&images).unwrap();
+        // Minimal valid 1x1 PNG so thumbnail() succeeds without CoreGraphics errors.
+        let png: &[u8] = &[
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, b'I', b'D', b'A', b'T', 0x08,
+            0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d,
+            0xb0, 0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+        ];
+        for i in 0..5 {
+            fs::write(images.join(format!("img-{i}.png")), png).unwrap();
+        }
+        let database = root.join("index.db");
+        crate::index::scan(
+            &database,
+            &Scope {
+                roots: vec![images.clone()],
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        image_scope(&database, Some(&images)).unwrap();
+
+        struct MockImageEncoder {
+            on_encode: Box<dyn FnMut() -> Result<Vec<f32>>>,
+        }
+        impl ImageEncoder for MockImageEncoder {
+            fn encode_image_bytes(&mut self, _: &[u8]) -> Result<Vec<f32>> {
+                (self.on_encode)()
+            }
+        }
+
+        let mut connect_count = 0usize;
+        let stop = AtomicBool::new(false);
+        let mut batches = Vec::new();
+        image_stream_with(
+            &database,
+            || {
+                connect_count += 1;
+                Ok(MockImageEncoder {
+                    on_encode: Box::new(|| Ok(query_vector())),
+                })
+            },
+            None,
+            2,
+            &stop,
+            |batch| {
+                batches.push((
+                    batch.processed,
+                    batch.indexed,
+                    batch.reused,
+                    batch.next_after.is_some(),
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(connect_count, 1);
+        assert_eq!(
+            batches,
+            [(2, 2, 0, true), (2, 2, 0, true), (1, 1, 0, false)]
+        );
+        assert_eq!(image_status(&database).unwrap().vectors, 5);
+
+        // Cached re-run skips launching the worker completely.
+        let mut cached_connects = 0usize;
+        let mut cached_batches = Vec::new();
+        image_stream_with(
+            &database,
+            || {
+                cached_connects += 1;
+                Ok(MockImageEncoder {
+                    on_encode: Box::new(|| Ok(query_vector())),
+                })
+            },
+            None,
+            2,
+            &stop,
+            |batch| {
+                cached_batches.push((
+                    batch.processed,
+                    batch.indexed,
+                    batch.reused,
+                    batch.next_after.is_some(),
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(cached_connects, 0);
+        assert_eq!(
+            cached_batches,
+            [(2, 0, 2, true), (2, 0, 2, true), (1, 0, 1, false)]
+        );
+
+        // Clean stop signal mid-batch yields partial progress and exits cleanly.
+        let writer = Connection::open(&database).unwrap();
+        writer.execute("DELETE FROM image_embedding", []).unwrap();
+        drop(writer);
+        let stop_flag = std::sync::Arc::new(AtomicBool::new(false));
+        let trigger = stop_flag.clone();
+        let mut stopped_batches = Vec::new();
+        image_stream_with(
+            &database,
+            || {
+                Ok(MockImageEncoder {
+                    on_encode: Box::new(move || {
+                        trigger.store(true, Ordering::Release);
+                        Ok(query_vector())
+                    }),
+                })
+            },
+            None,
+            2,
+            &stop_flag,
+            |batch| {
+                stopped_batches.push((batch.processed, batch.indexed, batch.next_after.is_some()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(stopped_batches, [(1, 1, true)]);
+        assert_eq!(image_status(&database).unwrap().vectors, 1);
+
         fs::remove_dir_all(root).unwrap();
     }
 }

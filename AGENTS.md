@@ -36,8 +36,8 @@ Run all relevant checks before reporting `worker_done`:
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-cargo test --locked --manifest-path extensions/Cargo.toml
-scripts/build-app.sh
+scripts/build-app.sh                # pure release build (without smoke tests)
+LUMEN_SMOKE=1 scripts/build-app.sh  # build with smoke tests enabled
 python3 scripts/smoke-app.py
 python3 scripts/smoke-launcher.py
 python3 scripts/smoke-relaunch.py target/Lumen.app

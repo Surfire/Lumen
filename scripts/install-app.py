@@ -19,7 +19,6 @@ from dataclasses import dataclass
 BUNDLE_ID = "io.github.surfire.lumen"
 HELPERS = {
     "lumen": f"{BUNDLE_ID}.engine",
-    "LumenLocalEmbedding": f"{BUNDLE_ID}.embedding",
     "LumenPdfExtractor": f"{BUNDLE_ID}.pdf",
     "LumenImageOcrExtractor": f"{BUNDLE_ID}.image-ocr",
 }

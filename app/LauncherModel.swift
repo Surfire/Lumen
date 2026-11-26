@@ -200,7 +200,6 @@ final class Launcher: ObservableObject {
     private var watchSupported: Bool?
     private var watchReportsProgress = false
     private var watchSupportsCachedStart = false
-    private var indexReportsProgress = true
     private var scanGeneration: UInt64 = 0
     private var revision: UInt64 = 0
     private var resultsRevision: UInt64?
@@ -386,14 +385,22 @@ final class Launcher: ObservableObject {
                 applyScope(names)
             }
         }
-        _ = engine.run(["watch", "--help"]) { [weak self] response in
-            guard let self, !self.closed else { return }
-            self.watchSupported = response.succeeded
-            let help = String(decoding: response.output, as: UTF8.self)
-            self.watchReportsProgress = response.succeeded && help.contains("--progress")
-            self.watchSupportsCachedStart = response.succeeded && help.contains("--cached-start")
-            self.indexStatus.set(\.watchState, to: response.succeeded ? (self.scopePending ? .paused : .needsSetup) : .unavailable)
-            self.startWatcherIfReady()
+        if engine.usesCoreLibrary {
+            watchSupported = true
+            watchReportsProgress = true
+            watchSupportsCachedStart = true
+            indexStatus.set(\.watchState, to: scopePending ? .paused : .needsSetup)
+            startWatcherIfReady()
+        } else {
+            _ = engine.run(["watch", "--help"]) { [weak self] response in
+                guard let self, !self.closed else { return }
+                self.watchSupported = response.succeeded
+                let help = String(decoding: response.output, as: UTF8.self)
+                self.watchReportsProgress = response.succeeded && help.contains("--progress")
+                self.watchSupportsCachedStart = response.succeeded && help.contains("--cached-start")
+                self.indexStatus.set(\.watchState, to: response.succeeded ? (self.scopePending ? .paused : .needsSetup) : .unavailable)
+                self.startWatcherIfReady()
+            }
         }
     }
 
@@ -1056,7 +1063,7 @@ final class Launcher: ObservableObject {
         scanGeneration &+= 1
         let generation = scanGeneration
         indexStatus.set(\.scanProgress, to: nil)
-        let progressOption = !contentOnly && indexReportsProgress ? ["--progress"] : []
+        let progressOption = contentOnly ? [] : ["--progress"]
         let arguments = contentOnly ? scope.contentArguments : engine.indexArguments(scope: scope)
         writer = engine.run(arguments + progressOption, onProgress: { [weak self] progress in
             guard let self, !self.closed, self.scanGeneration == generation else { return }
@@ -1065,14 +1072,7 @@ final class Launcher: ObservableObject {
             guard let self, !self.closed, self.scanGeneration == generation else { return }
             self.scanGeneration &+= 1
             self.writer = nil
-            let didReport = self.scanProgress != nil
             self.indexStatus.set(\.scanProgress, to: nil)
-            if !contentOnly, !response.succeeded, !didReport, self.indexReportsProgress,
-               response.diagnostic.contains("unexpected argument '--progress'") {
-                self.indexReportsProgress = false
-                self.scan(scope, then: next)
-                return
-            }
             guard let report = self.report(from: response) else {
                 self.firstNamesReady = false
                 self.invalidateSearch()
@@ -1310,11 +1310,10 @@ final class Launcher: ObservableObject {
             indexStatus.set(\.embeddingState, to: .idle)
             automaticBuildAttempted = false
         }
-        // Existing BGE vectors are evidence an older user explicitly started semantic indexing.
         // The saved scope in the database decides whether documents are eligible.
         if !automaticBuildAttempted, embeddingState == .idle, canBuildEmbeddings,
            defaults?.bool(forKey: "gemmaIndexingPaused") != true,
-           (report.embedded_chunks ?? 0) > 0 || defaults?.bool(forKey: "gemmaIndexingEnabled") == true {
+           defaults?.bool(forKey: "gemmaIndexingEnabled") == true {
             automaticBuildAttempted = true
             prepareEmbeddings()
         }

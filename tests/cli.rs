@@ -2812,95 +2812,6 @@ esac
     }
 
     #[test]
-    fn explicit_bge_workers_get_roles_and_do_not_reuse_other_model_vectors() {
-        let f = Fixture::new();
-        let root = f.0.join("scope");
-        fs::create_dir(&root).unwrap();
-        fs::write(
-            root.join("bge.md"),
-            "unrelated beginning\n\nmatched last paragraph",
-        )
-        .unwrap();
-        f.run(&["index", "--root", root.to_str().unwrap(), "--documents"]);
-        let legacy = f.0.join("legacy-helper");
-        let adapter = f.0.join("bge-helper");
-        let interpreter = f.0.join("test-interpreter");
-        let model = f.0.join("model");
-        fs::create_dir(&model).unwrap();
-
-        let vector = |one| {
-            serde_json::to_string(
-                &(0..512)
-                    .map(|index| u8::from(index == one))
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap()
-        };
-        executable(
-            &legacy,
-            &format!("#!/bin/sh\ncat >/dev/null\nprintf '%s' '{}'\n", vector(0)),
-        );
-        executable(
-            &interpreter,
-            "#!/bin/sh\n[ \"$1\" = -I ] || exit 2\nshift\nexec /bin/sh \"$@\"\n",
-        );
-        let worker = |fingerprint: char| {
-            format!(
-                r#"#!/bin/sh
-printf '%s\n' '{{"protocol":1,"language":"zh","fingerprint":"{}","dimensions":512}}'
-while IFS= read -r request; do
-  case "$request" in
-    *'"role":"passage"'*'matched last paragraph'*|*'"role":"query"'*'look for the ending'*)
-      printf '%s\n' '{{"vector":{}}}' ;;
-    *) printf '%s\n' '{{"vector":{}}}' ;;
-  esac
-done
-"#,
-                fingerprint.to_string().repeat(64),
-                vector(0),
-                vector(1)
-            )
-        };
-        executable(&adapter, &worker('a'));
-
-        let old_model = ["--language", "zh", "--helper", legacy.to_str().unwrap()];
-        let bge = [
-            "--helper",
-            adapter.to_str().unwrap(),
-            "--bge-python",
-            interpreter.to_str().unwrap(),
-            "--bge-model",
-            model.to_str().unwrap(),
-        ];
-        assert_eq!(
-            f.run(&[&["embed"][..], &old_model].concat())["new_embeddings"],
-            2
-        );
-        let query = ["query", "look for the ending", "--mode", "semantic"];
-        let rejected = |configuration: &[&str]| {
-            let result = f.cli().args(query).args(configuration).output().unwrap();
-            assert!(!result.status.success());
-            assert!(String::from_utf8_lossy(&result.stderr).contains("model or language changed"));
-        };
-        rejected(&bge);
-
-        assert_eq!(f.run(&[&["embed"][..], &bge].concat())["new_embeddings"], 2);
-        let document = root.join("bge.md");
-        let indexed_stamp = metadata_stamp(&document);
-        let replacement = root.join("replacement");
-        fs::write(&replacement, "replacement contents").unwrap();
-        fs::rename(&replacement, &document).unwrap();
-        let result = f.run(&[&query[..], &bge].concat());
-        assert_eq!(result[0]["snippet"], "matched last paragraph");
-        assert_eq!(result[0]["matched_by"], "semantic_candidate");
-        assert_eq!(result[0]["document_stamp"], indexed_stamp);
-        assert_ne!(result[0]["document_stamp"], metadata_stamp(&document));
-        rejected(&old_model);
-
-        executable(&adapter, &worker('b'));
-        rejected(&bge);
-    }
-    #[test]
     fn unencodable_chunks_do_not_block_batches_or_retry_forever() {
         let f = Fixture::new();
         let root = f.0.join("scope");
@@ -3023,44 +2934,20 @@ printf '[1,0,0,0,0,0,0,0]'
         let index = ["index", "--root", root_path, "--documents"];
         f.run(&index);
 
-        let adapter = f.0.join("bge-worker");
-        let interpreter = f.0.join("bge-runtime");
-        executable(&interpreter, "#!/bin/sh\nshift\nexec /bin/sh \"$@\"\n");
-        let vector = |one| {
-            serde_json::to_string(
-                &(0..512)
-                    .map(|index| u8::from(index == one))
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap()
-        };
+        let helper = f.0.join("legacy-helper");
         executable(
-            &adapter,
-            &format!(
-                r#"#!/bin/sh
-printf '%s\n' '{{"protocol":1,"language":"zh","fingerprint":"{}","dimensions":512}}'
-while IFS= read -r request; do
-    case "$request" in
-        *'solar panel'*) printf '%s\n' '{{"vector":{}}}' ;;
-        *) printf '%s\n' '{{"vector":{}}}' ;;
-    esac
-done
+            &helper,
+            r#"#!/bin/sh
+body=$(cat)
+case "$body" in
+  *'solar panel'*) printf '[1,0,0,0,0,0,0,0]' ;;
+  *) printf '[0,1,0,0,0,0,0,0]' ;;
+esac
 "#,
-                "a".repeat(64),
-                vector(0),
-                vector(1)
-            ),
         );
-        let bge_args = [
-            "--helper",
-            adapter.to_str().unwrap(),
-            "--bge-python",
-            interpreter.to_str().unwrap(),
-            "--bge-model",
-            root_path,
-        ];
+        let legacy_args = ["--helper", helper.to_str().unwrap()];
         assert_eq!(
-            f.run(&[&["embed"][..], &bge_args].concat())["new_embeddings"],
+            f.run(&[&["embed"][..], &legacy_args].concat())["new_embeddings"],
             2
         );
         let raw = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
@@ -3133,12 +3020,12 @@ done
             assert_eq!(reply["hits"][0]["matched_by"], "semantic_candidate");
             assert!(reply["hits"][0]["document_stamp"].is_string());
         }
-        let bge_query = [
+        let legacy_query = [
             &["query", "solar panel", "--mode", "semantic"][..],
-            &bge_args,
+            &legacy_args,
         ]
         .concat();
-        assert_eq!(f.run(&bge_query)[0]["snippet"], en);
+        assert_eq!(f.run(&legacy_query)[0]["snippet"], en);
         assert_eq!(f.run(&["status"])["embedded_chunks"], 2);
 
         fs::write(root.join("replace"), "A clay teapot should dry slowly.").unwrap();
@@ -3161,7 +3048,7 @@ done
         ]);
         assert_eq!(live.as_array().unwrap().len(), 1);
         assert_eq!(live[0]["snippet"], en);
-        assert_eq!(f.run(&bge_query)[0]["snippet"], en);
+        assert_eq!(f.run(&legacy_query)[0]["snippet"], en);
         assert_eq!(f.run(&embed)["new_embeddings"], 1);
         assert_eq!(
             f.run(&["gemma-status", "--gemma-home", home, "--verify"])["ready"],

@@ -72,7 +72,7 @@ open target/Lumen.app
 
 - **M1：搜索与索引可靠性。** 搜索面板跟随指针所在屏幕，不抢占其他应用，尊重输入法组字。应用支持模糊匹配，排序会参考成功打开的记录；名称索引默认跳过常见开发缓存，且不深入应用包。
 - **M2：Spotlight 式操作与统一检索。** 可拖出本地文件、用 `kind:` / `ext:` 或路径前缀筛选，并在浏览时按空格快速查看。支持登录时启动，以及锁屏、睡眠、静音等系统操作。常驻的 `lumen serve` 同时处理名称、正文查询及批量结果验证，不为每次查询或每条结果另起进程。
-- **M3：流式结果与简化设置。** `tr` / `qa` 逐段显示结果；可选网页命令默认关闭。主应用移除「扩展」设置页和辅助程序，独立 Rust 扩展 crate 保留。
+- **M3：流式结果与简化设置。** `tr` / `qa` 逐段显示结果；可选网页命令默认关闭。主应用移除「扩展」设置页和辅助程序。
 - **M3：整合版的独立语义与多模态工作。** T13 为新建或重建的向量采用 f16 存储，仍可读取 f32；T14 涵盖 HEIC/HEIF、WebP 图像检索，以及为本地图像和截图按需启用 Apple Vision OCR。这两项不属于启动器清理工作，不会为索引而下载仅云端文件。
 
 ### 百万文件名称索引基准
@@ -101,7 +101,6 @@ Rust 负责扫描、索引和检索，AppKit 与 SwiftUI 提供原生界面。
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-cargo test --locked --manifest-path extensions/Cargo.toml
 scripts/build-app.sh
 python3 scripts/smoke-updater.py
 python3 scripts/smoke-app.py

@@ -10,9 +10,8 @@ env "CFLAGS_$RUST_TARGET=$C_FLAGS -mmacosx-version-min=14.0" cargo build --locke
 APP="${LUMEN_BUILD_APP_DIR:-$PWD/target/Lumen.app}"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/lumen "$APP/Contents/Resources/lumen"
-cp scripts/local-bge.py "$APP/Contents/Resources/local-bge.py"
-# An incremental rebuild may still contain the retired helper.
-rm -f "$APP/Contents/Resources/lumen-extensions"
+# An incremental rebuild may still contain retired helpers.
+rm -f "$APP/Contents/Resources/lumen-extensions" "$APP/Contents/Resources/LumenLocalEmbedding" "$APP/Contents/Resources/local-bge.py"
 iconwork="$(mktemp -d "${TMPDIR:-/tmp}/lumen-icon.XXXXXXXX")"
 trap 'rm -rf "$iconwork"' EXIT
 iconset="$iconwork/Lumen.iconset"
@@ -38,12 +37,11 @@ xcrun swiftc -O -swift-version 5 -target "$SWIFT_TARGET" -module-cache-path "$PW
     $SMOKE_FLAG \
     app/LumenApp.swift app/LauncherUpdater.swift app/LauncherEngine.swift app/LauncherHotKey.swift app/LauncherModel.swift \
     app/WindowAccess.swift app/WindowManagement.swift \
-    app/LauncherViews.swift app/LauncherHighlight.swift app/LauncherActions.swift app/LauncherSystemActions.swift app/LauncherFileQuery.swift app/LauncherPreview.swift app/LauncherShortcuts.swift app/LauncherCalculation.swift $SMOKE_SOURCE \
+    app/LauncherViews.swift app/LauncherSettingsViews.swift app/LauncherHighlight.swift app/LauncherActions.swift app/LauncherSystemActions.swift app/LauncherFileQuery.swift app/LauncherPreview.swift app/LauncherShortcuts.swift app/LauncherCalculation.swift $SMOKE_SOURCE \
     app/LumenCommandCatalog.swift app/LumenQuickAnswer.swift app/LauncherCommands.swift app/LauncherScripts.swift app/LauncherImageSearch.swift \
     app/ClipboardStore.swift app/ClipboardManager.swift app/ClipboardViews.swift \
     app/InlinePreview.swift app/MacPreview.swift app/MacInlinePreviewView.swift app/LauncherInlinePreview.swift \
     app/TranslationClient.swift app/TranslationModel.swift app/TranslationPanel.swift app/LauncherExternalVolumes.swift -o "$APP/Contents/MacOS/Lumen"
-xcrun swiftc -O -swift-version 5 -target "$SWIFT_TARGET" -module-cache-path "$PWD/target/SwiftModuleCache" app/LocalEmbedding.swift -o "$APP/Contents/Resources/LumenLocalEmbedding"
 xcrun swiftc -O -swift-version 5 -target "$SWIFT_TARGET" -module-cache-path "$PWD/target/SwiftModuleCache" app/ExtractPdf.swift -o "$APP/Contents/Resources/LumenPdfExtractor"
 xcrun swiftc -O -swift-version 5 -target "$SWIFT_TARGET" -module-cache-path "$PWD/target/SwiftModuleCache" app/ExtractImageOcr.swift -o "$APP/Contents/Resources/LumenImageOcrExtractor"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
@@ -57,7 +55,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
  <key>CFBundleIconFile</key><string>Lumen.icns</string>
  <key>CFBundlePackageType</key><string>APPL</string>
  <key>CFBundleShortVersionString</key><string>0.5.1</string>
- <key>CFBundleVersion</key><string>28</string>
+ <key>CFBundleVersion</key><string>29</string>
  <key>LSMinimumSystemVersion</key><string>14.0</string>
  <key>LSUIElement</key><true/>
  <key>NSAppleEventsUsageDescription</key><string>Lumen uses macOS automation only when you run a system action such as Empty Trash or Toggle Dark Mode.</string>

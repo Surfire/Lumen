@@ -10,6 +10,7 @@ struct SearchWindow: View {
     @ObservedObject var contextActions: ContextActions
     @ObservedObject var translation: TranslationPanelModel
     @ObservedObject var commands: LauncherCommands
+    @ObservedObject var windowManagement: WindowManagement
     @ObservedObject var inlinePreview: LauncherInlinePreview
     @ObservedObject var imageSearch: LauncherImageSearch
     let clipboard: ClipboardManager
@@ -30,8 +31,8 @@ struct SearchWindow: View {
     static let maximumVisibleRows = 8
 
     static func height(for model: Launcher, contextCount: Int = 0, hasTranslation: Bool = false,
-                       commandHeight: CGFloat? = nil, hasPreview: Bool = false) -> CGFloat {
-        let shell = headerHeight + footerHeight
+                       needsAccessibility: Bool = false, commandHeight: CGFloat? = nil, hasPreview: Bool = false) -> CGFloat {
+        let shell = headerHeight + footerHeight + (needsAccessibility ? WindowAccessibilityBanner.launcherHeight : 0)
         if hasTranslation { return shell + 138 }
         if let commandHeight { return shell + commandHeight }
         if contextCount > 0 { return shell + CGFloat(min(contextCount, maximumVisibleRows) * 44) }
@@ -102,6 +103,10 @@ struct SearchWindow: View {
                             .padding(16)
                     }
                 }
+            }
+            if windowManagement.issue == .permissionRequired {
+                WindowAccessibilityBanner(model: model, openSettings: windowManagement.openAccessibilitySettings)
+                    .frame(height: WindowAccessibilityBanner.launcherHeight)
             }
             footer
         }
@@ -197,7 +202,9 @@ struct SearchWindow: View {
                 Text(title).lineLimit(1)
             }
         }
-        if let notice = model.searchNotice, !model.visibleResults.isEmpty {
+        if let issue = windowManagement.issue, issue != .permissionRequired {
+            Text(issue.title(model)).lineLimit(1).help(issue.title(model))
+        } else if let notice = model.searchNotice, !model.visibleResults.isEmpty {
             Text(model.title(for: notice)).lineLimit(1).help(model.title(for: notice))
                 .accessibilityIdentifier("launcher-notice")
         }
@@ -353,6 +360,9 @@ struct SearchWindow: View {
             category = ResultCategory(title: model.t("系统操作", "System Action"), symbol: "bolt")
             if case .define(let word) = operation { detail = word }
             else { detail = nil }
+        case .window:
+            category = ResultCategory(title: model.t("窗口管理", "Window Management"), symbol: "macwindow")
+            detail = nil
         }
         let title = action.title(chinese: model.zh)
         return HStack(spacing: 10) {
@@ -760,6 +770,33 @@ final class SettingsSession: ObservableObject {
     }
 }
 
+private struct WindowAccessibilityBanner: View {
+    static let launcherHeight: CGFloat = 66
+    let model: Launcher
+    let openSettings: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "accessibility").font(.title2).foregroundStyle(Color.accentColor)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(WindowActionIssue.permissionRequired.title(model)).font(.callout.weight(.semibold))
+                Text(model.t("请在「隐私与安全性」→「辅助功能」中启用 Lumen。",
+                             "Enable Lumen in Privacy & Security → Accessibility."))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+            Button(model.t("打开辅助功能设置…", "Open Accessibility Settings…"), action: openSettings)
+                .accessibilityIdentifier("window-accessibility-settings")
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal, 12)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("window-accessibility-banner")
+    }
+}
+
 struct LauncherSettings: View {
     @ObservedObject var model: Launcher
     @ObservedObject var session: SettingsSession
@@ -767,6 +804,7 @@ struct LauncherSettings: View {
     let volumes: ExternalVolumeCatalog
     let images: LauncherImageSearch
     let clipboard: ClipboardManager
+    @ObservedObject var windowManagement: WindowManagement
     let chooseImageFolder: () -> Void
     let chooseImageProjector: () -> Void
     let chooseQuicklinkFolder: (@escaping (URL) -> Void) -> Void
@@ -890,6 +928,9 @@ struct LauncherSettings: View {
     }
 
     @ViewBuilder private var general: some View {
+        if windowManagement.isTrusted == false {
+            WindowAccessibilityBanner(model: model, openSettings: windowManagement.openAccessibilitySettings)
+        }
         group(model.t("启动", "Startup")) {
             Toggle(model.t("登录时启动", "Launch at Login"), isOn: Binding(
                 get: { session.launchAtLogin }, set: { session.setLaunchAtLogin($0) }

@@ -23,6 +23,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     let applicationIcons = ResultIconDisplay()
     let contextActions = ContextActions()
     let commands = LauncherCommands()
+    let windowManagement: WindowManagement
+    private var windowIssueUpdates: AnyCancellable?
     let inlinePreview = LauncherInlinePreview()
     let imageSearch: LauncherImageSearch
     let clipboard: ClipboardManager
@@ -154,6 +156,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             contextActions: contextActions,
             translation: translation,
             commands: commands,
+            windowManagement: windowManagement,
             inlinePreview: inlinePreview,
             imageSearch: imageSearch,
             clipboard: clipboard,
@@ -204,6 +207,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     init(smoke: LauncherSmoke?) {
         self.smoke = smoke
+        windowManagement = smoke?.makeWindowManagement() ?? WindowManagement()
         defaults = smoke != nil ? smoke?.shortcutFixturePreferences : .standard
         let resources = Bundle.main.resourceURL ?? Bundle.main.bundleURL.appendingPathComponent("Contents/Resources")
         let executable = smoke?.executable ?? resources.appendingPathComponent("lumen")
@@ -242,6 +246,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             self.updatePresentation()
         }
         clipboard.start()
+        windowIssueUpdates = windowManagement.$issue.removeDuplicates().dropFirst().sink { [weak self] _ in
+            DispatchQueue.main.async { [weak self] in self?.updatePresentation() }
+        }
         contextUpdates = contextActions.$items.dropFirst().sink { [weak self] _ in
             DispatchQueue.main.async { [weak self] in self?.updatePresentation() }
         }
@@ -292,6 +299,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     func applicationDidBecomeActive(_ notification: Notification) {
         smoke?.wasActivated = true
         // Revalidate when returning from System Settings.
+        if settings?.isVisible == true || windowManagement.issue == .permissionRequired {
+            windowManagement.refreshTrust()
+        }
         guard smoke == nil, let configuredKey else { return }
         do {
             try globalHotKey.set(configuredKey)
@@ -323,6 +333,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     @objc func showSearch() {
         let firstShow = !searchPresented
+        if firstShow { windowManagement.captureTarget() }
         searchPresentationGeneration &+= 1
         searchPresented = true
         if firstShow {
@@ -393,6 +404,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         guard searchPresented else { return }
         searchPresentationGeneration &+= 1
         searchPresented = false
+        windowManagement.issue = nil
         panel.browsing = false
         localPreview?.close()
         translation.setCommand(nil)
@@ -430,6 +442,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     @objc private func searchFieldAction() {
         let text = searchText
+        if text != commands.raw { windowManagement.issue = nil }
         if (searchField.currentEditor() as? NSTextView)?.hasMarkedText() == true {
             if text != commands.raw {
                 if commands.answer == .loading { commands.invalidateAnswer() }
@@ -719,16 +732,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         guard searchPresented, current, !actionInFlight else { return }
         actionInFlight = true
         let query = model.query
-        let finished: (Bool) -> Void = { [weak self] success in
+        let raw = commands.raw
+        let presentation = searchPresentationGeneration
+        let finished: (Bool, WindowActionIssue?) -> Void = { [weak self] success, issue in
             guard let self else { return }
             self.actionInFlight = false
             if success { self.model.noteActionPerformed(action) }
-            guard self.searchPresented, self.model.query == query else { return }
+            guard self.searchPresented, self.searchPresentationGeneration == presentation,
+                  self.model.query == query, self.commands.raw == raw else { return }
             if success { self.dismissSearch() }
-            else { self.model.openingFailed() }
+            else if let issue {
+                self.contextActions.close()
+                self.windowManagement.issue = issue
+            } else { self.model.openingFailed() }
         }
-        if let smoke { smoke.dispatch(action, completion: finished) }
-        else { LaunchDispatcher.perform(action, chinese: model.zh, completion: finished) }
+        if case .window(let command) = action.destination {
+            windowManagement.perform(command) { issue in finished(issue == nil, issue) }
+        } else if let smoke {
+            smoke.dispatch(action) { finished($0, nil) }
+        } else {
+            LaunchDispatcher.perform(action, chinese: model.zh) { finished($0, nil) }
+        }
     }
 
     private func openFile(_ hit: SearchHit) {
@@ -896,6 +920,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func presentSettings(page: SettingsPage?) {
+        windowManagement.refreshTrust()
         if let page, page != settingsSession.page { settingsSession.page = page }
         else if settingsSession.page == .index, settings?.isVisible != true { externalVolumes.reload() }
         if smoke == nil { NSApp.activate() }
@@ -913,6 +938,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 volumes: externalVolumes,
                 images: imageSearch,
                 clipboard: clipboard,
+                windowManagement: windowManagement,
                 chooseImageFolder: { [weak self] in self?.chooseImageResource(folder: true) },
                 chooseImageProjector: { [weak self] in self?.chooseImageResource(folder: false) },
                 chooseQuicklinkFolder: { [weak self] in self?.chooseQuicklinkFolder($0) },
@@ -1132,6 +1158,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             : (commands.showsCard || (commands.isImageCommand && !model.isImageSearch) ? 162 : nil)
         let height = SearchWindow.height(for: model, contextCount: contextActions.items.count,
                                          hasTranslation: translation.command != nil,
+                                         needsAccessibility: windowManagement.issue == .permissionRequired,
                                          commandHeight: commandHeight,
                                          hasPreview: inlinePreview.isOpen)
         guard frame.height != height else { return }

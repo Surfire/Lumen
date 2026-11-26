@@ -1,6 +1,7 @@
 import AppKit
 import Carbon
 import Combine
+import Darwin
 import Foundation
 import ImageIO
 import SQLite3
@@ -36,16 +37,29 @@ final class LauncherSmoke {
     var wasActivated = false
     var dispatchedQuicklinks: [URL] = []
     var chosenQuicklinkFolder: URL?
+    var chosenScriptsFolder: URL?
     var chosenSettingsDirectories: [URL]?
     var automaticIndexScenario: Bool { exists("automatic-index-scenario") }
     var chosenDiagnosticFile: URL?
     var chosenImageFolder: URL?
     var chosenImageProjector: URL?
+    private var frontmostWindowPID: pid_t? = 42_001
+    private let windowAdapter = SmokeWindowAccess()
+    private var openedAccessibilitySettings: [URL] = []
+
+    func makeWindowManagement() -> WindowManagement {
+        WindowManagement(adapter: windowAdapter, frontmostPID: { [weak self] in self?.frontmostWindowPID },
+                         layout: { Self.windowPlanner }, openSettings: { [weak self] in self?.openedAccessibilitySettings.append($0) })
+    }
 
     private lazy var translationSuite = "io.github.surfire.lumen.gui-smoke.\(UUID())"
     private lazy var translationPreferences = UserDefaults(suiteName: translationSuite)
     private let translationSecrets = SmokeTranslationSecrets()
     var shortcutFixturePreferences: UserDefaults? { exists("quicklinks-scenario") ? translationPreferences : nil }
+
+    func makeScriptCatalog() -> LauncherScriptCatalog {
+        LauncherScriptCatalog(defaults: translationPreferences, shortcutsExecutable: directory.appendingPathComponent("shortcuts-fixture"))
+    }
 
     func makeClipboardManager() -> ClipboardManager {
         ClipboardManager(defaults: translationPreferences!, pasteboard: filePasteboard,
@@ -225,6 +239,9 @@ final class LauncherSmoke {
             app.clipboard.poll()
             try check(app.clipboard.items.map(\.text) == ["External copy fixture"], "copy regression did not start with active capture")
             try await verifyActions(app)
+            try verifyWindowGeometry()
+            try verifyWindowAccess()
+            try await verifyWindowActions(app)
             app.clipboard.clearAll()
             try await verifyClipboardHistory(app)
             return
@@ -965,6 +982,7 @@ final class LauncherSmoke {
         try await verifyInlineTranslation(app)
         try await verifyLauncherCommands(app)
         try verifyProviderDeletion(app.translation)
+        try await verifyLocalExecutables(app)
 
         for (term, expected) in [
             ("无线局域网", "com.apple.wifi-settings-extension"),
@@ -1145,6 +1163,247 @@ final class LauncherSmoke {
         print("Unified actions passed: real background app launch, routed Settings URLs, isolated file copies, and native local Quick Look input")
     }
 
+    private func verifyLocalExecutables(_ app: AppDelegate) async throws {
+        let fm = FileManager.default
+        let folder = directory.appendingPathComponent("Local Scripts", isDirectory: true)
+        let nested = folder.appendingPathComponent("Nested", isDirectory: true)
+        try fm.createDirectory(at: nested, withIntermediateDirectories: true)
+        func fixture(_ url: URL, _ script: String, mode: Int = 0o700) throws {
+            try Data(script.utf8).write(to: url)
+            try fm.setAttributes([.posixPermissions: mode], ofItemAtPath: url.path)
+        }
+        let echo = folder.appendingPathComponent("echo argument")
+        try fixture(echo, #"""
+        #!/bin/sh
+        # @lumen.title = Lumen Argv Probe
+        # @lumen.alias argvliteral
+        # @lumen.description metadata probe description
+        # @lumen.mode fullOutput
+        # @lumen.argument1 Exact text
+        printf '%s\n%s\n%s' "$#" "$1" "$0"
+        """#)
+        let flood = folder.appendingPathComponent("flood")
+        try fixture(flood, """
+        #!/bin/sh
+        # @lumen.title Lumen Output Flood
+        # @lumen.mode inline
+        /usr/bin/head -c 65537 /dev/zero
+        /usr/bin/head -c 65538 /dev/zero >&2
+        exit 7
+        """)
+        let silent = folder.appendingPathComponent("silent")
+        try fixture(silent, #"""
+        #!/bin/sh
+        # @lumen.title Lumen Silent Probe
+        # @lumen.mode silent
+        # @lumen.argument1 Silent argument
+        printf '%s' "$1" > silent-ran
+        """#)
+        for (name, title, mode) in [("group", "Lumen Group Probe", "fullOutput"),
+                                    ("silent-group", "Lumen Silent Group Probe", "silent")] {
+            try fixture(folder.appendingPathComponent(name), #"""
+            #!/bin/sh
+            # @lumen.title \#(title)
+            # @lumen.mode \#(mode)
+            trap '' TERM
+            /bin/sleep 120 &
+            printf '%s %s\n' "$$" "$!" > group-starting
+            /bin/mv group-starting group-ready
+            wait
+            """#)
+        }
+        try fixture(nested.appendingPathComponent("nested"), "#!/bin/sh\nexit 0")
+        try fixture(folder.appendingPathComponent("not executable"), "#!/bin/sh\nexit 0", mode: 0o644)
+        let external = directory.appendingPathComponent("outside script")
+        try fixture(external, "#!/bin/sh\n# @lumen.title Lumen Outside Symlink Target\nexit 0")
+        try fm.createSymbolicLink(at: folder.appendingPathComponent("symlink"), withDestinationURL: external)
+        let folderLink = directory.appendingPathComponent("folder link", isDirectory: true)
+        try fm.createSymbolicLink(at: folderLink, withDestinationURL: folder)
+        try check(mkfifo(folder.appendingPathComponent("fifo").path, 0o700) == 0, "could not create FIFO fixture")
+        var flags = stat()
+        flags.st_flags = UInt32(SF_DATALESS)
+        try check(!LauncherScriptFiles.isResident(flags), "a simulated SF_DATALESS file passed the resident gate")
+        try check(LauncherScriptFiles.scan(IndexScope.folderPath(folderLink)) == nil, "symlink folder was scanned")
+
+        let source = LauncherExecutable.Source.shortcut("parser fixture")
+        let prefix = Data([0xef, 0xbb, 0xbf]) + Data("// @lumen.title = Snow 猫\r\n# @lumen.alias snowy\r".utf8)
+            + Data([0x80, 0, 10]) + Data(("# @lumen.description " + String(repeating: "X", count: 1300)
+            + "\n# @lumen.mode = fullOutput\r\n# @lumen.argument1 = Path or text").utf8)
+        let parsed = LauncherExecutable.parse(prefix, eof: true, source: source, fallback: "fallback")
+        try check(parsed.title == "Snow 猫" && parsed.alias == "snowy" && parsed.mode == .fullOutput &&
+                  parsed.argument == "Path or text" && parsed.description.isEmpty,
+                  "BOM/CRLF, binary, or oversize metadata parsed incorrectly: \(parsed)")
+        let missing = LauncherExecutable.parse(Data("# @lumen.title\r\n# @lumen.mode bogus\n# @lumen.argument1 =\n".utf8),
+                                               eof: true, source: source, fallback: "fallback")
+        let overLimit = Data((String(repeating: "\n", count: LauncherScriptFiles.headerLimit - 20)
+                             + "# @lumen.title truncated-title\n# @lumen.mode silent\n").utf8)
+        let clipped = LauncherExecutable.parse(overLimit, eof: true, source: source, fallback: "clipped")
+        try check(missing.title == "fallback" && missing.mode == .compact && missing.argument == nil &&
+                  clipped.title == "clipped" && clipped.mode == .compact, "missing or truncated headers changed defaults")
+
+        let catalog = app.scriptCatalog
+        let shortcutName = "--Lumen Shortcuts Probe ; $(echo altered)"
+        let stub = catalog.shortcutsExecutable
+        try fixture(stub, #"""
+        #!/bin/sh
+        case "$1" in
+          list)
+            printf 'list\n' >> "${0%/*}/shortcuts-calls"
+            printf '%s\r\n%s\n\n%s\n' '--Lumen Shortcuts Probe ; $(echo altered)' '  Exact Spacing  ' '--Lumen Shortcuts Probe ; $(echo altered)'
+            ;;
+          run)
+            printf 'run\n' >> "${0%/*}/shortcuts-calls"
+            shift
+            case "$1" in
+              --input-path=*)
+                printf '%s\n' "${1#--input-path=}"
+                /bin/cat "${1#--input-path=}" || exit 6
+                shift
+                ;;
+            esac
+            [ "$#" = 2 ] && [ "$1" = '--' ] || exit 4
+            printf '<%s>' "$2"
+            ;;
+          *) exit 5 ;;
+        esac
+        """#)
+        func command(_ title: String) throws -> LauncherExecutable {
+            guard let command = (catalog.scripts + catalog.shortcuts).first(where: { $0.title == title }) else {
+                throw Failure("missing command: \(title)")
+            }
+            return command
+        }
+        func finished() -> LauncherProcess.Result? {
+            if case .finished(let result)? = app.commands.execution?.phase { return result }
+            return nil
+        }
+        try check(!catalog.scriptsEnabled && !catalog.shortcutsEnabled && !exists("shortcuts-calls"), "commands were not opt-in")
+        app.showSettings()
+        app.settingsSession.page = .scripts
+        chosenScriptsFolder = folder
+        app.chooseScriptsFolder()
+        let folderPath = IndexScope.folderPath(folder)
+        try check(catalog.folder == folderPath && !catalog.scriptsEnabled && catalog.scripts.isEmpty,
+                  "choosing a folder opted in or scanned before enable: \(catalog.folder ?? "nil") vs \(folderPath)")
+        catalog.setScriptsEnabled(true)
+        catalog.setShortcutsEnabled(true)
+        try await until("opt-in catalogs loaded") { !catalog.scriptLoading && !catalog.shortcutLoading }
+        try check(Set(catalog.scripts.map(\.title)) == ["Lumen Argv Probe", "Lumen Output Flood", "Lumen Silent Probe",
+                                                       "Lumen Group Probe", "Lumen Silent Group Probe"],
+                  "scan missed a safe executable or followed a link, nested path, FIFO, or non-executable")
+        try check(catalog.shortcuts.map(\.title) == [shortcutName, "  Exact Spacing  "] && lineCount("shortcuts-calls") == 1,
+                  "Shortcuts parsing lost exact spelling or ran before explicit enable")
+        let restored = makeScriptCatalog()
+        try check(restored.scriptsEnabled && restored.folder == folderPath && restored.shortcutsEnabled &&
+                  restored.shortcuts.isEmpty && !restored.shortcutLoading, "settings failed to persist or cold startup listed Shortcuts")
+        app.settings?.close()
+        app.showSearch()
+        try type("metadata probe description", into: app)
+        let selected = app.commands.selectedResult(in: app.model)
+        try check(selected?.id == (try command("Lumen Argv Probe")).action.id, "description did not select the script result")
+        try type("argvliteral", into: app)
+        try key(kVK_Return, "\r", in: app)
+        if case .argument("Exact text", required: false)? = app.commands.visibleExecution?.phase {} else {
+            throw Failure("Return did not open the script argument card")
+        }
+        let literal = "some spaced 'text'; $(/usr/bin/touch injected) & 🐈"
+        app.commands.executionArgument = literal
+        try key(kVK_Return, "\r", in: app)
+        try await until("argv probe finished") { finished() != nil }
+        let expected = "1\n\(literal)\n\(IndexScope.folderPath(echo))"
+        try check(finished()?.succeeded == true && finished()?.stdout.text == expected &&
+                  !fm.fileExists(atPath: folder.appendingPathComponent("injected").path),
+                  "script argument was split or expanded, or $0 was not the real script path")
+        try key(kVK_Return, "\r", in: app)
+        try check(filePasteboard.string(forType: .string) == expected && app.searchPresented,
+                  "command output copy did not use the in-place card")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try check(app.commands.visibleExecution == nil && app.searchPresented, "Esc did not close the output card")
+
+        try type("Lumen Output Flood", into: app)
+        try key(kVK_Return, "\r", in: app)
+        try await until("flood finished") { finished() != nil }
+        guard let output = finished() else { throw Failure("missing command result") }
+        try check(output.status == .exited(7) && [output.stdout, output.stderr].allSatisfy {
+            $0.bytes.count == 65_536 && $0.truncated && $0.text.hasSuffix(LauncherProcess.truncationMarker)
+        }, "stdout/stderr were not independently capped and marked")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+
+        try type(shortcutName, into: app)
+        try check(lineCount("shortcuts-calls") == 1, "typing started a Shortcuts CLI")
+        try key(kVK_Return, "\r", in: app)
+        try await until("stubbed Shortcut completed") { finished() != nil }
+        try check(finished()?.succeeded == true && finished()?.stdout.text == "<\(shortcutName)>" && lineCount("shortcuts-calls") == 2,
+                  "Shortcut run changed the name or interpreted it as an option")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        let input = directory.appendingPathComponent("input ; file.txt")
+        try Data("input bytes!".utf8).write(to: input)
+        let withInput = await LauncherProcess.execute(try command(shortcutName), argument: input.path, shortcuts: stub)
+        try check(withInput.succeeded && withInput.stdout.text == "\(IndexScope.folderPath(input))\ninput bytes!<\(shortcutName)>",
+                  "Shortcut argv did not carry the original input path")
+        catalog.refreshShortcuts()
+        try await until("explicit Shortcut refresh completed") { !catalog.shortcutLoading && self.lineCount("shortcuts-calls") == 4 }
+
+        let ready = folder.appendingPathComponent("group-ready")
+        func pids() throws -> [pid_t] {
+            let values = try String(contentsOf: ready, encoding: .utf8).split(whereSeparator: \.isWhitespace).compactMap { pid_t($0) }
+            try check(values.count == 2 && values.allSatisfy { $0 > 0 } && getpgid(values[0]) == values[0] && getpgid(values[1]) == values[0],
+                      "child and descendant did not have their own shared process group")
+            return values
+        }
+        func gone(_ pids: [pid_t]) -> Bool { pids.allSatisfy { kill($0, 0) == -1 && errno == ESRCH } }
+        try type("Lumen Group Probe", into: app)
+        try key(kVK_Return, "\r", in: app)
+        try await until("script spawned a descendant") { fm.fileExists(atPath: ready.path) }
+        let cancelled = try pids()
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try await until("Esc killed both members of the process group") { gone(cancelled) && app.commands.canStartExecutable }
+        try check(app.searchPresented && app.commands.execution == nil, "cancelled script left an output card behind")
+        try fm.removeItem(at: ready)
+
+        let start = ContinuousClock.now
+        try key(kVK_Return, "\r", in: app)
+        try await until("timeout fixture started") { fm.fileExists(atPath: ready.path) }
+        let expired = try pids()
+        try await until("15-second execution timeout killed the process group", seconds: 18) { finished()?.status == .timedOut && gone(expired) }
+        try check(start.duration(to: .now) >= .seconds(14) && start.duration(to: .now) < .seconds(18),
+                  "script did not use the bounded production deadline")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try type("Lumen Silent Probe", into: app)
+        try key(kVK_Return, "\r", in: app)
+        if case .argument("Silent argument", required: false)? = app.commands.visibleExecution?.phase {} else {
+            throw Failure("silent mode hid its argument prompt before running")
+        }
+        app.commands.executionArgument = literal
+        try key(kVK_Return, "\r", in: app)
+        try check(!app.searchPresented && app.commands.visibleExecution == nil, "silent mode left the search panel up")
+        try await until("silent mode completed using the chosen working folder") {
+            finished()?.succeeded == true && (try? String(contentsOf: folder.appendingPathComponent("silent-ran"), encoding: .utf8)) == literal
+        }
+
+        try fm.removeItem(at: ready)
+        app.showSearch()
+        try type("Lumen Silent Group Probe", into: app)
+        try key(kVK_Return, "\r", in: app)
+        try check(!app.searchPresented && app.commands.execution?.running == true, "silent group did not dismiss the launcher and run")
+        try await until("silent script spawned a descendant") { fm.fileExists(atPath: ready.path) }
+        let silentPIDs = try pids()
+        app.showSearch()
+        try check(app.searchPresented && app.commands.visibleExecution == nil && app.commands.execution?.running == true,
+                  "reopening the launcher did not keep the silent script running in the background")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try await until("Esc after reopening did not cancel both silent process-group members") {
+            gone(silentPIDs) && app.commands.canStartExecutable && app.commands.execution == nil && !app.searchPresented
+        }
+        catalog.setScriptsEnabled(false)
+        catalog.setShortcutsEnabled(false)
+        let disabled = makeScriptCatalog()
+        try check(catalog.scripts.isEmpty && catalog.shortcuts.isEmpty && !disabled.scriptsEnabled && !disabled.shortcutsEnabled,
+                  "disable did not retire cached actions or persist")
+        app.settingsSession.page = .general
+        print("Local Scripts & Apple Shortcuts passed (opt-in, no-follow, argv, output, process groups and timeout)")
+    }
+
     private func verifyCatalogRegressions() async throws {
         let manager = FileManager.default
         let roots = directory.appendingPathComponent("Linked Apps", isDirectory: true)
@@ -1186,6 +1445,212 @@ final class LauncherSmoke {
         }
         try check(launched == true, "NSWorkspace did not launch the app through its symlinked executable")
         try manager.removeItem(at: directory.appendingPathComponent("app-started"))
+    }
+
+    private static let windowPlanner = WindowLayoutPlanner(displays: [
+        // The primary has a Dock at the bottom and a menu bar/notch above the visible area.
+        .init(frame: CGRect(x: 0, y: 0, width: 1440, height: 900),
+              visibleFrame: CGRect(x: 0, y: 40, width: 1440, height: 822)),
+        .init(frame: CGRect(x: -1280, y: 0, width: 1280, height: 1024),
+              visibleFrame: CGRect(x: -1250, y: 0, width: 1250, height: 1000)),
+        .init(frame: CGRect(x: 0, y: 900, width: 1920, height: 1080),
+              visibleFrame: CGRect(x: 0, y: 930, width: 1920, height: 1026)),
+        .init(frame: CGRect(x: -300, y: -800, width: 1280, height: 800),
+              visibleFrame: CGRect(x: -300, y: -780, width: 1280, height: 750)),
+    ])
+
+    private static let spanningWindowFrame = CGRect(x: -450, y: 200, width: 600, height: 400)
+    private static let maximizedSpanningFrame = CGRect(x: -1250, y: -100, width: 1250, height: 1000)
+
+    private func verifyWindowGeometry() throws {
+        let planner = Self.windowPlanner
+        let roundTrips: [(CGRect, CGRect)] = [
+            (CGRect(x: 0, y: 40, width: 1440, height: 822), CGRect(x: 0, y: 38, width: 1440, height: 822)),
+            (CGRect(x: -1200, y: 720, width: 640, height: 240), CGRect(x: -1200, y: -60, width: 640, height: 240)),
+            (CGRect(x: 88, y: 1600, width: 800, height: 300), CGRect(x: 88, y: -1000, width: 800, height: 300)),
+            (CGRect(x: -260, y: -760, width: 500, height: 400), CGRect(x: -260, y: 1260, width: 500, height: 400)),
+        ]
+        for (appKit, ax) in roundTrips {
+            try check(planner.axFrame(appKit) == ax && planner.appKitFrame(ax) == appKit,
+                      "AX coordinates did not reflect the far edge around the primary display top")
+        }
+        let original = CGRect(x: 120, y: 400, width: 600, height: 400)
+        let layouts: [(WindowCommand, CGRect)] = [
+            (.leftHalf, CGRect(x: 0, y: 38, width: 720, height: 822)),
+            (.rightHalf, CGRect(x: 720, y: 38, width: 720, height: 822)),
+            (.topHalf, CGRect(x: 0, y: 38, width: 1440, height: 411)),
+            (.bottomHalf, CGRect(x: 0, y: 449, width: 1440, height: 411)),
+            (.maximize, CGRect(x: 0, y: 38, width: 1440, height: 822)),
+            (.center, CGRect(x: 420, y: 249, width: 600, height: 400)),
+            (.almostMaximize, CGRect(x: 72, y: 79, width: 1296, height: 739)),
+            (.reasonableSize, CGRect(x: 240, y: 175, width: 960, height: 548)),
+        ]
+        for (command, frame) in layouts {
+            try check(planner.placement(for: command, currentAX: original)?.frame == frame,
+                      "incorrect \(command) frame or visibleFrame inset")
+        }
+        let corner = CGRect(x: 840, y: 38, width: 600, height: 400)
+        let left = CGRect(x: -600, y: -100, width: 600, height: 400)
+        let below = CGRect(x: 380, y: 930, width: 600, height: 400)
+        let above = CGRect(x: 1320, y: -1056, width: 600, height: 400)
+        try check(planner.placement(for: .nextDisplay, currentAX: corner)?.frame == left &&
+                  planner.placement(for: .nextDisplay, currentAX: left)?.frame == above &&
+                  planner.placement(for: .previousDisplay, currentAX: corner)?.frame == below &&
+                  planner.placement(for: .nextDisplay, currentAX: below)?.frame == corner,
+                  "display cycling did not preserve point size and relative placement across insets")
+        try check(planner.placement(for: .maximize, currentAX: Self.spanningWindowFrame)?.frame == Self.maximizedSpanningFrame,
+                  "a spanning window did not use the display with the largest overlap")
+        let large = CGRect(x: 0, y: 38, width: 1440, height: 822)
+        try check(planner.placement(for: .nextDisplay, currentAX: large)?.frame == CGRect(x: -1250, y: -11, width: 1250, height: 822),
+                  "moving to a smaller display did not clamp the window")
+        let one = WindowLayoutPlanner(displays: [planner.displays[0]])
+        try check(planner.placement(for: .restore, currentAX: left, previousAX: original)?.frame == original &&
+                  one.placement(for: .restore, currentAX: original, previousAX: left)?.frame == CGRect(x: 0, y: 38, width: 600, height: 400) &&
+                  one.placement(for: .nextDisplay, currentAX: original) == nil,
+                  "restore did not honor the prior display or clamp after disconnection")
+        let acrossGap = CGRect(x: 100, y: 790, width: 600, height: 200)
+        try check(planner.placement(for: .restore, currentAX: original, previousAX: acrossGap)?.frame ==
+                    CGRect(x: 100, y: 660, width: 600, height: 200),
+                  "restore treated the gap between visible display edges as covered")
+    }
+
+    private func verifyWindowAccess() throws {
+        let adapter = SmokeWindowAccess()
+        adapter.trusted = true
+        let access = AXWindowAccess(adapter: adapter)
+        let planner = Self.windowPlanner
+        let initial = SmokeWindowAccess.State()
+        let rejected: [SmokeWindowAccess.State] = [
+            .init(role: "AXSheet"), .init(role: "AXPopover"), .init(role: "AXDrawer"),
+            .init(subrole: "AXDialog"), .init(minimized: true), .init(fullScreen: true),
+            .init(positionSettable: false), .init(sizeSettable: false), .init(frame: .zero),
+            .init(frame: CGRect(x: 120, y: 400, width: -600, height: 400)),
+        ]
+        for state in rejected {
+            adapter.states[1] = state
+            try check(access.perform(.leftHalf, targetPID: 42_001, planner: planner) == .noWindow && adapter.writes.isEmpty,
+                      "ineligible window was moved")
+        }
+        adapter.main = 2
+        adapter.states[2] = initial
+        let left = CGRect(x: 0, y: 38, width: 720, height: 822)
+        try check(access.perform(.leftHalf, targetPID: 42_001, planner: planner) == nil && adapter.states[2]?.frame == left &&
+                  adapter.writes == [.position(2, left.origin), .size(2, left.size), .position(2, left.origin)],
+                  "eligible main window fallback or position-size-position correction failed")
+        adapter.states[1] = initial
+        try check(access.perform(.maximize, targetPID: 42_001, planner: planner) == nil && adapter.states[2]?.frame == left &&
+                  access.perform(.rightHalf, targetPID: 42_001, planner: planner) == nil &&
+                  access.perform(.restore, targetPID: 42_001, planner: planner) == nil &&
+                  adapter.states[1]?.frame == CGRect(x: 0, y: 38, width: 1440, height: 822) &&
+                  access.perform(.restore, targetPID: 42_001, planner: planner) == .noPreviousFrame,
+                  "focused window did not retain only its last frame, or restore resurrected consumed history")
+        adapter.focused = nil
+        try check(access.perform(.restore, targetPID: 42_001, planner: planner) == nil && adapter.states[2]?.frame == initial.frame,
+                  "restore history did not stay isolated per window")
+        adapter.focused = 1
+        adapter.states[1] = .init(minimumWidth: 800)
+        try check(access.perform(.rightHalf, targetPID: 42_001, planner: planner) == .couldNotMove &&
+                  adapter.states[1]?.frame == CGRect(x: 640, y: 38, width: 800, height: 822),
+                  "app-enforced minimum size was not clamped or failed verification was reported as success")
+        adapter.states[1]?.minimumWidth = 0
+        try check(access.perform(.restore, targetPID: 42_001, planner: planner) == nil && adapter.states[1]?.frame == initial.frame,
+                  "partial move was not undoable")
+
+        let primaryOnly = WindowLayoutPlanner(displays: [planner.displays[0]])
+        for (restoreLayout, expected, scenario) in [
+            (planner, Self.spanningWindowFrame, "with both displays connected"),
+            (primaryOnly, CGRect(x: 0, y: 200, width: 600, height: 400), "after the left display disconnected"),
+        ] {
+            adapter.states[1] = .init(frame: Self.spanningWindowFrame)
+            try check(access.perform(.maximize, targetPID: 42_001, planner: planner) == nil &&
+                      adapter.states[1]?.frame == Self.maximizedSpanningFrame,
+                      "could not maximize the spanning window on the left display")
+            try check(access.perform(.restore, targetPID: 42_001, planner: restoreLayout) == nil &&
+                      adapter.states[1]?.frame == expected,
+                      "did not restore the spanning window to \(expected) \(scenario); got \(String(describing: adapter.states[1]?.frame))")
+            try check(access.perform(.restore, targetPID: 42_001, planner: restoreLayout) == .noPreviousFrame,
+                      "restoring the spanning window did not consume history \(scenario)")
+        }
+        adapter.main = nil
+        for id in 100...132 {
+            adapter.focused = id
+            adapter.states[id] = initial
+            try check(access.perform(.leftHalf, targetPID: 42_001, planner: planner) == nil, "history fill move failed")
+        }
+        adapter.focused = 100
+        try check(access.perform(.restore, targetPID: 42_001, planner: planner) == .noPreviousFrame,
+                  "oldest history entry was not evicted")
+        adapter.focused = 101
+        try check(access.perform(.restore, targetPID: 42_001, planner: planner) == nil && adapter.states[101]?.frame == initial.frame,
+                  "history discarded more than the oldest entry")
+    }
+
+    private func verifyWindowActions(_ app: AppDelegate) async throws {
+        let queries: [(WindowCommand, String, String)] = [
+            (.leftHalf, "left half", "左半屏"), (.rightHalf, "right half", "右半屏"),
+            (.topHalf, "top half", "上半屏"), (.bottomHalf, "bottom half", "下半屏"),
+            (.maximize, "max", "最大化"), (.center, "center", "居中"),
+            (.almostMaximize, "almost maximize", "接近最大化"), (.reasonableSize, "reasonable size", "合适大小"),
+            (.nextDisplay, "next display", "移至下一屏幕"), (.previousDisplay, "previous display", "移至上一屏幕"),
+            (.restore, "restore", "恢复原窗口大小"), (.leftHalf, "zuobanping", "zbp"),
+        ]
+        let catalog = LaunchCatalog.systemActions()
+        for (command, english, chinese) in queries {
+            for query in [english, chinese] {
+                let best = LaunchCatalog.matches(query, actions: catalog).first
+                try check(best?.action.destination == .window(command) && best?.primary == true,
+                          "window command did not rank first for \(query)")
+            }
+        }
+
+        app.dismissSearch()
+        app.settingsSession.page = .general
+        app.showSettings()
+        try check(app.windowManagement.isTrusted == false && openedAccessibilitySettings.isEmpty,
+                  "opening Settings did not silently check Accessibility trust")
+        try await verifyAccessibilitySettingsButton(in: app)
+        app.showSearch()
+        try type("left half", into: app)
+        let trustChecks = windowAdapter.trustChecks
+        let lookups = windowAdapter.lookups.count
+        try key(36, "\r", in: app)
+        try await until("untrusted window action did not present the onboarding banner") {
+            app.windowManagement.issue == .permissionRequired &&
+                app.panel.frame.height == SearchWindow.height(for: app.model, needsAccessibility: true)
+        }
+        try check(app.searchPresented && windowAdapter.trustChecks == trustChecks + 1 && windowAdapter.lookups.count == lookups &&
+                  windowAdapter.writes.isEmpty && openedAccessibilitySettings.count == 1,
+                  "untrusted command opened System Settings, retried trust or contacted a window")
+
+        windowAdapter.trusted = true
+        app.showSettings()
+        try check(app.windowManagement.isTrusted == true && app.windowManagement.issue == nil,
+                  "Accessibility grant was not recognized when reopening Settings")
+        app.showSearch()
+        frontmostWindowPID = ProcessInfo.processInfo.processIdentifier
+        try type("half", into: app)
+        try check(app.model.launchMatches.first?.action.destination != .window(.rightHalf),
+                  "frecency test must start with another half command first")
+        try type("右半屏", into: app)
+        try key(36, "\r", in: app)
+        try await until("window command did not run through Return and dismiss") { !app.searchPresented }
+        try check(windowAdapter.lookups.last == 42_001 && !windowAdapter.lookedUpOnMainThread &&
+                  windowAdapter.states[1]?.frame == CGRect(x: 720, y: 38, width: 720, height: 822),
+                  "command did not target the app captured before showSearch off the main thread")
+        app.showSearch()
+        try check(app.windowManagement.targetPID == nil, "showSearch captured Lumen itself or reused a stale target")
+        try type("half", into: app)
+        try check(app.model.launchMatches.first?.action.destination == .window(.rightHalf),
+                  "successful window command did not improve Frecency ranking")
+        app.dismissSearch()
+        frontmostWindowPID = 42_001
+        app.showSearch()
+        try type("restore", into: app)
+        try key(36, "\r", in: app)
+        try await until("restore command did not dismiss after restoring the previous frame") { !app.searchPresented }
+        try check(windowAdapter.states[1]?.frame == SmokeWindowAccess.State().frame && !NSApp.isActive && !app.panel.isVisible,
+                  "restore did not target the original test window or activated the GUI")
+        print("Window management passed: geometry, AX eligibility and history, onboarding, bilingual actions, and Frecency")
     }
 
     private func makeFileFrecencyFixtures() throws -> (project: URL, success: URL, failure: URL) {
@@ -3398,6 +3863,31 @@ final class LauncherSmoke {
                   "a missing release event suppressed the next shortcut")
     }
 
+    private func verifyAccessibilitySettingsButton(in app: AppDelegate) async throws {
+        guard let window = app.settings, let view = window.contentView else { throw Failure("Settings did not load") }
+        // SwiftUI requires an ordered window for mouse events. Keep it transparent and send the click locally.
+        let frame = window.frame
+        let opacity = window.alphaValue
+        window.alphaValue = 0
+        window.orderBack(nil)
+        defer {
+            window.orderOut(nil)
+            window.setFrame(frame, display: false)
+            window.alphaValue = opacity
+        }
+        view.layoutSubtreeIfNeeded()
+        let bounds = view.convert(view.bounds, to: nil)
+        // The button is on the right side of the banner, just below the General heading.
+        let point = CGPoint(x: bounds.maxX - 90, y: bounds.maxY - 105)
+        for type: NSEvent.EventType in [.leftMouseDown, .leftMouseUp] {
+            window.sendEvent(try mouseEvent(type, count: 1, at: point, in: window))
+        }
+        try await until("the Settings button did not dispatch the Accessibility deep-link") {
+            openedAccessibilitySettings.map(\.absoluteString) ==
+                ["x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"]
+        }
+    }
+
     private func click(count: Int, at point: NSPoint, in window: NSWindow) throws {
         // Hit-test the live row, then deliver AppKit events to that responder. The
         // app-local event does not depend on desktop focus or the global mouse queue.
@@ -3405,15 +3895,20 @@ final class LauncherSmoke {
             throw Failure("the fixture row was not hit-testable")
         }
         for type: NSEvent.EventType in [.leftMouseDown, .leftMouseUp] {
-            guard let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
-                                                 timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
-                                                 context: nil, eventNumber: 0, clickCount: count,
-                                                 pressure: type == .leftMouseDown ? 1 : 0) else {
-                throw Failure("cannot make in-process mouse event")
-            }
+            let event = try mouseEvent(type, count: count, at: point, in: window)
             if type == .leftMouseDown { target.mouseDown(with: event) }
             else { target.mouseUp(with: event) }
         }
+    }
+
+    private func mouseEvent(_ type: NSEvent.EventType, count: Int, at point: NSPoint, in window: NSWindow) throws -> NSEvent {
+        guard let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
+                                             timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                                             context: nil, eventNumber: 0, clickCount: count,
+                                             pressure: type == .leftMouseDown ? 1 : 0) else {
+            throw Failure("cannot make in-process mouse event")
+        }
+        return event
     }
 
     private func type(_ text: String, into app: AppDelegate) throws {
@@ -3465,6 +3960,76 @@ final class LauncherSmoke {
     private struct Failure: Error, CustomStringConvertible {
         let description: String
         init(_ description: String) { self.description = description }
+    }
+}
+
+// Smoke tests only inspect or change remote-window fixtures between completed commands.
+private final class SmokeWindowAccess: WindowAccessAdapter, @unchecked Sendable {
+    struct State {
+        var role = "AXWindow"
+        var subrole = "AXStandardWindow"
+        var minimized = false
+        var fullScreen = false
+        var positionSettable = true
+        var sizeSettable = true
+        var frame = CGRect(x: 120, y: 400, width: 600, height: 400)
+        var minimumWidth: CGFloat = 0
+    }
+
+    enum Write: Equatable {
+        case position(Int, CGPoint), size(Int, CGSize)
+    }
+
+    private let trustLock = NSLock()
+    private var trustState = (trusted: false, checks: 0)
+    var trusted: Bool {
+        get { trustLock.withLock { trustState.trusted } }
+        set { trustLock.withLock { trustState.trusted = newValue } }
+    }
+    var trustChecks: Int { trustLock.withLock { trustState.checks } }
+    private(set) var lookups: [pid_t] = []
+    private(set) var lookedUpOnMainThread = false
+    private(set) var writes: [Write] = []
+    var focused: Int? = 1
+    var main: Int?
+    var states: [Int: State] = [1: State()]
+
+    func isTrusted() -> Bool {
+        trustLock.withLock {
+            trustState.checks += 1
+            return trustState.trusted
+        }
+    }
+
+    func windows(in pid: pid_t) -> (focused: Int?, main: Int?) {
+        lookups.append(pid)
+        lookedUpOnMainThread = lookedUpOnMainThread || Thread.isMainThread
+        return pid == 42_001 ? (focused, main) : (nil, nil)
+    }
+
+    func inspect(_ window: Int) -> WindowAttributes? {
+        states[window].map { state in
+            WindowAttributes(role: state.role, subrole: state.subrole, minimized: state.minimized, fullScreen: state.fullScreen,
+                             positionSettable: state.positionSettable, sizeSettable: state.sizeSettable, frame: state.frame)
+        }
+    }
+
+    func frame(of window: Int) -> CGRect? { states[window]?.frame }
+
+    func setPosition(_ position: CGPoint, of window: Int) -> Bool {
+        writes.append(.position(window, position))
+        states[window]?.frame.origin = position
+        return true
+    }
+
+    func setSize(_ size: CGSize, of window: Int) -> Bool {
+        writes.append(.size(window, size))
+        if var state = states[window] {
+            state.frame.size = CGSize(width: max(size.width, state.minimumWidth), height: size.height)
+            state.frame.origin.y += 20 // Simulate WindowServer shifting the origin on resize.
+            states[window] = state
+        }
+        return true
     }
 }
 

@@ -10,11 +10,15 @@ struct SearchWindow: View {
     @ObservedObject var contextActions: ContextActions
     @ObservedObject var translation: TranslationPanelModel
     @ObservedObject var commands: LauncherCommands
+    @ObservedObject var windowManagement: WindowManagement
     @ObservedObject var inlinePreview: LauncherInlinePreview
     @ObservedObject var imageSearch: LauncherImageSearch
     let clipboard: ClipboardManager
     let selectClipboard: (Int64) -> Void
     let activateCommand: () -> Void
+    let activateExecution: () -> Void
+    let copyOutput: () -> Void
+    let cancelExecution: () -> Void
     let searchCommandAsFiles: () -> Void
     let closeInlinePreview: () -> Void
     let activateTranslation: () -> Void
@@ -23,6 +27,7 @@ struct SearchWindow: View {
     let beginIndex: () -> Void
     let open: (LauncherResult) -> Void
     let browse: () -> Void
+    let moveSelection: (Int) -> Void
     let fileAction: (FileAction, SearchHit) -> Void
 
     static let headerHeight: CGFloat = 56
@@ -30,21 +35,27 @@ struct SearchWindow: View {
     static let maximumVisibleRows = 8
 
     static func height(for model: Launcher, contextCount: Int = 0, hasTranslation: Bool = false,
-                       commandHeight: CGFloat? = nil, hasPreview: Bool = false) -> CGFloat {
-        let shell = headerHeight + footerHeight
+                       needsAccessibility: Bool = false, commandHeight: CGFloat? = nil, hasPreview: Bool = false,
+                       hasExecutableMatches: Bool = false) -> CGFloat {
+        let shell = headerHeight + footerHeight + (needsAccessibility ? WindowAccessibilityBanner.launcherHeight : 0)
         if hasTranslation { return shell + 138 }
         if let commandHeight { return shell + commandHeight }
         if contextCount > 0 { return shell + CGFloat(min(contextCount, maximumVisibleRows) * 44) }
-        guard model.showsResults else { return shell }
+        guard model.showsResults || hasExecutableMatches else { return shell }
         let rows = model.hasQuery ? maximumVisibleRows : min(model.visibleResults.count, maximumVisibleRows)
         return shell + max(CGFloat(rows * 44), hasPreview ? 176 : 0)
     }
 
     private static func rowHeight(_ hit: SearchHit) -> CGFloat { hit.hasPreview ? 60 : 44 }
 
+    private var showsResults: Bool { model.showsResults || !commands.executableMatches.isEmpty }
+
     var body: some View {
         VStack(spacing: 0) {
-            if let command = translation.command {
+            if let execution = commands.visibleExecution {
+                LauncherCommandOutputCard(commands: commands, execution: execution, chinese: model.zh,
+                                          run: activateExecution, copy: copyOutput, cancel: cancelExecution)
+            } else if let command = translation.command {
                 TranslationResultCard(model: translation, command: command, chinese: model.zh,
                                       activate: activateTranslation)
             } else if commands.isImageCommand && !model.isImageSearch {
@@ -93,15 +104,19 @@ struct SearchWindow: View {
                     .padding(12)
                     .frame(width: 295)
                 }
-            } else if model.showsResults {
+            } else if showsResults {
                 results.overlay {
-                    if model.visibleResults.isEmpty {
+                    if model.visibleResults.isEmpty && commands.executableMatches.isEmpty {
                         Text(emptyResultsLabel)
                             .font(.callout).foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                             .padding(16)
                     }
                 }
+            }
+            if windowManagement.issue == .permissionRequired {
+                WindowAccessibilityBanner(model: model, openSettings: windowManagement.openAccessibilitySettings)
+                    .frame(height: WindowAccessibilityBanner.launcherHeight)
             }
             footer
         }
@@ -110,7 +125,13 @@ struct SearchWindow: View {
 
     private var footer: some View {
         HStack(spacing: 12) {
-            if translation.command != nil {
+            if let execution = commands.visibleExecution {
+                keyHint("esc", execution.running ? model.t("取消", "Cancel") : model.t("关闭结果", "Close Result"))
+                if execution.command.mode == .fullOutput && execution.hasOutput {
+                    keyHint("PgUp/PgDn", model.t("翻页", "Scroll"))
+                }
+                Spacer(minLength: 8)
+            } else if translation.command != nil {
                 if translation.activity == .translating {
                     keyHint("esc", model.t("取消", "Cancel"))
                 } else if !translation.output.isEmpty {
@@ -177,10 +198,10 @@ struct SearchWindow: View {
         if model.isImageSearch {
             Label(model.t("图像内容", "Image Content"), systemImage: "photo")
         }
-        if model.showsResults {
+        if showsResults {
             keyHint("↑↓", model.t("选择", "Select"))
             keyHint("↵", model.t("打开", "Open"))
-            if let file = model.selectedHit {
+            if case .file(let file) = commands.selectedResult(in: model) {
                 keyHint("⌘↵", model.t("在 Finder 中显示", "Show in Finder"))
                 if file.isLocal && file.kind == "file" {
                     keyHint(model.t("空格 / ⌘Y", "Space / ⌘Y"), model.t("预览", "Preview"))
@@ -197,12 +218,14 @@ struct SearchWindow: View {
                 Text(title).lineLimit(1)
             }
         }
-        if let notice = model.searchNotice, !model.visibleResults.isEmpty {
+        if let issue = windowManagement.issue, issue != .permissionRequired {
+            Text(issue.title(model)).lineLimit(1).help(issue.title(model))
+        } else if let notice = model.searchNotice, !model.visibleResults.isEmpty {
             Text(model.title(for: notice)).lineLimit(1).help(model.title(for: notice))
                 .accessibilityIdentifier("launcher-notice")
         }
         Spacer(minLength: 8)
-        if !model.showsResults && !model.activityBusy {
+        if !showsResults && !model.activityBusy {
             Label(model.t("筛选", "Filters"), systemImage: "line.3.horizontal.decrease")
                 .help(model.t("kind:folder、ext:pdf 或 path:\"/Users/…/My Files/\"；也可直接输入绝对路径。",
                               "Try kind:folder, ext:pdf, or path:\"/Users/…/My Files/\". You can also type an absolute path."))
@@ -215,7 +238,7 @@ struct SearchWindow: View {
         } else {
             keyHint("esc", inlinePreview.isOpen ? model.t("关闭预览", "Close Preview") : model.t("关闭", "Close"))
         }
-        if model.selectedResult != nil {
+        if commands.selectedResult(in: model) != nil {
             Button(action: toggleContextActions) {
                 keyHint("⌘K", model.t("操作", "Actions"))
             }
@@ -236,31 +259,33 @@ struct SearchWindow: View {
 
     private var results: some View {
         let highlight = LauncherHighlight(model.query)
+        let selection = commands.selection(in: model)
         return ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(model.visibleResults) { result in
+                    ForEach(commands.results(in: model)) { result in
+                        let selected = selection == result.id
                         switch result {
-                        case .file(let hit): resultRow(hit, highlight: highlight).id(result.id)
-                        case .action(let action): actionRow(action, highlight: highlight).id(result.id)
+                        case .file(let hit): resultRow(hit, highlight: highlight, selected: selected).id(result.id)
+                        case .action(let action): actionRow(action, highlight: highlight, selected: selected).id(result.id)
                         case .shortcut(let shortcut):
                             utilityRow(result, title: shortcut.title, detail: shortcut.detail, symbol: shortcut.symbol,
-                                       highlight: highlight).id(result.id)
+                                       highlight: highlight, selected: selected).id(result.id)
                         case .calculation(let calculation):
                             utilityRow(result, title: calculation.display, detail: model.t("回车复制", "Return to Copy"),
-                                       symbol: "plus.forwardslash.minus", highlight: nil).id(result.id)
+                                       symbol: "plus.forwardslash.minus", highlight: nil, selected: selected).id(result.id)
                         }
                     }
                 }
                 .padding(.horizontal, 8)
             }
-            .onChange(of: model.selection) { _, value in
+            .onChange(of: selection) { _, value in
                 if let value { proxy.scrollTo(value) }
             }
-            .onKeyPress(.upArrow) { browse(); model.moveSelection(-1); return .handled }
-            .onKeyPress(.downArrow) { browse(); model.moveSelection(1); return .handled }
+            .onKeyPress(.upArrow) { moveSelection(-1); return .handled }
+            .onKeyPress(.downArrow) { moveSelection(1); return .handled }
             .onKeyPress(keys: [.return]) { press in
-                guard press.modifiers.isEmpty, let result = model.selectedResult else { return .ignored }
+                guard press.modifiers.isEmpty, let result = commands.selectedResult(in: model) else { return .ignored }
                 open(result)
                 return .handled
             }
@@ -286,8 +311,7 @@ struct SearchWindow: View {
     }
 
     private func utilityRow(_ result: LauncherResult, title: String, detail: String, symbol: String,
-                            highlight: LauncherHighlight?) -> some View {
-        let selected = model.selection == result.id
+                            highlight: LauncherHighlight?, selected: Bool) -> some View {
         return HStack(spacing: 10) {
             if case .shortcut(let shortcut) = result, let action = model.application(for: shortcut) {
                 ActionResultIcon(action: action, image: ApplicationIcons.Key(action).flatMap { applicationIcons.images[$0] },
@@ -318,7 +342,7 @@ struct SearchWindow: View {
 
     private func clickRow(_ result: LauncherResult, count: Int? = nil) {
         browse()
-        model.selection = result.id
+        commands.choose(result, in: model)
         // Select on mouseUp without waiting to see if it becomes a double click.
         let event = NSApp.currentEvent
         if (count ?? (event?.type == .leftMouseUp ? event?.clickCount : nil)) == 2 { open(result) }
@@ -338,8 +362,7 @@ struct SearchWindow: View {
             : model.t("没有匹配结果", "No matches")
     }
 
-    private func actionRow(_ action: LaunchAction, highlight: LauncherHighlight) -> some View {
-        let selected = model.selection == action.id
+    private func actionRow(_ action: LaunchAction, highlight: LauncherHighlight, selected: Bool) -> some View {
         let category: ResultCategory
         let detail: String?
         switch action.destination {
@@ -353,6 +376,18 @@ struct SearchWindow: View {
             category = ResultCategory(title: model.t("系统操作", "System Action"), symbol: "bolt")
             if case .define(let word) = operation { detail = word }
             else { detail = nil }
+        case .window:
+            category = ResultCategory(title: model.t("窗口管理", "Window Management"), symbol: "macwindow")
+            detail = nil
+        case .executable(let command):
+            switch command.source {
+            case .script(_, _, let name, _):
+                category = ResultCategory(title: model.t("本地脚本", "Local Script"), symbol: "terminal")
+                detail = command.description.isEmpty ? (command.alias.isEmpty ? name : command.alias) : command.description
+            case .shortcut:
+                category = ResultCategory(title: model.t("快捷指令", "Apple Shortcut"), symbol: "square.stack")
+                detail = nil
+            }
         }
         let title = action.title(chinese: model.zh)
         return HStack(spacing: 10) {
@@ -380,17 +415,16 @@ struct SearchWindow: View {
         .accessibilityIdentifier(action.id)
     }
 
-    @ViewBuilder private func resultRow(_ hit: SearchHit, highlight: LauncherHighlight) -> some View {
+    @ViewBuilder private func resultRow(_ hit: SearchHit, highlight: LauncherHighlight, selected: Bool) -> some View {
         if hit.isLocal && model.containsCurrentFile(hit) {
-            fileRow(hit, highlight: highlight).onDrag {
+            fileRow(hit, highlight: highlight, selected: selected).onDrag {
                 guard model.containsCurrentFile(hit), let url = LocalFile.dragURL(for: hit) else { return NSItemProvider() }
                 return NSItemProvider(object: url as NSURL)
             }
-        } else { fileRow(hit, highlight: highlight) }
+        } else { fileRow(hit, highlight: highlight, selected: selected) }
     }
 
-    private func fileRow(_ hit: SearchHit, highlight: LauncherHighlight) -> some View {
-        let selected = model.selection == hit.path
+    private func fileRow(_ hit: SearchHit, highlight: LauncherHighlight, selected: Bool) -> some View {
         let folder = hit.kind == "directory"
         return HStack(spacing: 10) {
             FileTypeIcon(name: hit.name, directory: folder)
@@ -630,7 +664,7 @@ extension Launcher {
 
 enum SettingsPage: String, CaseIterable, Identifiable {
     case general, index, quicklinks, translation
-    case advanced
+    case advanced, scripts
 
     var id: Self { self }
 
@@ -641,6 +675,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .quicklinks: return model.t("快捷链接", "Quicklinks")
         case .translation: return model.t("翻译", "Translation")
         case .advanced: return model.t("高级与诊断", "Advanced & Diagnostics")
+        case .scripts: return model.t("脚本与快捷指令", "Scripts & Shortcuts")
         }
     }
 
@@ -651,6 +686,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .quicklinks: return "link"
         case .translation: return "character.bubble"
         case .advanced: return "waveform.path.ecg"
+        case .scripts: return "terminal"
         }
     }
 }
@@ -760,6 +796,33 @@ final class SettingsSession: ObservableObject {
     }
 }
 
+private struct WindowAccessibilityBanner: View {
+    static let launcherHeight: CGFloat = 66
+    let model: Launcher
+    let openSettings: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "accessibility").font(.title2).foregroundStyle(Color.accentColor)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(WindowActionIssue.permissionRequired.title(model)).font(.callout.weight(.semibold))
+                Text(model.t("请在「隐私与安全性」→「辅助功能」中启用 Lumen。",
+                             "Enable Lumen in Privacy & Security → Accessibility."))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+            Button(model.t("打开辅助功能设置…", "Open Accessibility Settings…"), action: openSettings)
+                .accessibilityIdentifier("window-accessibility-settings")
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal, 12)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("window-accessibility-banner")
+    }
+}
+
 struct LauncherSettings: View {
     @ObservedObject var model: Launcher
     @ObservedObject var session: SettingsSession
@@ -767,6 +830,9 @@ struct LauncherSettings: View {
     let volumes: ExternalVolumeCatalog
     let images: LauncherImageSearch
     let clipboard: ClipboardManager
+    @ObservedObject var windowManagement: WindowManagement
+    @ObservedObject var scriptCatalog: LauncherScriptCatalog
+    let chooseScriptsFolder: () -> Void
     let chooseImageFolder: () -> Void
     let chooseImageProjector: () -> Void
     let chooseQuicklinkFolder: (@escaping (URL) -> Void) -> Void
@@ -794,6 +860,7 @@ struct LauncherSettings: View {
                             switch page {
                             case .general: general
                             case .index: indexAndPrivacy
+                            case .scripts: scriptsAndShortcuts
                             case .translation:
                                 group(model.t("模型与提供商", "Model & Providers")) {
                                     TranslationSettingsView(model: translation, chinese: model.zh)
@@ -889,7 +956,56 @@ struct LauncherSettings: View {
         session.page = destination
     }
 
+    @ViewBuilder private var scriptsAndShortcuts: some View {
+        group(model.t("本地脚本", "Local Scripts")) {
+            Toggle(model.t("启用本地脚本", "Enable Local Scripts"), isOn: Binding(
+                get: { scriptCatalog.scriptsEnabled }, set: { scriptCatalog.setScriptsEnabled($0) }
+            ))
+            .disabled(scriptCatalog.folder == nil)
+            .accessibilityIdentifier("settings.scripts.enabled")
+            if let folder = scriptCatalog.folder {
+                LabeledContent(model.t("脚本文件夹", "Scripts Folder")) {
+                    Text((folder as NSString).abbreviatingWithTildeInPath).textSelection(.enabled)
+                }
+            }
+            HStack {
+                Button(model.t("选择文件夹…", "Choose Folder…"), action: chooseScriptsFolder)
+                    .accessibilityIdentifier("settings.scripts.choose")
+                if scriptCatalog.folder == nil {
+                    Button(model.t("创建默认文件夹并启用", "Create Default Folder & Enable"), action: scriptCatalog.createAndEnable)
+                        .disabled(scriptCatalog.scriptLoading)
+                }
+                Button(model.t("重新载入脚本", "Reload Scripts"), action: scriptCatalog.reloadScripts)
+                    .disabled(!scriptCatalog.scriptsEnabled || scriptCatalog.scriptLoading)
+            }
+            if scriptCatalog.scriptLoading { note(model.t("正在读取脚本…", "Loading scripts…")) }
+            else if scriptCatalog.scriptFailed {
+                note(model.t("无法读取该文件夹。请选择本机非链接目录。", "Could not read the folder. Choose a resident folder that is not a link."))
+            } else {
+                note(model.t("\(scriptCatalog.scripts.count) 个脚本", "Scripts available: \(scriptCatalog.scripts.count)"))
+            }
+            note(model.t("仅搜索该文件夹内的可执行文件。脚本拥有您的权限；请仅启用您信任的脚本。将直接在所选文件夹内运行，工作目录为该文件夹。",
+                         "Only executables directly inside the folder are listed. Scripts run with your permissions; enable only scripts you trust. Scripts run directly with the selected folder as their working directory."))
+        }
+        group(model.t("Apple 快捷指令", "Apple Shortcuts")) {
+            Toggle(model.t("启用 Apple 快捷指令", "Enable Apple Shortcuts"), isOn: Binding(
+                get: { scriptCatalog.shortcutsEnabled }, set: { scriptCatalog.setShortcutsEnabled($0) }
+            ))
+            .accessibilityIdentifier("settings.apple-shortcuts.enabled")
+            Button(model.t("刷新快捷指令", "Refresh Shortcuts"), action: scriptCatalog.refreshShortcuts)
+                .disabled(!scriptCatalog.shortcutsEnabled || scriptCatalog.shortcutLoading)
+            if scriptCatalog.shortcutLoading { note(model.t("正在读取快捷指令…", "Loading Shortcuts…")) }
+            else if scriptCatalog.shortcutFailed { note(model.t("无法读取快捷指令。", "Could not list Shortcuts.")) }
+            else { note(model.t("\(scriptCatalog.shortcuts.count) 个快捷指令", "Shortcuts available: \(scriptCatalog.shortcuts.count)")) }
+            note(model.t("列表仅保存在内存中。重新启动 Lumen 后，请手动刷新。",
+                         "The list is kept in memory only. Refresh it after restarting Lumen."))
+        }
+    }
+
     @ViewBuilder private var general: some View {
+        if windowManagement.isTrusted == false {
+            WindowAccessibilityBanner(model: model, openSettings: windowManagement.openAccessibilitySettings)
+        }
         group(model.t("启动", "Startup")) {
             Toggle(model.t("登录时启动", "Launch at Login"), isOn: Binding(
                 get: { session.launchAtLogin }, set: { session.setLaunchAtLogin($0) }

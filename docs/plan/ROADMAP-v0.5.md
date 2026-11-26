@@ -56,16 +56,16 @@ All milestones follow [AGENTS.md](../../AGENTS.md) anti-over-defense rules and e
 
 ---
 
-## Milestone 6: Static Core Engine & Zero-Friction Distribution (`pending`)
+## Milestone 6: Static Core Engine & Zero-Friction Distribution (`done`)
 
-### `T19` Static `liblumen.a` In-Process Core Search (`pending`)
+### `T19` Static `liblumen.a` In-Process Core Search (`done`)
 - **Worktree**: `m6-static-engine`
 - **Scope**:
   - Expose a minimal C-ABI static library target (`liblumen.a` + `include/lumen_core.h`) for hot in-process Read/Name-SoA/FTS queries and cached hit validation directly inside `Lumen.app`, cutting idle RSS below ~100 MiB and eliminating pipe serialization overhead for the keystroke hot path while preserving `lumen` CLI binary for scripting and `tests/cli.rs`.
   - Keep heavy/untrusted extractors and native runtimes (`LumenPdfExtractor`, `LumenImageOcrExtractor`, `llama-server`) isolated in on-demand, timeout-guarded child processes so crashes or OOM in extractors/models can never take down the launcher UI.
   - Maintain full ABI/memory-safety verification (`cargo test`, ASan/leak smoke check across repeated open/search/close cycles).
 
-### `T20` Signed In-App Updater & Homebrew Cask Distribution (`pending`)
+### `T20` Signed In-App Updater & Homebrew Cask Distribution (`done`)
 - **Worktree**: `m6-release-updater`
 - **Scope**:
   - In-app lightweight update checker (opt-in / manual + quiet periodic HTTPS check against signed GitHub Releases manifest, zero third-party frameworks) verified with SHA-256 + Apple Designated Requirement (`SecStaticCodeCheckValidity` against the running app's DR before touching the installed bundle).

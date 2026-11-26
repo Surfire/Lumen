@@ -14,10 +14,22 @@ struct LaunchAction: Equatable, Identifiable {
     let symbol: String
     let destination: Destination
     let aliases: [String]
+    let normalizedNames: [String]
+    let normalizedSearchable: [String]
+
+    init(id: String, english: String, chinese: String, symbol: String, destination: Destination, aliases: [String]) {
+        self.id = id
+        self.english = english
+        self.chinese = chinese
+        self.symbol = symbol
+        self.destination = destination
+        self.aliases = aliases
+        let names = [english, chinese].map(LaunchCatalog.normalized)
+        self.normalizedNames = names
+        self.normalizedSearchable = names + aliases.map(LaunchCatalog.normalized)
+    }
 
     func title(chinese useChinese: Bool) -> String { useChinese ? chinese : english }
-
-    fileprivate var searchable: [String] { [english, chinese] + aliases }
 }
 
 actor ApplicationIcons {
@@ -65,27 +77,71 @@ actor ApplicationIcons {
 final class ResultIconDisplay: ObservableObject {
     @Published private(set) var images: [ApplicationIcons.Key: CGImage] = [:]
 
+    private let capacity = 64
     private let icons = ApplicationIcons()
     private var visible = Set<ApplicationIcons.Key>()
     private var tasks: [ApplicationIcons.Key: Task<Void, Never>] = [:]
+    private var pendingImages: [ApplicationIcons.Key: CGImage] = [:]
+    private var recent: [ApplicationIcons.Key] = []
+    private var flushScheduled = false
+
+    func cancelPending() {
+        for task in tasks.values { task.cancel() }
+        tasks.removeAll()
+        pendingImages.removeAll()
+        visible.removeAll()
+    }
 
     func update(for matches: [ActionMatch]) {
         let keys = Set(matches.compactMap { ApplicationIcons.Key($0.action) })
         guard keys != visible else { return }
-        let added = keys.subtracting(visible)
         for removed in visible.subtracting(keys) {
             tasks.removeValue(forKey: removed)?.cancel()
-            images.removeValue(forKey: removed)
+            pendingImages.removeValue(forKey: removed)
         }
         visible = keys
-        for key in added {
+        for key in keys {
+            if images[key] != nil {
+                recent.removeAll { $0 == key }
+                recent.append(key)
+                continue
+            }
+            guard tasks[key] == nil else { continue }
             tasks[key] = Task { [weak self, icons] in
                 let image = await icons.image(for: key)
                 guard !Task.isCancelled, let self else { return }
                 self.tasks[key] = nil
-                if let image { self.images[key] = image }
+                guard self.visible.contains(key), let image else { return }
+                self.pendingImages[key] = image
+                self.scheduleFlush()
             }
         }
+    }
+
+    private func scheduleFlush() {
+        guard !flushScheduled else { return }
+        flushScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            self?.flushPending()
+        }
+    }
+
+    private func flushPending() {
+        flushScheduled = false
+        guard !pendingImages.isEmpty else { return }
+        var next = images
+        for (key, image) in pendingImages {
+            next[key] = image
+            recent.removeAll { $0 == key }
+            recent.append(key)
+        }
+        pendingImages.removeAll()
+        while recent.count > capacity,
+              let oldestIndex = recent.firstIndex(where: { !visible.contains($0) }) {
+            let evicted = recent.remove(at: oldestIndex)
+            next.removeValue(forKey: evicted)
+        }
+        images = next
     }
 }
 
@@ -95,7 +151,7 @@ struct ActionMatch: Equatable {
     var primary: Bool { score >= 80 }
 }
 
-enum LauncherResult: Identifiable {
+enum LauncherResult: Identifiable, Equatable {
     case file(SearchHit), action(LaunchAction), shortcut(SavedShortcut), calculation(CalculationResult)
 
     var id: String {
@@ -281,11 +337,11 @@ enum LaunchCatalog {
             let isApplication: Bool
             if case .application = action.destination { isApplication = true }
             else { isApplication = false }
-            let names = [action.english, action.chinese].map(normalized)
+            let names = action.normalizedNames
             let score: Int
             if names.contains(term) { score = 110 }
             else if term.count == 1 && names.contains(where: { $0.hasPrefix(term) }) { score = isApplication ? 86 : 62 }
-            else { score = action.searchable.lazy.map { match(term, in: normalized($0), isApplication: isApplication) }.max() ?? 0 }
+            else { score = action.normalizedSearchable.lazy.map { match(term, in: $0, isApplication: isApplication) }.max() ?? 0 }
             guard score > 0 else { return nil }
             return ActionMatch(action: action, score: score + boost(action.id))
         }.sorted {

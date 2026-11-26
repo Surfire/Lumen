@@ -85,7 +85,11 @@ final class LauncherImageSearch: ObservableObject {
         checked = 0
         limited = false
         failed = false
-        batch(after: nil, projector: projector, generation: generation)
+        if engine.supportsStreamingBatches {
+            streamBuild(projector: projector, generation: generation)
+        } else {
+            batch(after: nil, projector: projector, generation: generation)
+        }
     }
 
     func stop(refreshStatus: Bool = true) {
@@ -95,6 +99,26 @@ final class LauncherImageSearch: ObservableObject {
         process = nil
         building = false
         if refreshStatus { refresh() }
+    }
+
+    private func streamBuild(projector: URL, generation: Int) {
+        let args = ["image-index", "--projector", projector.path, "--stream", "--max", "16"] + engine.gemmaOptions
+        var sawBatch = false
+        process = engine.run(args, onLine: { [weak self] line in
+            guard let self, self.generation == generation,
+                  let batch = try? JSONDecoder().decode(Batch.self, from: line) else { return }
+            sawBatch = true
+            self.checked += batch.indexed + batch.reused
+            self.limited = batch.limited
+        }, priority: .background) { [weak self] response in
+            guard let self, self.generation == generation else { return }
+            self.process = nil
+            self.building = false
+            if !response.succeeded || !sawBatch {
+                self.failed = true
+            }
+            self.refresh()
+        }
     }
 
     private func batch(after cursor: String?, projector: URL, generation: Int) {
@@ -123,6 +147,7 @@ final class LauncherImageSearch: ObservableObject {
 
 struct LauncherImageSettings: View {
     @ObservedObject var launcher: Launcher
+    @ObservedObject var indexStatus: IndexStatusState
     @ObservedObject var images: LauncherImageSearch
     let chooseFolder: () -> Void
     let chooseProjector: () -> Void
@@ -150,7 +175,7 @@ struct LauncherImageSettings: View {
                     Button(launcher.t("移除", "Remove")) { images.setFolder(nil) }
                 }
             }
-            .disabled(images.loading || images.building || !launcher.canSearch || launcher.scopePending)
+            .disabled(images.loading || images.building || !launcher.canSearch || indexStatus.scopePending)
             HStack {
                 if images.building {
                     ProgressView().controlSize(.small)
@@ -161,7 +186,7 @@ struct LauncherImageSettings: View {
                         .foregroundStyle(.secondary)
                     Button(launcher.t("建立或刷新图像索引", "Build or Refresh Image Index")) { images.build() }
                         .disabled(images.scope?.root == nil || images.projector == nil || images.loading ||
-                                  !launcher.canSearch || launcher.scopePending || launcher.indexWork != nil)
+                                  !launcher.canSearch || indexStatus.scopePending || indexStatus.indexWork != nil)
                 }
             }
             if images.failed { Text(launcher.t("操作失败。请检查目录和图像模型。", "Check the folder and image model, then retry.")).foregroundStyle(.secondary) }

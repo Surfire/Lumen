@@ -127,6 +127,14 @@ struct ContentBatch: Decodable {
     let processed: Int
     let indexed: Int
     let pending: Int
+    let skipped: Int?
+
+    init(processed: Int, indexed: Int, pending: Int, skipped: Int? = nil) {
+        self.processed = processed
+        self.indexed = indexed
+        self.pending = pending
+        self.skipped = skipped
+    }
 }
 
 struct GemmaCoverage: Decodable, Equatable {
@@ -239,10 +247,15 @@ struct EngineResponse {
 
 @MainActor
 final class LauncherEngine {
+    // Coordinator: flip to true after merging rust-pipelines (--stream on embed / image-index).
+    private static let streamIndexingEnabled = false
+
     let executable: URL
     let database: URL
+    let usesCoreLibrary: Bool
+    let supportsStreamingBatches: Bool
     private let root: URL?
-    private let core: CoreSearchConnection?
+    let core: CoreSearchConnection?
     private var connection: SearchConnection?
     private var semanticConnection: SearchConnection?
     private var imageConnection: SearchConnection?
@@ -260,7 +273,7 @@ final class LauncherEngine {
     }
 
     init(executable: URL, database: URL, syntheticRoot: URL? = nil, gemmaHome: URL? = nil,
-         requestTimeout: Duration = .seconds(20)) {
+         requestTimeout: Duration = .seconds(20), supportsStreamingBatches: Bool? = nil) {
         self.executable = executable
         self.database = database
         self.root = syntheticRoot
@@ -268,8 +281,10 @@ final class LauncherEngine {
         self.requestTimeout = requestTimeout
         let resources = Bundle.main.resourceURL ?? Bundle.main.bundleURL.appendingPathComponent("Contents/Resources")
         let bundled = resources.appendingPathComponent("lumen")
-        self.core = executable.standardizedFileURL.path == bundled.standardizedFileURL.path
-            ? CoreSearchConnection(database: database, root: syntheticRoot) : nil
+        let isBundled = executable.standardizedFileURL.path == bundled.standardizedFileURL.path
+        self.usesCoreLibrary = isBundled
+        self.supportsStreamingBatches = supportsStreamingBatches ?? (isBundled && Self.streamIndexingEnabled)
+        self.core = isBundled ? CoreSearchConnection(database: database, root: syntheticRoot) : nil
     }
 
     var hasDatabase: Bool {
@@ -398,7 +413,14 @@ final class LauncherEngine {
         return tail
     }
 
-    var nameSearchBusy: Bool { core?.isBusy == true || connection?.isBusy == true }
+    var nameSearchBusy: Bool { core?.isNameBusy == true || connection?.isBusy == true }
+
+    @discardableResult
+    func status(includeScope: Bool, complete: @escaping @MainActor (EngineResponse) -> Void) -> Process? {
+        // Coordinator: route core != nil to lumen_session_status_json on textWorker after rust-hotpath merges.
+        let command = includeScope ? ["status", "--include-scope"] : ["status"]
+        return run(command, complete: complete)
+    }
 
     func warmNameSearch() {
         if let core { core.warm() }
@@ -593,9 +615,9 @@ struct SearchFailure: Error {
 
 private typealias SearchCompletion = (Result<[SearchHit], SearchFailure>) -> Void
 
-private typealias ServeCompletion = (Result<SearchReply, SearchFailure>) -> Void
+typealias ServeCompletion = (Result<SearchReply, SearchFailure>) -> Void
 
-private struct SearchRequest: Encodable {
+struct SearchRequest: Encodable {
     let id: UInt64
     var query: String? = nil
     var mode: String? = nil
@@ -605,7 +627,7 @@ private struct SearchRequest: Encodable {
     var hits: [ValidationHit]? = nil
 }
 
-private struct ValidationHit: Encodable {
+struct ValidationHit: Encodable {
     let path: String
     let kind: String
     let availability: String
@@ -621,7 +643,7 @@ private struct ValidationHit: Encodable {
     }
 }
 
-private struct SearchReply: Decodable {
+struct SearchReply: Decodable {
     let id: UInt64?
     let hits: [SearchHit]?
     let valid: [Bool]?
@@ -630,13 +652,14 @@ private struct SearchReply: Decodable {
 
 // The handle is confined to this serial queue until the worker's last reference
 // is released. The main actor only schedules requests and delivers replies.
-private final class CoreSearchWorker: @unchecked Sendable {
-    let queue = DispatchQueue(label: "lumen.core.search", qos: .userInitiated)
+final class CoreSearchWorker: @unchecked Sendable {
+    let queue: DispatchQueue
     private let database: URL
     private let root: URL?
     private var handle: OpaquePointer?
 
-    init(database: URL, root: URL?) {
+    init(label: String, database: URL, root: URL?) {
+        self.queue = DispatchQueue(label: label, qos: .userInitiated)
         self.database = database
         self.root = root
     }
@@ -682,19 +705,21 @@ private final class CoreSearchWorker: @unchecked Sendable {
 }
 
 @MainActor
-private final class CoreSearchConnection {
+final class CoreSearchLane {
     private struct Pending {
         let request: SearchRequest
         let explicit: Bool
         let complete: ServeCompletion
     }
 
-    private let worker: CoreSearchWorker
+    let worker: CoreSearchWorker
     private var generation: UInt64 = 0
     private var queued: [Pending] = []
     private(set) var isBusy = false
 
-    init(database: URL, root: URL?) { worker = CoreSearchWorker(database: database, root: root) }
+    init(label: String, database: URL, root: URL?) {
+        worker = CoreSearchWorker(label: label, database: database, root: root)
+    }
 
     func warm() { worker.queue.async { [worker] in _ = worker.open() } }
 
@@ -732,6 +757,37 @@ private final class CoreSearchConnection {
                 self.sendNext()
             }
         }
+    }
+}
+
+@MainActor
+final class CoreSearchConnection {
+    let nameLane: CoreSearchLane
+    let textLane: CoreSearchLane
+
+    var isNameBusy: Bool { nameLane.isBusy }
+    var isBusy: Bool { nameLane.isBusy || textLane.isBusy }
+
+    init(database: URL, root: URL?) {
+        nameLane = CoreSearchLane(label: "lumen.core.name", database: database, root: root)
+        textLane = CoreSearchLane(label: "lumen.core.text", database: database, root: root)
+    }
+
+    func warm() { nameLane.warm() }
+
+    func enqueue(_ request: SearchRequest, explicit: Bool = false, complete: @escaping ServeCompletion) {
+        let target = request.mode == "name" ? nameLane : textLane
+        target.enqueue(request, explicit: explicit, complete: complete)
+    }
+
+    func discardQueued() {
+        nameLane.discardQueued()
+        textLane.discardQueued()
+    }
+
+    func close() {
+        nameLane.close()
+        textLane.close()
     }
 }
 

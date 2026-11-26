@@ -42,7 +42,7 @@ private struct LocalModelStatus: Decodable {
     let diagnostic: String?
 }
 
-struct EmbeddingBatch: Decodable {
+struct EmbeddingBatch: Decodable, Equatable {
     let new_embeddings: Int
     let skipped_chunks: Int
     let has_more: Bool
@@ -53,21 +53,21 @@ private struct WatchEvent: Decodable {
     let event: Kind
 }
 
-struct FileDiagnosis: Decodable {
+struct FileDiagnosis: Decodable, Equatable {
     let name: String
     let text: String
     let semantic: String
 }
 
-enum FileDiagnosisState {
+enum FileDiagnosisState: Equatable {
     case idle, checking(String), result(String, FileDiagnosis), failed(String)
 }
 
-enum LauncherProblem {
+enum LauncherProblem: Equatable {
     case status, indexing, search, embeddings, embeddingNoProgress, opening, scope, scopeState, watch, online, stale, preview, copiedName, copiedPath
 }
 
-struct LauncherNotice {
+struct LauncherNotice: Equatable {
     let problem: LauncherProblem
     let detail: String
     init(_ problem: LauncherProblem, _ detail: String = "") {
@@ -76,57 +76,121 @@ struct LauncherNotice {
     }
 }
 
+extension HotKeyIssue: Equatable {
+    static func == (lhs: HotKeyIssue, rhs: HotKeyIssue) -> Bool {
+        switch (lhs, rhs) {
+        case (.invalid, .invalid), (.system, .system), (.app, .app), (.occupied, .occupied): return true
+        case (.registration(let a), .registration(let b)): return a == b
+        default: return false
+        }
+    }
+}
+
+@MainActor
+final class IndexStatusState: ObservableObject {
+    @Published var indexPhase = IndexPhase.checking
+    @Published var indexWork: IndexWork?
+    @Published var indexReport: IndexReport?
+    @Published var scanProgress: IndexProgress?
+    @Published var watchState = WatchState.checking
+    @Published var watchProgress: IndexProgress?
+    @Published var watchNotice: LauncherNotice?
+    @Published var scopePending: Bool
+    @Published var savedScope: IndexScope?
+    @Published var scope: IndexScope {
+        didSet {
+            guard scope != oldValue else { return }
+            onScopeChanged?(scope)
+        }
+    }
+    @Published var indexNotice: LauncherNotice?
+    @Published var contentCoverage: ContentCoverage?
+    @Published var contentPaused = false
+    @Published var contentRunning = false
+    @Published var contentFailed = false
+    @Published var localModelState = LocalModelState.unchecked
+    @Published var gemmaCoverage: GemmaCoverage?
+    @Published var embeddingState = EmbeddingState.idle
+    @Published var embeddingBatch: EmbeddingBatch?
+    @Published var embeddingNotice: LauncherNotice?
+    @Published var fileDiagnosis = FileDiagnosisState.idle
+
+    var onScopeChanged: ((IndexScope) -> Void)?
+
+    init(scopePending: Bool, scope: IndexScope, contentPaused: Bool) {
+        self.scopePending = scopePending
+        self.scope = scope
+        self.contentPaused = contentPaused
+    }
+
+    func set<Value: Equatable>(_ keyPath: ReferenceWritableKeyPath<IndexStatusState, Value>, to value: Value) {
+        if self[keyPath: keyPath] != value {
+            self[keyPath: keyPath] = value
+        }
+    }
+}
+
 @MainActor
 final class Launcher: ObservableObject {
+    private static let trailingExtensionRegex = try! NSRegularExpression(pattern: #"\.[A-Za-z0-9]{1,8}$"#)
+
+    let indexStatus: IndexStatusState
     @Published private(set) var query = ""
     private var imageProjector: URL?
-    var isImageSearch: Bool { imageProjector != nil }
+    @Published private(set) var isImageSearch = false
     @Published private(set) var hits: [SearchHit] = []
+    @Published private(set) var visibleResults: [LauncherResult] = []
     @Published private(set) var launchMatches: [ActionMatch] = []
-    @Published private(set) var executableMatches: [ActionMatch] = []
+    private var executableMatches: [ActionMatch] = []
     @Published private(set) var calculation: CalculationResult?
     let shortcuts: ShortcutLibrary
     private var shortcutChanges: AnyCancellable?
     @Published var selectedID: String?
     var selection: String? {
         get { selectedID }
-        set { selectedID = newValue }
+        set { set(\.selectedID, to: newValue) }
     }
     @Published private(set) var searching = false
     @Published private(set) var semanticBusy = false
-    @Published private(set) var localModelState = LocalModelState.unchecked
-    @Published private(set) var gemmaCoverage: GemmaCoverage?
     @Published private(set) var searchNotice: LauncherNotice?
-    @Published private(set) var indexPhase = IndexPhase.checking
-    @Published private(set) var indexWork: IndexWork?
-    @Published private(set) var indexReport: IndexReport?
-    @Published private(set) var savedScope: IndexScope?
-    @Published private(set) var indexNotice: LauncherNotice?
-    @Published private(set) var scanProgress: IndexProgress?
-    @Published private(set) var watchProgress: IndexProgress?
-    @Published private(set) var scopePending: Bool
-    @Published private(set) var contentCoverage: ContentCoverage?
-    @Published private(set) var contentPaused = false
-    @Published private(set) var contentRunning = false
-    @Published private(set) var contentFailed = false
-    @Published private(set) var embeddingState = EmbeddingState.idle
-    @Published private(set) var embeddingBatch: EmbeddingBatch?
-    @Published private(set) var embeddingNotice: LauncherNotice?
-    @Published private(set) var watchState = WatchState.checking
-    @Published private(set) var watchNotice: LauncherNotice?
-    @Published private(set) var fileDiagnosis = FileDiagnosisState.idle
+    @Published private(set) var canSearchFlag = false
     @Published var hotKey: HotKey?
     @Published var hotKeyIssue: HotKeyIssue?
-    @Published var language: String { didSet { defaults?.set(language, forKey: "language") } }
-    @Published var scope: IndexScope {
+    @Published var language: String {
         didSet {
-            guard scope != oldValue else { return }
-            pauseEmbeddings()
-            defaults?.set(scope.roots, forKey: "rootsPaths")
-            defaults?.set(scope.allow, forKey: "allowPaths")
-            defaults?.set(scope.deny, forKey: "denyPaths")
-            defaults?.set(scope.documents, forKey: "documents")
-            defaults?.set(scope.content_roots, forKey: "contentRootPaths")
+            guard language != oldValue else { return }
+            defaults?.set(language, forKey: "language")
+        }
+    }
+
+    var localModelState: LocalModelState { indexStatus.localModelState }
+    var gemmaCoverage: GemmaCoverage? { indexStatus.gemmaCoverage }
+    var indexPhase: IndexPhase { indexStatus.indexPhase }
+    var indexWork: IndexWork? { indexStatus.indexWork }
+    var indexReport: IndexReport? { indexStatus.indexReport }
+    var savedScope: IndexScope? { indexStatus.savedScope }
+    var indexNotice: LauncherNotice? { indexStatus.indexNotice }
+    var scanProgress: IndexProgress? { indexStatus.scanProgress }
+    var watchProgress: IndexProgress? { indexStatus.watchProgress }
+    var scopePending: Bool { indexStatus.scopePending }
+    var contentCoverage: ContentCoverage? { indexStatus.contentCoverage }
+    var contentPaused: Bool { indexStatus.contentPaused }
+    var contentRunning: Bool { indexStatus.contentRunning }
+    var contentFailed: Bool { indexStatus.contentFailed }
+    var embeddingState: EmbeddingState { indexStatus.embeddingState }
+    var embeddingBatch: EmbeddingBatch? { indexStatus.embeddingBatch }
+    var embeddingNotice: LauncherNotice? { indexStatus.embeddingNotice }
+    var watchState: WatchState { indexStatus.watchState }
+    var watchNotice: LauncherNotice? { indexStatus.watchNotice }
+    var fileDiagnosis: FileDiagnosisState { indexStatus.fileDiagnosis }
+    var scope: IndexScope {
+        get { indexStatus.scope }
+        set { indexStatus.set(\.scope, to: newValue) }
+    }
+
+    func set<Value: Equatable>(_ keyPath: ReferenceWritableKeyPath<Launcher, Value>, to value: Value) {
+        if self[keyPath: keyPath] != value {
+            self[keyPath: keyPath] = value
         }
     }
 
@@ -145,6 +209,7 @@ final class Launcher: ObservableObject {
     private var directHits: [SearchHit] = []
     private var coverageUpdate: Task<Void, Never>?
     private var coverageRead: Process?
+    private var coverageInFlight = false
     private var coverageGeneration: UInt64 = 0
     private var automaticBuildAttempted = false
     private var modelInspection: Process?
@@ -152,14 +217,15 @@ final class Launcher: ObservableObject {
     private var diagnosisGeneration: UInt64 = 0
     private var textDebounce: Task<Void, Never>?
     private var semanticDebounce: Task<Void, Never>?
-    private var firstNamesReady = false
+    private var firstNamesReady = false { didSet { syncCanSearch() } }
     // An existing index may contain paths hidden by permission changes while Lumen was closed.
-    private var scopeTrustedForLookup = false
+    private var scopeTrustedForLookup = false { didSet { syncCanSearch() } }
     private var watchGeneration: UInt64 = 0
     private var watcher: Process?
     private var afterWatcherStops: (() -> Void)?
     private var stoppingWatcher = false
     private var writer: Process?
+    private var embeddingStreamGeneration: UInt64 = 0
     private var relatedRevision: UInt64?
     private var modelCheck: Process?
     private var modelCheckGeneration: UInt64 = 0
@@ -201,7 +267,7 @@ final class Launcher: ObservableObject {
         return appActions.first { $0.id == id }
     }
 
-    var visibleResults: [LauncherResult] {
+    private func computeVisibleResults() -> [LauncherResult] {
         guard hasQuery else { return shortcuts.home.map(LauncherResult.shortcut) }
         if isImageSearch { return hits.map(LauncherResult.file) }
         let nativeScores = Dictionary(uniqueKeysWithValues: launchMatches.map { ($0.action.id, $0.score) })
@@ -230,8 +296,19 @@ final class Launcher: ObservableObject {
         return result + (commands + files).sorted { $0.1 > $1.1 }.map(\.0)
     }
 
+    private func rebuildVisibleResults() {
+        set(\.visibleResults, to: computeVisibleResults())
+    }
+
     var hasQuery: Bool { !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-    var canSearch: Bool { indexPhase == .ready && (firstNamesReady || (!scopePending && scopeTrustedForLookup)) }
+    var canSearch: Bool { canSearchFlag }
+
+    private func syncCanSearch() {
+        let ready = indexStatus.indexPhase == .ready &&
+            (firstNamesReady || (!indexStatus.scopePending && scopeTrustedForLookup))
+        set(\.canSearchFlag, to: ready)
+    }
+
     var isIndexing: Bool { indexWork == .names || indexWork == .documents }
     var activeProgress: IndexProgress? { isIndexing ? scanProgress : watchProgress }
     var activityBusy: Bool { contentRunning || indexWork != nil || watchState == .starting || watchProgress != nil }
@@ -248,42 +325,59 @@ final class Launcher: ObservableObject {
         self.frecency = frecency
         shortcuts = ShortcutLibrary(defaults: defaults)
         builtInActions = LaunchCatalog.systemActions()
-        scopePending = engine.hasPendingScope
-        language = locale ?? defaults?.string(forKey: "language") ?? "system"
         let content = defaults?.stringArray(forKey: "contentRootPaths") ?? []
-        contentPaused = defaults?.bool(forKey: "contentIndexingPaused") ?? false
-        scope = IndexScope(roots: IndexScope.storedPaths("roots", in: defaults),
-                           allow: IndexScope.storedPaths("allow", in: defaults),
-                           deny: IndexScope.storedPaths("deny", in: defaults),
-                           documents: !content.isEmpty, content_roots: content)
+        let initialScope = IndexScope(roots: IndexScope.storedPaths("roots", in: defaults),
+                                      allow: IndexScope.storedPaths("allow", in: defaults),
+                                      deny: IndexScope.storedPaths("deny", in: defaults),
+                                      documents: !content.isEmpty, content_roots: content)
+        indexStatus = IndexStatusState(scopePending: engine.hasPendingScope,
+                                       scope: initialScope,
+                                       contentPaused: defaults?.bool(forKey: "contentIndexingPaused") ?? false)
+        language = locale ?? defaults?.string(forKey: "language") ?? "system"
+        indexStatus.onScopeChanged = { [weak self] nextScope in
+            guard let self else { return }
+            self.pauseEmbeddings()
+            self.defaults?.set(nextScope.roots, forKey: "rootsPaths")
+            self.defaults?.set(nextScope.allow, forKey: "allowPaths")
+            self.defaults?.set(nextScope.deny, forKey: "denyPaths")
+            self.defaults?.set(nextScope.documents, forKey: "documents")
+            self.defaults?.set(nextScope.content_roots, forKey: "contentRootPaths")
+        }
+        rebuildVisibleResults()
         shortcutChanges = shortcuts.objectWillChange.sink { [weak self] in
             DispatchQueue.main.async { [weak self] in
-                self?.objectWillChange.send()
-                self?.reconcileSelection()
+                guard let self else { return }
+                self.rebuildVisibleResults()
+                self.reconcileSelection()
             }
         }
         applicationOpens = LaunchDispatcher.didOpenApplication.sink { [weak self] action in
             guard let self, !self.closed, self.appActions.contains(action) else { return }
             self.frecency.noteOpened(action.id)
+            self.updateLaunchMatches()
+            self.rebuildVisibleResults()
+            self.reconcileSelection()
         }
     }
 
     func start(automaticallyIndex: Bool = true) {
         inspectLocalResources()
         if engine.hasDatabase {
-            _ = engine.run(["status", "--include-scope"]) { [weak self] response in
+            engine.status(includeScope: true) { [weak self] response in
                 guard let self, !self.closed else { return }
                 if let report = self.report(from: response) {
                     self.publish(report)
                     self.acceptCoverage(from: report)
                 } else {
-                    self.indexPhase = .unreadable
-                    self.indexNotice = LauncherNotice(.status, response.diagnostic)
+                    self.indexStatus.set(\.indexPhase, to: .unreadable)
+                    self.syncCanSearch()
+                    self.indexStatus.set(\.indexNotice, to: LauncherNotice(.status, response.diagnostic))
                 }
                 self.startWatcherIfReady()
             }
         } else {
-            indexPhase = .needsIndex
+            indexStatus.set(\.indexPhase, to: .needsIndex)
+            syncCanSearch()
             if automaticallyIndex, !scopePending {
                 // First launch builds names only; document indexing still requires opt-in.
                 var names = scope
@@ -298,7 +392,7 @@ final class Launcher: ObservableObject {
             let help = String(decoding: response.output, as: UTF8.self)
             self.watchReportsProgress = response.succeeded && help.contains("--progress")
             self.watchSupportsCachedStart = response.succeeded && help.contains("--cached-start")
-            self.watchState = response.succeeded ? (self.scopePending ? .paused : .needsSetup) : .unavailable
+            self.indexStatus.set(\.watchState, to: response.succeeded ? (self.scopePending ? .paused : .needsSetup) : .unavailable)
             self.startWatcherIfReady()
         }
     }
@@ -320,6 +414,7 @@ final class Launcher: ObservableObject {
 
     func close() {
         closed = true
+        embeddingStreamGeneration &+= 1
         cancelSilentRefresh()
         textDebounce?.cancel()
         semanticDebounce?.cancel()
@@ -383,6 +478,7 @@ final class Launcher: ObservableObject {
                 self.applicationsLoadedAt = .now
                 self.appActions = registered
                 self.updateLaunchMatches()
+                self.rebuildVisibleResults()
                 self.reconcileSelection()
             }
         }
@@ -392,29 +488,34 @@ final class Launcher: ObservableObject {
         let leavingImages = isImageSearch
         if leavingImages {
             imageProjector = nil
+            set(\.isImageSearch, to: false)
             engine.closeImages()
         }
         guard text != query || leavingImages else { return }
-        query = text
-        calculation = CalculationResult.evaluate(text)
+        set(\.query, to: text)
+        set(\.calculation, to: CalculationResult.evaluate(text))
         updateLaunchMatches()
         scheduleSearch(clearRows: leavingImages)
+        rebuildVisibleResults()
         if let first = visibleResults.first {
             switch first {
             case .file: break
             case .action(let action):
-                if isPrimaryAction(action) { selectedID = first.id }
-            case .shortcut, .calculation: selectedID = first.id
+                if isPrimaryAction(action) { set(\.selectedID, to: first.id) }
+            case .shortcut, .calculation: set(\.selectedID, to: first.id)
             }
         }
         reconcileSelection()
     }
 
     func setExecutableMatches(_ matches: [ActionMatch], resetSelection: Bool = false) {
-        if executableMatches != matches { executableMatches = matches }
+        if executableMatches != matches {
+            executableMatches = matches
+            rebuildVisibleResults()
+        }
         if resetSelection, let first = visibleResults.first,
-           case .action(let action) = first, isPrimaryAction(action), selectedID != first.id {
-            selectedID = first.id
+           case .action(let action) = first, isPrimaryAction(action) {
+            set(\.selectedID, to: first.id)
         }
         reconcileSelection()
     }
@@ -428,10 +529,11 @@ final class Launcher: ObservableObject {
         guard text != query || projector != imageProjector else { return }
         if projector != imageProjector { engine.closeImages() }
         imageProjector = projector
-        query = text
-        launchMatches = []
+        set(\.isImageSearch, to: true)
+        set(\.query, to: text)
+        set(\.launchMatches, to: [])
         executableMatches = []
-        calculation = nil
+        set(\.calculation, to: nil)
         scheduleSearch(clearRows: true)
     }
 
@@ -440,7 +542,7 @@ final class Launcher: ObservableObject {
         let now = Date.now
         let current = LauncherFileQuery(query).isFiltered ? [] :
             LaunchCatalog.matches(query, actions: builtInActions + appActions) { frecency.boost($0, now: now) }
-        if launchMatches != current { launchMatches = current }
+        set(\.launchMatches, to: current)
     }
 
     func containsCurrentAction(_ action: LaunchAction) -> Bool {
@@ -462,10 +564,14 @@ final class Launcher: ObservableObject {
     }
 
     func clear() {
-        if isImageSearch { imageProjector = nil; engine.closeImages() }
-        query = ""
-        calculation = nil
-        launchMatches = []
+        if isImageSearch {
+            imageProjector = nil
+            set(\.isImageSearch, to: false)
+            engine.closeImages()
+        }
+        set(\.query, to: "")
+        set(\.calculation, to: nil)
+        set(\.launchMatches, to: [])
         executableMatches = []
         scheduleSearch(clearRows: true)
     }
@@ -482,13 +588,13 @@ final class Launcher: ObservableObject {
             actionIntent &+= 1
             actionValidating = false
         }
-        searching = false
+        set(\.searching, to: false)
         if clearRows {
             presentedQuery = ""
             directHits = []
             publishHits([])
         }
-        searchNotice = nil
+        set(\.searchNotice, to: nil)
     }
 
     private func scheduleSearch(clearRows: Bool = false, keepAction: Bool = false) {
@@ -497,7 +603,7 @@ final class Launcher: ObservableObject {
         // rows are visual only until the current revision has been validated.
         invalidateSearch(clearRows: clearRows || !shouldSearch, keepAction: keepAction && shouldSearch)
         guard shouldSearch else { return }
-        searching = true
+        set(\.searching, to: true)
         let current = revision
         search(revision: current, watchRefresh: keepAction)
     }
@@ -540,11 +646,11 @@ final class Launcher: ObservableObject {
             self.resultsRevision = revision
             self.publishWithRelated(self.shouldFindRelatedExcerpts(directCount: lexical.count) ? related : [])
             if complete {
-                self.searching = false
+                self.set(\.searching, to: false)
                 if case .failure(let error) = names, bodyHits.isEmpty {
-                    self.searchNotice = LauncherNotice(.search, error.detail)
+                    self.set(\.searchNotice, to: LauncherNotice(.search, error.detail))
                 } else if case .failure(let error) = text, lexical.isEmpty {
-                    self.searchNotice = LauncherNotice(.search, error.detail)
+                    self.set(\.searchNotice, to: LauncherNotice(.search, error.detail))
                 }
                 self.queueRelatedExcerpts()
             }
@@ -591,8 +697,8 @@ final class Launcher: ObservableObject {
                 guard let self, self.revision == revision, self.isImageSearch, !self.closed else { return }
                 switch response {
                 case .failure:
-                    self.searching = false
-                    self.searchNotice = LauncherNotice(.search)
+                    self.set(\.searching, to: false)
+                    self.set(\.searchNotice, to: LauncherNotice(.search))
                 case .success(let results):
                     self.validateImageHits(results, query: query, revision: revision)
                 }
@@ -604,7 +710,7 @@ final class Launcher: ObservableObject {
         let candidates = results.prefix(5).filter { $0.isImageMatch && $0.isResident }
         validatePreviews(candidates, revision: revision) { [weak self] available in
             guard let self, !self.closed, self.revision == revision, !self.scopePending else { return }
-            self.searching = false
+            self.set(\.searching, to: false)
             self.presentedQuery = query
             self.resultsRevision = revision
             self.directHits = available
@@ -641,14 +747,15 @@ final class Launcher: ObservableObject {
 
     private func publishHits(_ hits: [SearchHit]) {
         let visible = rejectedPaths.isEmpty ? hits : hits.filter { !rejectedPaths.contains($0.path) }
-        if self.hits != visible { self.hits = visible }
+        set(\.hits, to: visible)
+        rebuildVisibleResults()
         reconcileSelection()
     }
 
     private func reconcileSelection() {
         let rows = visibleResults
-        if !rows.contains(where: { $0.id == selectedID }), selectedID != rows.first?.id {
-            selectedID = rows.first?.id
+        if !rows.contains(where: { $0.id == selectedID }) {
+            set(\.selectedID, to: rows.first?.id)
         }
     }
 
@@ -656,10 +763,10 @@ final class Launcher: ObservableObject {
         let rows = visibleResults
         guard !rows.isEmpty else { return }
         guard let index = rows.firstIndex(where: { $0.id == selectedID }) else {
-            selectedID = (step > 0 ? rows.first : rows.last)?.id
+            set(\.selectedID, to: (step > 0 ? rows.first : rows.last)?.id)
             return
         }
-        selectedID = rows[min(max(index + step, 0), rows.count - 1)].id
+        set(\.selectedID, to: rows[min(max(index + step, 0), rows.count - 1)].id)
     }
 
     var selectedResult: LauncherResult? {
@@ -673,21 +780,26 @@ final class Launcher: ObservableObject {
         return hits.first { $0.path == selectedID }
     }
 
-    func openingFailed() { searchNotice = LauncherNotice(.opening) }
+    func openingFailed() { set(\.searchNotice, to: LauncherNotice(.opening)) }
 
     func noteActionPerformed(_ action: LaunchAction) {
         if case .application = action.destination { return } // App launches are recorded by the dispatcher.
         frecency.noteOpened(action.id)
+        updateLaunchMatches()
+        rebuildVisibleResults()
+        reconcileSelection()
     }
 
     func noteFileOpened(_ hit: SearchHit) {
         frecency.noteOpened(LauncherFrecency.fileID(hit.path))
+        rebuildVisibleResults()
+        reconcileSelection()
     }
 
-    func previewFailed() { searchNotice = LauncherNotice(.preview) }
+    func previewFailed() { set(\.searchNotice, to: LauncherNotice(.preview)) }
 
     func copied(_ action: FileAction) {
-        searchNotice = LauncherNotice(action == .copyName ? .copiedName : .copiedPath)
+        set(\.searchNotice, to: LauncherNotice(action == .copyName ? .copiedName : .copiedPath))
     }
 
     func containsCurrentFile(_ hit: SearchHit) -> Bool {
@@ -728,15 +840,16 @@ final class Launcher: ObservableObject {
             directHits.removeAll { $0.path == hit.path }
         }
         publishHits(hits.filter { $0.path != hit.path })
-        searchNotice = LauncherNotice(.stale)
+        set(\.searchNotice, to: LauncherNotice(.stale))
     }
 
     static func qualifiesForRelatedExcerpts(_ query: String, directCount: Int) -> Bool {
         guard directCount < 8, !LauncherFileQuery(query).isFiltered else { return false }
         let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard text.utf8.count <= 512, !text.contains("/"), !text.contains("\\"),
-              !text.split(whereSeparator: \.isWhitespace).contains(where: {
-                  $0.range(of: #"\.[A-Za-z0-9]{1,8}$"#, options: .regularExpression) != nil
+              !text.split(whereSeparator: \.isWhitespace).contains(where: { word in
+                  let token = String(word)
+                  return Self.trailingExtensionRegex.firstMatch(in: token, range: NSRange(location: 0, length: token.utf16.count)) != nil
               }) else { return false }
         let words = text.split { !$0.isLetter && !$0.isNumber }
         let han = text.unicodeScalars.filter { (0x3400...0x9fff).contains($0.value) }.count
@@ -752,7 +865,7 @@ final class Launcher: ObservableObject {
         guard resultsRevision == revision, relatedRevision != revision,
               shouldFindRelatedExcerpts(directCount: directHits.count) else { return }
         if case .unavailable = localModelState { return }
-        semanticBusy = true
+        set(\.semanticBusy, to: true)
         if localModelState == .checking { return }
         let current = revision
         semanticDebounce?.cancel()
@@ -764,7 +877,7 @@ final class Launcher: ObservableObject {
             } else if self.localModelState == .ready {
                 self.searchRelatedExcerpts(revision: current)
             } else if self.localModelState != .checking {
-                self.semanticBusy = false
+                self.set(\.semanticBusy, to: false)
             }
         }
     }
@@ -773,17 +886,17 @@ final class Launcher: ObservableObject {
         semanticDebounce?.cancel()
         semanticDebounce = nil
         engine.discardQueuedSemantic()
-        semanticBusy = false
+        set(\.semanticBusy, to: false)
         relatedRevision = nil
     }
 
     private func searchRelatedExcerpts(revision: UInt64) {
         guard gemmaCoverage?.hasResults == true else {
-            semanticBusy = false
+            set(\.semanticBusy, to: false)
             return
         }
         relatedRevision = revision
-        semanticBusy = true
+        set(\.semanticBusy, to: true)
         engine.searchSemantic(query) { [weak self] reply in
             self?.receiveRelated(reply, revision: revision)
         }
@@ -796,12 +909,12 @@ final class Launcher: ObservableObject {
             validatePreviews(hits.filter(\.isSemanticCandidate), revision: revision) { [weak self] available in
                 guard let self, self.relatedRevision == revision else { return }
                 self.publishWithRelated(available)
-                self.semanticBusy = false
+                self.set(\.semanticBusy, to: false)
             }
         case .failure(let error):
             recordModelFailure(error.detail)
             publishWithRelated([])
-            semanticBusy = false
+            set(\.semanticBusy, to: false)
             refreshCoverage()
         }
     }
@@ -810,10 +923,11 @@ final class Launcher: ObservableObject {
         modelInspection = engine.run(["model-status", "--gemma"] + engine.gemmaOptions) { [weak self] response in
             guard let self, !self.closed, self.localModelState == .unchecked else { return }
             let status = try? JSONDecoder().decode(LocalModelStatus.self, from: response.output)
-            self.localModelState = response.succeeded && status?.available == true
+            let nextState: LocalModelState = response.succeeded && status?.available == true
                 ? .available : .unavailable(LocalModelProblem.classify(status?.diagnostic ?? response.diagnostic) ?? .verification)
+            self.indexStatus.set(\.localModelState, to: nextState)
             if self.localModelState == .available { self.queueRelatedExcerpts() }
-            else { self.semanticBusy = false }
+            else { self.set(\.semanticBusy, to: false) }
         }
     }
 
@@ -821,18 +935,18 @@ final class Launcher: ObservableObject {
         guard localModelState != .checking else { return }
         modelCheckGeneration &+= 1
         let current = modelCheckGeneration
-        localModelState = .checking
+        indexStatus.set(\.localModelState, to: .checking)
         modelCheck = engine.run(["model-status", "--gemma", "--verify"] + engine.gemmaOptions) { [weak self] response in
             guard let self, !self.closed, self.modelCheckGeneration == current else { return }
             self.modelCheck = nil
             let status = try? JSONDecoder().decode(LocalModelStatus.self, from: response.output)
             if response.succeeded, let status, status.available, status.verified {
-                self.localModelState = .ready
+                self.indexStatus.set(\.localModelState, to: .ready)
                 complete?(true)
                 self.queueRelatedExcerpts()
             } else {
                 let issue = LocalModelProblem.classify(status?.diagnostic ?? response.diagnostic) ?? .verification
-                self.localModelState = .unavailable(issue)
+                self.indexStatus.set(\.localModelState, to: .unavailable(issue))
                 self.cancelRelatedExcerpts()
                 if self.hits.contains(where: \.isSemanticCandidate) { self.publishWithRelated([]) }
                 complete?(false)
@@ -850,7 +964,7 @@ final class Launcher: ObservableObject {
         if let issue = LocalModelProblem.classify(diagnostic) {
             engine.closeSemantic()
             cancelModelCheck()
-            localModelState = .unavailable(issue)
+            indexStatus.set(\.localModelState, to: .unavailable(issue))
             if embeddingState == .verifying { finishEmbeddings(.idle) }
         }
     }
@@ -860,14 +974,14 @@ final class Launcher: ObservableObject {
         clearFileDiagnosis()
         let generation = diagnosisGeneration
         let name = file.lastPathComponent
-        fileDiagnosis = .checking(name)
+        indexStatus.set(\.fileDiagnosis, to: .checking(name))
         diagnosisProcess = engine.run(["diagnose", "--", file.path]) { [weak self] response in
             guard let self, !self.closed, !self.scopePending, self.diagnosisGeneration == generation else { return }
             self.diagnosisProcess = nil
             if response.succeeded, let report = try? JSONDecoder().decode(FileDiagnosis.self, from: response.output) {
-                self.fileDiagnosis = .result(name, report)
+                self.indexStatus.set(\.fileDiagnosis, to: .result(name, report))
             } else {
-                self.fileDiagnosis = .failed(name)
+                self.indexStatus.set(\.fileDiagnosis, to: .failed(name))
             }
         }
     }
@@ -876,8 +990,7 @@ final class Launcher: ObservableObject {
         diagnosisGeneration &+= 1
         if diagnosisProcess?.isRunning == true { diagnosisProcess?.terminate() }
         diagnosisProcess = nil
-        if case .idle = fileDiagnosis { return }
-        fileDiagnosis = .idle
+        indexStatus.set(\.fileDiagnosis, to: .idle)
     }
 
     func applyScope(_ requested: IndexScope) {
@@ -903,36 +1016,37 @@ final class Launcher: ObservableObject {
         let contentOnly = indexPhase == .ready && requested.content_roots != nil
             && savedScope.map { requested.sharesNameScope(with: $0) && requested.content_roots != $0.content_roots } == true
         if !requested.contentFolders.isEmpty { defaults?.set(true, forKey: "gemmaIndexingEnabled") }
-        contentFailed = false
+        indexStatus.set(\.contentFailed, to: false)
         scopeTrustedForLookup = false
         firstNamesReady = false
-        scopePending = true
+        indexStatus.set(\.scopePending, to: true)
+        syncCanSearch()
         clearFileDiagnosis()
         cancelCoverageRead()
-        gemmaCoverage = nil
+        indexStatus.set(\.gemmaCoverage, to: nil)
         invalidateSearch()
         engine.close()
-        indexNotice = nil
+        indexStatus.set(\.indexNotice, to: nil)
         do {
             try engine.beginScopeUpdate()
         } catch {
-            indexNotice = LauncherNotice(.scopeState, error.localizedDescription)
+            indexStatus.set(\.indexNotice, to: LauncherNotice(.scopeState, error.localizedDescription))
             withWatcherStopped {}
             return
         }
         guard requested.hasAbsolutePaths else {
-            indexNotice = LauncherNotice(.scope)
+            indexStatus.set(\.indexNotice, to: LauncherNotice(.scope))
             withWatcherStopped {}
             return
         }
-        embeddingState = .idle
-        embeddingBatch = nil
-        embeddingNotice = nil
+        indexStatus.set(\.embeddingState, to: .idle)
+        indexStatus.set(\.embeddingBatch, to: nil)
+        indexStatus.set(\.embeddingNotice, to: nil)
         automaticBuildAttempted = false
         let shouldStageDocuments = indexPhase != .ready && requested.documents
         var first = requested
         if shouldStageDocuments { first.documents = false; if first.content_roots != nil { first.content_roots = [] } }
-        indexWork = first.documents ? .documents : .names
+        indexStatus.set(\.indexWork, to: first.documents ? .documents : .names)
         withWatcherStopped { [weak self] in
             self?.scan(first, then: shouldStageDocuments ? requested : nil, contentOnly: contentOnly)
         }
@@ -941,18 +1055,18 @@ final class Launcher: ObservableObject {
     private func scan(_ scope: IndexScope, then next: IndexScope?, contentOnly: Bool = false) {
         scanGeneration &+= 1
         let generation = scanGeneration
-        scanProgress = nil
+        indexStatus.set(\.scanProgress, to: nil)
         let progressOption = !contentOnly && indexReportsProgress ? ["--progress"] : []
         let arguments = contentOnly ? scope.contentArguments : engine.indexArguments(scope: scope)
         writer = engine.run(arguments + progressOption, onProgress: { [weak self] progress in
             guard let self, !self.closed, self.scanGeneration == generation else { return }
-            if self.scanProgress != progress { self.scanProgress = progress }
+            self.indexStatus.set(\.scanProgress, to: progress)
         }) { [weak self] response in
             guard let self, !self.closed, self.scanGeneration == generation else { return }
             self.scanGeneration &+= 1
             self.writer = nil
             let didReport = self.scanProgress != nil
-            self.scanProgress = nil
+            self.indexStatus.set(\.scanProgress, to: nil)
             if !contentOnly, !response.succeeded, !didReport, self.indexReportsProgress,
                response.diagnostic.contains("unexpected argument '--progress'") {
                 self.indexReportsProgress = false
@@ -962,28 +1076,29 @@ final class Launcher: ObservableObject {
             guard let report = self.report(from: response) else {
                 self.firstNamesReady = false
                 self.invalidateSearch()
-                self.indexNotice = LauncherNotice(.indexing, response.diagnostic)
-                self.indexWork = nil
+                self.indexStatus.set(\.indexNotice, to: LauncherNotice(.indexing, response.diagnostic))
+                self.indexStatus.set(\.indexWork, to: nil)
                 return
             }
             if let next {
                 // The metadata pass has committed the requested path scope.
                 self.firstNamesReady = true
                 self.publish(report)
-                self.indexWork = .documents
+                self.indexStatus.set(\.indexWork, to: .documents)
                 self.scan(next, then: nil, contentOnly: next.content_roots != nil)
                 return
             }
             do {
                 try self.engine.finishScopeUpdate()
-                self.scopePending = false
-                self.savedScope = scope
+                self.indexStatus.set(\.scopePending, to: false)
+                self.indexStatus.set(\.savedScope, to: scope)
             } catch {
-                self.indexNotice = LauncherNotice(.scopeState, error.localizedDescription)
+                self.indexStatus.set(\.indexNotice, to: LauncherNotice(.scopeState, error.localizedDescription))
             }
             self.firstNamesReady = false
             self.scopeTrustedForLookup = !self.scopePending
-            self.indexWork = nil
+            self.syncCanSearch()
+            self.indexStatus.set(\.indexWork, to: nil)
             self.publish(report)
             self.startWatcherIfReady()
             self.refreshCoverage()
@@ -992,9 +1107,9 @@ final class Launcher: ObservableObject {
 
     func setContentPaused(_ paused: Bool) {
         defaults?.set(paused, forKey: "contentIndexingPaused")
-        contentPaused = paused
+        indexStatus.set(\.contentPaused, to: paused)
         if !paused {
-            contentFailed = false
+            indexStatus.set(\.contentFailed, to: false)
             startContentIfReady()
         }
     }
@@ -1006,22 +1121,28 @@ final class Launcher: ObservableObject {
     private func startContentIfReady() {
         guard canSearch, !scopePending, !closed, indexWork == nil, !contentRunning,
               embeddingState != .verifying, contentNeedsBatch else { return }
-        contentRunning = true
+        indexStatus.set(\.contentRunning, to: true)
         contentWriter = engine.run(["content", "--max", "8"], priority: .background) { [weak self] response in
             guard let self, !self.closed else { return }
             self.contentWriter = nil
-            self.contentRunning = false
+            self.indexStatus.set(\.contentRunning, to: false)
             guard response.succeeded, let batch = try? JSONDecoder().decode(ContentBatch.self, from: response.output) else {
-                self.contentFailed = true
+                self.indexStatus.set(\.contentFailed, to: true)
                 self.refreshCoverage()
                 return
             }
-            if batch.indexed > 0 && self.isSearchPresented && self.hasQuery {
-                self.scheduleSilentRefresh()
-            }
-            if batch.processed == 0 && batch.pending > 0 { self.contentFailed = true }
-            self.refreshCoverage(after: .milliseconds(100))
+            self.applyContentBatch(batch)
         }
+    }
+
+    func applyContentBatch(_ batch: ContentBatch) {
+        if batch.indexed > 0 && isSearchPresented && hasQuery {
+            scheduleSilentRefresh()
+        }
+        if batch.processed == 0 && (batch.skipped ?? 0) == 0 && batch.pending > 0 {
+            indexStatus.set(\.contentFailed, to: true)
+        }
+        refreshCoverage(after: .milliseconds(100))
     }
 
     func buildEmbeddings() {
@@ -1033,15 +1154,15 @@ final class Launcher: ObservableObject {
     }
 
     private func prepareEmbeddings() {
-        embeddingNotice = nil
-        if embeddingState != .paused { embeddingBatch = nil }
+        indexStatus.set(\.embeddingNotice, to: nil)
+        if embeddingState != .paused { indexStatus.set(\.embeddingBatch, to: nil) }
         if localModelState == .ready {
             startEmbeddings()
         } else {
-            embeddingState = .verifying
+            indexStatus.set(\.embeddingState, to: .verifying)
             verifyLocalModel { [weak self] verified in
                 guard let self, self.embeddingState == .verifying else { return }
-                self.embeddingState = .idle
+                self.indexStatus.set(\.embeddingState, to: .idle)
                 if verified, self.canBuildEmbeddings { self.startEmbeddings() }
                 else { self.startContentIfReady() }
             }
@@ -1053,38 +1174,45 @@ final class Launcher: ObservableObject {
         switch embeddingState {
         case .verifying:
             cancelModelCheck()
-            localModelState = .available
-            embeddingState = .paused
+            indexStatus.set(\.localModelState, to: .available)
+            indexStatus.set(\.embeddingState, to: .paused)
             refreshCoverage()
         case .running:
-            embeddingState = .pausing
+            indexStatus.set(\.embeddingState, to: .pausing)
+            if engine.supportsStreamingBatches, writer?.isRunning == true {
+                writer?.terminate()
+            }
         case .idle, .pausing, .paused, .finished:
             break
         }
     }
 
     private func startEmbeddings() {
-        embeddingState = .running
-        indexWork = .embeddings
+        indexStatus.set(\.embeddingState, to: .running)
+        indexStatus.set(\.indexWork, to: .embeddings)
         embedNextBatch()
     }
 
     private func embedNextBatch() {
+        if engine.supportsStreamingBatches {
+            streamEmbeddings()
+            return
+        }
         let arguments = ["embed", "--gemma", "--max", "32"] + engine.gemmaOptions
         writer = engine.run(arguments, priority: .background) { [weak self] response in
             guard let self, !self.closed else { return }
             self.writer = nil
             guard response.succeeded, let batch = try? JSONDecoder().decode(EmbeddingBatch.self, from: response.output) else {
                 self.recordModelFailure(response.diagnostic)
-                self.embeddingNotice = LauncherNotice(.embeddings)
+                self.indexStatus.set(\.embeddingNotice, to: LauncherNotice(.embeddings))
                 self.finishEmbeddings(.idle)
                 return
             }
-            self.embeddingBatch = batch
+            self.indexStatus.set(\.embeddingBatch, to: batch)
             if !batch.has_more {
                 self.finishEmbeddings(.finished)
             } else if batch.new_embeddings == 0 && batch.skipped_chunks == 0 {
-                self.embeddingNotice = LauncherNotice(.embeddingNoProgress)
+                self.indexStatus.set(\.embeddingNotice, to: LauncherNotice(.embeddingNoProgress))
                 self.finishEmbeddings(.paused)
             } else if self.embeddingState == .running {
                 if self.contentNeedsBatch {
@@ -1109,20 +1237,67 @@ final class Launcher: ObservableObject {
         if let writer { _ = setpriority(PRIO_PROCESS, UInt32(writer.processIdentifier), 10) }
     }
 
+    private func streamEmbeddings() {
+        embeddingStreamGeneration &+= 1
+        let generation = embeddingStreamGeneration
+        let arguments = ["embed", "--gemma", "--stream", "--max", "32"] + engine.gemmaOptions
+        var lastBatch: EmbeddingBatch?
+        var noProgress = false
+        writer = engine.run(arguments, onLine: { [weak self] line in
+            guard let self, !self.closed, self.embeddingStreamGeneration == generation,
+                  let batch = try? JSONDecoder().decode(EmbeddingBatch.self, from: line) else { return }
+            lastBatch = batch
+            self.indexStatus.set(\.embeddingBatch, to: batch)
+            if !batch.has_more { return }
+            if batch.new_embeddings == 0 && batch.skipped_chunks == 0 {
+                noProgress = true
+                self.indexStatus.set(\.embeddingNotice, to: LauncherNotice(.embeddingNoProgress))
+                self.writer?.terminate()
+                return
+            }
+            if self.embeddingState == .running {
+                let needsSettingsRefresh = self.isSettingsPresented &&
+                    (self.lastSettingsCoverageRefresh.map { $0.duration(to: .now) >= .seconds(2) } ?? true)
+                if self.gemmaCoverage?.hasResults != true || needsSettingsRefresh {
+                    if self.isSettingsPresented { self.lastSettingsCoverageRefresh = .now }
+                    self.refreshCoverage()
+                }
+            } else if self.writer?.isRunning == true {
+                self.writer?.terminate()
+            }
+        }, priority: .background) { [weak self] response in
+            guard let self, !self.closed, self.embeddingStreamGeneration == generation else { return }
+            self.writer = nil
+            if noProgress || self.embeddingState == .pausing {
+                self.finishEmbeddings(.paused)
+            } else if let lastBatch, !lastBatch.has_more, response.succeeded {
+                self.finishEmbeddings(.finished)
+            } else if !response.succeeded || lastBatch == nil {
+                self.recordModelFailure(response.diagnostic)
+                self.indexStatus.set(\.embeddingNotice, to: LauncherNotice(.embeddings))
+                self.finishEmbeddings(.idle)
+            } else {
+                self.finishEmbeddings(.paused)
+            }
+        }
+        // The engine's QoS controls pipe draining; lower the child itself too.
+        if let writer { _ = setpriority(PRIO_PROCESS, UInt32(writer.processIdentifier), 10) }
+    }
+
     private func finishEmbeddings(_ state: EmbeddingState) {
-        indexWork = nil
-        embeddingState = state
+        indexStatus.set(\.indexWork, to: nil)
+        indexStatus.set(\.embeddingState, to: state)
         refreshCoverage()
     }
 
     private func acceptCoverage(from report: IndexReport) {
         guard !scopePending else { return }
-        if savedScope != report.scope { savedScope = report.scope }
-        if indexReport != report { indexReport = report }
-        if contentCoverage != report.content { contentCoverage = report.content }
+        indexStatus.set(\.savedScope, to: report.scope)
+        indexStatus.set(\.indexReport, to: report)
+        indexStatus.set(\.contentCoverage, to: report.content)
         let previous = gemmaCoverage
         if previous != report.gemma {
-            gemmaCoverage = report.gemma
+            indexStatus.set(\.gemmaCoverage, to: report.gemma)
             if report.gemma?.hasResults != true, previous?.hasResults == true {
                 cancelRelatedExcerpts()
                 engine.closeSemantic()
@@ -1132,7 +1307,7 @@ final class Launcher: ObservableObject {
             }
         }
         if embeddingState == .finished, report.gemma?.pending == true {
-            embeddingState = .idle
+            indexStatus.set(\.embeddingState, to: .idle)
             automaticBuildAttempted = false
         }
         // Existing BGE vectors are evidence an older user explicitly started semantic indexing.
@@ -1152,14 +1327,16 @@ final class Launcher: ObservableObject {
             try? await Task.sleep(for: delay)
             guard let self, !Task.isCancelled else { return }
             self.coverageUpdate = nil
-            if self.coverageRead?.isRunning == true {
+            if self.coverageInFlight || self.coverageRead?.isRunning == true {
                 self.refreshCoverage(after: .milliseconds(250))
                 return
             }
             self.coverageGeneration &+= 1
             let generation = self.coverageGeneration
-            self.coverageRead = self.engine.run(["status", "--include-scope"]) { [weak self] response in
+            self.coverageInFlight = true
+            self.coverageRead = self.engine.status(includeScope: true) { [weak self] response in
                 guard let self, self.coverageGeneration == generation, !self.closed else { return }
+                self.coverageInFlight = false
                 self.coverageRead = nil
                 if let report = self.report(from: response) { self.acceptCoverage(from: report) }
             }
@@ -1169,6 +1346,7 @@ final class Launcher: ObservableObject {
     private func cancelCoverageRead() {
         coverageUpdate?.cancel()
         coverageUpdate = nil
+        coverageInFlight = false
         coverageGeneration &+= 1
         if coverageRead?.isRunning == true { coverageRead?.terminate() }
         coverageRead = nil
@@ -1180,16 +1358,17 @@ final class Launcher: ObservableObject {
     }
 
     private func publish(_ report: IndexReport) {
-        indexPhase = .ready
-        indexReport = report
+        indexStatus.set(\.indexPhase, to: .ready)
+        indexStatus.set(\.indexReport, to: report)
+        syncCanSearch()
         scheduleSearch()
     }
 
     private func startWatcherIfReady() {
         guard watchSupported == true, indexPhase == .ready, !scopePending,
               watcher == nil, !closed else { return }
-        watchState = .starting
-        watchNotice = nil
+        indexStatus.set(\.watchState, to: .starting)
+        indexStatus.set(\.watchNotice, to: nil)
         watchGeneration &+= 1
         let generation = watchGeneration
         let arguments = ["watch", "--bundled-pdf-helper"] + (watchReportsProgress ? ["--progress"] : [])
@@ -1200,12 +1379,12 @@ final class Launcher: ObservableObject {
         }, onProgress: { [weak self] progress in
             guard let self, !self.closed, self.watchGeneration == generation, !self.stoppingWatcher else { return }
             let active = progress.phase == "done" ? nil : progress
-            if self.watchProgress != active { self.watchProgress = active }
+            self.indexStatus.set(\.watchProgress, to: active)
         }) { [weak self] response in
             guard let self, !self.closed, self.watchGeneration == generation else { return }
             self.watchGeneration &+= 1
             self.watcher = nil
-            self.watchProgress = nil
+            self.indexStatus.set(\.watchProgress, to: nil)
             if self.stoppingWatcher {
                 self.stoppingWatcher = false
                 let next = self.afterWatcherStops
@@ -1213,10 +1392,10 @@ final class Launcher: ObservableObject {
                 next?()
             } else if response.diagnostic.contains("predates saved scope settings") ||
                         response.diagnostic.contains("no saved scope;") {
-                self.watchState = .needsSetup
+                self.indexStatus.set(\.watchState, to: .needsSetup)
             } else {
-                self.watchState = .failed
-                self.watchNotice = LauncherNotice(.watch, response.diagnostic)
+                self.indexStatus.set(\.watchState, to: .failed)
+                self.indexStatus.set(\.watchNotice, to: LauncherNotice(.watch, response.diagnostic))
             }
         }
     }
@@ -1228,7 +1407,8 @@ final class Launcher: ObservableObject {
             guard watchSupportsCachedStart else { return }
             engine.setCachedHitAccess(true)
             scopeTrustedForLookup = true
-            indexPhase = .ready
+            indexStatus.set(\.indexPhase, to: .ready)
+            syncCanSearch()
             if hasQuery { scheduleSearch(keepAction: true) }
             return
         }
@@ -1237,10 +1417,11 @@ final class Launcher: ObservableObject {
         if notice.event == .ready {
             engine.setCachedHitAccess(false)
             scopeTrustedForLookup = true
-            indexPhase = .ready
-            watchState = .running
+            indexStatus.set(\.indexPhase, to: .ready)
+            syncCanSearch()
+            indexStatus.set(\.watchState, to: .running)
         }
-        watchProgress = nil
+        indexStatus.set(\.watchProgress, to: nil)
         let setupIncomplete = indexReport == nil || savedScope == nil ||
             (contentCoverage?.pending ?? 0) > 0 ||
             (gemmaCoverage?.documents_enabled == true && gemmaCoverage?.pending == true)
@@ -1356,8 +1537,8 @@ final class Launcher: ObservableObject {
     }
 
     private func withWatcherStopped(_ next: @escaping () -> Void) {
-        if watchSupported == true { watchState = .paused }
-        watchProgress = nil
+        if watchSupported == true { indexStatus.set(\.watchState, to: .paused) }
+        indexStatus.set(\.watchProgress, to: nil)
         engine.setCachedHitAccess(false)
         guard let watcher else { next(); return }
         stoppingWatcher = true

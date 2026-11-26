@@ -20,6 +20,7 @@ struct LumenApp {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate {
     let model: Launcher
+    private let engine: LauncherEngine
     let smoke: LauncherSmoke?
     let applicationIcons = ResultIconDisplay()
     let contextActions = ContextActions()
@@ -45,6 +46,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var metricsItem: NSMenuItem?
     private var buildIndexItem: NSMenuItem?
     private var presentationScheduled = false
+    private var statusMenuUpdateScheduled = false
     let externalVolumes: ExternalVolumeCatalog
     let translation: TranslationPanelModel
     private(set) var settings: NSPanel?
@@ -231,6 +233,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             .appendingPathComponent("Library/Application Support/Lumen/index.sqlite")
         let engine = LauncherEngine(executable: executable, database: database,
                                     syntheticRoot: smoke?.corpus, gemmaHome: smoke?.gemmaHome)
+        self.engine = engine
         model = Launcher(engine: engine, defaults: defaults, locale: smoke?.language)
         externalVolumes = ExternalVolumeCatalog(engine: engine)
         imageSearch = LauncherImageSearch(engine: engine, defaults: defaults)
@@ -250,6 +253,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }.store(in: &cancellables)
         model.objectWillChange.sink { [weak self] _ in
             self?.schedulePresentationUpdate()
+        }.store(in: &cancellables)
+        model.indexStatus.objectWillChange.sink { [weak self] _ in
+            self?.scheduleStatusMenuUpdate()
         }.store(in: &cancellables)
         model.$selectedID.removeDuplicates().dropFirst().sink { [weak self] _ in
             DispatchQueue.main.async { [weak self] in
@@ -334,6 +340,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 .receive(on: DispatchQueue.main)
                 .sink { [weak self] _ in self?.externalVolumeStateChanged() }
                 .store(in: &cancellables)
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(300)) { [weak self] in
+                guard let self, FileManager.default.fileExists(atPath: self.engine.database.path) else { return }
+                self.model.warmNameSearch()
+            }
         }
         loadApplicationCatalog()
         if let smoke { Task { @MainActor in await smoke.run(self) } }
@@ -346,6 +356,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             guard let self else { return }
             self.presentationScheduled = false
             self.updatePresentation()
+        }
+    }
+
+    private func scheduleStatusMenuUpdate() {
+        guard !statusMenuUpdateScheduled else { return }
+        statusMenuUpdateScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.statusMenuUpdateScheduled = false
+            self.updateStatusMenuPresentation()
         }
     }
 
@@ -371,12 +391,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         guard smoke == nil, let configuredKey else { return }
         do {
             try globalHotKey.set(configuredKey)
-            model.hotKey = globalHotKey.shortcut
-            model.hotKeyIssue = nil
+            model.set(\.hotKey, to: globalHotKey.shortcut)
+            model.set(\.hotKeyIssue, to: nil)
         } catch {
             globalHotKey.disable()
-            model.hotKey = nil
-            model.hotKeyIssue = error as? HotKeyIssue
+            model.set(\.hotKey, to: nil)
+            model.set(\.hotKeyIssue, to: error as? HotKeyIssue)
         }
     }
 
@@ -494,6 +514,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         // Release the field editor first so an earlier composition cannot be restored on reopen.
         panel.makeFirstResponder(nil)
         searchField.stringValue = ""
+        applicationIcons.cancelPending()
         model.clear()
         panel.orderOut(nil)
         if smoke == nil, NSApp.isActive, !NSApp.windows.contains(where: { $0.isVisible && $0.canBecomeKey }) {
@@ -681,7 +702,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private func selectRow(_ result: LauncherResult, doubleClick: Bool) {
         panel.browsing = true
-        model.selectedID = result.id
+        model.set(\.selectedID, to: result.id)
         updatePresentation()
         if doubleClick { open(result) }
     }
@@ -1144,13 +1165,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         guard searchPresented, !model.scopePending, model.containsCurrentFile(hit) else { return }
         if !forceWindow, let kind = LauncherInlinePreview.kind(hit) {
             guard hit.isResident || hit.isPlaceholder else { return }
-            model.selectedID = hit.id
+            model.set(\.selectedID, to: hit.id)
             if inlinePreview.hit == hit { inlinePreview.close() }
             else { inlinePreview.show(hit, kind: kind, allowCloudDownload: allowCloudDownload) }
             updatePresentation()
             return
         }
-        model.selectedID = hit.id
+        model.set(\.selectedID, to: hit.id)
         model.resolve(hit, action: .preview) { [weak self] url in
             guard let self, self.searchPresented, !self.model.scopePending, self.model.containsCurrentFile(hit),
                   self.model.selectedResult?.id == hit.id else { return }
@@ -1258,6 +1279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             window.delegate = self
             window.contentView = NSHostingView(rootView: LauncherSettings(
                 model: model,
+                indexStatus: model.indexStatus,
                 session: settingsSession,
                 translation: translation,
                 volumes: externalVolumes,
@@ -1390,20 +1412,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             let key = try HotKey(event: event)
             try globalHotKey.set(key)
             configuredKey = key
-            model.hotKey = globalHotKey.shortcut
-            model.hotKeyIssue = nil
+            model.set(\.hotKey, to: globalHotKey.shortcut)
+            model.set(\.hotKeyIssue, to: nil)
             defaults?.set(try JSONEncoder().encode(key), forKey: "launcher.shortcut")
             defaults?.set(false, forKey: "launcher.shortcutDisabled")
         } catch {
-            model.hotKeyIssue = error as? HotKeyIssue
+            model.set(\.hotKeyIssue, to: error as? HotKeyIssue)
         }
     }
 
     func disableShortcut() {
         globalHotKey.disable()
         configuredKey = nil
-        model.hotKey = nil
-        model.hotKeyIssue = nil
+        model.set(\.hotKey, to: nil)
+        model.set(\.hotKeyIssue, to: nil)
         defaults?.set(true, forKey: "launcher.shortcutDisabled")
     }
 
@@ -1416,9 +1438,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         configuredKey = shortcut
         do {
             try globalHotKey.set(shortcut)
-            model.hotKey = globalHotKey.shortcut
+            model.set(\.hotKey, to: globalHotKey.shortcut)
         } catch {
-            model.hotKeyIssue = error as? HotKeyIssue
+            model.set(\.hotKeyIssue, to: error as? HotKeyIssue)
         }
     }
 
@@ -1474,13 +1496,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     var statusBarTitle: String { "" }
 
-    private func updatePresentation() {
-        let pinnedApps = model.visibleResults.prefix(SearchWindow.maximumVisibleRows).compactMap { row -> ActionMatch? in
-            guard case .shortcut(let shortcut) = row, let action = model.application(for: shortcut) else { return nil }
-            return ActionMatch(action: action, score: 0)
-        }
-        applicationIcons.update(for: searchPresented ? model.launchMatches + pinnedApps : [])
-
+    private func updateStatusMenuPresentation() {
         let activity = model.activityTitle
         let metrics = model.activityMetrics
         let metricsTitle = metrics ?? ""
@@ -1506,7 +1522,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
         }
         if model.scopePending, imageSearch.building { imageSearch.stop() }
+    }
+
+    private func updateSearchPresentation() {
         guard searchPresented else { return }
+        let pinnedApps = model.visibleResults.prefix(SearchWindow.maximumVisibleRows).compactMap { row -> ActionMatch? in
+            guard case .shortcut(let shortcut) = row, let action = model.application(for: shortcut) else { return nil }
+            return ActionMatch(action: action, score: 0)
+        }
+        applicationIcons.update(for: model.launchMatches + pinnedApps)
         refreshInlinePreview()
         let state = panelState
         let target = PanelGeometry.size(
@@ -1531,6 +1555,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if frame != panel.frame {
             panel.setFrame(frame, display: true)
         }
+    }
+
+    private func updatePresentation() {
+        updateStatusMenuPresentation()
+        updateSearchPresentation()
     }
 
     private func installEditMenu() {

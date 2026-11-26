@@ -222,10 +222,9 @@ struct SearchWindow: View {
                 }
             }
         }
-        if !model.canSearch, let title = model.launcherActivityTitle {
-            Label(title, systemImage: "internaldrive")
+        if !model.canSearch {
+            Label(model.t("索引启动盘上的可访问文件", "Index accessible files on this Mac"), systemImage: "internaldrive")
                 .lineLimit(1)
-            if let metrics = model.activityMetrics { Text(metrics).monospacedDigit().lineLimit(1) }
         }
         if let issue = windowManagement.issue, issue != .permissionRequired {
             Text(issue.title(model)).lineLimit(1).help(issue.title(model))
@@ -240,7 +239,7 @@ struct SearchWindow: View {
                               "Try kind:folder, ext:pdf, or path:\"/Users/…/My Files/\". You can also type an absolute path."))
                 .accessibilityIdentifier("query-filter-hints")
         }
-        if model.canStartIndexFromLauncher {
+        if !model.canSearch {
             Button(model.t("在后台建立索引", "Build in Background"), action: beginIndex)
                 .buttonStyle(.borderless).fontWeight(.semibold)
                 .accessibilityIdentifier("build-index")
@@ -784,6 +783,7 @@ enum ScopeFolders {
 @MainActor
 final class SettingsSession: ObservableObject {
     let model: Launcher
+    let indexStatus: IndexStatusState
     private let pageChanged: (SettingsPage?, SettingsPage?) -> Void
     @Published var page: SettingsPage? = .general {
         didSet { if page != oldValue { pageChanged(oldValue, page) } }
@@ -794,8 +794,10 @@ final class SettingsSession: ObservableObject {
     @Published private(set) var loginItemFailed = false
     let canManageLoginItem: Bool
 
-    init(model: Launcher, manageLoginItem: Bool, pageChanged: @escaping (SettingsPage?, SettingsPage?) -> Void) {
+    init(model: Launcher, indexStatus: IndexStatusState? = nil, manageLoginItem: Bool,
+         pageChanged: @escaping (SettingsPage?, SettingsPage?) -> Void) {
         self.model = model
+        self.indexStatus = indexStatus ?? model.indexStatus
         self.pageChanged = pageChanged
         canManageLoginItem = manageLoginItem && Bundle.main.bundleURL.pathExtension == "app"
     }
@@ -818,7 +820,7 @@ final class SettingsSession: ObservableObject {
     }
 
     private var baseline: IndexScope {
-        var scope = model.settingsScope
+        var scope = (!indexStatus.scopePending ? indexStatus.savedScope : nil) ?? indexStatus.scope
         // The engine materializes derived roots in the saved scope.
         if scope.roots == scope.allow || (scope.roots == ["/"] && scope.allow.isEmpty) { scope.roots = [] }
         return scope
@@ -828,12 +830,12 @@ final class SettingsSession: ObservableObject {
     var hasChanges: Bool { draft.map { $0 != baseline } ?? false }
 
     var canEditScope: Bool {
-        model.indexPhase != .checking && (model.savedScope != nil || model.needsScopeSetup)
+        indexStatus.indexPhase != .checking && (indexStatus.savedScope != nil || model.needsScopeSetup)
     }
     var canApply: Bool { canEditScope && model.canApplyScope && (hasChanges || model.needsScopeSetup) }
 
     var canRebuild: Bool {
-        model.canApplyScope && model.savedScope != nil && model.indexPhase == .ready && !model.scopePending
+        model.canApplyScope && indexStatus.savedScope != nil && indexStatus.indexPhase == .ready && !indexStatus.scopePending
     }
 
     func setDocuments(_ enabled: Bool) {
@@ -895,6 +897,7 @@ struct WindowAccessibilityBanner: View {
 
 struct LauncherSettings: View {
     @ObservedObject var model: Launcher
+    @ObservedObject var indexStatus: IndexStatusState
     @ObservedObject var session: SettingsSession
     let translation: TranslationPanelModel
     let volumes: ExternalVolumeCatalog
@@ -1094,7 +1097,8 @@ struct LauncherSettings: View {
         }
         group(model.t("语言", "Language")) {
             LabeledContent(model.t("界面语言", "Interface Language")) {
-                Picker(model.t("界面语言", "Interface Language"), selection: $model.language) {
+                Picker(model.t("界面语言", "Interface Language"),
+                       selection: Binding(get: { model.language }, set: { model.set(\.language, to: $0) })) {
                     Text(model.t("跟随系统", "System")).tag("system")
                     Text("简体中文").tag("zh")
                     Text("English").tag("en")
@@ -1132,11 +1136,11 @@ struct LauncherSettings: View {
             folderRows(.content, empty: model.t("请选择要建立正文和语义索引的目录。", "Choose folders to index for text and semantic search."))
             note(model.t("所选目录内的 TXT、Markdown、DOCX 和 PDF 文本层可检索（包括已下载到本机的云盘文件；仅在线占位文件仍只索引名称）。",
                          "Search TXT, Markdown, DOCX, and PDF text in selected folders, including downloaded cloud files. Online-only placeholders remain name-only."))
-            if let coverage = model.contentCoverage, coverage.total > 0 {
+            if let coverage = indexStatus.contentCoverage, coverage.total > 0 {
                 ProgressView(value: Double(coverage.checked), total: Double(coverage.total)) {
                     Text(model.t("已处理 \(coverage.checked) / \(coverage.total) 份文档", "\(coverage.checked) of \(coverage.total) documents checked"))
                 }
-                if model.contentPaused || model.contentFailed {
+                if indexStatus.contentPaused || indexStatus.contentFailed {
                     Button(model.t("继续正文索引", "Resume Document Indexing")) { model.setContentPaused(false) }
                 } else if coverage.pending > 0 {
                     Button(model.t("暂停正文索引", "Pause Document Indexing")) { model.setContentPaused(true) }
@@ -1162,14 +1166,14 @@ struct LauncherSettings: View {
         }
         .disabled(!session.canEditScope)
         group(model.t("图像内容", "Image Content")) {
-            LauncherImageSettings(launcher: model, images: images, chooseFolder: chooseImageFolder,
+            LauncherImageSettings(launcher: model, indexStatus: indexStatus, images: images, chooseFolder: chooseImageFolder,
                                   chooseProjector: chooseImageProjector)
         }
         group(model.t("外置卷", "External Volumes")) {
             LauncherExternalVolumes(launcher: model, catalog: volumes, changed: model.externalVolumesChanged)
                 .accessibilityIdentifier("settings.external-volumes")
         }
-        if let notice = model.indexNotice {
+        if let notice = indexStatus.indexNotice {
             NoticeView(model: model, notice: notice)
         }
     }
@@ -1231,11 +1235,11 @@ struct LauncherSettings: View {
                     .buttonStyle(.borderless)
             } else if model.isIndexing {
                 note(model.activityTitle)
-            } else if !session.canEditScope && model.indexPhase == .ready {
+            } else if !session.canEditScope && indexStatus.indexPhase == .ready {
                 note(model.t("当前索引的已保存范围不可用。", "The saved scope for this index is unavailable."))
             }
             Spacer()
-            Button(model.indexPhase == .needsIndex ? model.t("建立索引", "Build Index")
+            Button(indexStatus.indexPhase == .needsIndex ? model.t("建立索引", "Build Index")
                    : model.t("应用并更新索引", "Apply and Update Index")) { session.apply() }
                 .buttonStyle(.borderedProminent)
                 .disabled(!session.canApply)
@@ -1257,14 +1261,14 @@ struct LauncherSettings: View {
             } else if model.isIndexing {
                 ProgressView(model.activityTitle).controlSize(.small)
             }
-            if let notice = model.watchNotice { NoticeView(model: model, notice: notice) }
+            if let notice = indexStatus.watchNotice { NoticeView(model: model, notice: notice) }
         }
         group(model.t("本机语义搜索", "On-Device Semantic Search")) {
             LabeledContent(model.t("模型", "Model"), value: "EmbeddingGemma 2")
             localModelStatus
             semanticIndexStatus
             embeddingControls
-            if let notice = model.embeddingNotice { NoticeView(model: model, notice: notice) }
+            if let notice = indexStatus.embeddingNotice { NoticeView(model: model, notice: notice) }
             note(model.t("暂停语义索引时，文件变化仍会自动更新。",
                          "File changes continue to update while semantic indexing is paused."))
         }
@@ -1277,7 +1281,7 @@ struct LauncherSettings: View {
             if let updates { LauncherUpdateControls(updates: updates, model: model) }
         }
         group(model.t("索引统计", "Index Counts")) {
-            if let report = model.indexReport {
+            if let report = indexStatus.indexReport {
                 count(model.t("索引项目", "Indexed Items"), report.items)
                 if let value = report.documents { count(model.t("已索引正文", "Documents with Indexed Text"), value) }
                 if let value = report.placeholders { count(model.t("仅在线文件", "Online-Only Files"), value) }
@@ -1285,7 +1289,7 @@ struct LauncherSettings: View {
                 if let value = report.unverified, value > 0 { count(model.t("暂不可访问", "Unavailable Items"), value) }
                 if let value = report.documents_not_read, value > 0 { count(model.t("正文未读取", "Documents Without Readable Text"), value) }
             } else {
-                note(model.indexPhase == .checking ? model.activityTitle
+                note(indexStatus.indexPhase == .checking ? model.activityTitle
                      : model.t("尚无索引统计。", "Index counts are unavailable."))
             }
         }
@@ -1315,10 +1319,10 @@ struct LauncherSettings: View {
                              "Check the name, text, and semantic coverage of a selected file."))
                 Spacer(minLength: 12)
                 Button(model.t("选取文件…", "Choose File…"), action: chooseDiagnosticFile)
-                    .disabled(model.scopePending)
+                    .disabled(indexStatus.scopePending)
                     .accessibilityIdentifier("settings.diagnostics.choose")
             }
-            switch model.fileDiagnosis {
+            switch indexStatus.fileDiagnosis {
             case .idle:
                 EmptyView()
             case .checking(let name):
@@ -1398,24 +1402,24 @@ struct LauncherSettings: View {
     }
 
     @ViewBuilder private var embeddingControls: some View {
-        switch model.embeddingState {
+        switch indexStatus.embeddingState {
         case .verifying, .running, .pausing:
             Button(model.t("暂停语义索引", "Pause Semantic Indexing")) { model.pauseEmbeddings(userInitiated: true) }
-                .disabled(model.embeddingState == .pausing)
-            if model.embeddingState == .pausing {
+                .disabled(indexStatus.embeddingState == .pausing)
+            if indexStatus.embeddingState == .pausing {
                 Text(model.t("正在完成当前批次，随后暂停。", "Indexing will pause after the current batch."))
                     .foregroundStyle(.secondary)
             }
         case .idle, .paused, .finished:
-            if model.gemmaCoverage?.pending == true && model.gemmaCoverage?.limited == false {
-                Button(model.embeddingState == .paused
+            if indexStatus.gemmaCoverage?.pending == true && indexStatus.gemmaCoverage?.limited == false {
+                Button(indexStatus.embeddingState == .paused
                        ? model.t("继续生成语义索引", "Resume Semantic Indexing")
                        : model.t("生成语义索引", "Build Semantic Index")) {
                     model.buildEmbeddings()
                 }
                 .disabled(!model.canBuildEmbeddings)
             }
-            if model.embeddingState == .paused && model.embeddingNotice == nil {
+            if indexStatus.embeddingState == .paused && indexStatus.embeddingNotice == nil {
                 Text(model.t("已暂停。已完成的片段已保存，可以继续生成。",
                              "Indexing is paused. Completed chunks are saved and indexing can resume."))
                     .foregroundStyle(.secondary)
@@ -1424,7 +1428,7 @@ struct LauncherSettings: View {
     }
 
     @ViewBuilder private var localModelStatus: some View {
-        switch model.localModelState {
+        switch indexStatus.localModelState {
         case .unchecked:
             EmptyView()
         case .available:
@@ -1437,14 +1441,14 @@ struct LauncherSettings: View {
         case .unavailable(let issue):
             Label(model.modelDiagnostic(issue), systemImage: "info.circle")
                 .foregroundStyle(.secondary)
-            if !model.canBuildEmbeddings && model.indexWork != .embeddings {
+            if !model.canBuildEmbeddings && indexStatus.indexWork != .embeddings {
                 Button(model.t("重新检查本机模型", "Recheck Local Model")) { model.verifyLocalModel() }
             }
         }
     }
 
     @ViewBuilder private var semanticIndexStatus: some View {
-        if let coverage = model.gemmaCoverage {
+        if let coverage = indexStatus.gemmaCoverage {
             let count = coverage.embedded_chunks.formatted()
             let limit = coverage.chunk_limit.formatted()
             if !coverage.documents_enabled {
@@ -1459,7 +1463,7 @@ struct LauncherSettings: View {
             } else if coverage.hasResults {
                 Text(model.t("已有 \(count) 段可检索，仍有正文待处理。",
                              "Partial semantic index: \(count) searchable chunks, with more documents to process."))
-            } else if model.indexWork == .embeddings || model.embeddingState == .verifying {
+            } else if indexStatus.indexWork == .embeddings || indexStatus.embeddingState == .verifying {
                 Text(model.t("正在准备语义索引…", "Preparing the semantic index…"))
             } else if coverage.pending {
                 Text(model.t("正文可用于生成本机语义索引。", "Documents are ready for local semantic indexing."))
@@ -1473,7 +1477,7 @@ struct LauncherSettings: View {
     }
 
     private var watchLabel: String {
-        switch model.watchState {
+        switch indexStatus.watchState {
         case .checking: return model.t("正在检查文件监听支持…", "Checking file watching support…")
         case .unavailable: return model.t("当前版本请手动更新索引。", "Use manual index updates in this version.")
         case .needsSetup: return model.t("在「索引与隐私」中应用范围后可监听文件变化。",

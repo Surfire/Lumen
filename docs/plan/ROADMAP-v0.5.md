@@ -17,16 +17,16 @@ All milestones follow [AGENTS.md](../../AGENTS.md) anti-over-defense rules and e
 
 ---
 
-## Milestone 4: Visual/Highlight Polish & Local Clipboard History (`pending`)
+## Milestone 4: Visual/Highlight Polish & Local Clipboard History (`done`)
 
-### `T15` Native Visual Hierarchy, Match Highlighting & Motion Polish (`pending`)
+### `T15` Native Visual Hierarchy, Match Highlighting & Motion Polish (`done`)
 - **Worktree**: `m4-visual-clipboard`
 - **Scope**:
   - **Matched-substring highlighting**: Pass/compute safe Unicode-aware character/pinyin/token highlight ranges in result rows (filename, subtitle path, and snippet excerpts) using SwiftUI `AttributedString` with accent tinting, handling CJK/combining-mark boundaries accurately without allocating per-cell heavy formatters.
   - **Information hierarchy & theme polish**: Tighten typographic hierarchy across Apps / System Actions / Quicklinks / Filename hits / Body snippets / Semantic candidates, tune vibrancy (`NSVisualEffectView` `.hudWindow` / `.popover`) and light/dark contrast, and smooth panel reveal/resize transitions without triggering spurious `NSWindow.didResizeNotification` regressions in `LauncherSmoke`.
   - **Real verification**: Unit tests for Unicode/CJK/pinyin highlight span computation + snapshot visual captures (`--snapshots`) visually inspected at desktop and dark/light contrast.
 
-### `T16` Privacy-First Local Clipboard History (`pending`)
+### `T16` Privacy-First Local Clipboard History (`done`)
 - **Worktree**: `m4-visual-clipboard`
 - **Scope**:
   - **Dedicated local store**: Separate encrypted-at-rest-or-private SQLite table / store under Application Support (`0o700` dir, `0o600` files, strictly excluded from indexer and diagnostics dumps) capturing text (bounded size) and image thumbnails/entries (bounded item count & disk budget, e.g. 200 entries / 7–30 day retention configurable in Settings).

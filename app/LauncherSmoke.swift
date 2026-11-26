@@ -967,6 +967,7 @@ final class LauncherSmoke {
         try verifyHighlights()
         try await verifyCatalogRegressions()
         try await verifyEngineRegressions()
+        try await verifyBackgroundEmbeddingInterleavesContent()
         try check(model.indexPhase == .needsIndex && !model.canSearch, "action smoke unexpectedly had a file index")
         func chosen() -> LaunchAction? {
             if case .action(let action)? = model.selectedResult { return action }
@@ -3609,6 +3610,71 @@ final class LauncherSmoke {
         try type("missing stamp original", into: app)
         try await until("preview without a stamp was rejected") { !model.searching }
         try check(model.hits.isEmpty && model.selection == nil, "an unstamped snippet appeared as an actionable result")
+    }
+
+    private func verifyBackgroundEmbeddingInterleavesContent() async throws {
+        let root = directory.appendingPathComponent("background-embedding", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let executable = root.appendingPathComponent("engine")
+        let database = root.appendingPathComponent("index.sqlite")
+        let journal = root.appendingPathComponent("batches")
+        let source = #"""
+        #!/usr/bin/python3
+        import json, signal, sys
+        from pathlib import Path
+        root = Path(__file__).parent
+        journal = root / 'batches'
+        batches = journal.read_text().splitlines() if journal.exists() else []
+        checked, embedded = batches.count('content'), batches.count('embed')
+        command, *args = sys.argv[3:]
+        def record(batch):
+            with journal.open('a') as out:
+                print(batch, file=out)
+        if command == 'status':
+            print(json.dumps(dict(items=3, documents=checked,
+                content=dict(pending=3-checked, checked=checked, total=3),
+                gemma=dict(documents_enabled=True, pending=checked>embedded,
+                    limited=False, embedded_chunks=embedded, skipped_chunks=0, chunk_limit=100))))
+        elif command == 'watch':
+            if '--help' not in args:
+                print('{"event":"ready"}', flush=True)
+                signal.pause()
+        elif command == 'content':
+            assert args == ['--max', '8'] and checked < 3
+            record('content')
+            print(json.dumps(dict(processed=1, indexed=1, pending=2-checked)))
+        elif command == 'model-status':
+            print(json.dumps(dict(available=True, verified='--verify' in args)))
+        elif command == 'embed':
+            assert args == ['--gemma', '--max', '32'] and checked > embedded
+            record('embed')
+            print(json.dumps(dict(new_embeddings=1, skipped_chunks=0, has_more=False)))
+        else:
+            sys.exit(1)
+        """#
+        try Data(source.utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        try Data().write(to: database)
+        let suite = "lumen-background-embedding-\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else { throw Failure("missing isolated embedding defaults") }
+        defaults.set(true, forKey: "gemmaIndexingEnabled")
+        defaults.set(false, forKey: "gemmaIndexingPaused")
+        let model = Launcher(engine: LauncherEngine(executable: executable, database: database), defaults: defaults)
+        defer {
+            model.close()
+            defaults.removePersistentDomain(forName: suite)
+        }
+        model.start(automaticallyIndex: false)
+        try await until("background embeddings resumed after successive content batches") {
+            model.contentCoverage?.pending == 0 && model.gemmaCoverage?.embedded_chunks == 3 &&
+                model.embeddingState == .finished
+        }
+        let batches = try String(contentsOf: journal, encoding: .utf8).split(separator: "\n")
+        try check(batches == ["content", "embed", "content", "embed", "content", "embed"],
+                  "semantic indexing waited for content to drain: \(batches)")
+        try check(defaults.bool(forKey: "gemmaIndexingEnabled") && !defaults.bool(forKey: "gemmaIndexingPaused") &&
+                  defaults.object(forKey: "contentIndexingPaused") == nil && model.embeddingNotice == nil,
+                  "silent background embedding changed pause preferences or raised a notice")
     }
 
     private func verifyEmbeddingRun(_ app: AppDelegate) async throws {

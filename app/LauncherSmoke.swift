@@ -2,6 +2,8 @@ import AppKit
 import Carbon
 import Combine
 import Foundation
+import SQLite3
+import SwiftUI
 
 // Runs inside the built app with app-local AppKit and Carbon events and an isolated index.
 @MainActor
@@ -13,8 +15,8 @@ final class LauncherSmoke {
     let language: String
     let appRoots: [URL]
     let filePasteboard = NSPasteboard.withUniqueName()
-    private let clipboardPasteboard = NSPasteboard.withUniqueName()
     private let clipboardSession = NotificationCenter()
+    private lazy var clipboardFixtureRoot = ClipboardStore.canonicalStorageAnchor(directory)
     private(set) var dispatchedActions: [LaunchAction.Destination] = []
     let usesOffscreenWindows: Bool
     private let directory: URL
@@ -44,9 +46,9 @@ final class LauncherSmoke {
     var shortcutFixturePreferences: UserDefaults? { exists("quicklinks-scenario") ? translationPreferences : nil }
 
     func makeClipboardManager() -> ClipboardManager {
-        ClipboardManager(defaults: translationPreferences!, pasteboard: clipboardPasteboard,
-                         directory: directory.appendingPathComponent("Clipboard", isDirectory: true),
-                         automaticPolling: false, sessionCenter: clipboardSession)
+        ClipboardManager(defaults: translationPreferences!, pasteboard: filePasteboard,
+                         directory: clipboardFixtureRoot.appendingPathComponent("Clipboard", isDirectory: true),
+                         automaticPolling: false, sessionCenter: clipboardSession, isConsoleSessionActive: { true })
     }
 
     func makeTranslationModel() -> TranslationPanelModel {
@@ -215,7 +217,12 @@ final class LauncherSmoke {
         }
 
         if exists("action-scenario") {
+            try verifyClipboardOptIn(app.clipboard)
+            try writeClipboardText("External copy fixture")
+            app.clipboard.poll()
+            try check(app.clipboard.items.map(\.text) == ["External copy fixture"], "copy regression did not start with active capture")
             try await verifyActions(app)
+            app.clipboard.clearAll()
             try await verifyClipboardHistory(app)
             return
         }
@@ -402,47 +409,70 @@ final class LauncherSmoke {
         }
     }
 
-    private func verifyClipboardHistory(_ app: AppDelegate) async throws {
-        app.showSearch()
-        let history = app.clipboard
-        let store = history.store
-        let board = clipboardPasteboard
-        let fm = FileManager.default
-        func write(_ text: String, marker: String? = nil) throws {
-            let item = NSPasteboardItem()
-            try check(item.setString(text, forType: .string), "could not write text fixture")
-            board.clearContents()
-            if let marker {
-                let tagged = NSPasteboardItem()
-                try check(tagged.setData(Data(), forType: .init(marker)), "could not write marker fixture")
-                // A marker on another item must protect the entire pasteboard change.
-                try check(board.writeObjects([item, tagged]), "could not write marked pasteboard fixture")
-            } else {
-                try check(board.writeObjects([item]), "could not write text to the named pasteboard")
-            }
-        }
+    private func verifyInternalCopy(_ app: AppDelegate, _ label: String) throws {
+        try check(filePasteboard.types?.contains(ClipboardManager.internalType) == true, "\(label) was not marked internal")
+        app.clipboard.poll()
+        try check(app.clipboard.items.map(\.text) == ["External copy fixture"], "\(label) leaked into clipboard history")
+    }
 
+    private func writeClipboardText(_ text: String, marker: String? = nil) throws {
+        let item = NSPasteboardItem()
+        try check(item.setString(text, forType: .string), "could not write text fixture")
+        filePasteboard.clearContents()
+        if let marker {
+            let tagged = NSPasteboardItem()
+            try check(tagged.setData(Data(), forType: .init(marker)), "could not write marker fixture")
+            // A marker on another item must protect the entire pasteboard change.
+            try check(filePasteboard.writeObjects([item, tagged]), "could not write marked pasteboard fixture")
+        } else {
+            try check(filePasteboard.writeObjects([item]), "could not write text to the named pasteboard")
+        }
+    }
+
+    private func verifyClipboardOptIn(_ history: ClipboardManager) throws {
         try check(!history.enabled && history.limit == 200, "clipboard capture was not opt-in with a 200-item default")
-        try write("before opt-in")
+        try writeClipboardText("before opt-in")
         history.poll()
         history.setEnabled(true)
         try check(makeClipboardManager().enabled, "clipboard opt-in did not persist")
         history.poll()
-        try write(" \n\t ")
+        try writeClipboardText(" \n\t ")
         history.poll()
         for marker in ["org.nspasteboard.ConcealedType", "org.nspasteboard.TransientType",
                        "org.nspasteboard.AutoGeneratedType", "com.apple.is-sensitive", ClipboardManager.internalType.rawValue] {
-            try write("protected fixture", marker: marker)
+            try writeClipboardText("protected fixture", marker: marker)
             history.poll()
             try check(history.items.isEmpty, "clipboard history captured a change marked \(marker)")
         }
         clipboardSession.post(name: NSWorkspace.sessionDidResignActiveNotification, object: nil)
-        try write("inactive session")
+        try writeClipboardText("inactive session")
         history.poll()
         clipboardSession.post(name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
         history.poll()
-        try check(history.items.isEmpty && !fm.fileExists(atPath: store.directory.path),
+        try check(history.items.isEmpty && !FileManager.default.fileExists(atPath: history.store.directory.path),
                   "a skipped clipboard change created private storage")
+    }
+
+    private func verifyClipboardHistory(_ app: AppDelegate) async throws {
+        try verifyClipboardSymlinks()
+        try verifyClipboardDeduplication()
+        try verifyInactiveClipboardStartup()
+        try await verifyOriginalClipboardPNG()
+        app.showSearch()
+        let history = app.clipboard
+        let store = history.store
+        let board = filePasteboard
+        let fm = FileManager.default
+        func write(_ text: String) throws { try writeClipboardText(text) }
+
+        for text in ["A café receipt", "Côté açai frais", "Frequently asked cases"] {
+            try write(text)
+            history.poll()
+        }
+        try type("cb cÁf", into: app)
+        try check(app.commands.clipboardRows.map(\.text) == ["A café receipt", "Côté açai frais"] && app.model.query.isEmpty,
+                  "history search did not rank substrings over ordered fuzzy matches or ignored case/diacritics")
+        history.clearAll()
 
         let invoice = "October Invoice\nSynthetic line two"
         let earliestCapture = Date.now
@@ -473,6 +503,16 @@ final class LauncherSmoke {
             try check(app.commands.resolution == .clipboard("") && app.commands.clipboardSelection == pinned.id,
                       "clipboard verb did not immediately select a row")
         }
+        for verb in ["cb", "clip"] {
+            try type(verb, into: app)
+            try activateClipboardFileFallback(app)
+            try check(try editor(app).string == verb && app.commands.resolution == .search && app.model.query == verb,
+                      "Search Files did not keep the bare \(verb) query and return focus to file search")
+            try await until("Search Files did not find the literal file named \(verb)") {
+                app.model.hits.contains { $0.name == verb }
+            }
+        }
+        try type("cb ", into: app)
         try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.shift])
         try check(app.contextActions.items.map(\.id) == ["copy-clip", "pin-clip", "delete-clip"],
                   "Shift–Return did not show clipboard actions")
@@ -594,6 +634,129 @@ final class LauncherSmoke {
         try check(history.items.isEmpty && !reopened.enabled && reopened.limit == 3,
                   "capture continued after opt-out or settings did not persist")
         print("Clipboard history passed: named pasteboard capture, five privacy markers, session pause, private persistence, LRU, command routing, preview selection, copy and deletion")
+    }
+
+    private func activateClipboardFileFallback(_ app: AppDelegate) throws {
+        // Activate the Search Files button's bound action in the live, offscreen SwiftUI view.
+        guard let results = app.panel.contentView?.subviews.compactMap({ $0 as? NSHostingView<SearchWindow> }).first else {
+            throw Failure("could not find the launcher results view")
+        }
+        results.rootView.searchCommandAsFiles()
+    }
+
+    private func verifyInactiveClipboardStartup() throws {
+        let session = NotificationCenter()
+        let board = NSPasteboard.withUniqueName()
+        let history = ClipboardManager(defaults: translationPreferences!, pasteboard: board,
+            directory: clipboardFixtureRoot.appendingPathComponent("inactive-startup/Clipboard"), automaticPolling: false,
+            sessionCenter: session, isConsoleSessionActive: { false })
+        defer { history.stop() }
+        try check(history.enabled, "inactive startup fixture was not opted in")
+        history.start()
+        func write(_ text: String) throws {
+            board.clearContents()
+            try check(board.setString(text, forType: .string), "could not write startup session fixture")
+            history.poll()
+        }
+        try write("inactive at launch")
+        session.post(name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
+        history.poll()
+        try check(history.items.isEmpty && !FileManager.default.fileExists(atPath: history.store.directory.path),
+                  "inactive startup captured a change before the session became active")
+        try write("active after launch")
+        try check(history.items.map(\.text) == ["active after launch"], "capture did not resume on session activation")
+    }
+
+    private func verifyClipboardDeduplication() throws {
+        let store = ClipboardStore(directory: clipboardFixtureRoot.appendingPathComponent("dedup/Clipboard"), limit: 2)
+        for pinned in [false, true] {
+            try store.clearAll()
+            let start = Date(timeIntervalSince1970: 1234)
+            try check(try store.addText("A", capturedAt: start, bundleID: nil, appName: nil), "could not insert A")
+            guard let a = try store.items().first else { throw Failure("missing deduplication fixture A") }
+            if pinned { try store.togglePin(id: a.id) }
+            try check(try store.addText("B", capturedAt: start + 1, bundleID: nil, appName: nil), "could not insert B")
+            try check(try store.addText("A", capturedAt: start + 2, bundleID: "test.recapture", appName: nil), "could not recapture A")
+            let rows = try store.items()
+            try check(rows.map(\.text) == ["A", "B"] && rows.first?.id == a.id && rows.first?.pinned == pinned &&
+                      rows.first?.capturedAt == start + 2 && rows.first?.sourceBundleID == "test.recapture",
+                      "A, B, A did not refresh the existing row without evicting B (pinned: \(pinned))")
+        }
+    }
+
+    private func verifyClipboardSymlinks() throws {
+        let fm = FileManager.default
+        let root = clipboardFixtureRoot.appendingPathComponent("symlink-storage")
+        let outside = root.appendingPathComponent("outside")
+        try fm.createDirectory(at: outside, withIntermediateDirectories: true)
+        let sentinel = outside.appendingPathComponent("sentinel")
+        let original = Data("outside clipboard storage".utf8)
+        try original.write(to: sentinel)
+        try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: sentinel.path)
+        func reject(_ location: URL) throws {
+            let store = ClipboardStore(directory: location)
+            do { _ = try store.items() }
+            catch {
+                do { _ = try store.addText("private", capturedAt: .now, bundleID: nil, appName: nil) }
+                catch { return }
+                throw Failure("clipboard write accepted unsafe storage at \(location.path)")
+            }
+            throw Failure("clipboard read accepted unsafe storage at \(location.path)")
+        }
+        let linkedDirectory = root.appendingPathComponent("Clipboard")
+        try fm.createSymbolicLink(at: linkedDirectory, withDestinationURL: outside)
+        try reject(linkedDirectory)
+        try reject(linkedDirectory.appendingPathComponent("nested/Clipboard"))
+        for name in [".history.sqlite", ".history.sqlite-wal", ".history.sqlite-shm", ".history.sqlite-journal"] {
+            let location = root.appendingPathComponent("case-\(name)")
+            let store = ClipboardStore(directory: location)
+            try check(try store.addText("initial", capturedAt: .now, bundleID: nil, appName: nil), "could not seed symlink fixture")
+            let link = location.appendingPathComponent(name)
+            if name == ".history.sqlite" { try fm.removeItem(at: link) }
+            try fm.createSymbolicLink(at: link, withDestinationURL: sentinel)
+            try reject(location)
+        }
+        try check(try Data(contentsOf: sentinel) == original && fm.contentsOfDirectory(atPath: outside.path) == ["sentinel"] &&
+                  (fm.attributesOfItem(atPath: sentinel.path)[.posixPermissions] as? NSNumber)?.intValue == 0o644,
+                  "unsafe storage modified files outside the clipboard directory")
+    }
+
+    private func verifyOriginalClipboardPNG() async throws {
+        let board = NSPasteboard.withUniqueName()
+        let storeDirectory = clipboardFixtureRoot.appendingPathComponent("png-fidelity/Clipboard")
+        let history = ClipboardManager(defaults: translationPreferences!, pasteboard: board, directory: storeDirectory,
+            automaticPolling: false, sessionCenter: NotificationCenter(), isConsoleSessionActive: { true })
+        history.start()
+        defer { history.stop() }
+        // Force explicit pixel dimensions regardless of the display's backing scale.
+        let width = 1800
+        guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: 24, bitsPerSample: 8,
+                                           samplesPerPixel: 3, hasAlpha: false, isPlanar: false, colorSpaceName: .deviceRGB,
+                                           bytesPerRow: 0, bitsPerPixel: 0), let pixels = bitmap.bitmapData else {
+            throw Failure("could not create original PNG fixture")
+        }
+        memset(pixels, 90, bitmap.bytesPerRow * bitmap.pixelsHigh)
+        guard let png = bitmap.representation(using: .png, properties: [:]), png.count <= ClipboardStore.maximumImageBytes else {
+            throw Failure("original PNG fixture exceeded the byte budget")
+        }
+        board.clearContents()
+        try check(board.setData(png, forType: .png), "could not put original PNG on pasteboard")
+        await history.poll()?.value
+        guard let clip = history.items.first else { throw Failure("valid PNG was not captured") }
+        try check(try history.store.image(id: clip.id) == png && history.copy(id: clip.id) && board.data(forType: .png) == png,
+                  "bounded original PNG was resized or re-encoded")
+
+        var handle: OpaquePointer?
+        defer { sqlite3_close(handle) }
+        let path = storeDirectory.appendingPathComponent(".history.sqlite").path
+        try check(sqlite3_open_v2(path, &handle, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK, "could not open corrupt blob fixture")
+        let marker = board.changeCount
+        for blob in ["X'89504e470d0a1a0a'", "zeroblob(\(ClipboardStore.maximumImageBytes + 1))"] {
+            try check(sqlite3_exec(handle, "UPDATE clips SET image = \(blob) WHERE id = \(clip.id)", nil, nil, nil) == SQLITE_OK,
+                      "could not inject an invalid image row")
+            try check(try history.store.image(id: clip.id) == nil && !history.copy(id: clip.id) && board.changeCount == marker,
+                      "an invalid stored image could be copied to the pasteboard")
+        }
     }
 
     private func verifyActions(_ app: AppDelegate) async throws {
@@ -718,6 +881,9 @@ final class LauncherSmoke {
         try check(dispatchedActions.count == count, "Return dispatched an action from a previous query")
 
         let frecencyFixtures = exists("quicklinks-scenario") ? try makeFileFrecencyFixtures() : nil
+        for verb in ["cb", "clip"] {
+            try "Literal command name fixture".write(to: corpus.appendingPathComponent(verb), atomically: true, encoding: .utf8)
+        }
         app.startBackgroundIndex()
         try await until("the isolated file index became available alongside actions") { model.canSearch && model.watchState == .running }
         try check(model.launcherActivityTitle == nil && model.activityTitle == model.t("正在监听文件变化", "Watching file changes"),
@@ -741,10 +907,12 @@ final class LauncherSmoke {
         try await until("Command–Shift–C copied the selected file's name") {
             self.filePasteboard.string(forType: .string) == expected.name && app.searchPresented
         }
+        try verifyInternalCopy(app, "Copy File Name")
         try key(kVK_ANSI_C, "c", in: app, throughPanel: true, flags: [.command, .option])
         try await until("Command–Option–C copied the selected file's exact path") {
             self.filePasteboard.string(forType: .string) == expected.path
         }
+        try verifyInternalCopy(app, "Copy File Path")
         try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
         try await until("Command–Y assigned a local item to the native Quick Look view") { app.localPreview?.previewURL != nil }
         guard let preview = app.localPreview, let snapshot = preview.previewURL else { throw Failure("Quick Look had no item") }
@@ -1351,6 +1519,7 @@ final class LauncherSmoke {
         try key(kVK_Return, "\r", in: app)
         try check(commands.copied && filePasteboard.string(forType: .string)?.contains("回答") == true &&
                   panel.firstResponder === input && app.searchPresented, "second Return did not copy in place")
+        try verifyInternalCopy(app, "Copy QA Answer")
 
         try type("qa synthetic error", into: app)
         try key(kVK_Return, "\r", in: app)
@@ -1545,6 +1714,7 @@ final class LauncherSmoke {
         try key(kVK_Return, "\r", in: app)
         try check(mdl.copied && filePasteboard.string(forType: .string) == mdl.output &&
                   field.string == originalText && app.searchPresented, "second Return did not copy in place")
+        try verifyInternalCopy(app, "Copy Translation")
 
         try type("tr it is fine", into: app)
         try check(mdl.output.isEmpty && !mdl.copied, "edited text kept the old result or copy affordance")
@@ -1780,6 +1950,7 @@ final class LauncherSmoke {
         try check(app.contextActions.items.first?.id == "copy", "calculator context did not offer Copy Result")
         try key(kVK_Return, "\r", in: app)
         try check(filePasteboard.string(forType: .string) == "20", "context menu did not copy the calculated value")
+        try verifyInternalCopy(app, "Copy Calculator Result")
         app.showSearch()
         try type("10 公里 到 米", into: app)
         try check(model.calculation?.copyValue == "10000 m", "local Chinese unit conversion failed")
@@ -1787,6 +1958,7 @@ final class LauncherSmoke {
         try check(filePasteboard.string(forType: .string) == "10000 m" &&
                   CalculationResult.evaluate("1 m to kg") == nil && CalculationResult.evaluate("2/0") == nil &&
                   CalculationResult.evaluate("2026-11-25") == nil, "conversion or invalid-input boundary failed")
+        try verifyInternalCopy(app, "Copy Unit Conversion")
         print("Quicklinks passed: gh/wiki/map toggle, alias conflicts and precedence, Chinese titles, pins, keyboard actions, recent projects, web dispatch, pinyin ranking, arithmetic and unit conversion")
     }
 

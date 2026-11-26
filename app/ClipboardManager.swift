@@ -23,14 +23,16 @@ final class ClipboardManager: ObservableObject {
     private let automaticPolling: Bool
     private let sessionCenter: NotificationCenter
     private var sessionObservers: [AnyCancellable] = []
-    private var sessionActive = true
+    private var sessionActive: Bool
     private var timer: Timer?
     private var lastChangeCount: Int?
     private var imageWork: Task<Void, Never>?
     private var loaded = false
 
     init(defaults: UserDefaults, pasteboard: NSPasteboard, directory: URL = ClipboardStore.defaultDirectory,
-         automaticPolling: Bool = true, sessionCenter: NotificationCenter = NSWorkspace.shared.notificationCenter) {
+         automaticPolling: Bool = true, sessionCenter: NotificationCenter = NSWorkspace.shared.notificationCenter,
+         isConsoleSessionActive: () -> Bool = ClipboardManager.isOnConsole) {
+        sessionActive = isConsoleSessionActive()
         self.defaults = defaults
         self.pasteboard = pasteboard
         self.automaticPolling = automaticPolling
@@ -39,6 +41,11 @@ final class ClipboardManager: ObservableObject {
         let limit = defaults.object(forKey: Self.limitKey) as? Int ?? ClipboardStore.defaultLimit
         self.limit = ClipboardStore.boundedLimit(limit)
         store = ClipboardStore(directory: directory, limit: limit)
+    }
+
+    nonisolated static func isOnConsole() -> Bool {
+        let session = CGSessionCopyCurrentDictionary() as? [String: Any]
+        return session?["kCGSSessionOnConsoleKey"] as? Bool == true
     }
 
     deinit {
@@ -92,19 +99,28 @@ final class ClipboardManager: ObservableObject {
         (try? store.thumbnail(id: id)).flatMap(NSImage.init(data:))
     }
 
+    @discardableResult static func writeInternalString(_ text: String, to pasteboard: NSPasteboard = .general) -> Bool {
+        let item = NSPasteboardItem()
+        return item.setString(text, forType: .string) && writeInternalItem(item, to: pasteboard)
+    }
+
+    private static func writeInternalItem(_ item: NSPasteboardItem, to pasteboard: NSPasteboard) -> Bool {
+        guard item.setData(Data(), forType: internalType) else { return false }
+        pasteboard.clearContents()
+        return pasteboard.writeObjects([item])
+    }
+
     @discardableResult func copy(id: Int64) -> Bool {
         guard let entry = items.first(where: { $0.id == id }) else { return false }
         do {
-            let item = NSPasteboardItem()
             let wrote: Bool
             if let text = entry.text {
-                wrote = item.setString(text, forType: .string)
+                wrote = Self.writeInternalString(text, to: pasteboard)
             } else if let data = try store.image(id: id) {
-                wrote = item.setData(data, forType: .png)
+                let item = NSPasteboardItem()
+                wrote = item.setData(data, forType: .png) && Self.writeInternalItem(item, to: pasteboard)
             } else { return false }
-            guard wrote, item.setData(Data(), forType: Self.internalType) else { return false }
-            pasteboard.clearContents()
-            guard pasteboard.writeObjects([item]) else { failed = true; return false }
+            guard wrote else { failed = true; return false }
             change { try store.noteUsed(id: id) }
             return true
         } catch {
@@ -219,11 +235,14 @@ final class ClipboardManager: ObservableObject {
             CGImageDestinationAddImage(output, image, nil)
             return CGImageDestinationFinalize(output) ? data as Data : nil
         }
-        // Decode only inline image bytes (never file URLs), strip source metadata and cap the PNG.
+        // Keep an already bounded PNG verbatim, including its original dimensions and metadata.
+        if bytes.count <= ClipboardStore.maximumImageBytes, ClipboardStore.isDecodablePNG(bytes, source: source) {
+            return png(maximumDimension: 240).map { (bytes, $0) }
+        }
+        // Other inline image bytes (never file URLs) are resized and re-encoded to fit.
         for dimension in [1600, 896, 512, 320] {
-            if let payload = png(maximumDimension: dimension), payload.count <= ClipboardStore.maximumImageBytes,
-               let thumbnail = png(maximumDimension: 240) {
-                return (payload, thumbnail)
+            if let payload = png(maximumDimension: dimension), payload.count <= ClipboardStore.maximumImageBytes {
+                return png(maximumDimension: 240).map { (payload, $0) }
             }
         }
         return nil

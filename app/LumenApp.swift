@@ -237,7 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
         clipboardUpdates = clipboard.$items.dropFirst().sink { [weak self] items in
             guard let self, self.commands.isClipboardCommand else { return }
-            self.commands.updateClipboard(items)
+            self.updateClipboardCommands(items)
             self.updatePresentation()
         }
         clipboard.start()
@@ -441,7 +441,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         translation.setCommand(translationCommand)
         if previousCommand != next {
             if commands.isClipboardCommand { clipboard.loadHistory() }
-            commands.updateClipboard(clipboard.items, resetSelection: true)
+            updateClipboardCommands(clipboard.items, resetSelection: true)
         }
         if case .image(let term) = next {
             imageSearch.ensureStatus()
@@ -462,6 +462,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
     }
 
+    private func updateClipboardCommands(_ items: [ClipboardItem], resetSelection: Bool = false) {
+        let ranked: [ClipboardItem]
+        if case .clipboard(let filter) = commands.resolution { ranked = ClipboardStore.rank(items, for: filter) }
+        else { ranked = items }
+        commands.updateClipboard(ranked, resetSelection: resetSelection)
+    }
+
     private func searchCommandAsFiles() {
         literalCommand = searchText
         searchFieldAction()
@@ -480,9 +487,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             if let id = commands.clipboardSelection { copyClipboardItem(id) }
         case .question(let question):
             if case .answer(let output) = commands.answer {
-                let pasteboard = smoke?.filePasteboard ?? .general
-                pasteboard.clearContents()
-                if pasteboard.setString(output, forType: .string) { commands.noteCopied() }
+                if ClipboardManager.writeInternalString(output, to: smoke?.filePasteboard ?? .general) { commands.noteCopied() }
             } else if commands.answer != .loading, let ask = translation.answerWithSavedProvider() {
                 commands.submit(question, using: ask)
             }
@@ -670,9 +675,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         case .shortcut(let shortcut): openShortcut(shortcut)
         case .calculation(let calculation):
             guard searchPresented, model.calculation == calculation else { return }
-            let pasteboard = smoke?.filePasteboard ?? NSPasteboard.general
-            pasteboard.clearContents()
-            if pasteboard.setString(calculation.copyValue, forType: .string) { dismissSearch() }
+            if ClipboardManager.writeInternalString(calculation.copyValue, to: smoke?.filePasteboard ?? .general) { dismissSearch() }
             else { model.openingFailed() }
         }
     }
@@ -774,11 +777,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         case .copyName, .copyPath:
             model.resolve(hit, action: action) { [weak self] _ in
                 guard let self, self.searchPresented else { return }
-                let pasteboard = self.smoke?.filePasteboard ?? NSPasteboard.general
                 let value = action == .copyName ? hit.name : hit.path
-                pasteboard.clearContents()
-                if pasteboard.setString(value, forType: .string) { self.model.copied(action) }
-                else { self.model.openingFailed() }
+                if ClipboardManager.writeInternalString(value, to: self.smoke?.filePasteboard ?? .general) {
+                    self.model.copied(action)
+                } else { self.model.openingFailed() }
             }
         }
     }
@@ -1014,9 +1016,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if translation.output.isEmpty {
             translation.translate()
         } else {
-            let pasteboard = smoke?.filePasteboard ?? .general
-            pasteboard.clearContents()
-            if pasteboard.setString(translation.output, forType: .string) { translation.noteCopied() }
+            if ClipboardManager.writeInternalString(translation.output, to: smoke?.filePasteboard ?? .general) { translation.noteCopied() }
         }
     }
 

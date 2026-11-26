@@ -104,12 +104,18 @@ enum LauncherSystemActions {
         return alert
     }
 
-    private static func script(_ source: String, completion: (Bool) -> Void) {
+    private static func script(_ source: String, completion: @escaping (Bool) -> Void) {
         // Fixed local Apple events only: no shell, no user input interpolated into scripts.
-        var error: NSDictionary?
-        guard let script = NSAppleScript(source: source) else { completion(false); return }
-        script.executeAndReturnError(&error)
-        completion(error == nil)
+        DispatchQueue.global(qos: .userInitiated).async {
+            var error: NSDictionary?
+            guard let script = NSAppleScript(source: source) else {
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            script.executeAndReturnError(&error)
+            let succeeded = error == nil
+            DispatchQueue.main.async { completion(succeeded) }
+        }
     }
 
     private static func setMuted(_ muted: Bool) -> Bool {

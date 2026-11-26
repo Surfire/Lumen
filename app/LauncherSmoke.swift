@@ -1,6 +1,7 @@
 import AppKit
 import Carbon
 import Combine
+import Darwin
 import Foundation
 import ImageIO
 import SQLite3
@@ -36,6 +37,7 @@ final class LauncherSmoke {
     var wasActivated = false
     var dispatchedQuicklinks: [URL] = []
     var chosenQuicklinkFolder: URL?
+    var chosenScriptsFolder: URL?
     var chosenSettingsDirectories: [URL]?
     var automaticIndexScenario: Bool { exists("automatic-index-scenario") }
     var chosenDiagnosticFile: URL?
@@ -54,6 +56,10 @@ final class LauncherSmoke {
     private lazy var translationPreferences = UserDefaults(suiteName: translationSuite)
     private let translationSecrets = SmokeTranslationSecrets()
     var shortcutFixturePreferences: UserDefaults? { exists("quicklinks-scenario") ? translationPreferences : nil }
+
+    func makeScriptCatalog() -> LauncherScriptCatalog {
+        LauncherScriptCatalog(defaults: translationPreferences, shortcutsExecutable: directory.appendingPathComponent("shortcuts-fixture"))
+    }
 
     func makeClipboardManager() -> ClipboardManager {
         ClipboardManager(defaults: translationPreferences!, pasteboard: filePasteboard,
@@ -976,6 +982,7 @@ final class LauncherSmoke {
         try await verifyInlineTranslation(app)
         try await verifyLauncherCommands(app)
         try verifyProviderDeletion(app.translation)
+        try await verifyLocalExecutables(app)
 
         for (term, expected) in [
             ("无线局域网", "com.apple.wifi-settings-extension"),
@@ -1154,6 +1161,247 @@ final class LauncherSmoke {
             try await verifyQuicklinks(app)
         }
         print("Unified actions passed: real background app launch, routed Settings URLs, isolated file copies, and native local Quick Look input")
+    }
+
+    private func verifyLocalExecutables(_ app: AppDelegate) async throws {
+        let fm = FileManager.default
+        let folder = directory.appendingPathComponent("Local Scripts", isDirectory: true)
+        let nested = folder.appendingPathComponent("Nested", isDirectory: true)
+        try fm.createDirectory(at: nested, withIntermediateDirectories: true)
+        func fixture(_ url: URL, _ script: String, mode: Int = 0o700) throws {
+            try Data(script.utf8).write(to: url)
+            try fm.setAttributes([.posixPermissions: mode], ofItemAtPath: url.path)
+        }
+        let echo = folder.appendingPathComponent("echo argument")
+        try fixture(echo, #"""
+        #!/bin/sh
+        # @lumen.title = Lumen Argv Probe
+        # @lumen.alias argvliteral
+        # @lumen.description metadata probe description
+        # @lumen.mode fullOutput
+        # @lumen.argument1 Exact text
+        printf '%s\n%s\n%s' "$#" "$1" "$0"
+        """#)
+        let flood = folder.appendingPathComponent("flood")
+        try fixture(flood, """
+        #!/bin/sh
+        # @lumen.title Lumen Output Flood
+        # @lumen.mode inline
+        /usr/bin/head -c 65537 /dev/zero
+        /usr/bin/head -c 65538 /dev/zero >&2
+        exit 7
+        """)
+        let silent = folder.appendingPathComponent("silent")
+        try fixture(silent, #"""
+        #!/bin/sh
+        # @lumen.title Lumen Silent Probe
+        # @lumen.mode silent
+        # @lumen.argument1 Silent argument
+        printf '%s' "$1" > silent-ran
+        """#)
+        for (name, title, mode) in [("group", "Lumen Group Probe", "fullOutput"),
+                                    ("silent-group", "Lumen Silent Group Probe", "silent")] {
+            try fixture(folder.appendingPathComponent(name), #"""
+            #!/bin/sh
+            # @lumen.title \#(title)
+            # @lumen.mode \#(mode)
+            trap '' TERM
+            /bin/sleep 120 &
+            printf '%s %s\n' "$$" "$!" > group-starting
+            /bin/mv group-starting group-ready
+            wait
+            """#)
+        }
+        try fixture(nested.appendingPathComponent("nested"), "#!/bin/sh\nexit 0")
+        try fixture(folder.appendingPathComponent("not executable"), "#!/bin/sh\nexit 0", mode: 0o644)
+        let external = directory.appendingPathComponent("outside script")
+        try fixture(external, "#!/bin/sh\n# @lumen.title Lumen Outside Symlink Target\nexit 0")
+        try fm.createSymbolicLink(at: folder.appendingPathComponent("symlink"), withDestinationURL: external)
+        let folderLink = directory.appendingPathComponent("folder link", isDirectory: true)
+        try fm.createSymbolicLink(at: folderLink, withDestinationURL: folder)
+        try check(mkfifo(folder.appendingPathComponent("fifo").path, 0o700) == 0, "could not create FIFO fixture")
+        var flags = stat()
+        flags.st_flags = UInt32(SF_DATALESS)
+        try check(!LauncherScriptFiles.isResident(flags), "a simulated SF_DATALESS file passed the resident gate")
+        try check(LauncherScriptFiles.scan(IndexScope.folderPath(folderLink)) == nil, "symlink folder was scanned")
+
+        let source = LauncherExecutable.Source.shortcut("parser fixture")
+        let prefix = Data([0xef, 0xbb, 0xbf]) + Data("// @lumen.title = Snow 猫\r\n# @lumen.alias snowy\r".utf8)
+            + Data([0x80, 0, 10]) + Data(("# @lumen.description " + String(repeating: "X", count: 1300)
+            + "\n# @lumen.mode = fullOutput\r\n# @lumen.argument1 = Path or text").utf8)
+        let parsed = LauncherExecutable.parse(prefix, eof: true, source: source, fallback: "fallback")
+        try check(parsed.title == "Snow 猫" && parsed.alias == "snowy" && parsed.mode == .fullOutput &&
+                  parsed.argument == "Path or text" && parsed.description.isEmpty,
+                  "BOM/CRLF, binary, or oversize metadata parsed incorrectly: \(parsed)")
+        let missing = LauncherExecutable.parse(Data("# @lumen.title\r\n# @lumen.mode bogus\n# @lumen.argument1 =\n".utf8),
+                                               eof: true, source: source, fallback: "fallback")
+        let overLimit = Data((String(repeating: "\n", count: LauncherScriptFiles.headerLimit - 20)
+                             + "# @lumen.title truncated-title\n# @lumen.mode silent\n").utf8)
+        let clipped = LauncherExecutable.parse(overLimit, eof: true, source: source, fallback: "clipped")
+        try check(missing.title == "fallback" && missing.mode == .compact && missing.argument == nil &&
+                  clipped.title == "clipped" && clipped.mode == .compact, "missing or truncated headers changed defaults")
+
+        let catalog = app.scriptCatalog
+        let shortcutName = "--Lumen Shortcuts Probe ; $(echo altered)"
+        let stub = catalog.shortcutsExecutable
+        try fixture(stub, #"""
+        #!/bin/sh
+        case "$1" in
+          list)
+            printf 'list\n' >> "${0%/*}/shortcuts-calls"
+            printf '%s\r\n%s\n\n%s\n' '--Lumen Shortcuts Probe ; $(echo altered)' '  Exact Spacing  ' '--Lumen Shortcuts Probe ; $(echo altered)'
+            ;;
+          run)
+            printf 'run\n' >> "${0%/*}/shortcuts-calls"
+            shift
+            case "$1" in
+              --input-path=*)
+                printf '%s\n' "${1#--input-path=}"
+                /bin/cat "${1#--input-path=}" || exit 6
+                shift
+                ;;
+            esac
+            [ "$#" = 2 ] && [ "$1" = '--' ] || exit 4
+            printf '<%s>' "$2"
+            ;;
+          *) exit 5 ;;
+        esac
+        """#)
+        func command(_ title: String) throws -> LauncherExecutable {
+            guard let command = (catalog.scripts + catalog.shortcuts).first(where: { $0.title == title }) else {
+                throw Failure("missing command: \(title)")
+            }
+            return command
+        }
+        func finished() -> LauncherProcess.Result? {
+            if case .finished(let result)? = app.commands.execution?.phase { return result }
+            return nil
+        }
+        try check(!catalog.scriptsEnabled && !catalog.shortcutsEnabled && !exists("shortcuts-calls"), "commands were not opt-in")
+        app.showSettings()
+        app.settingsSession.page = .scripts
+        chosenScriptsFolder = folder
+        app.chooseScriptsFolder()
+        let folderPath = IndexScope.folderPath(folder)
+        try check(catalog.folder == folderPath && !catalog.scriptsEnabled && catalog.scripts.isEmpty,
+                  "choosing a folder opted in or scanned before enable: \(catalog.folder ?? "nil") vs \(folderPath)")
+        catalog.setScriptsEnabled(true)
+        catalog.setShortcutsEnabled(true)
+        try await until("opt-in catalogs loaded") { !catalog.scriptLoading && !catalog.shortcutLoading }
+        try check(Set(catalog.scripts.map(\.title)) == ["Lumen Argv Probe", "Lumen Output Flood", "Lumen Silent Probe",
+                                                       "Lumen Group Probe", "Lumen Silent Group Probe"],
+                  "scan missed a safe executable or followed a link, nested path, FIFO, or non-executable")
+        try check(catalog.shortcuts.map(\.title) == [shortcutName, "  Exact Spacing  "] && lineCount("shortcuts-calls") == 1,
+                  "Shortcuts parsing lost exact spelling or ran before explicit enable")
+        let restored = makeScriptCatalog()
+        try check(restored.scriptsEnabled && restored.folder == folderPath && restored.shortcutsEnabled &&
+                  restored.shortcuts.isEmpty && !restored.shortcutLoading, "settings failed to persist or cold startup listed Shortcuts")
+        app.settings?.close()
+        app.showSearch()
+        try type("metadata probe description", into: app)
+        let selected = app.commands.selectedResult(in: app.model)
+        try check(selected?.id == (try command("Lumen Argv Probe")).action.id, "description did not select the script result")
+        try type("argvliteral", into: app)
+        try key(kVK_Return, "\r", in: app)
+        if case .argument("Exact text", required: false)? = app.commands.visibleExecution?.phase {} else {
+            throw Failure("Return did not open the script argument card")
+        }
+        let literal = "some spaced 'text'; $(/usr/bin/touch injected) & 🐈"
+        app.commands.executionArgument = literal
+        try key(kVK_Return, "\r", in: app)
+        try await until("argv probe finished") { finished() != nil }
+        let expected = "1\n\(literal)\n\(IndexScope.folderPath(echo))"
+        try check(finished()?.succeeded == true && finished()?.stdout.text == expected &&
+                  !fm.fileExists(atPath: folder.appendingPathComponent("injected").path),
+                  "script argument was split or expanded, or $0 was not the real script path")
+        try key(kVK_Return, "\r", in: app)
+        try check(filePasteboard.string(forType: .string) == expected && app.searchPresented,
+                  "command output copy did not use the in-place card")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try check(app.commands.visibleExecution == nil && app.searchPresented, "Esc did not close the output card")
+
+        try type("Lumen Output Flood", into: app)
+        try key(kVK_Return, "\r", in: app)
+        try await until("flood finished") { finished() != nil }
+        guard let output = finished() else { throw Failure("missing command result") }
+        try check(output.status == .exited(7) && [output.stdout, output.stderr].allSatisfy {
+            $0.bytes.count == 65_536 && $0.truncated && $0.text.hasSuffix(LauncherProcess.truncationMarker)
+        }, "stdout/stderr were not independently capped and marked")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+
+        try type(shortcutName, into: app)
+        try check(lineCount("shortcuts-calls") == 1, "typing started a Shortcuts CLI")
+        try key(kVK_Return, "\r", in: app)
+        try await until("stubbed Shortcut completed") { finished() != nil }
+        try check(finished()?.succeeded == true && finished()?.stdout.text == "<\(shortcutName)>" && lineCount("shortcuts-calls") == 2,
+                  "Shortcut run changed the name or interpreted it as an option")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        let input = directory.appendingPathComponent("input ; file.txt")
+        try Data("input bytes!".utf8).write(to: input)
+        let withInput = await LauncherProcess.execute(try command(shortcutName), argument: input.path, shortcuts: stub)
+        try check(withInput.succeeded && withInput.stdout.text == "\(IndexScope.folderPath(input))\ninput bytes!<\(shortcutName)>",
+                  "Shortcut argv did not carry the original input path")
+        catalog.refreshShortcuts()
+        try await until("explicit Shortcut refresh completed") { !catalog.shortcutLoading && self.lineCount("shortcuts-calls") == 4 }
+
+        let ready = folder.appendingPathComponent("group-ready")
+        func pids() throws -> [pid_t] {
+            let values = try String(contentsOf: ready, encoding: .utf8).split(whereSeparator: \.isWhitespace).compactMap { pid_t($0) }
+            try check(values.count == 2 && values.allSatisfy { $0 > 0 } && getpgid(values[0]) == values[0] && getpgid(values[1]) == values[0],
+                      "child and descendant did not have their own shared process group")
+            return values
+        }
+        func gone(_ pids: [pid_t]) -> Bool { pids.allSatisfy { kill($0, 0) == -1 && errno == ESRCH } }
+        try type("Lumen Group Probe", into: app)
+        try key(kVK_Return, "\r", in: app)
+        try await until("script spawned a descendant") { fm.fileExists(atPath: ready.path) }
+        let cancelled = try pids()
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try await until("Esc killed both members of the process group") { gone(cancelled) && app.commands.canStartExecutable }
+        try check(app.searchPresented && app.commands.execution == nil, "cancelled script left an output card behind")
+        try fm.removeItem(at: ready)
+
+        let start = ContinuousClock.now
+        try key(kVK_Return, "\r", in: app)
+        try await until("timeout fixture started") { fm.fileExists(atPath: ready.path) }
+        let expired = try pids()
+        try await until("15-second execution timeout killed the process group", seconds: 18) { finished()?.status == .timedOut && gone(expired) }
+        try check(start.duration(to: .now) >= .seconds(14) && start.duration(to: .now) < .seconds(18),
+                  "script did not use the bounded production deadline")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try type("Lumen Silent Probe", into: app)
+        try key(kVK_Return, "\r", in: app)
+        if case .argument("Silent argument", required: false)? = app.commands.visibleExecution?.phase {} else {
+            throw Failure("silent mode hid its argument prompt before running")
+        }
+        app.commands.executionArgument = literal
+        try key(kVK_Return, "\r", in: app)
+        try check(!app.searchPresented && app.commands.visibleExecution == nil, "silent mode left the search panel up")
+        try await until("silent mode completed using the chosen working folder") {
+            finished()?.succeeded == true && (try? String(contentsOf: folder.appendingPathComponent("silent-ran"), encoding: .utf8)) == literal
+        }
+
+        try fm.removeItem(at: ready)
+        app.showSearch()
+        try type("Lumen Silent Group Probe", into: app)
+        try key(kVK_Return, "\r", in: app)
+        try check(!app.searchPresented && app.commands.execution?.running == true, "silent group did not dismiss the launcher and run")
+        try await until("silent script spawned a descendant") { fm.fileExists(atPath: ready.path) }
+        let silentPIDs = try pids()
+        app.showSearch()
+        try check(app.searchPresented && app.commands.visibleExecution == nil && app.commands.execution?.running == true,
+                  "reopening the launcher did not keep the silent script running in the background")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try await until("Esc after reopening did not cancel both silent process-group members") {
+            gone(silentPIDs) && app.commands.canStartExecutable && app.commands.execution == nil && !app.searchPresented
+        }
+        catalog.setScriptsEnabled(false)
+        catalog.setShortcutsEnabled(false)
+        let disabled = makeScriptCatalog()
+        try check(catalog.scripts.isEmpty && catalog.shortcuts.isEmpty && !disabled.scriptsEnabled && !disabled.shortcutsEnabled,
+                  "disable did not retire cached actions or persist")
+        app.settingsSession.page = .general
+        print("Local Scripts & Apple Shortcuts passed (opt-in, no-follow, argv, output, process groups and timeout)")
     }
 
     private func verifyCatalogRegressions() async throws {

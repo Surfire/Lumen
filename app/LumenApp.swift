@@ -7,12 +7,19 @@ import SwiftUI
 @main
 struct LumenApp {
     @MainActor static func main() {
+        #if LUMEN_SMOKE
         LauncherSmoke.runUpdaterIfRequested()
         let application = NSApplication.shared
         let smoke = LauncherSmoke.configuration()
         let launcher = AppDelegate(smoke: smoke)
         application.delegate = launcher
         application.setActivationPolicy(smoke?.usesOffscreenWindows == true ? .prohibited : .accessory)
+        #else
+        let application = NSApplication.shared
+        let launcher = AppDelegate()
+        application.delegate = launcher
+        application.setActivationPolicy(.accessory)
+        #endif
         withExtendedLifetime(launcher) { application.run() }
     }
 }
@@ -21,7 +28,16 @@ struct LumenApp {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate {
     let model: Launcher
     private let engine: LauncherEngine
+    #if LUMEN_SMOKE
     let smoke: LauncherSmoke?
+    #endif
+    private var targetPasteboard: NSPasteboard {
+        #if LUMEN_SMOKE
+        smoke?.filePasteboard ?? .general
+        #else
+        .general
+        #endif
+    }
     let applicationIcons = ResultIconDisplay()
     let contextActions = ContextActions()
     let commands = LauncherCommands()
@@ -51,7 +67,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     let translation: TranslationPanelModel
     private(set) var settings: NSPanel?
     private lazy var updateSettings = UpdateSettings()
-    private(set) lazy var settingsSession = SettingsSession(model: model, manageLoginItem: smoke == nil) { [weak self] oldPage, page in
+    private var shouldManageLoginItem: Bool {
+        #if LUMEN_SMOKE
+        smoke == nil
+        #else
+        true
+        #endif
+    }
+    private(set) lazy var settingsSession = SettingsSession(model: model, manageLoginItem: shouldManageLoginItem) { [weak self] oldPage, page in
         guard let self else { return }
         if oldPage == .translation { self.translation.endSettingsSession() }
         if page == .index {
@@ -221,17 +244,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         return panel
     }()
 
+    private static func defaultEngineLocations() -> (executable: URL, database: URL) {
+        let resources = Bundle.main.resourceURL ?? Bundle.main.bundleURL.appendingPathComponent("Contents/Resources")
+        return (
+            resources.appendingPathComponent("lumen"),
+            FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/Lumen/index.sqlite")
+        )
+    }
+
+    #if LUMEN_SMOKE
     init(smoke: LauncherSmoke?) {
         self.smoke = smoke
         inlinePreview = LauncherInlinePreview(downloads: smoke?.previewDownloads ?? .system)
         windowManagement = smoke?.makeWindowManagement() ?? WindowManagement()
         defaults = smoke != nil ? smoke?.shortcutFixturePreferences : .standard
         scriptCatalog = smoke?.makeScriptCatalog() ?? LauncherScriptCatalog(defaults: defaults)
-        let resources = Bundle.main.resourceURL ?? Bundle.main.bundleURL.appendingPathComponent("Contents/Resources")
-        let executable = smoke?.executable ?? resources.appendingPathComponent("lumen")
-        let database = smoke?.database ?? FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/Lumen/index.sqlite")
-        let engine = LauncherEngine(executable: executable, database: database,
+        let locations = Self.defaultEngineLocations()
+        let engine = LauncherEngine(executable: smoke?.executable ?? locations.executable,
+                                    database: smoke?.database ?? locations.database,
                                     syntheticRoot: smoke?.corpus, gemmaHome: smoke?.gemmaHome)
         self.engine = engine
         model = Launcher(engine: engine, defaults: defaults, locale: smoke?.language)
@@ -239,15 +270,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         imageSearch = LauncherImageSearch(engine: engine, defaults: defaults)
         clipboard = smoke?.makeClipboardManager() ?? ClipboardManager(defaults: .standard, pasteboard: .general)
         translation = smoke?.makeTranslationModel() ?? TranslationPanelModel()
+        super.init()
+    }
+    #else
+    override init() {
+        inlinePreview = LauncherInlinePreview()
+        windowManagement = WindowManagement()
+        defaults = .standard
+        scriptCatalog = LauncherScriptCatalog(defaults: defaults)
+        let locations = Self.defaultEngineLocations()
+        let engine = LauncherEngine(executable: locations.executable, database: locations.database)
+        self.engine = engine
+        model = Launcher(engine: engine, defaults: defaults)
+        externalVolumes = ExternalVolumeCatalog(engine: engine)
+        imageSearch = LauncherImageSearch(engine: engine, defaults: defaults)
+        clipboard = ClipboardManager(defaults: .standard, pasteboard: .general)
+        translation = TranslationPanelModel()
+        super.init()
+    }
+    #endif
+
+    private func configureResidentUI() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem?.button?.imagePosition = .imageLeading
+        loadShortcut()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         inlinePreview.onQuickLookReady = { [weak self] in self?.updatePresentation() }
-        if smoke == nil {
-            statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-            statusItem?.button?.imagePosition = .imageLeading
-            loadShortcut()
-        }
+        #if LUMEN_SMOKE
+        if smoke == nil { configureResidentUI() }
+        #else
+        configureResidentUI()
+        #endif
         model.$language.dropFirst().sink { [weak self] _ in
             DispatchQueue.main.async { [weak self] in self?.updateLanguage() }
         }.store(in: &cancellables)
@@ -331,22 +386,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         scriptCatalog.reloadScripts()
         if scriptCatalog.shortcutsEnabled { scriptCatalog.refreshShortcuts() }
         updateLanguage()
+        #if LUMEN_SMOKE
         model.start(automaticallyIndex: smoke == nil || smoke?.automaticIndexScenario == true)
-        if smoke == nil {
-            let workspace = NSWorkspace.shared.notificationCenter
-            workspace.publisher(for: NSWorkspace.didMountNotification)
-                .merge(with: workspace.publisher(for: NSWorkspace.didUnmountNotification),
-                       workspace.publisher(for: NSWorkspace.didRenameVolumeNotification))
-                .receive(on: DispatchQueue.main)
-                .sink { [weak self] _ in self?.externalVolumeStateChanged() }
-                .store(in: &cancellables)
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(300)) { [weak self] in
-                guard let self, FileManager.default.fileExists(atPath: self.engine.database.path) else { return }
-                self.model.warmNameSearch()
-            }
-        }
+        if smoke == nil { observeExternalVolumesAndWarmSearch() }
+        #else
+        model.start(automaticallyIndex: true)
+        observeExternalVolumesAndWarmSearch()
+        #endif
         loadApplicationCatalog()
+        #if LUMEN_SMOKE
         if let smoke { Task { @MainActor in await smoke.run(self) } }
+        #endif
+    }
+
+    private func observeExternalVolumesAndWarmSearch() {
+        let workspace = NSWorkspace.shared.notificationCenter
+        workspace.publisher(for: NSWorkspace.didMountNotification)
+            .merge(with: workspace.publisher(for: NSWorkspace.didUnmountNotification),
+                   workspace.publisher(for: NSWorkspace.didRenameVolumeNotification))
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.externalVolumeStateChanged() }
+            .store(in: &cancellables)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(300)) { [weak self] in
+            guard let self, FileManager.default.fileExists(atPath: self.engine.database.path) else { return }
+            self.model.warmNameSearch()
+        }
     }
 
     private func schedulePresentationUpdate() {
@@ -370,25 +434,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func loadApplicationCatalog() {
+        #if LUMEN_SMOKE
         if let smoke {
             model.loadApplications(roots: smoke.appRoots, extraApps: [])
-        } else {
-            let home = FileManager.default.homeDirectoryForCurrentUser
-            let knownSystemApps = ["com.apple.finder", "com.apple.Safari"].compactMap { identifier -> URL? in
-                let path = NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier)?.resolvingSymlinksInPath()
-                return path?.path.hasPrefix("/System/") == true ? path : nil
-            }
-            model.loadApplications(roots: LaunchCatalog.applicationRoots(home: home), extraApps: knownSystemApps)
+            return
         }
+        #endif
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let knownSystemApps = ["com.apple.finder", "com.apple.Safari"].compactMap { identifier -> URL? in
+            let path = NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier)?.resolvingSymlinksInPath()
+            return path?.path.hasPrefix("/System/") == true ? path : nil
+        }
+        model.loadApplications(roots: LaunchCatalog.applicationRoots(home: home), extraApps: knownSystemApps)
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
+        #if LUMEN_SMOKE
         smoke?.wasActivated = true
+        #endif
         // Revalidate when returning from System Settings.
         if settings?.isVisible == true || windowManagement.issue == .permissionRequired {
             windowManagement.refreshTrust()
         }
+        #if LUMEN_SMOKE
         guard smoke == nil, let configuredKey else { return }
+        #else
+        guard let configuredKey else { return }
+        #endif
         do {
             try globalHotKey.set(configuredKey)
             model.set(\.hotKey, to: globalHotKey.shortcut)
@@ -448,10 +520,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
         updatePresentation()
         (panel.contentView as? SearchBackdrop)?.refreshTransparency()
+        #if LUMEN_SMOKE
         if self.smoke == nil {
             panel.alphaValue = 1
             panel.makeKeyAndOrderFront(nil)
         }
+        #else
+        panel.alphaValue = 1
+        panel.makeKeyAndOrderFront(nil)
+        #endif
         focusSearch()
         if firstShow {
             loadApplicationCatalog()
@@ -517,7 +594,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         applicationIcons.cancelPending()
         model.clear()
         panel.orderOut(nil)
-        if smoke == nil, NSApp.isActive, !NSApp.windows.contains(where: { $0.isVisible && $0.canBecomeKey }) {
+        #if LUMEN_SMOKE
+        let allowDeactivate = smoke == nil
+        #else
+        let allowDeactivate = true
+        #endif
+        if allowDeactivate, NSApp.isActive, !NSApp.windows.contains(where: { $0.isVisible && $0.canBecomeKey }) {
             NSApp.deactivate()
         }
     }
@@ -612,13 +694,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             if let id = commands.clipboardSelection { copyClipboardItem(id) }
         case .question(let question):
             if case .answer(let output) = commands.answer {
-                if ClipboardManager.writeInternalString(output, to: smoke?.filePasteboard ?? .general) { commands.noteCopied() }
+                if ClipboardManager.writeInternalString(output, to: targetPasteboard) { commands.noteCopied() }
             } else if commands.answer != .loading, let ask = translation.answerWithSavedProvider() {
                 commands.submit(question, using: ask)
             }
         case .web(_, _, let url):
-            if let smoke { smoke.dispatchedQuicklinks.append(url); dismissSearch() }
-            else if NSWorkspace.shared.open(url) { dismissSearch() }
+            #if LUMEN_SMOKE
+            if let smoke { smoke.dispatchedQuicklinks.append(url); dismissSearch(); return }
+            #endif
+            if NSWorkspace.shared.open(url) { dismissSearch() }
             else { commands.recordWebFailure() }
         default: break
         }
@@ -788,7 +872,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         guard searchPresented, commands.isClipboardCommand, commands.clipboardSelection == id else { return }
         if clipboard.copy(id: id) {
             dismissSearch()
+            #if LUMEN_SMOKE
             if smoke == nil { pasteIntoPreviousAppIfPermitted() }
+            #else
+            pasteIntoPreviousAppIfPermitted()
+            #endif
         }
     }
 
@@ -937,7 +1025,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         case .shortcut(let shortcut): openShortcut(shortcut)
         case .calculation(let calculation):
             guard searchPresented, model.calculation == calculation else { return }
-            if ClipboardManager.writeInternalString(calculation.copyValue, to: smoke?.filePasteboard ?? .general) { dismissSearch() }
+            if ClipboardManager.writeInternalString(calculation.copyValue, to: targetPasteboard) { dismissSearch() }
             else { model.openingFailed() }
         }
     }
@@ -960,8 +1048,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             guard let verified = SavedShortcut.webURL(destination.absoluteString) else { model.openingFailed(); return }
             url = verified
         }
-        if let smoke { smoke.dispatchedQuicklinks.append(url) }
-        else if !NSWorkspace.shared.open(url) { model.openingFailed(); return }
+        #if LUMEN_SMOKE
+        if let smoke {
+            smoke.dispatchedQuicklinks.append(url)
+        } else if !NSWorkspace.shared.open(url) { model.openingFailed(); return }
+        #else
+        if !NSWorkspace.shared.open(url) { model.openingFailed(); return }
+        #endif
         model.shortcuts.noteOpened(shortcut)
         dismissSearch()
     }
@@ -1004,7 +1097,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func copyCommandOutput() {
-        commands.copyOutput(to: smoke?.filePasteboard ?? .general)
+        commands.copyOutput(to: targetPasteboard)
     }
 
     private func closeExecutionCard() {
@@ -1014,7 +1107,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func copyDefinition() {
-        commands.copyDefinition(to: smoke?.filePasteboard ?? .general)
+        commands.copyDefinition(to: targetPasteboard)
     }
 
     private func closeDefinitionCard() {
@@ -1035,7 +1128,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if case .system(.define(let word)) = action.destination {
             contextActions.close()
             inlinePreview.close()
+            #if LUMEN_SMOKE
             let fetcher: @Sendable (String) -> String? = smoke?.definitionProvider ?? { @Sendable in LauncherSystemActions.dictionaryDefinition($0) }
+            #else
+            let fetcher: @Sendable (String) -> String? = { @Sendable in LauncherSystemActions.dictionaryDefinition($0) }
+            #endif
             commands.lookupDefinition(word, fetcher: fetcher)
             updatePresentation()
             return
@@ -1058,9 +1155,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
         if case .window(let command) = action.destination {
             windowManagement.perform(command) { issue in finished(issue == nil, issue) }
-        } else if let smoke {
-            smoke.dispatch(action) { finished($0, nil) }
         } else {
+            #if LUMEN_SMOKE
+            if let smoke {
+                smoke.dispatch(action) { finished($0, nil) }
+                return
+            }
+            #endif
             LaunchDispatcher.perform(action, chinese: model.zh) { finished($0, nil) }
         }
     }
@@ -1068,6 +1169,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private func openFile(_ hit: SearchHit) {
         model.resolve(hit, action: .open) { [weak self] url in
             guard let self else { return }
+            let config = NSWorkspace.OpenConfiguration()
+            #if LUMEN_SMOKE
             if let smoke = self.smoke, smoke.simulatesFileOpen(url) {
                 smoke.opened = url
                 self.dismissSearch()
@@ -1080,9 +1183,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 self.model.openingFailed()
                 return
             }
-            let config = NSWorkspace.OpenConfiguration()
             config.activates = !isSmoke
             config.promptsUserIfNeeded = !isSmoke
+            #else
+            config.activates = true
+            config.promptsUserIfNeeded = true
+            #endif
             NSWorkspace.shared.open(url, configuration: config) { [weak self] app, error in
                 DispatchQueue.main.async {
                     guard let self else { return }
@@ -1099,12 +1205,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     func revealInFinder(_ hit: SearchHit) {
         model.resolve(hit, action: .reveal) { [weak self] url in
+            #if LUMEN_SMOKE
             guard let self else { return }
             if let smoke = self.smoke {
                 smoke.revealed = url
-            } else {
-                NSWorkspace.shared.activateFileViewerSelecting([url])
+                return
             }
+            #else
+            guard self != nil else { return }
+            #endif
+            NSWorkspace.shared.activateFileViewerSelecting([url])
         }
     }
 
@@ -1117,7 +1227,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             model.resolve(hit, action: action) { [weak self] _ in
                 guard let self, self.searchPresented else { return }
                 let value = action == .copyName ? hit.name : hit.path
-                if ClipboardManager.writeInternalString(value, to: self.smoke?.filePasteboard ?? .general) {
+                if ClipboardManager.writeInternalString(value, to: self.targetPasteboard) {
                     self.model.copied(action)
                 } else { self.model.openingFailed() }
             }
@@ -1194,26 +1304,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         localPreview = preview
         preview.onToggle = { [weak self] in self?.closeLocalPreview() }
         preview.delegate = self
+        #if LUMEN_SMOKE
         if smoke == nil {
             preview.center()
             makeLocalPreviewKey()
         } else {
             preview.setFrameOrigin(NSPoint(x: -12_000, y: -12_000))
         }
+        #else
+        preview.center()
+        makeLocalPreviewKey()
+        #endif
     }
 
     func makeLocalPreviewKey() {
         guard let localPreview else { return }
+        #if LUMEN_SMOKE
         if smoke == nil { NSApp.activate() }
+        #else
+        NSApp.activate()
+        #endif
         localPreview.makeKeyAndOrderFront(nil)
     }
 
     private func chooseQuicklinkFolder(_ complete: @escaping (URL) -> Void) {
         guard let settings else { return }
+        #if LUMEN_SMOKE
         if let smoke {
             if let folder = smoke.chosenQuicklinkFolder { complete(folder) }
             return
         }
+        #endif
         let picker = NSOpenPanel()
         picker.canChooseDirectories = true
         picker.canChooseFiles = false
@@ -1226,10 +1347,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     func chooseScriptsFolder() {
         guard let settings else { return }
+        #if LUMEN_SMOKE
         if let smoke {
             if let folder = smoke.chosenScriptsFolder { scriptCatalog.selectFolder(folder) }
             return
         }
+        #endif
         let picker = NSOpenPanel()
         picker.canChooseDirectories = true
         picker.canChooseFiles = false
@@ -1269,7 +1392,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         windowManagement.refreshTrust()
         if let page, page != settingsSession.page { settingsSession.page = page }
         else if settingsSession.page == .index, settings?.isVisible != true { externalVolumes.reload() }
+        #if LUMEN_SMOKE
         if smoke == nil { NSApp.activate() }
+        #else
+        NSApp.activate()
+        #endif
         if settings == nil {
             let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 770, height: 568),
                                  styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
@@ -1277,6 +1404,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             window.hidesOnDeactivate = false
             window.contentMinSize = NSSize(width: 700, height: 488)
             window.delegate = self
+            #if LUMEN_SMOKE
+            let updates: UpdateSettings? = smoke == nil ? updateSettings : nil
+            #else
+            let updates: UpdateSettings? = updateSettings
+            #endif
             window.contentView = NSHostingView(rootView: LauncherSettings(
                 model: model,
                 indexStatus: model.indexStatus,
@@ -1287,7 +1419,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 clipboard: clipboard,
                 windowManagement: windowManagement,
                 scriptCatalog: scriptCatalog,
-                updates: smoke == nil ? updateSettings : nil,
+                updates: updates,
                 chooseScriptsFolder: { [weak self] in self?.chooseScriptsFolder() },
                 chooseImageFolder: { [weak self] in self?.chooseImageResource(folder: true) },
                 chooseImageProjector: { [weak self] in self?.chooseImageResource(folder: false) },
@@ -1297,13 +1429,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 chooseDirectories: { [weak self] in self?.chooseSettingsDirectories($0) },
                 chooseDiagnosticFile: { [weak self] in self?.chooseDiagnosticFile() }
             ))
+            #if LUMEN_SMOKE
             if smoke == nil { window.center() }
             else { window.setFrameOrigin(NSPoint(x: -12_000, y: -12_000)) }
+            #else
+            window.center()
+            #endif
             settings = window
         }
         settings?.title = model.t("Lumen 设置", "Lumen Settings")
         model.setSettingsPresented(true)
+        #if LUMEN_SMOKE
         if smoke == nil { settings?.makeKeyAndOrderFront(nil) }
+        #else
+        settings?.makeKeyAndOrderFront(nil)
+        #endif
         let preservePermissionIssue = windowManagement.issue == .permissionRequired
         if searchPresented { dismissSearch() }
         if preservePermissionIssue && windowManagement.isTrusted != true {
@@ -1313,11 +1453,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     func chooseImageResource(folder: Bool) {
         guard let settings else { return }
+        #if LUMEN_SMOKE
         if let smoke {
             if folder, let url = smoke.chosenImageFolder { imageSearch.setFolder(url) }
             else if !folder, let url = smoke.chosenImageProjector { imageSearch.setProjector(url) }
             return
         }
+        #endif
         let picker = NSOpenPanel()
         picker.canChooseFiles = !folder
         picker.canChooseDirectories = folder
@@ -1331,6 +1473,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     func chooseSettingsDirectories(_ group: ScopeFolders) {
         guard let settings else { return }
+        #if LUMEN_SMOKE
         if let smoke {
             if let urls = smoke.chosenSettingsDirectories {
                 smoke.chosenSettingsDirectories = nil
@@ -1338,6 +1481,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
             return
         }
+        #endif
         let open = NSOpenPanel()
         open.canChooseFiles = false
         open.canChooseDirectories = true
@@ -1354,6 +1498,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     func chooseDiagnosticFile() {
         guard let settings, !model.scopePending else { return }
+        #if LUMEN_SMOKE
         if let smoke {
             if let file = smoke.chosenDiagnosticFile {
                 smoke.chosenDiagnosticFile = nil
@@ -1361,6 +1506,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
             return
         }
+        #endif
         let open = NSOpenPanel()
         open.canChooseFiles = true
         open.canChooseDirectories = false
@@ -1403,7 +1549,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if translation.output.isEmpty {
             translation.translate()
         } else {
-            if ClipboardManager.writeInternalString(translation.output, to: smoke?.filePasteboard ?? .general) { translation.noteCopied() }
+            if ClipboardManager.writeInternalString(translation.output, to: targetPasteboard) { translation.noteCopied() }
         }
     }
 

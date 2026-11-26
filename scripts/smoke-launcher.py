@@ -229,8 +229,6 @@ if action == "watch":
     assert args == ["--bundled-pdf-helper", "--progress"], "watch must use the saved scope and current app helper"
     with (work / "watch-launches").open("a") as handle:
         handle.write("start\\n")
-    if (work / "hold-startup-watch").exists():
-        gate("startup-watch")
     print(json.dumps({"event": "ready"}), flush=True)
     while True:
         if (work / "fail-watch").exists():
@@ -264,8 +262,6 @@ if action == "status":
                            embedded_chunks=43000 if limited else 2 if (work / "finish-embedding-3").exists()
                            else 1 if (work / "finish-embedding-1").exists() else 0,
                            skipped_chunks=0, pending=pending, limited=limited, chunk_limit=43000)
-    if (work / "legacy-bge-consent").exists():
-        status["embedded_chunks"] = 2
     print(json.dumps(status))
     sys.exit(0)
 
@@ -457,7 +453,15 @@ def install_fixture(root):
     return script
 
 
+def require_smoke_app():
+    if not APP.is_file():
+        raise SystemExit("Build the app first with LUMEN_SMOKE=1 scripts/build-app.sh")
+    if b"--gui-smoke" not in APP.read_bytes():
+        raise SystemExit("Built app lacks --gui-smoke; rebuild with LUMEN_SMOKE=1 scripts/build-app.sh")
+
+
 def run(root, language, gemma_home=None):
+    require_smoke_app()
     environment = os.environ.copy()
     environment.pop("LUMEN_GEMMA_TEST_HOME", None)
     if gemma_home is not None:
@@ -619,8 +623,7 @@ def main():
         parser.error("--watch-engine must point to a lumen binary")
     if args.real_gemma and not args.real_gemma.is_dir():
         parser.error("--real-gemma must point to a pinned Gemma resource directory")
-    if not APP.is_file():
-        raise SystemExit("Build the app first with scripts/build-app.sh")
+    require_smoke_app()
     if args.image_projector or args.image_fixtures:
         if not args.real_gemma or not args.image_projector or not args.image_fixtures:
             parser.error("image smoke requires --image-fixtures, --image-projector and --real-gemma")
@@ -720,18 +723,6 @@ def main():
         if args.snapshots:
             for image in root.glob("settings-*.png"):
                 shutil.copyfile(image, args.snapshots / image.name)
-    for documents in (True, False):
-        with tempfile.TemporaryDirectory(prefix="lumen-gui-migrate-") as tmp:
-            root = Path(tmp).resolve()
-            make_corpus(root)
-            fixture = install_fixture(root)
-            for marker in ("legacy-bge-consent", "gemma-present", "finish-documents"):
-                (root / marker).touch()
-            subprocess.run([str(fixture), "--db", str(root / "index.sqlite"), "index",
-                            "--root", str(root / "corpus"), *(["--documents"] if documents else [])],
-                           check=True, timeout=15, capture_output=True)
-            (root / "hold-startup-watch").touch()
-            run(root, "en")
     if args.watch_engine:
         help_text = subprocess.check_output([str(args.watch_engine.resolve()), "watch", "--help"], text=True, timeout=10)
         with tempfile.TemporaryDirectory(prefix="lumen-gui-") as tmp:

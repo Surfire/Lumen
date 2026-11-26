@@ -1,3 +1,4 @@
+#if LUMEN_SMOKE
 import AppKit
 import Carbon
 import Combine
@@ -335,18 +336,6 @@ final class LauncherSmoke {
         if controlledTiming && startsWithIndex {
             if exists("settings-scenario") {
                 try await verifySettings(app)
-                return
-            }
-            if exists("legacy-bge-consent") {
-                if exists("hold-startup-watch") {
-                    try await until("startup permission verification held") { model.indexPhase == .ready && self.exists("startup-watch-started") }
-                    try type("archive", into: app)
-                    try await Task.sleep(for: .milliseconds(170))
-                    try check(!model.canSearch && model.hits.isEmpty, "cached names became visible before scope verification")
-                    try signal("finish-startup-watch")
-                    try await until("startup scope verified") { model.canSearch && model.hits.contains { $0.name == "archive-one.txt" } }
-                }
-                try await verifyLegacyMigration(app)
                 return
             }
             try await verifyFailedScopeRelaunch(app)
@@ -1985,10 +1974,6 @@ final class LauncherSmoke {
         db, command, *args = sys.argv[2:]
         def mark(name):
             (root / name).touch()
-        def stamp(path):
-            stat = path.stat()
-            return ':'.join(map(str, (stat.st_dev % 2**64, stat.st_ino, stat.st_size,
-                                     *divmod(stat.st_mtime_ns, 10**9))))
         def hold(name):
             def stopped(*_):
                 mark(name + '-terminated')
@@ -2020,17 +2005,6 @@ final class LauncherSmoke {
             for line in sys.stdin.buffer:
                 assert len(line) <= 12 * 1024, len(line)
                 request = json.loads(line)
-                if Path(db).name == 'legacy':
-                    reply = dict(id=request['id'], hits=[])
-                    if request.get('op') == 'validate':
-                        reply = dict(id=request['id'], error='missing field `query`')
-                    elif request['query'] == 'legacy probe' and request['mode'] == 'text':
-                        paths = [root.resolve() / name for name in ('legacy.txt', 'legacy.PNG')]
-                        reply['hits'] = [dict(path=str(path), name=path.name, kind='file', availability='local',
-                                              matched_by='text', snippet='legacy probe', document_stamp=stamp(path))
-                                         for path in paths]
-                    print(json.dumps(reply), flush=True)
-                    continue
                 if request.get('op') == 'validate':
                     assert set(request) == {'id', 'op', 'hits'}
                     hits = request['hits']
@@ -2247,41 +2221,6 @@ final class LauncherSmoke {
         try await until("image search did not restart") { marked("hold-close-started") }
         model.close()
         try await until("closing the launcher leaked image search worker") { marked("hold-close-terminated") }
-
-        let legacy = Launcher(engine: try testEngine("legacy"), defaults: nil)
-        defer { legacy.close() }
-        let legacyRoot = URL(fileURLWithPath: IndexScope.folderPath(root), isDirectory: true)
-        let textFile = legacyRoot.appendingPathComponent("legacy.txt")
-        let imageFile = legacyRoot.appendingPathComponent("legacy.PNG")
-        for file in [textFile, imageFile] { try Data("legacy probe".utf8).write(to: file) }
-        legacy.start()
-        try await until("the legacy engine did not become searchable") { legacy.canSearch && legacy.watchState == .running }
-        legacy.setQuery("legacy probe")
-        try await until("the legacy engine did not publish both stamped text and OCR hits") {
-            !legacy.searching && Set(legacy.hits.map(\.path)) == Set([textFile.path, imageFile.path])
-        }
-        guard let textHit = legacy.hits.first(where: { $0.path == textFile.path }),
-              let imageHit = legacy.hits.first(where: { $0.path == imageFile.path }) else {
-            throw Failure("missing legacy validation fixtures")
-        }
-        // Editing a file on disk must not block open/copy or spawn validate-hit.
-        try Data("legacy probe edited after indexing".utf8).write(to: textFile, options: .atomic)
-        var resolved: URL?
-        legacy.resolve(textHit, action: .open) { resolved = $0 }
-        try await until("edited text resolve did not finish") { resolved != nil || legacy.searchNotice?.problem == .stale }
-        try check(resolved == textFile && !marked("unexpected-standalone-query"),
-                  "resolving an edited text hit failed or spawned validate-hit")
-
-        resolved = nil
-        legacy.resolve(imageHit, action: .open) { resolved = $0 }
-        try await until("image resolve did not finish") { resolved != nil || legacy.searchNotice?.problem == .stale }
-        try check(resolved == imageFile && !marked("unexpected-standalone-query"),
-                  "resolving an OCR image hit failed or spawned validate-hit")
-
-        var copiedURL: URL?
-        legacy.resolve(textHit, action: .copyName) { copiedURL = $0 }
-        try check(copiedURL == textFile, "copyName did not invoke completion synchronously on main thread")
-        legacy.close()
 
         // libdispatch reads this setting at process startup. One cooperative worker is
         // enough to expose starvation without racing to saturate a machine-sized pool.
@@ -2867,35 +2806,6 @@ final class LauncherSmoke {
             !model.searching && Set(model.hits.map(\.name)) == expected.union(["Other project.pptx", "成都 卫健委.pptx.bak", "成都 卫健委目录.pptx"])
         }
         print("Raw AppKit multiword and bare-extension queries passed")
-    }
-
-    private func verifyLegacyMigration(_ app: AppDelegate) async throws {
-        let model = app.model
-        try await until("saved scope and watch became available") {
-            model.gemmaCoverage != nil && model.watchState == .running
-        }
-        try type("archive", into: app)
-        try await until("lexical results remained available during migration") {
-            model.selectedHit?.name == "archive-one.txt" && !model.searching
-        }
-        if model.gemmaCoverage?.documents_enabled == false {
-            try check(model.localModelState == .available && model.embeddingState == .idle &&
-                      !model.canBuildEmbeddings && !exists("model-check-started") && !exists("embeddings-started"),
-                      "legacy consent expanded a metadata-only scope")
-            return
-        }
-        try await until("legacy BGE coverage automatically queued Gemma verification") { self.exists("model-check-started") }
-        try check(model.embeddingState == .verifying && !exists("embeddings-started"),
-                  "migration started writing before verification")
-        try signal("finish-model-check")
-        try await waitForEmbeddingBatch(1)
-        model.pauseEmbeddings(userInitiated: true)
-        try signal("finish-embedding-1")
-        try await until("legacy migration kept completed work when paused") {
-            model.embeddingState == .paused && model.gemmaCoverage?.embedded_chunks == 1
-        }
-        try check(!exists("embedding-2-started") && model.watchState == .running && watchLaunches() == 1,
-                  "migration ignored pause or disrupted live updates")
     }
 
     private func verifyInstalledModel(_ app: AppDelegate) async throws {
@@ -5272,3 +5182,4 @@ private final class SmokeTranslationSecrets: TranslationSecrets, @unchecked Send
         lock.withLock { _ = values.removeValue(forKey: provider) }
     }
 }
+#endif

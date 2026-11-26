@@ -25,15 +25,25 @@ final class LauncherUpdater: Sendable {
     private let transport: UpdateTransport
     private let bundle: URL
 
-    init(smokeFeed: URL? = nil) {
-        feed = smokeFeed ?? Self.feed
-        transport = UpdateTransport(loopbackOnly: smokeFeed != nil)
+    private init(feed: URL, loopbackOnly: Bool) {
+        self.feed = feed
+        transport = UpdateTransport(loopbackOnly: loopbackOnly)
         let config = URLSessionConfiguration.default
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.timeoutIntervalForResource = 300
         session = URLSession(configuration: config, delegate: transport, delegateQueue: nil)
         bundle = Bundle.main.bundleURL
     }
+
+    #if LUMEN_SMOKE
+    convenience init(smokeFeed: URL? = nil) {
+        self.init(feed: smokeFeed ?? Self.feed, loopbackOnly: smokeFeed != nil)
+    }
+    #else
+    convenience init() {
+        self.init(feed: Self.feed, loopbackOnly: false)
+    }
+    #endif
 
     deinit { session.finishTasksAndInvalidate() }
 
@@ -60,7 +70,21 @@ final class LauncherUpdater: Sendable {
         return b > a && release.version.compare(oldVersion, options: .numeric) != .orderedAscending ? release : nil
     }
 
+    #if LUMEN_SMOKE
     func install(_ release: LumenRelease, smokeFailAfterSwap: Bool = false) async throws -> URL {
+        try await installRelease(release) {
+            if self.transport.loopbackOnly && smokeFailAfterSwap {
+                throw UpdateError("Simulated post-swap failure.")
+            }
+        }
+    }
+    #else
+    func install(_ release: LumenRelease) async throws -> URL {
+        try await installRelease(release)
+    }
+    #endif
+
+    private func installRelease(_ release: LumenRelease, afterVerify: () throws -> Void = {}) async throws -> URL {
         let (requirement, _) = try runningIdentity()
         let archive = try await download(release.url)
         defer { try? FileManager.default.removeItem(at: archive) }
@@ -95,7 +119,7 @@ final class LauncherUpdater: Sendable {
         keepBackup = true
         do {
             try Self.verify(destination, requirement, release)
-            if transport.loopbackOnly && smokeFailAfterSwap { throw UpdateError("Simulated post-swap failure.") }
+            try afterVerify()
         } catch {
             do { try Self.swap(staged, destination) }
             catch { throw UpdateError("Update verification and rollback failed. The previous app is at \(staged.path).") }

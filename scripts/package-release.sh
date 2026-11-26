@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.."
 work=$(mktemp -d "${TMPDIR:-/tmp}/lumen-release.XXXXXXXX")
 trap 'rm -rf "$work"' EXIT
 app="$work/Lumen.app"
-LUMEN_BUILD_APP_DIR="$app" scripts/build-app.sh
+LUMEN_SMOKE=0 LUMEN_BUILD_APP_DIR="$app" scripts/build-app.sh
 
 # Notarize public Developer ID releases before computing the published digest.
 if [ -n "${LUMEN_NOTARY_PROFILE:-}" ]; then

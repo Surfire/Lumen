@@ -23,15 +23,22 @@ for size in 16 32 128 256 512; do
     /usr/bin/sips --resampleHeightWidth "$pixels" "$pixels" app/Assets/Lumen-1024.png --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
 done
 /usr/bin/iconutil -c icns -o "$APP/Contents/Resources/Lumen.icns" "$iconset"
+SMOKE_FLAG=
+SMOKE_SOURCE=
+if [ "${LUMEN_SMOKE:-0}" = "1" ]; then
+    SMOKE_FLAG=-DLUMEN_SMOKE
+    SMOKE_SOURCE=app/LauncherSmoke.swift
+fi
 # The archive supplies SQLite for Rust and Swift's SQLite3 calls. Strip unused
 # archive code and dylibs (including the SQLite3 module's system autolink).
 xcrun swiftc -O -swift-version 5 -target "$SWIFT_TARGET" -module-cache-path "$PWD/target/SwiftModuleCache" -parse-as-library \
     -import-objc-header include/lumen_core.h target/release/liblumen.a -larchive \
     -Xlinker -dead_strip -Xlinker -dead_strip_dylibs \
     -framework DiskArbitration -framework IOKit \
+    $SMOKE_FLAG \
     app/LumenApp.swift app/LauncherUpdater.swift app/LauncherEngine.swift app/LauncherHotKey.swift app/LauncherModel.swift \
     app/WindowAccess.swift app/WindowManagement.swift \
-    app/LauncherViews.swift app/LauncherHighlight.swift app/LauncherActions.swift app/LauncherSystemActions.swift app/LauncherFileQuery.swift app/LauncherPreview.swift app/LauncherShortcuts.swift app/LauncherCalculation.swift app/LauncherSmoke.swift \
+    app/LauncherViews.swift app/LauncherHighlight.swift app/LauncherActions.swift app/LauncherSystemActions.swift app/LauncherFileQuery.swift app/LauncherPreview.swift app/LauncherShortcuts.swift app/LauncherCalculation.swift $SMOKE_SOURCE \
     app/LumenCommandCatalog.swift app/LumenQuickAnswer.swift app/LauncherCommands.swift app/LauncherScripts.swift app/LauncherImageSearch.swift \
     app/ClipboardStore.swift app/ClipboardManager.swift app/ClipboardViews.swift \
     app/InlinePreview.swift app/MacPreview.swift app/MacInlinePreviewView.swift app/LauncherInlinePreview.swift \

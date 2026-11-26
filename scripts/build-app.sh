@@ -2,8 +2,11 @@
 set -eu
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo build --locked --release "$@"
 SWIFT_TARGET="$(uname -m)-apple-macosx14.0"
+# Match the bundled SQLite C object to the app without changing Rust host proc-macro builds.
+RUST_TARGET="$(rustc --print host-tuple)"
+C_FLAGS="$(printenv "CFLAGS_$RUST_TARGET" || printenv "CFLAGS_$(printf '%s' "$RUST_TARGET" | tr '-' '_')" || :)"
+env "CFLAGS_$RUST_TARGET=$C_FLAGS -mmacosx-version-min=14.0" cargo build --locked --release "$@"
 APP="$PWD/target/Lumen.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/lumen "$APP/Contents/Resources/lumen"
@@ -20,7 +23,12 @@ for size in 16 32 128 256 512; do
     /usr/bin/sips --resampleHeightWidth "$pixels" "$pixels" app/Assets/Lumen-1024.png --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
 done
 /usr/bin/iconutil -c icns -o "$APP/Contents/Resources/Lumen.icns" "$iconset"
+# The archive supplies SQLite for Rust and Swift's SQLite3 calls. Strip unused
+# archive code and dylibs (including the SQLite3 module's system autolink).
 xcrun swiftc -O -swift-version 5 -target "$SWIFT_TARGET" -module-cache-path "$PWD/target/SwiftModuleCache" -parse-as-library \
+    -import-objc-header include/lumen_core.h target/release/liblumen.a \
+    -Xlinker -dead_strip -Xlinker -dead_strip_dylibs \
+    -framework DiskArbitration -framework IOKit \
     app/LumenApp.swift app/LauncherEngine.swift app/LauncherHotKey.swift app/LauncherModel.swift \
     app/WindowAccess.swift app/WindowManagement.swift \
     app/LauncherViews.swift app/LauncherHighlight.swift app/LauncherActions.swift app/LauncherSystemActions.swift app/LauncherFileQuery.swift app/LauncherPreview.swift app/LauncherShortcuts.swift app/LauncherCalculation.swift app/LauncherSmoke.swift \

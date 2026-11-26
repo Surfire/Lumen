@@ -595,6 +595,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private func cancelCurrentPanelAction() {
         if commands.visibleExecution != nil { closeExecutionCard(); return }
+        if commands.execution?.running == true, let execution = commands.cancelExecution() {
+            let generation = searchPresentationGeneration
+            Task { [weak self] in
+                await execution.value
+                guard let self, self.searchPresentationGeneration == generation else { return }
+                self.dismissSearch()
+            }
+            return
+        }
         if localPreview != nil { closeLocalPreview(); return }
         if closeInlinePreview() { return }
         if commands.answer == .loading { commands.invalidateAnswer() }

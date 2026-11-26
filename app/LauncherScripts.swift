@@ -1,4 +1,3 @@
-import Combine
 import Darwin
 import Foundation
 import os
@@ -6,7 +5,8 @@ import os
 struct LauncherExecutable: Equatable, Sendable {
     enum Mode: String, Sendable { case compact, fullOutput, silent, inline }
     enum Source: Equatable, Sendable {
-        case script(folder: String, identity: String, name: String, stamp: String)
+        // Keep the result row's case shape; only the folder and name carry data.
+        case script(folder: String, Never? = nil, name: String, Never? = nil)
         case shortcut(String)
     }
 
@@ -71,7 +71,6 @@ enum LauncherScriptFiles {
     static let headerLimit = 8 * 1024
     // Darwin rejects combining O_NOFOLLOW_ANY with O_NOFOLLOW; ANY includes the leaf.
     private static let noLinks = O_NOFOLLOW_ANY | O_CLOEXEC
-    private static let stageLimit = 64 * 1024 * 1024
 
     static func isResident(_ attributes: stat) -> Bool { attributes.st_flags & UInt32(SF_DATALESS) == 0 }
 
@@ -83,44 +82,23 @@ enum LauncherScriptFiles {
         return IndexScope.folderPath(url)
     }
 
-    private static func identity(_ attributes: stat) -> String { "\(attributes.st_dev):\(attributes.st_ino)" }
-
-    private static func directory(_ path: String) -> (Int32, String)? {
-        guard let before = SearchHit.pathAttributes(at: path, kind: "directory") else { return nil }
-        let fd = open(path, O_RDONLY | O_DIRECTORY | noLinks)
-        guard fd >= 0 else { return nil }
-        var actual = stat()
-        guard fstat(fd, &actual) == 0, isResident(actual), identity(actual) == identity(before) else {
-            close(fd)
-            return nil
-        }
-        return (fd, identity(actual))
+    static func openDirectory(_ path: String) -> Int32 {
+        var info = stat()
+        guard path.hasPrefix("/"), !path.utf8.contains(0), lstat(path, &info) == 0,
+              info.st_mode & S_IFMT == S_IFDIR, isResident(info) else { return -1 }
+        return open(path, O_RDONLY | O_DIRECTORY | noLinks)
     }
 
-    private static func openFile(in dir: Int32, name: String, executable: Bool) -> (Int32, stat)? {
-        func allowed(_ info: stat) -> Bool {
-            info.st_mode & S_IFMT == S_IFREG && isResident(info) && info.st_nlink == 1
-                && (!executable || info.st_mode & S_IXUSR != 0)
-        }
-        var before = stat(), actual = stat()
-        guard fstatat(dir, name, &before, AT_SYMLINK_NOFOLLOW) == 0, allowed(before) else { return nil }
-        // O_NONBLOCK keeps a concurrently substituted FIFO from stalling the worker.
-        let fd = openat(dir, name, O_RDONLY | O_NONBLOCK | noLinks)
-        guard fd >= 0 else { return nil }
-        guard fstat(fd, &actual) == 0, allowed(actual), identity(actual) == identity(before) else {
-            close(fd)
-            return nil
-        }
-        return (fd, actual)
+    static func isExecutable(_ path: String) -> Bool {
+        var info = stat()
+        return lstat(path, &info) == 0 && info.st_mode & S_IFMT == S_IFREG && isResident(info) && access(path, X_OK) == 0
     }
 
     static func scan(_ folder: String, isCancelled: () -> Bool = { false }) -> [LauncherExecutable]? {
         withNoDatalessMaterialization {
-            guard let (fd, folderID) = directory(folder) else { return nil }
-            defer { close(fd) }
-            let enumeration = fcntl(fd, F_DUPFD_CLOEXEC, 0)
-            guard enumeration >= 0 else { return nil }
-            guard let stream = fdopendir(enumeration) else { close(enumeration); return nil }
+            let fd = openDirectory(folder)
+            guard fd >= 0 else { return nil }
+            guard let stream = fdopendir(fd) else { close(fd); return nil }
             defer { closedir(stream) }
             var commands: [LauncherExecutable] = []
             while !isCancelled() {
@@ -129,15 +107,19 @@ enum LauncherScriptFiles {
                 let name = withUnsafeBytes(of: &entry.pointee.d_name) { raw in
                     String(bytes: raw.prefix(Int(entry.pointee.d_namlen)), encoding: .utf8)
                 }
-                guard let name, !name.hasPrefix("."),
-                      let (file, info) = openFile(in: fd, name: name, executable: true) else { continue }
+                guard let name, !name.hasPrefix(".") else { continue }
+                let path = folder + "/" + name
+                guard isExecutable(path) else { continue }
+                let file = open(path, O_RDONLY | O_NONBLOCK | noLinks)
+                guard file >= 0 else { continue }
                 defer { close(file) }
+                var info = stat()
+                guard fstat(file, &info) == 0, info.st_mode & S_IFMT == S_IFREG, isResident(info) else { continue }
                 var header = Data(count: headerLimit)
                 let count = header.withUnsafeMutableBytes { read(file, $0.baseAddress, $0.count) }
                 guard count >= 0 else { continue }
                 header.count = count
-                let source = LauncherExecutable.Source.script(folder: folder, identity: folderID, name: name,
-                                                               stamp: SearchHit.filesystemStamp(info))
+                let source = LauncherExecutable.Source.script(folder: folder, name: name)
                 commands.append(.parse(header, eof: Int64(count) == info.st_size, source: source, fallback: name))
             }
             return nil
@@ -151,8 +133,9 @@ enum LauncherScriptFiles {
     static func createSuggestedFolder() -> URL? {
         withNoDatalessMaterialization {
             let home = FileManager.default.homeDirectoryForCurrentUser
-            guard let homePath = path(home), let (homeFD, _) = directory(homePath) else { return nil }
-            var parent = homeFD
+            guard let homePath = path(home) else { return nil }
+            var parent = openDirectory(homePath)
+            guard parent >= 0 else { return nil }
             defer { close(parent) }
             for component in ["Library", "Application Support", "Lumen", "Scripts"] {
                 guard mkdirat(parent, component, 0o700) == 0 || errno == EEXIST else { return nil }
@@ -166,78 +149,6 @@ enum LauncherScriptFiles {
             }
             return suggestedFolder
         }
-    }
-
-    // Darwin's spawn takes a path, not an executable fd. Run a private local snapshot of
-    // the checked file so a path replacement (including a shebang reopen) can't hydrate
-    // or execute a different file. Keep the approved folder as the working directory.
-    static func withStagedFile(_ source: LauncherExecutable.Source, inputPath: String? = nil,
-                               deadline: ContinuousClock.Instant, isCancelled: () -> Bool,
-                               _ body: (String, Int32) -> LauncherProcess.Result) -> LauncherProcess.Result? {
-        var dirFD: Int32 = -1
-        defer { if dirFD >= 0 { close(dirFD) } }
-        var temporary: URL?
-        defer { if let temporary { try? FileManager.default.removeItem(at: temporary) } }
-        let staged: String? = withNoDatalessMaterialization {
-            let folder: String, name: String, executable: Bool, folderID: String?, stamp: String?
-            switch source {
-            case .script(let root, let identity, let filename, let version):
-                (folder, name, executable, folderID, stamp) = (root, filename, true, identity, version)
-            case .shortcut:
-                guard let inputPath, inputPath.hasPrefix("/"), !inputPath.utf8.contains(0),
-                      let localPath = path(URL(fileURLWithPath: inputPath)) else { return nil }
-                let url = URL(fileURLWithPath: localPath)
-                (folder, name, executable, folderID, stamp) = (url.deletingLastPathComponent().path, url.lastPathComponent, false, nil, nil)
-            }
-            guard let (dir, actualID) = directory(folder) else { return nil }
-            dirFD = dir
-            guard folderID == nil || folderID == actualID,
-                  let (file, info) = openFile(in: dir, name: name, executable: executable) else { return nil }
-            defer { close(file) }
-            let version = SearchHit.filesystemStamp(info)
-            guard stamp == nil || stamp == version, info.st_size <= stageLimit else { return nil }
-            let base = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
-            let templatePath = IndexScope.folderPath(base.appendingPathComponent("LumenCommand.XXXXXX"))
-            var template = templatePath.utf8CString
-            guard let temp = template.withUnsafeMutableBufferPointer({ buffer in
-                mkdtemp(buffer.baseAddress!).map { String(cString: $0) }
-            }) else { return nil }
-            let root = URL(fileURLWithPath: temp, isDirectory: true)
-            temporary = root
-            let target = root.appendingPathComponent(name).path
-            let output = open(target, O_WRONLY | O_CREAT | O_EXCL | noLinks, mode_t(executable ? 0o700 : 0o600))
-            guard output >= 0 else { return nil }
-            defer { close(output) }
-            var buffer = [UInt8](repeating: 0, count: 64 * 1024)
-            var total = 0
-            while !isCancelled(), ContinuousClock.now < deadline {
-                let count = read(file, &buffer, buffer.count)
-                if count == 0 {
-                    var after = stat()
-                    // Preserve xattrs (including quarantine) on executing a staged copy.
-                    guard (!executable || fcopyfile(file, output, nil, copyfile_flags_t(COPYFILE_XATTR)) == 0),
-                          fstat(file, &after) == 0, isResident(after), SearchHit.filesystemStamp(after) == version else { return nil }
-                    return target
-                }
-                if count < 0 && errno == EINTR { continue }
-                guard count > 0, total + count <= stageLimit else { return nil }
-                total += count
-                let written = buffer.withUnsafeBytes { raw -> Bool in
-                    var offset = 0
-                    while offset < count {
-                        let n = write(output, raw.baseAddress! + offset, count - offset)
-                        if n < 0 && errno == EINTR { continue }
-                        guard n > 0 else { return false }
-                        offset += n
-                    }
-                    return true
-                }
-                guard written else { return nil }
-            }
-            return nil
-        }
-        guard let staged else { return nil }
-        return body(staged, dirFD)
     }
 }
 
@@ -285,20 +196,26 @@ enum LauncherProcess {
             let cancelled = { work.isCancelled }
             if let stop = interruption(deadline, isCancelled: cancelled) { return Result(status: stop) }
             guard argument?.utf8.contains(0) != true else { return Result(status: .unavailable) }
-            switch command.source {
-            case .script(_, _, let name, _):
-                return LauncherScriptFiles.withStagedFile(command.source, deadline: deadline, isCancelled: cancelled) { staged, dir in
-                    run(staged, argv0: name, arguments: argument.map { [$0] } ?? [], directory: dir, deadline: deadline, isCancelled: cancelled)
-                } ?? Result(status: interruption(deadline, isCancelled: cancelled) ?? .unavailable)
-            case .shortcut(let name):
-                if let argument {
-                    return LauncherScriptFiles.withStagedFile(command.source, inputPath: argument, deadline: deadline,
-                                                              isCancelled: cancelled) { staged, _ in
-                        run(shortcuts.path, arguments: ["run", "--input-path=\(staged)", "--", name], deadline: deadline, isCancelled: cancelled)
-                    } ?? Result(status: interruption(deadline, isCancelled: cancelled) ?? .unavailable)
+            return withNoDatalessMaterialization { () -> Result? in
+                switch command.source {
+                case .script(let folder, _, let name, _):
+                    let path = folder + "/" + name
+                    let directory = LauncherScriptFiles.openDirectory(folder)
+                    guard directory >= 0 else { return nil }
+                    defer { close(directory) }
+                    guard LauncherScriptFiles.isExecutable(path) else { return nil }
+                    return run(path, arguments: argument.map { [$0] } ?? [], directory: directory,
+                               deadline: deadline, isCancelled: cancelled)
+                case .shortcut(let name):
+                    var arguments = ["run"]
+                    if let argument {
+                        guard argument.hasPrefix("/"), let path = LauncherScriptFiles.path(URL(fileURLWithPath: argument)),
+                              SearchHit.pathAttributes(at: path, kind: "file") != nil else { return nil }
+                        arguments.append("--input-path=\(path)")
+                    }
+                    return run(shortcuts.path, arguments: arguments + ["--", name], deadline: deadline, isCancelled: cancelled)
                 }
-                return run(shortcuts.path, arguments: ["run", "--", name], deadline: deadline, isCancelled: cancelled)
-            }
+            } ?? Result(status: interruption(deadline, isCancelled: cancelled) ?? .unavailable)
         }
     }
 
@@ -317,7 +234,7 @@ enum LauncherProcess {
         return nil
     }
 
-    static func run(_ executable: String, argv0: String? = nil, arguments: [String], directory: Int32? = nil,
+    static func run(_ executable: String, arguments: [String], directory: Int32? = nil,
                     deadline: ContinuousClock.Instant, isCancelled: () -> Bool) -> Result {
         if let stop = interruption(deadline, isCancelled: isCancelled) { return Result(status: stop) }
         var attributes: posix_spawnattr_t?
@@ -346,7 +263,7 @@ enum LauncherProcess {
                   fcntl(pair[0], F_SETFL, O_NONBLOCK) == 0,
                   posix_spawn_file_actions_adddup2(&actions, pair[1], output) == 0 else { return Result(status: .unavailable) }
         }
-        let words = [argv0 ?? executable] + arguments
+        let words = [executable] + arguments
         guard words.allSatisfy({ !$0.utf8.contains(0) }) else { return Result(status: .unavailable) }
         var argv = words.map { strdup($0) }
         var environment = ProcessInfo.processInfo.environment.map { strdup("\($0.key)=\($0.value)") }
@@ -358,9 +275,7 @@ enum LauncherProcess {
         let spawned = withNoDatalessMaterialization {
             posix_spawn(&pid, executable, &actions, &attributes, &argv, &environment)
         }
-        guard spawned == 0 else {
-            return Result(status: .unavailable)
-        }
+        guard spawned == 0 else { return Result(status: .unavailable) }
         for index in [1, 3] { close(fds[index]); fds[index] = -1 }
         var readers = [pollfd(fd: fds[0], events: Int16(POLLIN), revents: 0),
                        pollfd(fd: fds[2], events: Int16(POLLIN), revents: 0)]
@@ -403,127 +318,5 @@ enum LauncherProcess {
             }
         }
         return Result(status: outcome, stdout: stdout, stderr: stderr)
-    }
-}
-
-@MainActor
-final class LauncherScriptCatalog: ObservableObject {
-    let shortcutsExecutable: URL
-    @Published private(set) var scriptsEnabled: Bool
-    @Published private(set) var folder: String?
-    @Published private(set) var shortcutsEnabled: Bool
-    @Published private(set) var scripts: [LauncherExecutable] = []
-    @Published private(set) var shortcuts: [LauncherExecutable] = []
-    @Published private(set) var scriptLoading = false
-    @Published private(set) var shortcutLoading = false
-    @Published private(set) var scriptFailed = false
-    @Published private(set) var shortcutFailed = false
-    private let defaults: UserDefaults?
-    private var scriptLoad: Task<Void, Never>?
-    private var shortcutLoad: Task<Void, Never>?
-
-    init(defaults: UserDefaults?, shortcutsExecutable: URL = URL(fileURLWithPath: "/usr/bin/shortcuts")) {
-        self.defaults = defaults
-        self.shortcutsExecutable = shortcutsExecutable
-        let savedFolder = defaults?.string(forKey: "localScriptsFolder")
-        folder = savedFolder
-        scriptsEnabled = savedFolder != nil && defaults?.bool(forKey: "localScriptsEnabled") == true
-        shortcutsEnabled = defaults?.bool(forKey: "appleShortcutsEnabled") == true
-    }
-
-    func selectFolder(_ url: URL) {
-        guard let path = LauncherScriptFiles.path(url) else { scriptFailed = true; return }
-        if folder != path { scripts = [] }
-        folder = path
-        defaults?.set(path, forKey: "localScriptsFolder")
-        reloadScripts()
-    }
-
-    func createAndEnable() {
-        scriptLoad?.cancel()
-        scriptLoading = true
-        scriptFailed = false
-        scriptLoad = Task { [weak self] in
-            let folder = await LauncherProcess.offMain { $0.isCancelled ? nil : LauncherScriptFiles.createSuggestedFolder() }
-            guard !Task.isCancelled, let self else { return }
-            self.scriptLoading = false
-            self.scriptLoad = nil
-            guard let folder else { self.scriptFailed = true; return }
-            self.selectFolder(folder)
-            self.setScriptsEnabled(true)
-        }
-    }
-
-    func setScriptsEnabled(_ enabled: Bool) {
-        guard !enabled || folder != nil else { return }
-        scriptsEnabled = enabled
-        defaults?.set(enabled, forKey: "localScriptsEnabled")
-        reloadScripts()
-    }
-
-    func reloadScripts() {
-        scriptLoad?.cancel()
-        scriptLoad = nil
-        scriptFailed = false
-        guard scriptsEnabled, let folder else { scripts = []; scriptLoading = false; return }
-        scriptLoading = true
-        scriptLoad = Task { [weak self] in
-            let commands = await LauncherProcess.offMain { work in LauncherScriptFiles.scan(folder) { work.isCancelled } }
-            guard !Task.isCancelled, let self else { return }
-            self.scripts = commands ?? []
-            self.scriptFailed = commands == nil
-            self.scriptLoading = false
-            self.scriptLoad = nil
-        }
-    }
-
-    func setShortcutsEnabled(_ enabled: Bool) {
-        shortcutsEnabled = enabled
-        defaults?.set(enabled, forKey: "appleShortcutsEnabled")
-        refreshShortcuts()
-    }
-
-    func refreshShortcuts() {
-        shortcutLoad?.cancel()
-        shortcutLoad = nil
-        shortcutFailed = false
-        guard shortcutsEnabled else { shortcuts = []; shortcutLoading = false; return }
-        shortcutLoading = true
-        let executable = shortcutsExecutable.path
-        shortcutLoad = Task { [weak self] in
-            let result = await LauncherProcess.offMain { work in
-                LauncherProcess.run(executable, arguments: ["list"], deadline: ContinuousClock.now + .seconds(5)) { work.isCancelled }
-            }
-            guard !Task.isCancelled, let self else { return }
-            let names = Self.shortcutNames(result)
-            if let names {
-                self.shortcuts = names.map { LauncherExecutable(source: .shortcut($0), title: $0, mode: .fullOutput) }
-            }
-            self.shortcutFailed = names == nil
-            self.shortcutLoading = false
-            self.shortcutLoad = nil
-        }
-    }
-
-    static func shortcutNames(_ result: LauncherProcess.Result) -> [String]? {
-        guard result.succeeded, !result.stdout.truncated,
-              let listing = String(data: result.stdout.bytes, encoding: .utf8) else { return nil }
-        var seen = Set<String>()
-        return listing.split { $0 == "\n" || $0 == "\r" || $0 == "\r\n" }.map(String.init).filter {
-            !$0.utf8.contains(0) && !$0.allSatisfy(\.isWhitespace) && seen.insert($0).inserted
-        }
-    }
-
-    func contains(_ command: LauncherExecutable) -> Bool {
-        switch command.source {
-        case .script: return scriptsEnabled && scripts.contains(command)
-        case .shortcut: return shortcutsEnabled && shortcuts.contains(command)
-        }
-    }
-
-    @discardableResult func close() -> Task<Void, Never>? {
-        scriptLoad?.cancel()
-        shortcutLoad?.cancel()
-        return shortcutLoad
     }
 }

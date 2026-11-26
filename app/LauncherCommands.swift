@@ -521,3 +521,125 @@ struct LauncherScrollableText: NSViewRepresentable {
         scroll.reflectScrolledClipView(scroll.contentView)
     }
 }
+
+@MainActor
+final class LauncherScriptCatalog: ObservableObject {
+    let shortcutsExecutable: URL
+    @Published private(set) var scriptsEnabled: Bool
+    @Published private(set) var folder: String?
+    @Published private(set) var shortcutsEnabled: Bool
+    @Published private(set) var scripts: [LauncherExecutable] = []
+    @Published private(set) var shortcuts: [LauncherExecutable] = []
+    @Published private(set) var scriptLoading = false
+    @Published private(set) var shortcutLoading = false
+    @Published private(set) var scriptFailed = false
+    @Published private(set) var shortcutFailed = false
+    private let defaults: UserDefaults?
+    private var scriptLoad: Task<Void, Never>?
+    private var shortcutLoad: Task<Void, Never>?
+
+    init(defaults: UserDefaults?, shortcutsExecutable: URL = URL(fileURLWithPath: "/usr/bin/shortcuts")) {
+        self.defaults = defaults
+        self.shortcutsExecutable = shortcutsExecutable
+        let savedFolder = defaults?.string(forKey: "localScriptsFolder")
+        folder = savedFolder
+        scriptsEnabled = savedFolder != nil && defaults?.bool(forKey: "localScriptsEnabled") == true
+        shortcutsEnabled = defaults?.bool(forKey: "appleShortcutsEnabled") == true
+    }
+
+    func selectFolder(_ url: URL) {
+        guard let path = LauncherScriptFiles.path(url) else { scriptFailed = true; return }
+        if folder != path { scripts = [] }
+        folder = path
+        defaults?.set(path, forKey: "localScriptsFolder")
+        reloadScripts()
+    }
+
+    func createAndEnable() {
+        scriptLoad?.cancel()
+        scriptLoading = true
+        scriptFailed = false
+        scriptLoad = Task { [weak self] in
+            let folder = await LauncherProcess.offMain { $0.isCancelled ? nil : LauncherScriptFiles.createSuggestedFolder() }
+            guard !Task.isCancelled, let self else { return }
+            self.scriptLoading = false
+            self.scriptLoad = nil
+            guard let folder else { self.scriptFailed = true; return }
+            self.selectFolder(folder)
+            self.setScriptsEnabled(true)
+        }
+    }
+
+    func setScriptsEnabled(_ enabled: Bool) {
+        guard !enabled || folder != nil else { return }
+        scriptsEnabled = enabled
+        defaults?.set(enabled, forKey: "localScriptsEnabled")
+        reloadScripts()
+    }
+
+    func reloadScripts() {
+        scriptLoad?.cancel()
+        scriptLoad = nil
+        scriptFailed = false
+        guard scriptsEnabled, let folder else { scripts = []; scriptLoading = false; return }
+        scriptLoading = true
+        scriptLoad = Task { [weak self] in
+            let commands = await LauncherProcess.offMain { work in LauncherScriptFiles.scan(folder) { work.isCancelled } }
+            guard !Task.isCancelled, let self else { return }
+            self.scripts = commands ?? []
+            self.scriptFailed = commands == nil
+            self.scriptLoading = false
+            self.scriptLoad = nil
+        }
+    }
+
+    func setShortcutsEnabled(_ enabled: Bool) {
+        shortcutsEnabled = enabled
+        defaults?.set(enabled, forKey: "appleShortcutsEnabled")
+        refreshShortcuts()
+    }
+
+    func refreshShortcuts() {
+        shortcutLoad?.cancel()
+        shortcutLoad = nil
+        shortcutFailed = false
+        guard shortcutsEnabled else { shortcuts = []; shortcutLoading = false; return }
+        shortcutLoading = true
+        let executable = shortcutsExecutable.path
+        shortcutLoad = Task { [weak self] in
+            let result = await LauncherProcess.offMain { work in
+                LauncherProcess.run(executable, arguments: ["list"], deadline: ContinuousClock.now + .seconds(5)) { work.isCancelled }
+            }
+            guard !Task.isCancelled, let self else { return }
+            let names = Self.shortcutNames(result)
+            if let names {
+                self.shortcuts = names.map { LauncherExecutable(source: .shortcut($0), title: $0, mode: .fullOutput) }
+            }
+            self.shortcutFailed = names == nil
+            self.shortcutLoading = false
+            self.shortcutLoad = nil
+        }
+    }
+
+    static func shortcutNames(_ result: LauncherProcess.Result) -> [String]? {
+        guard result.succeeded, !result.stdout.truncated,
+              let listing = String(data: result.stdout.bytes, encoding: .utf8) else { return nil }
+        var seen = Set<String>()
+        return listing.split { $0 == "\n" || $0 == "\r" || $0 == "\r\n" }.map(String.init).filter {
+            !$0.utf8.contains(0) && !$0.allSatisfy(\.isWhitespace) && seen.insert($0).inserted
+        }
+    }
+
+    func contains(_ command: LauncherExecutable) -> Bool {
+        switch command.source {
+        case .script: return scriptsEnabled && scripts.contains(command)
+        case .shortcut: return shortcutsEnabled && shortcuts.contains(command)
+        }
+    }
+
+    @discardableResult func close() -> Task<Void, Never>? {
+        scriptLoad?.cancel()
+        shortcutLoad?.cancel()
+        return shortcutLoad
+    }
+}

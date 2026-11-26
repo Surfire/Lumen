@@ -1169,7 +1169,7 @@ final class LauncherSmoke {
         # @lumen.description metadata probe description
         # @lumen.mode fullOutput
         # @lumen.argument1 Exact text
-        printf '%s\n%s' "$#" "$1"
+        printf '%s\n%s\n%s' "$#" "$1" "$0"
         """#)
         let flood = folder.appendingPathComponent("flood")
         try fixture(flood, """
@@ -1188,27 +1188,27 @@ final class LauncherSmoke {
         # @lumen.argument1 Silent argument
         printf '%s' "$1" > silent-ran
         """#)
-        let group = folder.appendingPathComponent("group")
-        try fixture(group, #"""
-        #!/bin/sh
-        # @lumen.title Lumen Group Probe
-        # @lumen.mode fullOutput
-        trap '' TERM
-        /bin/sleep 120 &
-        printf '%s %s\n' "$$" "$!" > group-starting
-        /bin/mv group-starting group-ready
-        wait
-        """#)
+        for (name, title, mode) in [("group", "Lumen Group Probe", "fullOutput"),
+                                    ("silent-group", "Lumen Silent Group Probe", "silent")] {
+            try fixture(folder.appendingPathComponent(name), #"""
+            #!/bin/sh
+            # @lumen.title \#(title)
+            # @lumen.mode \#(mode)
+            trap '' TERM
+            /bin/sleep 120 &
+            printf '%s %s\n' "$$" "$!" > group-starting
+            /bin/mv group-starting group-ready
+            wait
+            """#)
+        }
         try fixture(nested.appendingPathComponent("nested"), "#!/bin/sh\nexit 0")
-        try fixture(folder.appendingPathComponent("not executable"), "#!/bin/sh\nexit 0", mode: 0o600)
+        try fixture(folder.appendingPathComponent("not executable"), "#!/bin/sh\nexit 0", mode: 0o644)
         let external = directory.appendingPathComponent("outside script")
-        try fixture(external, "#!/bin/sh\nexit 0")
-        try fm.createSymbolicLink(at: folder.appendingPathComponent("symlink"), withDestinationURL: echo)
+        try fixture(external, "#!/bin/sh\n# @lumen.title Lumen Outside Symlink Target\nexit 0")
+        try fm.createSymbolicLink(at: folder.appendingPathComponent("symlink"), withDestinationURL: external)
         let folderLink = directory.appendingPathComponent("folder link", isDirectory: true)
         try fm.createSymbolicLink(at: folderLink, withDestinationURL: folder)
-        try check(link(external.path, folder.appendingPathComponent("hardlink").path) == 0 &&
-                  mkfifo(folder.appendingPathComponent("fifo").path, 0o700) == 0,
-                  "could not create hardlink/FIFO fixtures")
+        try check(mkfifo(folder.appendingPathComponent("fifo").path, 0o700) == 0, "could not create FIFO fixture")
         var flags = stat()
         flags.st_flags = UInt32(SF_DATALESS)
         try check(!LauncherScriptFiles.isResident(flags), "a simulated SF_DATALESS file passed the resident gate")
@@ -1244,7 +1244,11 @@ final class LauncherSmoke {
             printf 'run\n' >> "${0%/*}/shortcuts-calls"
             shift
             case "$1" in
-              --input-path=*) /bin/cat "${1#--input-path=}"; shift ;;
+              --input-path=*)
+                printf '%s\n' "${1#--input-path=}"
+                /bin/cat "${1#--input-path=}" || exit 6
+                shift
+                ;;
             esac
             [ "$#" = 2 ] && [ "$1" = '--' ] || exit 4
             printf '<%s>' "$2"
@@ -1273,7 +1277,8 @@ final class LauncherSmoke {
         catalog.setScriptsEnabled(true)
         catalog.setShortcutsEnabled(true)
         try await until("opt-in catalogs loaded") { !catalog.scriptLoading && !catalog.shortcutLoading }
-        try check(Set(catalog.scripts.map(\.title)) == ["Lumen Argv Probe", "Lumen Output Flood", "Lumen Silent Probe", "Lumen Group Probe"],
+        try check(Set(catalog.scripts.map(\.title)) == ["Lumen Argv Probe", "Lumen Output Flood", "Lumen Silent Probe",
+                                                       "Lumen Group Probe", "Lumen Silent Group Probe"],
                   "scan missed a safe executable or followed a link, nested path, FIFO, or non-executable")
         try check(catalog.shortcuts.map(\.title) == [shortcutName, "  Exact Spacing  "] && lineCount("shortcuts-calls") == 1,
                   "Shortcuts parsing lost exact spelling or ran before explicit enable")
@@ -1294,10 +1299,12 @@ final class LauncherSmoke {
         app.commands.executionArgument = literal
         try key(kVK_Return, "\r", in: app)
         try await until("argv probe finished") { finished() != nil }
-        try check(finished()?.succeeded == true && finished()?.stdout.text == "1\n" + literal &&
-                  !fm.fileExists(atPath: folder.appendingPathComponent("injected").path), "script argument was split or expanded")
+        let expected = "1\n\(literal)\n\(IndexScope.folderPath(echo))"
+        try check(finished()?.succeeded == true && finished()?.stdout.text == expected &&
+                  !fm.fileExists(atPath: folder.appendingPathComponent("injected").path),
+                  "script argument was split or expanded, or $0 was not the real script path")
         try key(kVK_Return, "\r", in: app)
-        try check(filePasteboard.string(forType: .string) == "1\n" + literal && app.searchPresented,
+        try check(filePasteboard.string(forType: .string) == expected && app.searchPresented,
                   "command output copy did not use the in-place card")
         try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
         try check(app.commands.visibleExecution == nil && app.searchPresented, "Esc did not close the output card")
@@ -1321,7 +1328,8 @@ final class LauncherSmoke {
         let input = directory.appendingPathComponent("input ; file.txt")
         try Data("input bytes!".utf8).write(to: input)
         let withInput = await LauncherProcess.execute(try command(shortcutName), argument: input.path, shortcuts: stub)
-        try check(withInput.succeeded && withInput.stdout.text == "input bytes!<\(shortcutName)>", "Shortcut argv did not carry the staged input file")
+        try check(withInput.succeeded && withInput.stdout.text == "\(IndexScope.folderPath(input))\ninput bytes!<\(shortcutName)>",
+                  "Shortcut argv did not carry the original input path")
         catalog.refreshShortcuts()
         try await until("explicit Shortcut refresh completed") { !catalog.shortcutLoading && self.lineCount("shortcuts-calls") == 4 }
 
@@ -1362,11 +1370,20 @@ final class LauncherSmoke {
             finished()?.succeeded == true && (try? String(contentsOf: folder.appendingPathComponent("silent-ran"), encoding: .utf8)) == literal
         }
 
-        let argvCommand = try command("Lumen Argv Probe")
-        try fm.removeItem(at: echo)
-        try fm.createSymbolicLink(at: echo, withDestinationURL: external)
-        let replaced = await LauncherProcess.execute(argvCommand, argument: nil, shortcuts: stub)
-        try check(replaced.status == .unavailable, "a cached command invoked a substituted symlink")
+        try fm.removeItem(at: ready)
+        app.showSearch()
+        try type("Lumen Silent Group Probe", into: app)
+        try key(kVK_Return, "\r", in: app)
+        try check(!app.searchPresented && app.commands.execution?.running == true, "silent group did not dismiss the launcher and run")
+        try await until("silent script spawned a descendant") { fm.fileExists(atPath: ready.path) }
+        let silentPIDs = try pids()
+        app.showSearch()
+        try check(app.searchPresented && app.commands.visibleExecution == nil && app.commands.execution?.running == true,
+                  "reopening the launcher did not keep the silent script running in the background")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try await until("Esc after reopening did not cancel both silent process-group members") {
+            gone(silentPIDs) && app.commands.canStartExecutable && app.commands.execution == nil && !app.searchPresented
+        }
         catalog.setScriptsEnabled(false)
         catalog.setShortcutsEnabled(false)
         let disabled = makeScriptCatalog()

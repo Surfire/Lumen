@@ -1024,10 +1024,6 @@ final class Launcher: ObservableObject {
                 return
             }
             if batch.indexed > 0 {
-                if self.embeddingState == .finished {
-                    self.embeddingState = .idle
-                    self.automaticBuildAttempted = false
-                }
                 self.scheduleSearch(keepAction: true)
             }
             if batch.processed == 0 && batch.pending > 0 { self.contentFailed = true }
@@ -1136,6 +1132,10 @@ final class Launcher: ObservableObject {
             } else if report.gemma?.hasResults == true, previous?.hasResults != true {
                 queueRelatedExcerpts()
             }
+        }
+        if embeddingState == .finished, report.gemma?.pending == true {
+            embeddingState = .idle
+            automaticBuildAttempted = false
         }
         // Existing BGE vectors are evidence an older user explicitly started semantic indexing.
         // The saved scope in the database decides whether documents are eligible.

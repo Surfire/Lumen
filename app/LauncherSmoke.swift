@@ -3620,24 +3620,29 @@ final class LauncherSmoke {
         let journal = root.appendingPathComponent("batches")
         let source = #"""
         #!/usr/bin/python3
-        import json, signal, sys
+        import json, signal, sys, time
         from pathlib import Path
         root = Path(__file__).parent
         journal = root / 'batches'
+        recovered = root / 'recover-document'
         batches = journal.read_text().splitlines() if journal.exists() else []
         checked, embedded = batches.count('content'), batches.count('embed')
+        visible = checked + int(recovered.exists())
         command, *args = sys.argv[3:]
         def record(batch):
             with journal.open('a') as out:
                 print(batch, file=out)
         if command == 'status':
-            print(json.dumps(dict(items=3, documents=checked,
+            print(json.dumps(dict(items=4, documents=visible,
                 content=dict(pending=3-checked, checked=checked, total=3),
-                gemma=dict(documents_enabled=True, pending=checked>embedded,
+                gemma=dict(documents_enabled=True, pending=visible>embedded,
                     limited=False, embedded_chunks=embedded, skipped_chunks=0, chunk_limit=100))))
         elif command == 'watch':
             if '--help' not in args:
                 print('{"event":"ready"}', flush=True)
+                while not recovered.exists():
+                    time.sleep(0.02)
+                print('{"event":"updated"}', flush=True)
                 signal.pause()
         elif command == 'content':
             assert args == ['--max', '8'] and checked < 3
@@ -3646,7 +3651,7 @@ final class LauncherSmoke {
         elif command == 'model-status':
             print(json.dumps(dict(available=True, verified='--verify' in args)))
         elif command == 'embed':
-            assert args == ['--gemma', '--max', '32'] and checked > embedded
+            assert args == ['--gemma', '--max', '32'] and visible > embedded
             record('embed')
             print(json.dumps(dict(new_embeddings=1, skipped_chunks=0, has_more=False)))
         else:
@@ -3667,11 +3672,22 @@ final class LauncherSmoke {
         model.start(automaticallyIndex: false)
         try await until("background embeddings resumed after successive content batches") {
             model.contentCoverage?.pending == 0 && model.gemmaCoverage?.embedded_chunks == 3 &&
-                model.embeddingState == .finished
+                model.gemmaCoverage?.complete == true && model.embeddingState == .finished && model.watchState == .running
         }
         let batches = try String(contentsOf: journal, encoding: .utf8).split(separator: "\n")
         try check(batches == ["content", "embed", "content", "embed", "content", "embed"],
                   "semantic indexing waited for content to drain: \(batches)")
+        var resumedFromIdle = false
+        let stateUpdates = model.$embeddingState.sink { if $0 == .idle { resumedFromIdle = true } }
+        defer { stateUpdates.cancel() }
+        try Data().write(to: root.appendingPathComponent("recover-document"))
+        try await until("watch recovery automatically embedded newly visible text") {
+            model.gemmaCoverage?.embedded_chunks == 4 && model.gemmaCoverage?.complete == true &&
+                model.embeddingState == .finished
+        }
+        let recoveredBatches = try String(contentsOf: journal, encoding: .utf8).split(separator: "\n")
+        try check(resumedFromIdle && recoveredBatches == batches + ["embed"],
+                  "finished embeddings did not return to idle and resume without a content batch: \(recoveredBatches)")
         try check(defaults.bool(forKey: "gemmaIndexingEnabled") && !defaults.bool(forKey: "gemmaIndexingPaused") &&
                   defaults.object(forKey: "contentIndexingPaused") == nil && model.embeddingNotice == nil,
                   "silent background embedding changed pause preferences or raised a notice")

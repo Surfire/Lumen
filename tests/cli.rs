@@ -1842,6 +1842,42 @@ printf 'second batch text'
     }
 
     #[test]
+    fn cached_start_keeps_resident_provider_documents_verified() {
+        let f = Fixture::new();
+        let provider = f.0.join("OneDrive-Fixture");
+        let selected = provider.join("Selected");
+        fs::create_dir_all(&selected).unwrap();
+        fs::write(selected.join("resident.md"), "cachedresidentneedle").unwrap();
+        fs::write(provider.join("outside.md"), "outsidecloudneedle").unwrap();
+        f.run(&[
+            "index",
+            "--root",
+            provider.to_str().unwrap(),
+            "--content-root",
+            selected.to_str().unwrap(),
+        ]);
+        assert_eq!(f.run(&["content"])["indexed"], 1);
+
+        let mut watcher = Process::launch(
+            f.cli()
+                .args(["watch", "--cached-start", "--progress"])
+                .stderr(Stdio::piped()),
+        );
+        assert_eq!(watcher.json()["event"], "cached");
+        assert_eq!(watcher.json()["event"], "ready");
+        watcher.child.kill().unwrap();
+        let stderr = std::io::read_to_string(watcher.child.stderr.take().unwrap()).unwrap();
+        assert!(stderr.contains("lumen watch: recovered"), "{stderr}");
+
+        let mut checked = Serve::launch(&f, &["--check-access"]);
+        let hits = checked.hits("cachedresidentneedle", "text");
+        assert_eq!(hits[0]["name"], "resident.md");
+        assert_eq!(hits[0]["availability"], "provider_metadata_only");
+        assert!(checked.names("outsidecloudneedle", "text").is_empty());
+        assert_eq!(checked.names("outside.md", "name"), ["outside.md"]);
+    }
+
+    #[test]
     fn watcher_seeds_legacy_catalog_and_resumes_persisted_native_events() {
         let f = Fixture::new();
         let root = f.0.join("scope");

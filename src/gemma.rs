@@ -217,10 +217,10 @@ IFS= read -r owner || :
 }
 
 fn check_directory(path: &Path) -> Result<fs::Metadata> {
-    let meta = fs::symlink_metadata(path).context("Gemma resource directory is missing")?;
+    let meta = fs::metadata(path).context("Gemma resource directory is missing")?;
     ensure!(
-        meta.is_dir() && meta.mode() & 0o022 == 0,
-        "Gemma resource directory must be a non-symlink writable only by its owner"
+        meta.is_dir() && meta.mode() & 0o002 == 0,
+        "Gemma resource directory must be a directory that is not world-writable"
     );
     Ok(meta)
 }
@@ -301,7 +301,7 @@ fn write_verifications(home: &Path, path: &Path, cache: &Verifications) -> Resul
 
 // Return whether this call actually hashed the asset.
 fn asset(path: &Path, expected: &Asset, verify: bool, cache: &mut Verifications) -> Result<bool> {
-    let file = OpenOptions::new()
+    let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
@@ -329,18 +329,9 @@ fn asset(path: &Path, expected: &Asset, verify: bool, cache: &mut Verifications)
     {
         return Ok(false);
     }
-    let output = Command::new("/usr/bin/openssl")
-        .args(["dgst", "-sha256", "-r"])
-        .env_clear()
-        .stdin(Stdio::from(file.try_clone()?))
-        .output()
-        .context("verify Gemma SHA-256")?;
+    let digest = sha256_file(&mut file)?;
     ensure!(
-        output.status.success()
-            && std::str::from_utf8(&output.stdout)?
-                .split_whitespace()
-                .next()
-                == Some(expected.sha256.as_str()),
+        digest == expected.sha256,
         "Gemma asset failed SHA-256 verification: {}",
         path.file_name().unwrap_or_default().to_string_lossy()
     );
@@ -358,6 +349,137 @@ fn asset(path: &Path, expected: &Asset, verify: bool, cache: &mut Verifications)
         );
     }
     Ok(true)
+}
+
+fn sha256_file(reader: &mut impl Read) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => hasher.update(&buffer[..count]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error).context("verify Gemma SHA-256"),
+        }
+    }
+    Ok(hasher.finalize_hex())
+}
+
+struct Sha256 {
+    state: [u32; 8],
+    buffer: [u8; 64],
+    buffered: usize,
+    len_bytes: u64,
+}
+
+impl Sha256 {
+    const INIT: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    #[rustfmt::skip]
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+
+    fn new() -> Self {
+        Self {
+            state: Self::INIT,
+            buffer: [0; 64],
+            buffered: 0,
+            len_bytes: 0,
+        }
+    }
+
+    fn update(&mut self, mut input: &[u8]) {
+        self.len_bytes = self.len_bytes.wrapping_add(input.len() as u64);
+        if self.buffered > 0 {
+            let take = (64 - self.buffered).min(input.len());
+            self.buffer[self.buffered..self.buffered + take].copy_from_slice(&input[..take]);
+            self.buffered += take;
+            input = &input[take..];
+            if self.buffered == 64 {
+                Self::compress(&mut self.state, &self.buffer);
+                self.buffered = 0;
+            }
+        }
+        while input.len() >= 64 {
+            let (block, rest) = input.split_at(64);
+            Self::compress(&mut self.state, block.try_into().expect("64-byte block"));
+            input = rest;
+        }
+        if !input.is_empty() {
+            self.buffer[..input.len()].copy_from_slice(input);
+            self.buffered = input.len();
+        }
+    }
+
+    fn finalize_hex(mut self) -> String {
+        let bit_len = (u128::from(self.len_bytes) << 3) as u64;
+        self.buffer[self.buffered] = 0x80;
+        self.buffered += 1;
+        if self.buffered > 56 {
+            self.buffer[self.buffered..64].fill(0);
+            Self::compress(&mut self.state, &self.buffer);
+            self.buffered = 0;
+        }
+        self.buffer[self.buffered..56].fill(0);
+        self.buffer[56..64].copy_from_slice(&bit_len.to_be_bytes());
+        Self::compress(&mut self.state, &self.buffer);
+        self.state
+            .into_iter()
+            .flat_map(u32::to_be_bytes)
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
+        let mut w = [0_u32; 64];
+        for (i, word) in w[..16].iter_mut().enumerate() {
+            let off = i * 4;
+            *word =
+                u32::from_be_bytes([block[off], block[off + 1], block[off + 2], block[off + 3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+        for (&word, &k) in w.iter().zip(&Self::K) {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(k)
+                .wrapping_add(word);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        for (slot, delta) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *slot = slot.wrapping_add(delta);
+        }
+    }
 }
 
 pub(crate) struct GemmaWorker {
@@ -643,5 +765,95 @@ mod tests {
                 .contains("failed SHA-256")
         );
         fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn pure_rust_sha256_matches_nist_vectors_and_streaming_chunks() {
+        let digest = |bytes: &[u8]| {
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            hasher.finalize_hex()
+        };
+        assert_eq!(
+            digest(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            digest(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            digest(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        // Multi-block (>64 bytes) NIST vector fed in uneven chunks and via File.
+        let multi = b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
+        let expected_multi = "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1";
+        let mut streamed = Sha256::new();
+        for chunk in multi.chunks(7) {
+            streamed.update(chunk);
+        }
+        assert_eq!(streamed.finalize_hex(), expected_multi);
+
+        let dir = std::env::temp_dir().join(format!("lumen-sha256-stream-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let big_path = dir.join("multi-buffer.bin");
+        let big_bytes = vec![b'a'; 150_000];
+        fs::write(&big_path, &big_bytes).unwrap();
+        let mut file = File::open(&big_path).unwrap();
+        assert_eq!(sha256_file(&mut file).unwrap(), digest(&big_bytes));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn symlinked_gemma_directory_allows_external_ssd_while_blocking_world_writable_or_symlink_files()
+     {
+        let root = std::env::temp_dir().join(format!("lumen-gemma-symlink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let ssd = root.join("external-ssd/Gemma2");
+        let runtime = ssd.join("runtime");
+        fs::create_dir_all(&runtime).unwrap();
+        fs::set_permissions(&ssd, fs::Permissions::from_mode(0o775)).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o775)).unwrap();
+        fs::write(ssd.join(MODEL_FILE), b"abc").unwrap();
+        let linked_home = root.join("Library/Gemma2");
+        fs::create_dir_all(linked_home.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&ssd, &linked_home).unwrap();
+
+        let expected = Asset {
+            size: 3,
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+        };
+        let manifest = Manifest {
+            model: expected,
+            image_projector: Asset {
+                size: 3,
+                sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+            },
+            runtime: BTreeMap::new(),
+        };
+        let model = GemmaModel::installed(Some(&linked_home)).unwrap();
+        assert_eq!(model.check_assets(&manifest, true, None).unwrap(), 1);
+        assert_eq!(model.check_assets(&manifest, true, None).unwrap(), 0);
+
+        // World-writable directory is still rejected.
+        fs::set_permissions(&ssd, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            model
+                .check_assets(&manifest, false, None)
+                .unwrap_err()
+                .to_string()
+                .contains("world-writable")
+        );
+        fs::set_permissions(&ssd, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Individual model files must still be non-symlink regular files (O_NOFOLLOW).
+        let target_model = root.join("elsewhere.gguf");
+        fs::rename(ssd.join(MODEL_FILE), &target_model).unwrap();
+        std::os::unix::fs::symlink(&target_model, ssd.join(MODEL_FILE)).unwrap();
+        assert!(model.check_assets(&manifest, true, None).is_err());
+
+        fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -3632,7 +3632,7 @@ try rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithP
         assert_eq!(f.run(&scope)["content"]["pending"], 1);
         assert_eq!(
             f.run(&["content"]),
-            serde_json::json!({"processed":1,"indexed":1,"pending":0})
+            serde_json::json!({"processed":1,"indexed":1,"pending":0,"skipped":0})
         );
         assert_eq!(f.run(&["status"])["gemma"]["pending"], true);
 
@@ -3682,7 +3682,7 @@ static const struct { const void *replacement; const void *original; } hook = {d
         );
         assert_eq!(
             serde_json::from_slice::<Value>(&output.stdout).unwrap(),
-            serde_json::json!({"processed":1,"indexed":0,"pending":0})
+            serde_json::json!({"processed":1,"indexed":0,"pending":0,"skipped":0})
         );
         assert_eq!(
             f.run(&["diagnose", resident.to_str().unwrap()]),
@@ -4005,6 +4005,7 @@ printf 'stale extraction'
         ]);
         let stale = f.run(&["content"]);
         assert_eq!(stale["processed"], 0);
+        assert_eq!(stale["skipped"], 1);
         assert_eq!(stale["pending"], 2);
         let next = f.run(&["content", "--max", "1"]);
         assert_eq!(next["indexed"], 1);
@@ -4801,5 +4802,186 @@ static const struct { const void *replacement; const void *original; } interpose
             f.run(&["query", "transientrecoveryneedle", "--mode", "text"])[0]["name"],
             "important.md"
         );
+    }
+
+    #[test]
+    fn content_poison_pill_timeout_and_denied_report_skipped_and_index_healthy_docs() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let f = Fixture::new();
+        let root = f.0.join("docs");
+        fs::create_dir_all(&root).unwrap();
+        let timeout_pdf = root.join("01-timeout.pdf");
+        let denied_doc = root.join("02-denied.txt");
+        let healthy_doc = root.join("03-healthy.md");
+        fs::write(&timeout_pdf, "%PDF-1.4\n").unwrap();
+        fs::write(&denied_doc, "denied poison pill document").unwrap();
+        fs::write(&healthy_doc, "healthy document after poison pills").unwrap();
+        let helper = f.0.join("pdf-timeout-helper");
+        executable(&helper, "#!/bin/sh\ncat >/dev/null\nwhile :; do :; done\n");
+
+        let root_str = root.to_str().unwrap();
+        f.run(&[
+            "index",
+            "--root",
+            root_str,
+            "--content-root",
+            root_str,
+            "--documents",
+            "--pdf-helper",
+            helper.to_str().unwrap(),
+        ]);
+        fs::set_permissions(&denied_doc, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let first = f.run(&["content"]);
+        assert_eq!(first["processed"], 0);
+        assert_eq!(first["indexed"], 0);
+        assert!(first["skipped"].as_u64().unwrap() >= 1, "{first}");
+        assert_eq!(first["pending"], 3);
+
+        let second = f.run(&["content", "--max", "1"]);
+        assert_eq!(second["processed"], 1);
+        assert_eq!(second["indexed"], 1);
+        assert_eq!(second["skipped"], 1);
+        assert_eq!(second["pending"], 2);
+        assert_eq!(
+            Serve::new(&f).names("healthy document after poison pills", "text"),
+            ["03-healthy.md"]
+        );
+
+        let denied_only = f.run(&["content", "--max", "1"]);
+        assert_eq!(denied_only["processed"], 0);
+        assert!(
+            denied_only["skipped"].as_u64().unwrap() >= 1,
+            "{denied_only}"
+        );
+        fs::set_permissions(&denied_doc, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn embed_and_image_index_stream_flags_emit_valid_json_lines() {
+        let f = Fixture::new();
+        let docs = f.0.join("docs");
+        let empty_images = f.0.join("empty-images");
+        fs::create_dir_all(&docs).unwrap();
+        fs::create_dir_all(&empty_images).unwrap();
+
+        // Empty Gemma content scope with `--stream` emits one clean EmbedBatch line without booting llama-server.
+        f.run(&[
+            "index",
+            "--root",
+            empty_images.to_str().unwrap(),
+            "--documents",
+        ]);
+        let empty_gemma = f
+            .cli()
+            .args([
+                "embed",
+                "--gemma",
+                "--gemma-home",
+                f.0.join("unused-gemma").to_str().unwrap(),
+                "--stream",
+                "--max",
+                "32",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            empty_gemma.status.success(),
+            "{}",
+            String::from_utf8_lossy(&empty_gemma.stderr)
+        );
+        let empty_gemma_lines: Vec<Value> = String::from_utf8_lossy(&empty_gemma.stdout)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            empty_gemma_lines,
+            [serde_json::json!({"new_embeddings":0,"skipped_chunks":0,"has_more":false})]
+        );
+
+        for i in 0..5 {
+            fs::write(docs.join(format!("doc-{i}.md")), format!("Stream body {i}")).unwrap();
+        }
+        let helper = f.0.join("embed-helper");
+        executable(
+            &helper,
+            "#!/bin/sh\ncat >/dev/null\nprintf '[1,0,0,0,0,0,0,0]\\n'\n",
+        );
+
+        f.run(&[
+            "index",
+            "--root",
+            docs.to_str().unwrap(),
+            "--root",
+            empty_images.to_str().unwrap(),
+            "--content-root",
+            docs.to_str().unwrap(),
+        ]);
+        f.run(&["content", "--max", "32"]);
+
+        let stream_out = f
+            .cli()
+            .args([
+                "embed",
+                "--helper",
+                helper.to_str().unwrap(),
+                "--stream",
+                "--max",
+                "2",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            stream_out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&stream_out.stderr)
+        );
+        let lines: Vec<Value> = String::from_utf8_lossy(&stream_out.stdout)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0],
+            serde_json::json!({"new_embeddings":2,"skipped_chunks":0,"has_more":true})
+        );
+        assert_eq!(
+            lines[1],
+            serde_json::json!({"new_embeddings":2,"skipped_chunks":0,"has_more":true})
+        );
+        assert_eq!(
+            lines[2],
+            serde_json::json!({"new_embeddings":1,"skipped_chunks":0,"has_more":false})
+        );
+
+        // Verify `image-index --stream` on an empty folder emits 1 ImageBatch JSON line cleanly.
+        f.run(&["image-scope", empty_images.to_str().unwrap()]);
+        let image_out = f
+            .cli()
+            .args([
+                "image-index",
+                "--projector",
+                f.0.join("unused.gguf").to_str().unwrap(),
+                "--stream",
+                "--max",
+                "16",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            image_out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&image_out.stderr)
+        );
+        let image_lines: Vec<Value> = String::from_utf8_lossy(&image_out.stdout)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(image_lines.len(), 1);
+        assert_eq!(image_lines[0]["processed"], 0);
+        assert_eq!(image_lines[0]["next_after"], Value::Null);
     }
 }

@@ -6,7 +6,34 @@ use serde_json::json;
 use std::{
     io::{self, BufRead, Write},
     path::PathBuf,
+    sync::atomic::{AtomicBool, Ordering},
 };
+
+static STOP_STREAM: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_stream_stop(_: libc::c_int) {
+    STOP_STREAM.store(true, Ordering::Release);
+}
+
+fn install_stream_stop_handler() {
+    STOP_STREAM.store(false, Ordering::Release);
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handle_stream_stop as *const () as usize;
+        action.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+        libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
+    }
+}
+
+fn write_json_line<T: Serialize + ?Sized>(value: &T) -> Result<()> {
+    let mut out = io::stdout().lock();
+    serde_json::to_writer(&mut out, value)?;
+    writeln!(out)?;
+    out.flush()?;
+    Ok(())
+}
 
 #[derive(Parser)]
 #[command(version, about = "Lumen — local search / 本地搜索")]
@@ -239,6 +266,9 @@ enum Action {
         after: Option<String>,
         #[arg(long, default_value_t = 8)]
         max: usize,
+        /// Keep the Gemma vision model running across batches and emit one JSON line per batch.
+        #[arg(long)]
+        stream: bool,
     },
     /// Serve local text-to-image candidate searches over newline-delimited JSON.
     ImageServe {
@@ -272,6 +302,9 @@ enum Action {
         /// Maximum number of encodable chunks to process in this batch.
         #[arg(long, default_value_t = 32)]
         max: usize,
+        /// Keep the local model running across batches and emit one JSON line per batch.
+        #[arg(long)]
+        stream: bool,
     },
     /// Check installed local semantic resources without modifying the index.
     ModelStatus {
@@ -651,16 +684,31 @@ fn main() -> Result<()> {
         Action::Diagnose { path } => {
             println!("{}", serde_json::to_string(&lumen::diagnose(&db, &path))?);
         }
-        Action::Embed { semantic, max } => {
+        Action::Embed {
+            semantic,
+            max,
+            stream,
+        } => {
             let gemma_home = semantic.gemma_home.clone();
             let model = match semantic.configure()? {
                 Some(model) => model,
                 None => ConfiguredModel::Gemma(GemmaModel::installed(gemma_home.as_deref())?),
             };
-            println!(
-                "{}",
-                serde_json::to_string(&lumen::embed_batch(&db, model.backend(), max)?)?
-            );
+            if stream {
+                install_stream_stop_handler();
+                lumen::EmbedBatch::stream(
+                    &db,
+                    model.backend(),
+                    max,
+                    &STOP_STREAM,
+                    write_json_line,
+                )?;
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string(&lumen::embed_batch(&db, model.backend(), max)?)?
+                );
+            }
         }
         Action::ModelStatus {
             gemma: true,
@@ -693,18 +741,32 @@ fn main() -> Result<()> {
             gemma_home,
             after,
             max,
+            stream,
         } => {
             let model = GemmaModel::installed(gemma_home.as_deref())?;
-            println!(
-                "{}",
-                serde_json::to_string(&lumen::image_batch(
+            if stream {
+                install_stream_stop_handler();
+                lumen::ImageSearchSession::index_stream(
                     &db,
                     &model,
                     &projector,
                     after.as_deref(),
-                    max
-                )?)?
-            );
+                    max,
+                    &STOP_STREAM,
+                    write_json_line,
+                )?;
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string(&lumen::image_batch(
+                        &db,
+                        &model,
+                        &projector,
+                        after.as_deref(),
+                        max
+                    )?)?
+                );
+            }
         }
         Action::ImageServe {
             projector,

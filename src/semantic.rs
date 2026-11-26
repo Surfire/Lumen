@@ -9,7 +9,12 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use std::{collections::HashMap, ops::Range, path::Path};
+use std::{
+    collections::HashMap,
+    ops::Range,
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 const CHUNK_CHARS: usize = 480;
 const EARLIEST_BREAK: usize = 300;
@@ -191,17 +196,22 @@ const GEMMA_VECTOR: &str = "typeof(v.vector)='blob' AND length(v.vector) IN (?2/
 const GEMMA_MIN_COSINE: f32 = f32::MIN_POSITIVE;
 const GEMMA_Z_THRESHOLD: f64 = 1.0;
 
-fn documents_enabled(conn: &Connection) -> Result<bool> {
+fn scope_state(conn: &Connection) -> Result<(Option<String>, bool)> {
     let saved: Option<String> = conn
         .query_row("SELECT value FROM info WHERE key='scope'", [], |row| {
             row.get(0)
         })
         .optional()?;
-    Ok(saved
+    let enabled = saved
         .as_deref()
         .map(serde_json::from_str::<crate::Scope>)
         .transpose()?
-        .is_some_and(|scope| scope.documents))
+        .is_some_and(|scope| scope.documents);
+    Ok((saved, enabled))
+}
+
+fn documents_enabled(conn: &Connection) -> Result<bool> {
+    Ok(scope_state(conn)?.1)
 }
 
 const GEMMA_QUEUE: &str = "FROM semantic_chunk c JOIN item i ON i.id=c.document_id
@@ -265,63 +275,195 @@ fn gemma_limit() -> i64 {
     vector_limit(gemma::DIMENSIONS as i64)
 }
 
+trait PassageEncoder {
+    fn encode_passage(&mut self, text: &str) -> Result<Vec<f32>>;
+}
+
+impl PassageEncoder for crate::model::Encoder<'_> {
+    fn encode_passage(&mut self, text: &str) -> Result<Vec<f32>> {
+        self.encode(Role::Passage, text)
+    }
+}
+
+fn embed_gemma_batch(
+    conn: &mut Connection,
+    encoder: &mut impl PassageEncoder,
+    max: usize,
+    initial_scope: Option<&str>,
+    stop: Option<&AtomicBool>,
+) -> Result<(EmbedBatch, bool)> {
+    let (scope_now, enabled) = scope_state(conn)?;
+    if !enabled || initial_scope.is_some_and(|expected| scope_now.as_deref() != Some(expected)) {
+        return Ok((EmbedBatch::default(), true));
+    }
+    let limit = gemma_limit();
+    if gemma_count(conn)? >= limit || !gemma_pending(conn)? {
+        return Ok((EmbedBatch::default(), false));
+    }
+    let max = max.clamp(1, MAX_BATCH);
+    let mut items = Vec::with_capacity(max);
+    let mut prepared = 0;
+    let mut after = 0_i64;
+    let extra_budget = max.max(32);
+    while items.len() < max {
+        if stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Ok((EmbedBatch::default(), true));
+        }
+        let (scope_now, enabled) = scope_state(conn)?;
+        if !enabled || initial_scope.is_some_and(|expected| scope_now.as_deref() != Some(expected))
+        {
+            return Ok((EmbedBatch::default(), true));
+        }
+        let remaining = (max - items.len()) as i64;
+        let mut stmt = conn.prepare_cached(&format!(
+            "WITH next AS (SELECT c.id,c.document_id,c.start_byte,c.end_byte {GEMMA_QUEUE} AND c.id>?2 ORDER BY c.id LIMIT ?3)
+             SELECT c.id, CAST(substr(CAST(d.body AS BLOB),c.start_byte+1,c.end_byte-c.start_byte) AS TEXT)
+             FROM next c JOIN document d ON d.id=c.document_id ORDER BY c.id"
+        ))?;
+        let rows = stmt.query_map(params![gemma::ID, after, remaining], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut fetched = 0;
+        for row in rows {
+            let (id, text) = row?;
+            after = id;
+            items.push((id, text));
+            fetched += 1;
+        }
+        drop(stmt);
+        if fetched == 0 {
+            if prepared >= extra_budget || !prepare_next_document(conn, true)? {
+                break;
+            }
+            prepared += 1;
+        }
+    }
+    if items.is_empty() {
+        let (scope_now, enabled) = scope_state(conn)?;
+        let scope_mismatch =
+            initial_scope.is_some_and(|expected| scope_now.as_deref() != Some(expected));
+        let has_more =
+            enabled && !scope_mismatch && gemma_count(conn)? < limit && gemma_pending(conn)?;
+        return Ok((
+            EmbedBatch {
+                has_more,
+                ..EmbedBatch::default()
+            },
+            !enabled || scope_mismatch,
+        ));
+    }
+
+    let remaining_cap = (limit - gemma_count(conn)?).max(0) as usize;
+    let mut encoded = Vec::with_capacity(items.len());
+    let mut valid_encoded = 0usize;
+    let mut stopped = false;
+    for (id, text) in items {
+        if stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            stopped = true;
+            break;
+        }
+        if valid_encoded >= remaining_cap {
+            break;
+        }
+        let vector = match encoder.encode_passage(&text) {
+            Ok(vector) => {
+                valid_encoded += 1;
+                Some(pack(&vector))
+            }
+            Err(error) if error.is::<Unencodable>() => None,
+            Err(error) => return Err(error).context("compute next Gemma document chunk"),
+        };
+        encoded.push((id, vector));
+    }
+
+    let mut report = EmbedBatch::default();
+    let mut scope_changed = false;
+    if !encoded.is_empty() {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (scope_now, enabled) = scope_state(&tx)?;
+        if !enabled || initial_scope.is_some_and(|expected| scope_now.as_deref() != Some(expected))
+        {
+            scope_changed = true;
+        } else {
+            let mut count = gemma_count(&tx)?;
+            let mut insert = tx.prepare_cached(
+                "INSERT OR IGNORE INTO semantic_vector(model,chunk_id,vector)
+                 SELECT ?1,c.id,?3 FROM semantic_chunk c JOIN item i ON i.id=c.document_id
+                 JOIN document_state ds ON ds.id=c.document_id WHERE c.id=?2 AND i.availability IN ('local','provider_metadata_only')",
+            )?;
+            for (id, vector) in encoded {
+                if vector.is_some() && count >= limit {
+                    break;
+                }
+                let saved = insert.execute(params![gemma::ID, id, vector])?;
+                if vector.is_some() {
+                    count += saved as i64;
+                    report.new_embeddings += saved;
+                } else {
+                    report.skipped_chunks += saved;
+                }
+            }
+            drop(insert);
+            tx.commit()?;
+        }
+    }
+    let (scope_now, enabled) = scope_state(conn)?;
+    let scope_mismatch =
+        initial_scope.is_some_and(|expected| scope_now.as_deref() != Some(expected));
+    report.has_more =
+        enabled && !scope_mismatch && gemma_count(conn)? < limit && gemma_pending(conn)?;
+    let yielded = stopped || scope_changed || !enabled || scope_mismatch;
+    Ok((report, yielded))
+}
+
 fn embed_gemma(conn: &mut Connection, model: &crate::GemmaModel, max: usize) -> Result<EmbedBatch> {
     ensure!(
         documents_enabled(conn)?,
         "Gemma requires explicit document indexing scope"
     );
-    let mut report = EmbedBatch::default();
     if gemma_count(conn)? >= gemma_limit() || !gemma_pending(conn)? {
-        return Ok(report);
+        return Ok(EmbedBatch::default());
     }
     let mut encoder = ModelBackend::Gemma(model).connect()?;
-    let max = max.clamp(1, MAX_BATCH);
-    let mut prepared = 0;
-    let mut after = 0_i64;
-    for _ in 0..max {
-        if !documents_enabled(conn)? || gemma_count(conn)? >= gemma_limit() {
+    Ok(embed_gemma_batch(conn, &mut encoder, max, None, None)?.0)
+}
+
+fn stream_gemma_with<E: PassageEncoder>(
+    conn: &mut Connection,
+    max: usize,
+    stop: &AtomicBool,
+    connect: impl FnOnce() -> Result<E>,
+    mut emit: impl FnMut(&EmbedBatch) -> Result<()>,
+) -> Result<()> {
+    let (initial_scope, enabled) = scope_state(conn)?;
+    ensure!(enabled, "Gemma requires explicit document indexing scope");
+    if gemma_count(conn)? >= gemma_limit() || !gemma_pending(conn)? {
+        emit(&EmbedBatch::default())?;
+        return Ok(());
+    }
+    let mut encoder = connect()?;
+    loop {
+        if stop.load(Ordering::Acquire) {
             break;
         }
-        let next = loop {
-            let row: Option<(i64, String)> = conn.prepare_cached(&format!(
-                "WITH next AS (SELECT c.id,c.document_id,c.start_byte,c.end_byte {GEMMA_QUEUE} AND c.id>?2 ORDER BY c.id LIMIT 1)
-                 SELECT c.id, CAST(substr(CAST(d.body AS BLOB),c.start_byte+1,c.end_byte-c.start_byte) AS TEXT)
-                 FROM next c JOIN document d ON d.id=c.document_id"
-            ))?.query_row(params![gemma::ID, after], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-            if row.is_some() || prepared >= max.max(32) || !prepare_next_document(conn, true)? {
-                break row;
-            }
-            prepared += 1;
-        };
-        let Some((id, text)) = next else {
-            break;
-        };
-        after = id;
-        let vector = match encoder.encode(Role::Passage, &text) {
-            Ok(vector) => Some(pack(&vector)),
-            Err(error) if error.is::<Unencodable>() => None,
-            Err(error) => return Err(error).context("compute next Gemma document chunk"),
-        };
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if !documents_enabled(&tx)? || gemma_count(&tx)? >= gemma_limit() {
-            break;
-        }
-        let saved = tx.execute(
-            "INSERT OR IGNORE INTO semantic_vector(model,chunk_id,vector)
-             SELECT ?1,c.id,?3 FROM semantic_chunk c JOIN item i ON i.id=c.document_id
-             JOIN document_state ds ON ds.id=c.document_id WHERE c.id=?2 AND i.availability IN ('local','provider_metadata_only')",
-            params![gemma::ID, id, vector],
+        let (batch, yielded) = embed_gemma_batch(
+            conn,
+            &mut encoder,
+            max,
+            initial_scope.as_deref(),
+            Some(stop),
         )?;
-        tx.commit()?;
-        if vector.is_some() {
-            report.new_embeddings += saved;
-        } else {
-            report.skipped_chunks += saved;
+        if yielded && batch.new_embeddings == 0 && batch.skipped_chunks == 0 {
+            break;
+        }
+        let done =
+            !batch.has_more || (batch.new_embeddings == 0 && batch.skipped_chunks == 0) || yielded;
+        emit(&batch)?;
+        if done {
+            break;
         }
     }
-    report.has_more =
-        documents_enabled(conn)? && gemma_count(conn)? < gemma_limit() && gemma_pending(conn)?;
-    Ok(report)
+    Ok(())
 }
 
 pub(super) enum GemmaQuery {
@@ -479,6 +621,62 @@ pub struct EmbedBatch {
     pub has_more: bool,
 }
 
+impl EmbedBatch {
+    pub fn stream(
+        database: &Path,
+        model: ModelBackend<'_>,
+        max: usize,
+        stop: &AtomicBool,
+        mut emit: impl FnMut(&Self) -> Result<()>,
+    ) -> Result<()> {
+        let database = absolute(database)?;
+        match model {
+            ModelBackend::Gemma(model) => {
+                ensure!(
+                    crate::open_read(&database).and_then(|conn| documents_enabled(&conn))?,
+                    "Gemma requires explicit document indexing scope"
+                );
+                let (mut conn, _lease) = open_write(&database, false)?;
+                stream_gemma_with(
+                    &mut conn,
+                    max,
+                    stop,
+                    || ModelBackend::Gemma(model).connect(),
+                    &mut emit,
+                )
+            }
+            other => {
+                let (mut conn, _lease) = open_write(&database, false)?;
+                let mut encoder = other.connect()?;
+                let signature = encoder.signature().to_owned();
+                let initial_scope = scope_state(&conn)?.0;
+                let mut expected = State::read(&conn)?.model;
+                loop {
+                    if stop.load(Ordering::Acquire) || scope_state(&conn)?.0 != initial_scope {
+                        break;
+                    }
+                    let batch = embed_encoder_batch(
+                        &mut conn,
+                        &mut encoder,
+                        &signature,
+                        &mut expected,
+                        max,
+                    )?;
+                    let done = !batch.has_more
+                        || (batch.new_embeddings == 0 && batch.skipped_chunks == 0)
+                        || stop.load(Ordering::Acquire)
+                        || scope_state(&conn)?.0 != initial_scope;
+                    emit(&batch)?;
+                    if done {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 pub fn embed_batch(database: &Path, model: ModelBackend<'_>, max: usize) -> Result<EmbedBatch> {
     if matches!(model, ModelBackend::Gemma(_)) {
         ensure!(
@@ -493,6 +691,16 @@ pub fn embed_batch(database: &Path, model: ModelBackend<'_>, max: usize) -> Resu
     let mut encoder = model.connect()?;
     let signature = encoder.signature().to_owned();
     let mut expected = State::read(&conn)?.model;
+    embed_encoder_batch(&mut conn, &mut encoder, &signature, &mut expected, max)
+}
+
+fn embed_encoder_batch(
+    conn: &mut Connection,
+    encoder: &mut crate::model::Encoder<'_>,
+    signature: &str,
+    expected: &mut Option<String>,
+    max: usize,
+) -> Result<EmbedBatch> {
     let mut report = EmbedBatch::default();
     let mut prepared = 0;
     let mut attempted = 0;
@@ -500,14 +708,14 @@ pub fn embed_batch(database: &Path, model: ModelBackend<'_>, max: usize) -> Resu
     let max = max.clamp(1, MAX_BATCH);
     let extra_budget = max.max(32);
     while attempted < max && unencodable < extra_budget {
-        let state = State::read(&conn)?;
-        state.check_model(&signature, expected.as_deref())?;
-        let reuse = state.model.as_deref() == Some(&signature);
+        let state = State::read(conn)?;
+        state.check_model(signature, expected.as_deref())?;
+        let reuse = state.model.as_deref() == Some(signature);
         if reuse && state.full() {
             break;
         }
-        let Some((id, text)) = next_chunk(&conn, reuse, &signature)? else {
-            if prepared >= extra_budget || !prepare_next_document(&mut conn, false)? {
+        let Some((id, text)) = next_chunk(conn, reuse, signature)? else {
+            if prepared >= extra_budget || !prepare_next_document(conn, false)? {
                 break;
             }
             prepared += 1;
@@ -518,7 +726,7 @@ pub fn embed_batch(database: &Path, model: ModelBackend<'_>, max: usize) -> Resu
         let vector = match encoder.encode(Role::Passage, &text) {
             Ok(vector) => vector,
             Err(error) if error.is::<Unencodable>() => {
-                report.skipped_chunks += save_skip(&mut conn, id, &signature, expected.as_deref())?;
+                report.skipped_chunks += save_skip(conn, id, signature, expected.as_deref())?;
                 unencodable += 1;
                 continue;
             }
@@ -532,16 +740,16 @@ pub fn embed_batch(database: &Path, model: ModelBackend<'_>, max: usize) -> Resu
             }
         };
         attempted += 1;
-        if save_vector(&mut conn, id, &vector, &signature, expected.as_deref())? {
-            expected = Some(signature.clone());
+        if save_vector(conn, id, &vector, signature, expected.as_deref())? {
+            *expected = Some(signature.to_owned());
             report.new_embeddings += 1;
         }
     }
-    let state = State::read(&conn)?;
-    state.check_model(&signature, expected.as_deref())?;
-    let reuse = state.model.as_deref() == Some(&signature);
+    let state = State::read(conn)?;
+    state.check_model(signature, expected.as_deref())?;
+    let reuse = state.model.as_deref() == Some(signature);
     if !(reuse && state.full()) {
-        report.has_more = next_chunk(&conn, reuse, &signature)?.is_some()
+        report.has_more = next_chunk(conn, reuse, signature)?.is_some()
             || conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM semantic_document p JOIN item i ON i.id=p.document_id
                    WHERE p.prepared=0 AND i.availability IN ('local','provider_metadata_only'))",
@@ -1255,5 +1463,173 @@ mod tests {
         );
         assert_eq!(vector_limit(512), MAX_EMBEDDED_CHUNKS);
         assert_eq!(vector_limit(4096), MAX_VECTOR_BYTES / (4096 * 4));
+    }
+
+    #[test]
+    fn gemma_stream_connects_once_commits_batches_atomically_and_yields_on_stop_or_scope_change() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-gemma-stream-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let docs = root.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        for i in 0..5 {
+            fs::write(docs.join(format!("doc-{i}.txt")), format!("Paragraph {i}")).unwrap();
+        }
+        let database = root.join("index.sqlite");
+        crate::scan(
+            &database,
+            &Scope {
+                roots: vec![docs.clone()],
+                documents: true,
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+
+        type EncodeCallback = Box<dyn FnMut(usize, &str) -> Result<Vec<f32>>>;
+        struct MockEncoder {
+            calls: usize,
+            on_encode: EncodeCallback,
+        }
+        impl PassageEncoder for MockEncoder {
+            fn encode_passage(&mut self, text: &str) -> Result<Vec<f32>> {
+                self.calls += 1;
+                (self.on_encode)(self.calls, text)
+            }
+        }
+
+        let (mut conn, _lease) = open_write(&database, false).unwrap();
+        let mut connect_count = 0usize;
+        let stop = AtomicBool::new(false);
+        let mut batches = Vec::new();
+        stream_gemma_with(
+            &mut conn,
+            2,
+            &stop,
+            || {
+                connect_count += 1;
+                Ok(MockEncoder {
+                    calls: 0,
+                    on_encode: Box::new(|call, _| {
+                        if call == 2 {
+                            return Err(Unencodable.into());
+                        }
+                        Ok(query_vector())
+                    }),
+                })
+            },
+            |batch| {
+                batches.push((batch.new_embeddings, batch.skipped_chunks, batch.has_more));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(connect_count, 1);
+        assert_eq!(batches, [(1, 1, true), (2, 0, true), (1, 0, false)]);
+        let coverage = gemma_coverage(&conn).unwrap();
+        assert_eq!(coverage.embedded_chunks, 4);
+        assert_eq!(coverage.skipped_chunks, 1);
+        assert!(!coverage.pending);
+
+        // Clean no-op emission without connecting when nothing is pending.
+        let mut idle_connects = 0usize;
+        let mut idle_batches = Vec::new();
+        stream_gemma_with(
+            &mut conn,
+            32,
+            &stop,
+            || {
+                idle_connects += 1;
+                Ok(MockEncoder {
+                    calls: 0,
+                    on_encode: Box::new(|_, _| Ok(query_vector())),
+                })
+            },
+            |batch| {
+                idle_batches.push((batch.new_embeddings, batch.skipped_chunks, batch.has_more));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(idle_connects, 0);
+        assert_eq!(idle_batches, [(0, 0, false)]);
+
+        // Re-seed 3 new documents to verify mid-batch signal termination and scope-change yielding.
+        for i in 5..8 {
+            fs::write(docs.join(format!("doc-{i}.txt")), format!("Extra {i}")).unwrap();
+        }
+        drop(conn);
+        crate::scan(
+            &database,
+            &Scope {
+                roots: vec![docs.clone()],
+                documents: true,
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        let (mut conn, _lease) = open_write(&database, false).unwrap();
+        let stop_flag = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_trigger = stop_flag.clone();
+        let mut stopped_batches = Vec::new();
+        stream_gemma_with(
+            &mut conn,
+            2,
+            &stop_flag,
+            || {
+                Ok(MockEncoder {
+                    calls: 0,
+                    on_encode: Box::new(move |call, _| {
+                        if call == 1 {
+                            stop_trigger.store(true, Ordering::Release);
+                        }
+                        Ok(query_vector())
+                    }),
+                })
+            },
+            |batch| {
+                stopped_batches.push((batch.new_embeddings, batch.skipped_chunks, batch.has_more));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(stopped_batches, [(1, 0, true)]);
+        assert_eq!(gemma_coverage(&conn).unwrap().embedded_chunks, 5);
+
+        // Mutate scope mid-run and confirm the stream yields cleanly without committing stale work.
+        let db_for_scope = database.clone();
+        let mut scope_batches = Vec::new();
+        let stop = AtomicBool::new(false);
+        stream_gemma_with(
+            &mut conn,
+            2,
+            &stop,
+            || {
+                Ok(MockEncoder {
+                    calls: 0,
+                    on_encode: Box::new(move |_, _| {
+                        Connection::open(&db_for_scope)
+                            .unwrap()
+                            .execute(
+                                "UPDATE info SET value=json_set(value,'$.deny',json_array('/tmp/x')) WHERE key='scope'",
+                                [],
+                            )
+                            .unwrap();
+                        Ok(query_vector())
+                    }),
+                })
+            },
+            |batch| {
+                scope_batches.push((batch.new_embeddings, batch.skipped_chunks, batch.has_more));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(scope_batches.is_empty());
+        assert_eq!(gemma_coverage(&conn).unwrap().embedded_chunks, 5);
+
+        drop(conn);
+        fs::remove_dir_all(root).unwrap();
     }
 }

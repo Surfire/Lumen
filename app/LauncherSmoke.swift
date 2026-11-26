@@ -3791,16 +3791,20 @@ final class LauncherSmoke {
             }
             try signal("finish-watch-progress")
         }
-        try await until("watch notification refreshed active results") { model.hits.first?.name == "watchneedle.txt" }
+        try await until("watch notification refreshed active results and PanelGeometry") {
+            model.hits.first?.name == "watchneedle.txt" &&
+                app.panel.frame.size == PanelGeometry.size(for: app.panelState, rows: model.visibleResults, showsResults: model.showsResults)
+        }
         try check(model.watchProgress == nil, "watch completion left progress busy")
-        try check(app.panel.frame.size == PanelGeometry.size(for: app.panelState, rows: model.visibleResults, showsResults: model.showsResults) &&
-                  abs(app.panel.frame.maxY - top) <= 1, "watch addition did not match compact PanelGeometry or moved top edge")
+        try check(abs(app.panel.frame.maxY - top) <= 1, "watch addition moved top edge")
         if !controlledTiming {
             try FileManager.default.removeItem(at: file)
-            try await until("watch notification removed deleted result") { model.hits.isEmpty && !model.searching }
+            try await until("watch notification removed deleted result and restored compact PanelGeometry") {
+                model.hits.isEmpty && !model.searching &&
+                    app.panel.frame.size == PanelGeometry.size(for: app.panelState, rows: model.visibleResults, showsResults: model.showsResults)
+            }
         }
-        try check(app.panel.frame.size == PanelGeometry.size(for: app.panelState, rows: model.visibleResults, showsResults: model.showsResults) &&
-                  abs(app.panel.frame.maxY - top) <= 1, "watch events broke PanelGeometry or moved the launcher top edge")
+        try check(abs(app.panel.frame.maxY - top) <= 1, "watch events moved the launcher top edge")
     }
 
     private func verifyCloudAction(_ app: AppDelegate) async throws {
@@ -4371,8 +4375,26 @@ final class LauncherSmoke {
         try key(kVK_Tab, "\t", in: app)
         try check(field.string == "unmatched_tab_text" && !field.string.contains("\t"),
                   "Tab inserted a literal tab character")
+        // 7. Lane 2B checks: calculator exponentiation/comma grouping and locale-aware wiki URLs.
+        let power = CalculationResult.evaluate("2^10")
+        let nestedPower = CalculationResult.evaluate("2^3^2")
+        let grouped = CalculationResult.evaluate("1,000 + 2,500")
+        try check(power?.display == "1,024" && power?.copyValue == "1024" &&
+                  nestedPower?.display == "512" &&
+                  grouped?.display == "3,500" && grouped?.copyValue == "3500",
+                  "calculator exponentiation or comma formatting mismatch")
+        let zhCatalog = LumenCommandCatalog(includeOptionalLinks: true, chinese: true)
+        let enCatalog = LumenCommandCatalog(includeOptionalLinks: true, chinese: false)
+        if case .web(_, _, let zhURL) = zhCatalog.resolve("wiki lumen"),
+           case .web(_, _, let enURL) = enCatalog.resolve("wiki lumen") {
+            try check(zhURL.host == "zh.wikipedia.org" && enURL.host == "en.wikipedia.org",
+                      "wiki URL did not follow UI language: \(zhURL) / \(enURL)")
+        } else {
+            throw Failure("wiki command failed to resolve under locale catalogs")
+        }
+
         try type("", into: app)
-        print("Phase 2 core regressions passed (HotKey, PanelGeometry, ranking, 2-Han semantic trigger, image-status retry, Tab)")
+        print("Phase 2 core regressions passed (HotKey, PanelGeometry, ranking, 2-Han semantic trigger, image-status retry, Tab, calc ^/commas, wiki locale)")
     }
 
     private func verifyPhase2LiveFileInteractions(_ app: AppDelegate) async throws {

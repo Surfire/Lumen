@@ -301,10 +301,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }.store(in: &cancellables)
         model.shortcuts.$entries.combineLatest(model.shortcuts.$includeOptionalLinks)
             .sink { [weak self] entries, includeOptionalLinks in
-                guard let self else { return }
-                self.catalog = LumenCommandCatalog(includeOptionalLinks: includeOptionalLinks,
-                                                   additionalLinks: entries.compactMap(\.queryLink))
-                if self.searchPresented { self.searchFieldAction() }
+                self?.updateCatalog(entries: entries, includeOptionalLinks: includeOptionalLinks)
             }.store(in: &cancellables)
         imageSearch.objectWillChange.sink { [weak self] _ in
             DispatchQueue.main.async { [weak self] in
@@ -1425,8 +1422,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
     }
 
+    private func updateCatalog(entries: [SavedShortcut]? = nil, includeOptionalLinks: Bool? = nil) {
+        let resolvedEntries = entries ?? model.shortcuts.entries
+        let resolvedOptional = includeOptionalLinks ?? model.shortcuts.includeOptionalLinks
+        catalog = LumenCommandCatalog(includeOptionalLinks: resolvedOptional,
+                                      additionalLinks: resolvedEntries.compactMap(\.queryLink),
+                                      chinese: model.zh)
+        if searchPresented { searchFieldAction() }
+    }
+
     private func updateLanguage() {
         updateSearchField()
+        updateCatalog()
         updateStatusMenu()
         installEditMenu()
         settings?.title = model.t("Lumen 设置", "Lumen Settings")

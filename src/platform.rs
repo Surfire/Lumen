@@ -226,8 +226,8 @@ pub(crate) fn stream_rest_duration(
     let bounded = work.min(Duration::from_secs(60));
     match (thermal, on_battery) {
         (ThermalPressure::Nominal, false) => bounded
-            .mul_f64(1.2)
-            .clamp(Duration::from_millis(150), Duration::from_secs(4)),
+            .mul_f64(2.0)
+            .clamp(Duration::from_millis(200), Duration::from_secs(5)),
         (ThermalPressure::Fair, false) | (ThermalPressure::Nominal, true) => bounded
             .mul_f64(3.5)
             .clamp(Duration::from_millis(300), Duration::from_secs(8)),
@@ -888,10 +888,10 @@ mod tests {
             assert_eq!(stream_rest_duration(secs(2), thermal, battery), secs(1));
         }
 
-        // Nominal on AC: 1.2x clamped to [150ms, 4s].
-        assert_eq!(stream_rest_duration(ms(50), Nominal, false), ms(150));
-        assert_eq!(stream_rest_duration(ms(1000), Nominal, false), ms(1200));
-        assert_eq!(stream_rest_duration(secs(5), Nominal, false), secs(4));
+        // Nominal on AC: 2.0x clamped to [200ms, 5s] (~33% GPU duty cycle).
+        assert_eq!(stream_rest_duration(ms(50), Nominal, false), ms(200));
+        assert_eq!(stream_rest_duration(ms(1000), Nominal, false), secs(2));
+        assert_eq!(stream_rest_duration(secs(5), Nominal, false), secs(5));
 
         // Fair on AC or Nominal on battery: 3.5x clamped to [300ms, 8s].
         for (thermal, battery) in [(Fair, false), (Nominal, true)] {
@@ -929,7 +929,7 @@ mod tests {
         assert_eq!(sampled.get(), 0);
         assert!(sleeps.is_empty());
 
-        // Immediate wakeup on stop during normal rest (1.2s -> stops after 3x50ms = 150ms).
+        // Immediate wakeup on stop during normal rest (2s -> stops after 3x50ms = 150ms).
         let stop = AtomicBool::new(false);
         let mut normal_sleeps = Vec::new();
         pace_stream_batch_with(

@@ -536,8 +536,8 @@ struct LauncherSettings: View {
     @ViewBuilder private var contentScopeSummary: some View {
         if let preview = session.contentPreview {
             let counts = preview.by_category
-            note(model.t("约 \(preview.total_files.formatted()) 个文件 · PDF \(counts.pdf.formatted()) · DOCX \(counts.docx.formatted()) · 文本 \(counts.text.formatted()) · 图片 \(counts.images.formatted()) · 代码 \(counts.code.formatted())",
-                         "About \(preview.total_files.formatted()) files · PDF \(counts.pdf.formatted()) · DOCX \(counts.docx.formatted()) · Text \(counts.text.formatted()) · Images \(counts.images.formatted()) · Code \(counts.code.formatted())"))
+            note(model.t("约 \(preview.total_files.formatted()) 个文件 · PDF \(counts.pdf.formatted()) · Office \(counts.docx.formatted()) · 文本 \(counts.text.formatted()) · 图片 \(counts.images.formatted()) · 代码 \(counts.code.formatted())",
+                         "About \(preview.total_files.formatted()) files · PDF \(counts.pdf.formatted()) · Office \(counts.docx.formatted()) · Text \(counts.text.formatted()) · Images \(counts.images.formatted()) · Code \(counts.code.formatted())"))
                 .accessibilityIdentifier("settings.content.preview")
             let noise = preview.top_subfolders.filter { $0.suggested_noise && !session.contentFilter.deny_folders.contains($0.path) }
             if !noise.isEmpty {
@@ -646,7 +646,7 @@ struct LauncherSettings: View {
                     .font(.callout)
             }
         }
-        semanticIndexStatus.font(.callout).foregroundStyle(.secondary)
+        semanticIndexStatus.font(.callout)
         LauncherImageSettings(launcher: model, images: images).font(.callout)
         if let notice = indexStatus.embeddingNotice { NoticeView(model: model, notice: notice) }
         HStack(spacing: 10) {
@@ -1012,27 +1012,50 @@ struct LauncherSettings: View {
         if let coverage = indexStatus.gemmaCoverage {
             let count = coverage.embedded_chunks.formatted()
             let limit = coverage.chunk_limit.formatted()
+            let partial = coverage.documents_enabled && !coverage.complete && !coverage.limited && coverage.pending
             if !coverage.documents_enabled {
                 Text(model.t("启用正文索引才能生成语义索引。", "Enable document indexing to build a semantic index."))
+                    .foregroundStyle(.secondary)
             } else if coverage.limited && coverage.hasResults {
                 Text(model.t("已达到 \(limit) 段的存储上限。已建立索引的 \(count) 段仍可检索。",
                              "Storage limit reached (\(limit) chunks). The \(count) indexed chunks are still searchable."))
+                    .foregroundStyle(.secondary)
             } else if coverage.limited {
                 Text(model.t("已达到语义索引存储上限。", "The semantic index reached its storage limit."))
+                    .foregroundStyle(.secondary)
             } else if coverage.complete {
                 Text(model.t("语义索引已就绪，包含 \(count) 段。", "Semantic index ready with \(count) chunks."))
+                    .foregroundStyle(.secondary)
+            } else if partial && [.verifying, .running, .pausing].contains(indexStatus.embeddingState) {
+                let label = indexStatus.embeddingState == .pausing
+                    ? model.t("语义向量：正在暂停 · 已完成 \(count) / \(limit) 段", "Semantic vectors: pausing · \(count) / \(limit) chunks")
+                    : model.t("语义向量：正在后台生成 · \(count) / \(limit) 段", "Semantic vectors: indexing in background · \(count) / \(limit) chunks")
+                if coverage.chunk_limit > 0 {
+                    ProgressView(value: Double(min(coverage.embedded_chunks, coverage.chunk_limit)),
+                                 total: Double(coverage.chunk_limit)) { Text(label).font(.callout) }
+                } else {
+                    ProgressView { Text(label).font(.callout) }
+                }
+            } else if partial && indexStatus.embeddingState == .paused && coverage.hasResults {
+                Text(model.t("语义向量：已暂停 · 已有 \(count) / \(limit) 段可检索",
+                             "Semantic vectors: paused · \(count) / \(limit) chunks searchable"))
+                    .foregroundStyle(.secondary)
             } else if coverage.hasResults {
-                Text(model.t("已有 \(count) 段可检索，仍有正文待处理。",
-                             "Partial semantic index: \(count) searchable chunks, with more documents to process."))
+                Text(model.t("已有 \(count) / \(limit) 段可检索，仍有正文待处理。",
+                             "Partial semantic index: \(count) / \(limit) searchable chunks, with more documents to process."))
+                    .foregroundStyle(.secondary)
             } else if indexStatus.indexWork == .embeddings || indexStatus.embeddingState == .verifying {
-                Text(model.t("正在准备语义索引…", "Preparing the semantic index…"))
+                Text(model.t("正在准备语义索引…", "Preparing the semantic index…")).foregroundStyle(.secondary)
             } else if coverage.pending {
                 Text(model.t("正文可用于生成本机语义索引。", "Documents are ready for local semantic indexing."))
+                    .foregroundStyle(.secondary)
             } else if coverage.skipped_chunks > 0 {
                 let skipped = coverage.skipped_chunks.formatted()
                 Text(model.t("已跳过 \(skipped) 段无法索引的正文。", "Skipped \(skipped) chunks that could not be indexed."))
+                    .foregroundStyle(.secondary)
             } else {
                 Text(model.t("当前范围还没有可建立语义索引的正文。", "There is no document text to index in this scope yet."))
+                    .foregroundStyle(.secondary)
             }
         }
     }

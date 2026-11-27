@@ -1,5 +1,14 @@
 # 更新记录
 
+## 0.5.5（build 37）
+
+- **默认噪音与 Python 虚拟环境精准过滤（`scope_policy_v5`）**：默认排除 `/Users/Deleted Users`、`site-packages`/`dist-packages` 与 `*venv*` 变体目录，并通过 PEP 405 `pyvenv.cfg` 真实文件系统标记停止下钻（对云占位目录豁免多余检测）。
+- **瞬态文件前置过滤**：在 `Scope::excludes` 剔除 `-wal`/`-shm`/`-journal`/`.heartbeat`/`.part`/`.crdownload`/`~$*`，扫描与 FSEvents `watch` 同步止刷盘，保护内存快照稳定。
+- **索引库瘦身（Schema v5）**：`name_fts` 改为关联 `item` 的外部内容表（消除冗余 `name_fts_content` 影子表；新建库即时生效，旧库在 `<= 4 GiB` 且大清理可回收空间 `>= 15%` / `64 MiB` 后自动 `VACUUM` 缩容，更大向量库由 SQLite freelist 复用，避免启动卡顿）。
+- **应用与活文件排序校准**：`INSTALLED_APP` 优先匹配 `/Applications` / `/System/Applications` / `~/Applications` 正式应用（去 `.app` 精准命中）；将 `backups`/`retention`/`staging`/`archive`/`作废归档` 等归档目录自然降权让位于活文件。
+- **零新增依赖 `.xlsx` / `.pptx` 全文解析**：复用 `zip` + `quick-xml` 支持 Excel 单元格与 PPTX（上限 64 MB）幻灯片及演讲备注提取，设置页统一标注 `Office`（支持 DOCX / XLSX / PPTX）；`>= 64 GB` Mac 内存名称索引预算自动放宽至 512 MiB；中国大陆时区默认选用 `HF-Mirror`。
+- **后台语义进展与显存优化**：设置页后台生成语义向量时明确展示进度条与 `已完成 / 上限` 段数；精简文本 `llama-server` 双槽上下文（`--parallel 2 --ctx-size 4096`，保持 `--ubatch-size 2048` 匹配单槽上限并把 500 超长批错兜底映射为 `Unencodable`）并采用更温和的 2.0× 常温 GPU 冷却节流。
+
 ## 0.5.4（build 36）
 
 - **后台静音温控与 GPU 占空比节流**：流式后台索引（`--stream`）基于 Darwin `com.apple.system.thermalpressurelevel` 与 IOKit 电源状态自动按批间耗时让出 GPU（交流电常温主动休眠冷却，低电量或温度升至 `Fair`/`Serious` 时进一步放慢或退避），并按 `50ms` 切片响应即时暂停。

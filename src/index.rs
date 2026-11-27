@@ -558,9 +558,35 @@ pub(super) fn restrict_scope(conn: &mut Connection, coverage: &Coverage) -> Resu
     }
     tx.commit()?;
     if purged >= 10_000 {
-        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        if let Some((total_bytes, free_bytes)) = database_page_bytes(conn)
+            && should_auto_vacuum(total_bytes, free_bytes)
+        {
+            let _ = conn.execute_batch("VACUUM;");
+        }
     }
     Ok(())
+}
+
+fn database_page_bytes(conn: &Connection) -> Option<(u64, u64)> {
+    let pragma_u64 = |name| {
+        conn.pragma_query_value(None, name, |r| r.get::<_, i64>(0))
+            .ok()
+            .and_then(|value| u64::try_from(value).ok())
+    };
+    let page_size = pragma_u64("page_size")?;
+    let page_count = pragma_u64("page_count")?;
+    let freelist_count = pragma_u64("freelist_count")?;
+    Some((
+        page_count.saturating_mul(page_size),
+        freelist_count.saturating_mul(page_size),
+    ))
+}
+
+fn should_auto_vacuum(total_bytes: u64, free_bytes: u64) -> bool {
+    total_bytes <= 4 * 1024 * 1024 * 1024
+        && free_bytes >= 64 * 1024 * 1024
+        && free_bytes.saturating_mul(100) >= total_bytes.saturating_mul(15)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1004,7 +1030,10 @@ impl<'a> Walk<'a> {
                 continue;
             };
             let opaque = directory
-                && (opaque_package(&path) || (!is_root && crate::is_python_venv_dir(&path)));
+                && (opaque_package(&path)
+                    || (!is_root
+                        && availability != "placeholder"
+                        && crate::is_python_venv_dir(&path)));
             let mut descend =
                 recursive && directory && !is_symlink && availability != "placeholder" && !opaque;
             if !recursive && directory && !is_symlink && availability != "placeholder" && !opaque {
@@ -1984,5 +2013,54 @@ mod tests {
         scan(&database, &scope).unwrap();
         assert_eq!(paths(&reader).len(), WRITE_BATCH + 1);
         assert!(!paths(&reader).contains(&root.join("record-0.txt").to_str().unwrap().to_owned()));
+    }
+
+    #[test]
+    fn should_auto_vacuum_respects_size_and_reclaimable_thresholds() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+
+        // (a) ~1.9 GB DB with ~47% free -> vacuum.
+        assert!(should_auto_vacuum(1_900 * MIB, 900 * MIB));
+
+        // (b) 12 GB DB even with 20% free -> skip to avoid freezing large vector DBs.
+        assert!(!should_auto_vacuum(12 * GIB, 12 * GIB / 5));
+
+        // (c) 1 GB DB with 20 MB free -> skip (below 64 MiB and below 15%).
+        assert!(!should_auto_vacuum(GIB, 20 * MIB));
+
+        // (d) Exact boundary values: 4 GiB max size, 64 MiB min free, 15% min ratio.
+        assert!(!should_auto_vacuum(0, 0));
+        assert!(should_auto_vacuum(400 * MIB, 64 * MIB));
+        assert!(!should_auto_vacuum(400 * MIB, 64 * MIB - 1));
+        assert!(should_auto_vacuum(1_000_000_000, 150_000_000));
+        assert!(!should_auto_vacuum(1_000_000_000, 149_999_999));
+        // At exactly 4 GiB, ceil(4 GiB * 0.15) = 644_245_095 bytes.
+        assert!(should_auto_vacuum(4 * GIB, 644_245_095));
+        assert!(!should_auto_vacuum(4 * GIB, 644_245_094));
+        assert!(!should_auto_vacuum(4 * GIB + 1, 2 * GIB));
+    }
+
+    #[test]
+    fn database_page_bytes_reports_live_sqlite_freelist_growth() {
+        let fixture = Fixture::new("page-bytes");
+        let database = fixture.0.join("index.db");
+        let (conn, _lease) = open_write(&database, true).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE scratch(payload BLOB);
+             WITH RECURSIVE cnt(x) AS (
+                 SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 128
+             )
+             INSERT INTO scratch SELECT zeroblob(4096) FROM cnt;",
+        )
+        .unwrap();
+        let (total_before, free_before) = database_page_bytes(&conn).unwrap();
+        assert!(total_before >= 128 * 4096);
+        assert_eq!(free_before, 0);
+
+        conn.execute_batch("DELETE FROM scratch;").unwrap();
+        let (total_after, free_after) = database_page_bytes(&conn).unwrap();
+        assert_eq!(total_after, total_before);
+        assert!(free_after >= 128 * 4096);
     }
 }

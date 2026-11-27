@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Surfire/Lumen/releases/tag/v0.5.4"><img src="https://img.shields.io/badge/Release-v0.5.4_(Build_36)-e11d48?style=flat-square" alt="Release v0.5.4"></a>
+  <a href="https://github.com/Surfire/Lumen/releases/tag/v0.5.5"><img src="https://img.shields.io/badge/Release-v0.5.5_(Build_37)-e11d48?style=flat-square" alt="Release v0.5.5"></a>
   <a href="https://github.com/Surfire/Lumen/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Surfire/Lumen/ci.yml?branch=main&style=flat-square&label=CI" alt="CI Status"></a>
   <img src="https://img.shields.io/badge/Platform-Apple_Silicon_%7C_macOS_14%2B-1e293b?style=flat-square" alt="Platform">
   <img src="https://img.shields.io/badge/Engine-Rust_%2B_AppKit%2FSwiftUI-0f172a?style=flat-square" alt="Stack">
@@ -51,8 +51,9 @@
 ## 核心产品亮点与特性
 
 ### 1. 百万级文件名约 1 ms 响应，常驻内存压至 ~145 MiB
-- **零倒排紧凑 SoA + AArch64 NEON**：抛弃冗重的内存倒排索引与多通道重复副本，仅在 `nameLane` 维护一套按数组结构（SoA）排布的紧凑名称表，并用 ARM64 NEON SIMD 并行扫描。
+- **零倒排紧凑 SoA + AArch64 NEON & 外部内容 FTS5**：抛弃冗重的内存倒排索引与多通道重复副本，仅在 `nameLane` 维护一套按数组结构（SoA）排布的紧凑名称表（`>= 64 GB` 内存机型自动放宽至 `512 MiB` `NameFast` 预算），并用 ARM64 NEON SIMD 并行扫描；落盘目录库采用外部内容 FTS5（Schema v5，消除冗余 `name_fts_content` 影子表）与安全阈值自动 `VACUUM`。
 - **高扇出与空排不卡顿**：在 **1,667,692 条真实磁盘项目** 上，拼音首字母 `lm` 仅 **0.79 ms**，中文双字 **0.85–0.93 ms**，高频单字回退 **1.54–1.61 ms**，不存在关键词（如 `哈基米`）**1.75 ms** 立即排空，彻底告别“输入后卡 1–2 秒才显示无结果”。
+- **正式应用优先与活文件排序校准**：`INSTALLED_APP` 优先匹配 `/Applications`、`/System/Applications` 与 `~/Applications` 下的正式应用（去 `.app` 精准直命中），并将 `backups`、`retention`、`staging`、`archive`、`作废归档` 等归档目录自然降权让位于活跃工作文件。
 
 ### 2. 视觉优先预览：PDF 匹配页高亮直达，空格与 `⌘Y` 体验统一
 - **直达页码 + 琥珀色原页高亮**：检索到 PDF 文档时，内联预览与独立预览窗不再只展示冷冰冰的纯文本摘录，而是直接渲染对应命中页，并在原页面上用琥珀色高亮匹配段落（下方附全文上下文）。
@@ -60,10 +61,10 @@
 - **统一的云盘按需同步边界**：无论在普通搜索还是剪贴板文件列表中按 `空格` 或 `⌘Y`，遇到未下载云端文件均执行同一套安全同步流程，显示进度环并支持随时按 `Esc` 取消。
 
 ### 3. 统一多模态语义索引、静音温控、智能降噪与一键下载 Gemma
-- **正文与图片统一引擎 & 公平调度**：将文档与图片目录收口至同一「语义与内容索引」配置，按文件修改时间倒序推进并采用随物理内存动态伸缩的向量预算（128 GiB 机型约 69.9 万正文片段 / 34.9 万图像向量）。冷启动先预热 `64` 张最新图片，随后在后台按「正文 `100` 批 ↔ 图像 `16` 批」公平交替推进；安装 `mmproj` 后支持主框单字视觉召回与跨模态结果融合。
-- **后台静音温控与算力优化（v0.5.4）**：基于 Darwin `thermalpressurelevel` 与 IOKit 电源状态在批间自动让出 GPU，消除长期风扇狂转；`llama-server` 禁用无用的 8 GiB Prompt Cache 与忙等轮询（`--cache-ram 0 --poll 0`，常驻内存直接减半），`gemma_pending_chunk` 物化队列消除 $O(N^2)$ 全表扫，不透明图像改传 JPEG `0.85` 缩略图并启用双槽并发编码。
-- **默认跳过开发噪音 + 渐进式规则**：添加工程/工作目录时支持先只读预扫目录文件分布，一键排除高噪音子目录；默认跳过 `node_modules`、`target`、`dist`、`build`、锁文件、压缩产物与中间文本，且**默认关闭源码索引**；其余自定义扩展名与路径规则统一折叠于「高级过滤规则…」。
-- **内置 1-Click Gemma 下载与校验器**：无需命令行配置 Python/脚本，在设置页选择 **HuggingFace** 或国内 **HF-Mirror** 源即可一键下载模型、多模态投影器与推理运行时（保留系统代理），全程强制验证 SHA-256 与精确字节大小；也支持本地已下载文件一键导入。
+- **正文（PDF / Office 全家桶）与图片统一引擎 & 公平调度**：将文档与图片目录收口至同一「语义与内容索引」配置，零新增依赖支持 **Office（`.docx` / `.xlsx` 单元格 / `.pptx` 幻灯片与演讲备注，上限 64 MB）**、PDF 与纯文本解析，按文件修改时间倒序推进并采用随物理内存动态伸缩的向量预算（128 GiB 机型约 69.9 万正文片段 / 34.9 万图像向量）。冷启动先预热 `64` 张最新图片，随后在后台按「正文 `100` 批 ↔ 图像 `16` 批」公平交替推进，并在设置页实时展示进度条与 `已完成 / 上限` 段数；安装 `mmproj` 后支持主框单字视觉召回与跨模态结果融合。
+- **后台静音温控与算力优化（v0.5.4 / v0.5.5）**：基于 Darwin `thermalpressurelevel` 与 IOKit 电源状态在批间自动让出 GPU（交流电常温 2.0× 温和冷却节流），消除长期风扇狂转；`llama-server` 禁用无用的 8 GiB Prompt Cache 与忙等轮询（`--cache-ram 0 --poll 0`）并收紧双槽上下文（`--parallel 2 --ctx-size 4096`，保持 `--ubatch-size 2048` 兼容高密度短块），`gemma_pending_chunk` 物化队列消除 $O(N^2)$ 全表扫，不透明图像改传 JPEG `0.85` 缩略图并启用双槽并发编码。
+- **默认跳过开发/虚拟环境与瞬态噪音 + 渐进式规则**：添加目录时支持只读预扫文件分布（`PDF` / `Office` / `文本` / `图片` / `代码`），一键排除高噪音子目录；默认跳过 `node_modules`、`target`、`dist`、`build`、`/Users/Deleted Users`、`site-packages`/`dist-packages` 与 `*venv*` 变体，通过 PEP 405 `pyvenv.cfg` 文件系统标记精准阻断 Python 虚拟环境下钻（豁免云占位目录），并在 `Scope::excludes` 前置剔除 `-wal`/`-shm`/`-journal`/`.heartbeat`/`.part`/`.crdownload`/`~$*` 瞬态文件以停止 FSEvents 无效刷盘；**默认关闭源码索引**，自定义规则统一折叠于「高级过滤规则…」。
+- **内置 1-Click Gemma 下载与校验器**：无需命令行配置 Python/脚本，在设置页一键下载模型、多模态投影器与推理运行时（中国大陆时区默认自动选用 **HF-Mirror**，也可随时切换 **HuggingFace**，并完整保留系统代理），全程强制验证 SHA-256 与精确字节大小；也支持本地已下载文件一键导入。
 
 ### 4. 网盘零误下载硬边界 + 物理外置盘 & SMB / NFS 网络共享
 - **内核级零唤醒保证**：扫描、文本提取、预览与诊断线程全链路强制 `IOPOL_VFS_MATERIALIZE_DATALESS_FILES_OFF`、`SF_DATALESS` 校验与 `O_NOFOLLOW_ANY`。已识别的 iCloud Drive、OneDrive 与 File Provider 目录仅记录可见元数据，**绝不偷偷触发云端文件自动下载**。
@@ -174,7 +175,7 @@
 | **全盘文件名引擎** | 自研 **Rust 零倒排 SoA + NEON**（独立脱离 `mds`） | 系统 `mds` / `mdimporter`（依赖后台调度） | 依赖 Spotlight (`mdfind`) | 依赖 Spotlight (`mdfind`) | 自研 **C + NEON** 极速扫描 | 专注内容切片向量召回，非全盘文件名启动器 |
 | **百万文件常驻内存** | **~138–145 MiB**（实测 100W–167W 文件） | 多系统守护进程后台常驻 | UI 轻量，索引开销归属 OS `mds` | UI 轻量，索引开销归属 OS `mds` | 极低纯文件名驻留内存 | 随向量库与模型权重规模动态变化 |
 | **中文拼音 & 首字母** | **原生内建**全拼与首字母缩写（`luming`/`lm`） | 仅极有限系统支持 | 需社区扩展或自定义脚本 | 需工作流插件 | 原生内建拼音与模糊匹配 | 不以拼音文件名为主要场景 |
-| **本地语义 & 以文搜图** | **免费内置** FTS + **EmbeddingGemma 2** 多模态（含 **1-Click 国内镜像下载**） | 仅关键词与元数据，无本地 Gemma | 官方 AI 为云端/Pro 订阅 | 需付费 Powerpack + 第三方扩展 | 文件名与外置盘免费；文本/图片搜需 **付费 Pro** | **免费开源** EmbeddingGemma 2 多模态深搜 |
+| **本地语义 & 以文搜图** | **免费内置** FTS（PDF + Office `.docx`/`.xlsx`/`.pptx`）+ **EmbeddingGemma 2** 多模态（含 **1-Click 国内镜像默认下载**） | 仅关键词与元数据，无本地 Gemma | 官方 AI 为云端/Pro 订阅 | 需付费 Powerpack + 第三方扩展 | 文件名与外置盘免费；文本/图片搜需 **付费 Pro** | **免费开源** EmbeddingGemma 2 多模态深搜 |
 | **PDF 原页直达与高亮** | 内联与悬浮窗 **直接渲染命中页 + 琥珀色原页高亮** | Quick Look 仅打开文件或手动二次查找 | Quick Look / 插件形式预览 | Quick Look 预览 | 侧重定位路径与常规预览 | 展示切片段落上下文定位 |
 | **空格 / `⌘Y` 与比例适配** | 两者逻辑统一 + 按 PDF CropBox / EXIF **自动缩放窗口** | 原生 Quick Look 支持部分适配 | 按扩展卡片或原生 Quick Look | 按 Quick Look 预览 | 快捷路径定位与预览 | 内置多模态切片结果面板 |
 | **云盘零误下载边界** | 线程级 `IOPOL` + `SF_DATALESS` 隔离 + 按需进度环/Esc取消 | 依赖系统 File Provider 规则 | 依赖 `mdfind` 与 Finder 机制 | 依赖 `mdfind` 与脚本实现 | 检查云占位标记避免无意触发 | 面向用户选定本机目录 |

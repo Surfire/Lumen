@@ -36,7 +36,7 @@ const MAX_PASSAGE_BYTES: usize = 8192;
 /// Passages sent per `POST /v1/embeddings` request.
 pub(crate) const PASSAGE_BATCH: usize = 16;
 const PASSAGE_BATCH_BYTES: usize = 12_000;
-const PARALLEL_SLOTS: usize = 4;
+const PARALLEL_SLOTS: usize = 2;
 const SLOT_CONTEXT: usize = 2048;
 pub(crate) const IMAGE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const IMAGE_TIMEOUT: Duration = Duration::from_secs(12);
@@ -233,13 +233,15 @@ fn server_args(
         "0".into(),
         "--poll".into(),
         "0".into(),
+        // Non-causal EmbeddingGemma requires each input to fit in one physical ubatch;
+        // derive --ubatch-size from SLOT_CONTEXT so full-slot chunks never trigger HTTP 500.
         "--batch-size".into(),
         "4096".into(),
         "--ubatch-size".into(),
-        "2048".into(),
+        SLOT_CONTEXT.to_string().into(),
         "--gpu-layers".into(),
         "99".into(),
-        // llama-server splits the context across slots; keep 2048 tokens per slot.
+        // llama-server splits the context across slots; 2 slots x 2048 keeps Metal scratch buffers lean.
         "--parallel".into(),
         PARALLEL_SLOTS.to_string().into(),
         "--ctx-size".into(),
@@ -675,9 +677,9 @@ impl GemmaWorker {
         let payload = serde_json::to_vec(&serde_json::json!({"input":inputs}))?;
         let (status, body) =
             self.request("POST /v1/embeddings", &payload, Instant::now() + timeout)?;
-        if status == 400
-            && (body.windows(9).any(|s| s == b"truncated")
-                || body.windows(7).any(|s| s == b"context"))
+        let contains = |needle: &[u8]| body.windows(needle.len()).any(|s| s == needle);
+        if (status == 400 && (contains(b"truncated") || contains(b"context")))
+            || (status == 500 && contains(b"too large to process"))
         {
             return Err(Unencodable.into());
         }
@@ -1224,6 +1226,29 @@ mod tests {
         let (mut worker, _) = stub_worker("failure", |_| (500, "{}".into()));
         let error = worker.encode_passages(&["t1", "t2"]).unwrap_err();
         assert!(!error.is::<Unencodable>());
+
+        // Non-causal physical-batch overflow returns HTTP 500 "too large to process";
+        // classify it as Unencodable so bisect skips only the oversized chunk.
+        let (mut worker, _) = stub_worker("ubatch-overflow", |inputs| {
+            if inputs.iter().any(|input| input.ends_with("HUGE")) {
+                return (
+                    500,
+                    r#"{"error":{"message":"input (1882 tokens) is too large to process. increase the physical batch size (current batch size: 1024)"}}"#.into(),
+                );
+            }
+            (200, rows(inputs, |i| i))
+        });
+        let vectors = worker.encode_passages(&["t1", "t2 HUGE", "t3"]).unwrap();
+        assert_eq!(vectors.len(), 3);
+        assert_eq!(vectors[0].as_ref().unwrap()[1], 1.0);
+        assert!(vectors[1].is_none());
+        assert_eq!(vectors[2].as_ref().unwrap()[3], 1.0);
+        assert!(
+            worker
+                .encode(Role::Passage, "t2 HUGE")
+                .unwrap_err()
+                .is::<Unencodable>()
+        );
     }
 
     fn axis_reply(axis: usize) -> String {
@@ -1255,9 +1280,13 @@ mod tests {
         assert_eq!(flag(&text, "--poll"), "0");
         assert_eq!(flag(&text, "--batch-size"), "4096");
         assert_eq!(flag(&text, "--ubatch-size"), "2048");
+        assert!(
+            flag(&text, "--ubatch-size").parse::<usize>().unwrap() >= SLOT_CONTEXT,
+            "non-causal EmbeddingGemma requires --ubatch-size >= SLOT_CONTEXT"
+        );
         assert_eq!(flag(&text, "--gpu-layers"), "99");
-        assert_eq!(flag(&text, "--parallel"), "4");
-        assert_eq!(flag(&text, "--ctx-size"), "8192");
+        assert_eq!(flag(&text, "--parallel"), "2");
+        assert_eq!(flag(&text, "--ctx-size"), "4096");
         assert_eq!(flag(&text, "--threads"), "2");
         assert_eq!(flag(&text, "--threads-batch"), "5");
 

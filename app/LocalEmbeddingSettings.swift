@@ -210,7 +210,7 @@ struct TextEmbeddingEngineCard: View {
                 LumenStatusPill(text: model.t("已安装", "Installed"), color: SettingsTheme.green)
             case .unavailable, .unchecked:
                 if assets.textInstalled {
-                    LumenStatusPill(text: model.t("已安装", "Installed"), color: SettingsTheme.amber)
+                    LumenStatusPill(text: model.t("已安装", "Installed"), color: SettingsTheme.green)
                 } else {
                     LumenStatusPill(text: model.t("未安装", "Not Installed"), color: SettingsTheme.textTertiary)
                 }

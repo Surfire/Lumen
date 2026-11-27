@@ -69,6 +69,11 @@ enum SettingsTheme {
         light: (0.7686, 0.4824, 0.1608, 1.0),
         dark:  (0.8784, 0.5961, 0.2627, 1.0)
     )
+    /// Dedicated high-contrast fill for white-on-amber primary CTAs (WCAG AA in both themes).
+    static let primaryCtaFill = dynamic(
+        light: (0.7686, 0.4627, 0.0980, 1.0),
+        dark:  (0.7059, 0.3961, 0.0667, 1.0)
+    )
     static let green = dynamic(
         light: (0.1765, 0.5412, 0.3059, 1.0),
         dark:  (0.3216, 0.7686, 0.4824, 1.0)
@@ -337,7 +342,7 @@ struct LumenPrimaryButtonStyle: ButtonStyle {
             .padding(.vertical, 6.5)
             .background(
                 RoundedRectangle(cornerRadius: SettingsTheme.cornerMD, style: .continuous)
-                    .fill(SettingsTheme.amber.opacity(isEnabled ? (configuration.isPressed ? 0.82 : 1.0) : 0.42))
+                    .fill(SettingsTheme.primaryCtaFill.opacity(isEnabled ? (configuration.isPressed ? 0.82 : 1.0) : 0.42))
             )
             .contentShape(Rectangle())
     }

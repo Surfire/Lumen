@@ -231,38 +231,25 @@ struct LauncherSettings: View {
                 .frame(width: 1)
                 .frame(maxHeight: .infinity)
             VStack(spacing: 0) {
-                switch page {
-                case .quicklinks:
-                    VStack(alignment: .leading, spacing: 0) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: SettingsTheme.spacingLG) {
                         pageHeader
-                            .padding(.horizontal, 28)
-                            .padding(.top, 24)
-                            .padding(.bottom, 10)
-                        QuicklinksView(model: model, library: model.shortcuts, chooseFolder: chooseQuicklinkFolder)
-                            .scrollContentBackground(.hidden)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                default:
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: SettingsTheme.spacingLG) {
-                            pageHeader
-                            switch page {
-                            case .general: general
-                            case .index: indexAndPrivacy
-                            case .translation: aiAndModels
-                            case .scripts: scriptsAndShortcuts
-                            case .advanced: statusAndAbout
-                            case .quicklinks: EmptyView()
-                            }
+                        switch page {
+                        case .general: general
+                        case .index: indexAndPrivacy
+                        case .quicklinks: QuicklinksView(model: model, library: model.shortcuts, chooseFolder: chooseQuicklinkFolder)
+                        case .translation: aiAndModels
+                        case .scripts: scriptsAndShortcuts
+                        case .advanced: statusAndAbout
                         }
-                        .frame(maxWidth: 640, alignment: .leading)
-                        .padding(.horizontal, 28)
-                        .padding(.vertical, 24)
-                        .frame(maxWidth: .infinity)
                     }
-                    .id(page)
-                    if page == .index { applyBar }
+                    .frame(maxWidth: 640, alignment: .leading)
+                    .padding(.horizontal, 28)
+                    .padding(.vertical, 24)
+                    .frame(maxWidth: .infinity)
                 }
+                .id(page)
+                if page == .index { applyBar }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(SettingsTheme.canvasBackground)

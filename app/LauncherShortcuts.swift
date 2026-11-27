@@ -310,82 +310,176 @@ struct QuicklinksView: View {
     @State private var saveResult: ShortcutLibrary.SaveResult?
 
     var body: some View {
-        Form {
-            Section(model.t("内置网页搜索", "Built-in Web Search")) {
+        VStack(alignment: .leading, spacing: SettingsTheme.spacingLG) {
+            LumenSettingsCard(title: model.t("内置网页搜索", "Built-in Web Search"), icon: "globe") {
                 Toggle(model.t("启用 GitHub、维基百科和 Google 地图搜索",
-                               "Enable GitHub, Wikipedia, and Google Maps Search"), isOn: $library.includeOptionalLinks)
+                               "Enable GitHub, Wikipedia, and Google Maps Search"),
+                       isOn: $library.includeOptionalLinks)
                 Text(model.t("输入 gh、wiki 或 map，空一格后输入搜索词，按回车在浏览器中打开。已保存的自定义查询别名优先。",
                              "Type gh, wiki, or map followed by a search term, then press Return to open it in your browser. Saved custom query aliases take precedence."))
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(SettingsTheme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            Section(model.t("已保存", "Saved")) {
-                if library.entries.isEmpty { Text(model.t("暂无快捷链接", "No Quicklinks yet")).foregroundStyle(.secondary) }
-                ForEach(library.entries) { shortcut in
-                    HStack {
-                        Label(shortcut.title, systemImage: shortcut.pinned ? "pin.fill" : shortcut.symbol)
-                        Spacer()
-                        Button(model.t("编辑", "Edit")) { edit(shortcut) }
-                        Button(model.t("移除", "Remove")) {
-                            library.remove(shortcut)
-                            if editing?.id == shortcut.id { reset() }
+
+            LumenSettingsCard(title: model.t("已保存", "Saved"), icon: "bookmark") {
+                if library.entries.isEmpty {
+                    LumenSettingsWell {
+                        Text(model.t("暂无自定义快捷链接", "No Quicklinks yet"))
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(SettingsTheme.textSecondary)
+                    }
+                } else {
+                    LumenSettingsWell(padding: 4) {
+                        VStack(spacing: 0) {
+                            ForEach(Array(library.entries.enumerated()), id: \.element.id) { index, shortcut in
+                                if index > 0 { LumenSettingsHairline().padding(.horizontal, 8) }
+                                HStack(spacing: 10) {
+                                    Label(shortcut.title, systemImage: shortcut.pinned ? "pin.fill" : shortcut.symbol)
+                                        .font(.system(size: 12.5, weight: .medium))
+                                        .foregroundStyle(SettingsTheme.textPrimary)
+                                        .lineLimit(1)
+                                    if !shortcut.alias.isEmpty {
+                                        Text(shortcut.alias)
+                                            .font(.system(size: 11, design: .monospaced))
+                                            .foregroundStyle(SettingsTheme.amber)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(SettingsTheme.amber.opacity(0.12), in: Capsule())
+                                    }
+                                    Spacer(minLength: 8)
+                                    Button(model.t("编辑", "Edit")) { edit(shortcut) }
+                                        .buttonStyle(LumenSecondaryButtonStyle())
+                                        .controlSize(.small)
+                                    Button(model.t("移除", "Remove")) {
+                                        library.remove(shortcut)
+                                        if editing?.id == shortcut.id { reset() }
+                                    }
+                                    .buttonStyle(LumenSecondaryButtonStyle())
+                                    .controlSize(.small)
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 7)
+                            }
                         }
                     }
                 }
             }
-            Section(editing == nil ? model.t("添加快捷链接", "Add Quicklink") : model.t("编辑快捷链接", "Edit Quicklink")) {
-                Picker(model.t("目标类型", "Destination"), selection: $kind) {
-                    Text(model.t("应用程序", "Application")).tag(Kind.application)
-                    Text(model.t("项目文件夹", "Project Folder")).tag(Kind.folder)
-                    Text(model.t("网页", "Website")).tag(Kind.web)
+
+            LumenSettingsCard(title: editing == nil ? model.t("添加快捷链接", "Add Quicklink") : model.t("编辑快捷链接", "Edit Quicklink"),
+                              icon: editing == nil ? "plus.circle" : "pencil.circle") {
+                LabeledContent(model.t("目标类型", "Destination")) {
+                    Picker(model.t("目标类型", "Destination"), selection: $kind) {
+                        Text(model.t("应用程序", "Application")).tag(Kind.application)
+                        Text(model.t("项目文件夹", "Project Folder")).tag(Kind.folder)
+                        Text(model.t("网页", "Website")).tag(Kind.web)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .fixedSize()
                 }
                 .onChange(of: kind) { _, value in
                     if editing.map(kindOf) != value { destination = "" }
                 }
-                TextField(model.t("名称", "Name"), text: $title)
-                TextField(model.t("搜索别名（可选）", "Search Alias (Optional)"), text: $alias)
+
+                LumenSettingsHairline()
+
+                HStack(alignment: .top, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 5) {
+                        fieldLabel(model.t("名称", "Name"))
+                        TextField("", text: $title,
+                                  prompt: Text(model.t("例如：GitHub 问题", "e.g. GitHub Issues")))
+                            .lumenWellField()
+                    }
+                    VStack(alignment: .leading, spacing: 5) {
+                        fieldLabel(model.t("搜索别名（可选）", "Search Alias (Optional)"))
+                        TextField("", text: $alias,
+                                  prompt: Text(model.t("例如：gh", "e.g. gh")))
+                            .lumenWellField()
+                    }
+                }
+
                 switch kind {
                 case .application:
-                    Picker(model.t("应用程序", "Application"), selection: $destination) {
-                        Text(model.t("选择应用", "Choose an App")).tag("")
-                        ForEach(model.installedActions) { action in
-                            Text(action.title(chinese: model.zh)).tag(action.id)
+                    LabeledContent(model.t("应用程序", "Application")) {
+                        Picker(model.t("应用程序", "Application"), selection: $destination) {
+                            Text(model.t("选择应用", "Choose an App")).tag("")
+                            ForEach(model.installedActions) { action in
+                                Text(action.title(chinese: model.zh)).tag(action.id)
+                            }
                         }
+                        .labelsHidden()
+                        .frame(maxWidth: 260)
                     }
                 case .folder:
                     LabeledContent(model.t("项目文件夹", "Project Folder")) {
-                        HStack {
-                            Text(destination.isEmpty ? "—" : (destination as NSString).abbreviatingWithTildeInPath)
-                                .lineLimit(1).truncationMode(.middle)
+                        HStack(spacing: 8) {
+                            Text(destination.isEmpty ? model.t("未选择", "None selected") : (destination as NSString).abbreviatingWithTildeInPath)
+                                .font(.system(size: 12))
+                                .foregroundStyle(SettingsTheme.textSecondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
                             Button(model.t("选择…", "Choose…")) { chooseFolder { destination = IndexScope.folderPath($0) } }
+                                .buttonStyle(LumenSecondaryButtonStyle())
+                                .controlSize(.small)
                         }
                     }
                 case .web:
-                    TextField(model.t("网页地址", "Website URL"), text: $destination,
-                              prompt: Text(verbatim: "https://example.com"))
-                    TextField(model.t("查询参数（可选）", "Query Parameter (Optional)"), text: $queryParameter,
-                              prompt: Text(verbatim: "q"))
+                    HStack(alignment: .top, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 5) {
+                            fieldLabel(model.t("网页地址", "Website URL"))
+                            TextField("", text: $destination, prompt: Text(verbatim: "https://example.com"))
+                                .lumenWellField()
+                        }
+                        VStack(alignment: .leading, spacing: 5) {
+                            fieldLabel(model.t("查询参数（可选）", "Query Parameter (Optional)"))
+                            TextField("", text: $queryParameter, prompt: Text(verbatim: "q"))
+                                .lumenWellField()
+                        }
+                        .frame(width: 170)
+                    }
                     if !queryParameter.isEmpty {
                         Text(model.t("用「别名 搜索词」打开 HTTPS 网页。网址请填写不含查询参数的地址。",
                                      "Type the alias and a query to open an HTTPS page. Use a base URL without a query string."))
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(SettingsTheme.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
-                Toggle(model.t("固定在空搜索页", "Pin to Empty Search"), isOn: $pinned)
-                HStack {
-                    Button(model.t("保存", "Save")) { save() }.buttonStyle(.borderedProminent)
-                    if editing != nil { Button(model.t("取消编辑", "Cancel Editing")) { reset() } }
+
+                LumenSettingsHairline()
+
+                HStack(spacing: 10) {
+                    Toggle(model.t("固定在空搜索页", "Pin to Empty Search"), isOn: $pinned)
+                        .font(.system(size: 12.5))
+                    Spacer()
+                    if editing != nil {
+                        Button(model.t("取消编辑", "Cancel Editing")) { reset() }
+                            .buttonStyle(LumenSecondaryButtonStyle())
+                    }
+                    Button(model.t("保存", "Save")) { save() }
+                        .buttonStyle(LumenPrimaryButtonStyle())
                 }
+
                 if case .aliasInUse(let alias) = saveResult {
                     Text(model.t("查询别名「\(alias)」已被使用。请选择其他别名。",
                                  "The query alias “\(alias)” is already in use. Choose a different alias."))
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 12))
+                        .foregroundStyle(SettingsTheme.amber)
                 } else if saveResult == .invalid {
                     Text(model.t("请检查名称、别名或目标地址。", "Check the name, alias, or destination."))
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 12))
+                        .foregroundStyle(SettingsTheme.red)
                 }
             }
         }
-        .formStyle(.grouped)
+    }
+
+    private func fieldLabel(_ label: String) -> some View {
+        Text(label.uppercased())
+            .font(.system(size: 10, weight: .semibold))
+            .tracking(0.8)
+            .foregroundStyle(SettingsTheme.textTertiary)
     }
 
     private func kindOf(_ shortcut: SavedShortcut) -> Kind {

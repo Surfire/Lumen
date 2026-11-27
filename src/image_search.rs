@@ -1,5 +1,5 @@
 use crate::{
-    GemmaModel, Hit, Scope, absolute,
+    ContentCategory, GemmaModel, Hit, Scope, absolute,
     content::has_table,
     diagnose::{local_stamp, read_snapshot},
     gemma::DIMENSIONS,
@@ -27,8 +27,7 @@ const IMAGE_LIVE: &str = "FROM image_embedding e JOIN item i USING(id)
     WHERE e.model=?1 AND i.path>=?2 AND i.path<?3 AND i.kind='file'
     AND i.availability IN ('local','provider_metadata_only')
     AND typeof(e.vector)='blob' AND length(e.vector) IN (?4/2,?4)";
-const SCHEMA: &str = "
-    CREATE TABLE IF NOT EXISTS image_scope(id INTEGER PRIMARY KEY CHECK(id=1), root TEXT, epoch INTEGER NOT NULL);
+pub(crate) const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS image_embedding(
         id INTEGER PRIMARY KEY, model TEXT NOT NULL, stamp TEXT NOT NULL, vector BLOB NOT NULL
     );
@@ -39,42 +38,102 @@ const SCHEMA: &str = "
     BEGIN DELETE FROM image_embedding WHERE id=old.id; END;
 ";
 
+/// Image rules derived from the one saved content scope: `content_roots`
+/// gated by `content_filter.enable_images`. There is no separate image list.
 #[derive(Debug, PartialEq, Eq)]
 struct Rules {
-    root: String,
-    epoch: i64,
+    /// Non-nested UTF-8 content roots, ordered by their path range.
+    roots: Vec<PathBuf>,
     names: Scope,
 }
 
 impl Rules {
     fn read(conn: &Connection) -> Result<Option<Self>> {
-        if !has_table(conn, "image_scope")? {
+        if !has_table(conn, "image_embedding")? {
             return Ok(None);
         }
-        let scope: Option<(String, i64)> = conn
-            .query_row(
-                "SELECT root,epoch FROM image_scope WHERE id=1 AND root IS NOT NULL",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let Some((root, epoch)) = scope else {
-            return Ok(None);
-        };
-        let names = saved_index_scope(conn)?.context("no filename index scope")?;
-        Ok(Some(Self { root, epoch, names }))
+        Ok(saved_index_scope(conn)?.and_then(Self::from_scope))
+    }
+
+    fn from_scope(names: Scope) -> Option<Self> {
+        if !names.documents || !names.content_filter.enable_images {
+            return None;
+        }
+        let candidates: Vec<&PathBuf> = names
+            .content_roots
+            .iter()
+            .flatten()
+            .filter(|root| root.as_path() != Path::new("/") && root.to_str().is_some())
+            .collect();
+        let mut roots: Vec<PathBuf> = candidates
+            .iter()
+            .filter(|root| {
+                !candidates
+                    .iter()
+                    .any(|other| other != *root && root.starts_with(other))
+            })
+            .map(|root| (*root).clone())
+            .collect();
+        roots.sort_by_key(|root| format!("{}/", root.display()));
+        roots.dedup();
+        (!roots.is_empty()).then_some(Self { roots, names })
     }
 
     fn allows(&self, path: &Path) -> bool {
         supported_path(path)
-            && path.starts_with(&self.root)
-            && path != Path::new(&self.root)
+            && self
+                .roots
+                .iter()
+                .any(|root| path.starts_with(root) && path != root)
             && named_in(&self.names, path)
+            && !self.names.content_filter.excludes(path, &self.roots)
+            && self.names.content_filter.category(path) == Some(ContentCategory::Image)
     }
 
-    fn bounds(&self) -> (String, String) {
-        (format!("{}/", self.root), format!("{}0", self.root))
+    /// Disjoint `[root/, root0)` ranges in ascending path order.
+    fn bounds(&self) -> impl Iterator<Item = (String, String)> + '_ {
+        self.roots.iter().filter_map(|root| {
+            let root = root.to_str()?;
+            Some((format!("{root}/"), format!("{root}0")))
+        })
     }
+
+    fn strings(&self) -> Vec<String> {
+        self.roots
+            .iter()
+            .filter_map(|root| root.to_str().map(str::to_owned))
+            .collect()
+    }
+}
+
+/// Add `root` to the explicit content roots unless already covered. A legacy
+/// scope that indexed documents everywhere (`content_roots` unset) first keeps
+/// that coverage as explicit roots, so adding a folder never narrows it.
+fn add_content_root(scope: &mut Scope, root: PathBuf) {
+    if scope.content_roots.is_none() && scope.documents {
+        let mut seeded: Vec<PathBuf> = scope
+            .roots
+            .iter()
+            .filter(|path| path.as_path() != Path::new("/"))
+            .cloned()
+            .collect();
+        if scope.roots.is_empty() || scope.roots.iter().any(|path| path == Path::new("/")) {
+            seeded.extend(
+                scope
+                    .allow
+                    .iter()
+                    .filter(|path| path.as_path() != Path::new("/"))
+                    .cloned(),
+            );
+        }
+        scope.content_roots = Some(seeded);
+    }
+    let roots = scope.content_roots.get_or_insert_with(Vec::new);
+    if !roots.iter().any(|existing| root.starts_with(existing)) {
+        roots.push(root);
+    }
+    scope.documents = true;
+    scope.content_filter.enable_images = true;
 }
 
 fn named_in(scope: &Scope, path: &Path) -> bool {
@@ -83,78 +142,140 @@ fn named_in(scope: &Scope, path: &Path) -> bool {
         && scope.allows(path)
 }
 
+/// One-time migration of the retired `image_scope` table: its folder joins
+/// `content_roots` and the legacy row is cleared, leaving one source of truth.
+pub(crate) fn migrate_legacy_scope(conn: &mut Connection) -> Result<()> {
+    const LEGACY: &str = "SELECT root FROM image_scope WHERE id=1 AND root IS NOT NULL";
+    if !has_table(conn, "image_scope")?
+        || conn
+            .query_row(LEGACY, [], |r| r.get::<_, String>(0))
+            .optional()?
+            .is_none()
+    {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let Some(root) = tx
+        .query_row(LEGACY, [], |r| r.get::<_, String>(0))
+        .optional()?
+    else {
+        return Ok(());
+    };
+    if let Some(mut scope) = saved_index_scope(&tx)? {
+        add_content_root(&mut scope, PathBuf::from(root));
+        tx.execute(
+            "UPDATE info SET value=?1 WHERE key='scope'",
+            [serde_json::to_string(&scope)?],
+        )?;
+        // Force the next scope pass to seed content jobs for the merged folder.
+        tx.execute("DELETE FROM info WHERE key='cloud_content_policy_v1'", [])?;
+    }
+    tx.execute("UPDATE image_scope SET root=NULL,epoch=epoch+1", [])?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Drop image vectors the given scope no longer covers (inside the caller's
+/// scope transaction).
+pub(crate) fn prune(conn: &Connection, scope: &Scope) -> Result<()> {
+    if !has_table(conn, "image_embedding")? {
+        return Ok(());
+    }
+    let rules = Rules::from_scope(scope.clone());
+    let doomed: Vec<i64> = {
+        let mut stmt =
+            conn.prepare("SELECT e.id,i.path FROM image_embedding e LEFT JOIN item i USING(id)")?;
+        let mut rows = stmt.query([])?;
+        let mut doomed = Vec::new();
+        while let Some(row) = rows.next()? {
+            let path: Option<String> = row.get(1)?;
+            if !path.is_some_and(|path| rules.as_ref().is_some_and(|r| r.allows(Path::new(&path))))
+            {
+                doomed.push(row.get(0)?);
+            }
+        }
+        doomed
+    };
+    let mut delete = conn.prepare_cached("DELETE FROM image_embedding WHERE id=?1")?;
+    for id in doomed {
+        delete.execute([id])?;
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 pub struct ImageScopeStatus {
     root: Option<String>,
+    roots: Vec<String>,
     vectors: i64,
 }
 
-/// Inspect the saved image opt-in and stored vector count without changing the database.
+/// Inspect the image-enabled content folders and stored vector count without changing the database.
 pub fn image_status(database: &Path) -> Result<ImageScopeStatus> {
     let conn = open_read(database)?;
     let snapshot = conn.unchecked_transaction()?;
     let Some(rules) = Rules::read(&snapshot)? else {
         return Ok(ImageScopeStatus {
             root: None,
+            roots: Vec::new(),
             vectors: 0,
         });
     };
     let vectors = count_images(&snapshot, &rules)?;
+    let roots = rules.strings();
     Ok(ImageScopeStatus {
-        root: Some(rules.root),
+        root: roots.first().cloned(),
+        roots,
         vectors,
     })
 }
 
-/// Set or clear an explicit image folder. No file bytes are read.
+/// Compatibility adapter for `image-scope`: add a folder to `content_roots`
+/// with images enabled, or turn image vectors off. No file bytes are read.
 pub fn image_scope(database: &Path, root: Option<&Path>) -> Result<ImageScopeStatus> {
-    #[cfg(target_os = "macos")]
-    let _io = platform::NoMaterialization::enter()?;
     let database = absolute(database)?;
-    drop(open_read(&database)?);
-    let (mut conn, _lease) = open_write(&database, false)?;
-    let txn = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let names = saved_index_scope(&txn)?.context("no filename index scope")?;
-    let root = root
-        .map(|path| -> Result<String> {
-            let path = absolute(path)?;
-            let path = platform::filesystem_spelling(&path);
+    let requested = root
+        .map(|path| -> Result<PathBuf> {
+            #[cfg(target_os = "macos")]
+            let _io = platform::NoMaterialization::enter()?;
+            let names =
+                saved_index_scope(&open_read(&database)?)?.context("no filename index scope")?;
+            let path = platform::filesystem_spelling(&absolute(path)?);
             ensure!(
                 path != Path::new("/")
                     && named_in(&names, &path)
                     && local_stamp(&path, true).is_some(),
                 "choose a readable local image folder within the saved filename scope"
             );
-            path.into_os_string()
-                .into_string()
-                .ok()
-                .context("image folder path is not valid UTF-8")
+            ensure!(
+                path.to_str().is_some(),
+                "image folder path is not valid UTF-8"
+            );
+            Ok(path)
         })
         .transpose()?;
-    txn.execute_batch(SCHEMA)?;
-    let changed = txn.execute(
-        "INSERT INTO image_scope VALUES(1,?1,1)
-         ON CONFLICT(id) DO UPDATE SET root=excluded.root,epoch=epoch+1
-         WHERE root IS NOT excluded.root",
-        [&root],
-    )?;
-    if changed != 0 {
-        txn.execute("DELETE FROM image_embedding", [])?;
+    crate::content::update_scope(&database, |scope| {
+        match &requested {
+            Some(path) => add_content_root(scope, path.clone()),
+            None => scope.content_filter.enable_images = false,
+        }
+        Ok(())
+    })?;
+    let mut status = image_status(&database)?;
+    if let Some(path) = requested {
+        status.root = path.to_str().map(str::to_owned);
     }
-    let vectors = Rules::read(&txn)?
-        .as_ref()
-        .map_or(Ok(0), |rules| count_images(&txn, rules))?;
-    txn.commit()?;
-    Ok(ImageScopeStatus { root, vectors })
+    Ok(status)
 }
 
 fn count_images(conn: &Connection, rules: &Rules) -> Result<i64> {
-    let (lower, upper) = rules.bounds();
     let mut stmt = conn.prepare_cached(&format!("SELECT i.path {IMAGE_LIVE}"))?;
-    let mut rows = stmt.query(params![MODEL_ID, lower, upper, LEGACY_VECTOR_BYTES])?;
     let mut count = 0;
-    while let Some(row) = rows.next()? {
-        count += i64::from(rules.allows(Path::new(row.get_ref(0)?.as_str()?)));
+    for (lower, upper) in rules.bounds() {
+        let mut rows = stmt.query(params![MODEL_ID, lower, upper, LEGACY_VECTOR_BYTES])?;
+        while let Some(row) = rows.next()? {
+            count += i64::from(rules.allows(Path::new(row.get_ref(0)?.as_str()?)));
+        }
     }
     Ok(count)
 }
@@ -234,17 +355,20 @@ fn image_batch_step<E: ImageEncoder>(
         return Ok((None, true));
     }
     let rules = current_rules.context("choose a folder with image-scope first")?;
-    let (lower, upper) = rules.bounds();
     let after = after.unwrap_or("");
     ensure!(
-        after.is_empty() || (after >= lower.as_str() && after < upper.as_str()),
+        after.is_empty()
+            || rules
+                .bounds()
+                .any(|(lower, upper)| after >= lower.as_str() && after < upper.as_str()),
         "image cursor is outside the selected folder"
     );
     let mut available = MAX_VECTORS
         - snapshot.query_row("SELECT count(*) FROM image_embedding", [], |r| {
             r.get::<_, i64>(0)
         })?;
-    let rows = {
+    let mut rows = Vec::new();
+    {
         let mut stmt = snapshot.prepare(
             "SELECT i.id,i.path,CASE WHEN e.model=?4 AND typeof(e.vector)='blob'
                 AND length(e.vector) IN (?6/2,?6) THEN e.stamp END,e.id IS NOT NULL
@@ -255,26 +379,34 @@ fn image_batch_step<E: ImageEncoder>(
                  OR substr(lower(i.path),-5) IN ('.jpeg','.heic','.heif','.webp'))
              ORDER BY i.path LIMIT ?5",
         )?;
-        stmt.query_map(
-            params![
-                lower,
-                upper,
-                after,
-                MODEL_ID,
-                max as i64 + 1,
-                LEGACY_VECTOR_BYTES
-            ],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, bool>(3)?,
-                ))
-            },
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-    };
+        // Ranges are disjoint and ascending, so the cursor orders all roots.
+        for (lower, upper) in rules.bounds() {
+            if rows.len() > max || after >= upper.as_str() {
+                continue;
+            }
+            rows.extend(
+                stmt.query_map(
+                    params![
+                        lower,
+                        upper,
+                        after,
+                        MODEL_ID,
+                        (max + 1 - rows.len()) as i64,
+                        LEGACY_VECTOR_BYTES
+                    ],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, bool>(3)?,
+                        ))
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
+    }
     drop(snapshot);
     let total_rows = rows.len();
     let planned = total_rows.min(max);
@@ -556,7 +688,27 @@ impl<'a> ImageSearchSession<'a> {
     }
 }
 
-struct ImageRow {
+/// Image vectors cached for blending into unified semantic results.
+pub(crate) type ImageCache = MatrixCache<ImageRow>;
+
+/// Rank stored image vectors against an already encoded text query. The text
+/// tower is shared, so semantic search needs no extra worker for this.
+pub(crate) fn rank_with_query(
+    conn: &Connection,
+    cache: &mut ImageCache,
+    query: &[f32],
+    limit: usize,
+) -> Result<Vec<Hit>> {
+    read_snapshot(conn, |snapshot| {
+        Ok(rank_images(
+            cache.get_for_bucket(snapshot, "img_generation", load_images)?,
+            query,
+            limit,
+        ))
+    })
+}
+
+pub(crate) struct ImageRow {
     path: Box<str>,
     name: Box<str>,
     availability: Box<str>,
@@ -568,23 +720,24 @@ fn load_images(snapshot: &Connection) -> Result<Matrix<ImageRow>> {
     let Some(rules) = Rules::read(snapshot)? else {
         return Ok(matrix);
     };
-    let (lower, upper) = rules.bounds();
     let mut stmt = snapshot.prepare_cached(&format!(
         "SELECT i.path,i.display,i.availability,e.stamp,e.vector {IMAGE_LIVE}"
     ))?;
-    let mut rows = stmt.query(params![MODEL_ID, lower, upper, LEGACY_VECTOR_BYTES])?;
-    while let Some(row) = rows.next()? {
-        let path = row.get_ref(0)?.as_str()?;
-        if rules.allows(Path::new(path)) {
-            matrix.push(
-                ImageRow {
-                    path: path.into(),
-                    name: row.get_ref(1)?.as_str()?.into(),
-                    availability: row.get_ref(2)?.as_str()?.into(),
-                    stamp: row.get_ref(3)?.as_str()?.into(),
-                },
-                row.get_ref(4)?.as_blob()?,
-            );
+    for (lower, upper) in rules.bounds() {
+        let mut rows = stmt.query(params![MODEL_ID, lower, upper, LEGACY_VECTOR_BYTES])?;
+        while let Some(row) = rows.next()? {
+            let path = row.get_ref(0)?.as_str()?;
+            if rules.allows(Path::new(path)) {
+                matrix.push(
+                    ImageRow {
+                        path: path.into(),
+                        name: row.get_ref(1)?.as_str()?.into(),
+                        availability: row.get_ref(2)?.as_str()?.into(),
+                        stamp: row.get_ref(3)?.as_str()?.into(),
+                    },
+                    row.get_ref(4)?.as_blob()?,
+                );
+            }
         }
     }
     Ok(matrix)
@@ -802,7 +955,8 @@ mod tests {
             "UPDATE info SET value=json_set(value,'$.deny',json_array((SELECT path FROM item WHERE display='sample.png'))) WHERE key='scope'",
             // Keep the vector to make sure availability is independently checked.
             "DROP TRIGGER image_entry_moved; UPDATE item SET availability='unverified' WHERE display='sample.png'",
-            "UPDATE image_scope SET root=NULL,epoch=epoch+1",
+            // Image vectors follow content_filter.enable_images in the one saved scope.
+            "UPDATE info SET value=json_set(value,'$.content_filter',json('{\"enable_images\":false}')) WHERE key='scope'",
         ] {
             assert_visible(&mut session);
             let database = database.clone();
@@ -819,7 +973,7 @@ mod tests {
                 session.search_candidates(text, 20).unwrap().is_empty(),
                 "{update}"
             );
-            writer.execute_batch("UPDATE info SET value=json_set(value,'$.deny',json('[]')) WHERE key='scope'; UPDATE item SET availability='local' WHERE display='sample.png'").unwrap();
+            writer.execute_batch("UPDATE info SET value=json_remove(json_set(value,'$.deny',json('[]')),'$.content_filter') WHERE key='scope'; UPDATE item SET availability='local' WHERE display='sample.png'").unwrap();
         }
         drop(session);
         drop(writer);
@@ -1027,6 +1181,147 @@ mod tests {
         assert_eq!(stopped_batches, [(1, 1, true)]);
         assert_eq!(image_status(&database).unwrap().vectors, 1);
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_image_scope_migrates_once_into_content_roots_which_drive_image_status() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-image-unified-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (photos, docs) = (root.join("photos"), root.join("docs"));
+        fs::create_dir_all(&photos).unwrap();
+        fs::create_dir_all(&docs).unwrap();
+        let (photo, scan) = (photos.join("a.png"), docs.join("b.jpg"));
+        fs::write(&photo, "image").unwrap();
+        fs::write(&scan, "image").unwrap();
+        fs::write(docs.join("notes.txt"), "notes").unwrap();
+        let database = root.join("index.db");
+        crate::scan(
+            &database,
+            &Scope {
+                roots: vec![root.clone()],
+                content_roots: Some(vec![docs.clone()]),
+                documents: true,
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        // An index written by the previous engine kept a second, image-only list.
+        let legacy = Connection::open(&database).unwrap();
+        legacy
+            .execute(
+                "INSERT OR REPLACE INTO image_scope VALUES(1,?1,3)",
+                [photos.to_str().unwrap()],
+            )
+            .unwrap();
+        // Readers never treat the legacy row as authority.
+        assert_eq!(
+            image_status(&database).unwrap().roots,
+            [docs.to_str().unwrap()]
+        );
+        drop(crate::open_write(&database, false).unwrap());
+        let saved = saved_index_scope(&legacy).unwrap().unwrap();
+        assert_eq!(
+            saved.content_roots,
+            Some(vec![docs.clone(), photos.clone()])
+        );
+        assert!(saved.documents && saved.content_filter.enable_images);
+        let leftover: Option<String> = legacy
+            .query_row("SELECT root FROM image_scope WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(leftover, None);
+        let status = image_status(&database).unwrap();
+        assert_eq!(
+            status.roots,
+            [docs.to_str().unwrap(), photos.to_str().unwrap()]
+        );
+        // The migration re-seeds content jobs for the merged folder on the next pass.
+        crate::apply_content_scope(&database, saved.content_roots.clone().unwrap(), false).unwrap();
+        // Store one vector per folder, then turn images off through the adapter.
+        for path in [&photo, &scan] {
+            legacy
+                .execute(
+                    "INSERT INTO image_embedding SELECT id,?1,?2,?3 FROM item WHERE path=?4",
+                    params![
+                        MODEL_ID,
+                        local_stamp(path, false).unwrap(),
+                        pack(&query_vector()),
+                        path.to_str().unwrap()
+                    ],
+                )
+                .unwrap();
+        }
+        assert_eq!(image_status(&database).unwrap().vectors, 2);
+        // Narrowing content_roots drops the other folder's vectors too.
+        crate::apply_content_scope(&database, vec![docs.clone()], false).unwrap();
+        assert_eq!(image_status(&database).unwrap().vectors, 1);
+        let cleared = image_scope(&database, None).unwrap();
+        assert_eq!((cleared.root, cleared.vectors), (None, 0));
+        let stored: i64 = legacy
+            .query_row("SELECT count(*) FROM image_embedding", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, 0);
+        let kept = saved_index_scope(&legacy).unwrap().unwrap();
+        assert_eq!(kept.content_roots, Some(vec![docs.clone()]));
+        assert!(kept.documents && !kept.content_filter.enable_images);
+        // Re-enabling through the adapter adds the folder to the same list.
+        let enabled = image_scope(&database, Some(&photos)).unwrap();
+        assert_eq!(enabled.root.as_deref(), photos.to_str());
+        assert_eq!(
+            enabled.roots,
+            [docs.to_str().unwrap(), photos.to_str().unwrap()]
+        );
+        drop(legacy);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn adding_an_image_folder_never_narrows_legacy_whole_scope_documents() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-image-legacy-docs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (photos, docs) = (root.join("photos"), root.join("docs"));
+        fs::create_dir_all(&photos).unwrap();
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(photos.join("a.png"), "image").unwrap();
+        fs::write(docs.join("notes.txt"), "legacy whole scope prose").unwrap();
+        let database = root.join("index.db");
+        // Legacy mode: documents everywhere in the scope, no content_roots.
+        crate::scan(
+            &database,
+            &Scope {
+                roots: vec![root.clone()],
+                documents: true,
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        let documents = |database: &Path| -> i64 {
+            open_read(database)
+                .unwrap()
+                .query_row("SELECT count(*) FROM document", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(documents(&database), 1);
+        let legacy = Connection::open(&database).unwrap();
+        legacy
+            .execute(
+                "INSERT OR REPLACE INTO image_scope VALUES(1,?1,1)",
+                [photos.to_str().unwrap()],
+            )
+            .unwrap();
+        drop(crate::open_write(&database, false).unwrap());
+        let migrated = saved_index_scope(&legacy).unwrap().unwrap();
+        assert_eq!(migrated.content_roots, Some(vec![root.clone()]));
+        // The adapter path keeps the same coverage too.
+        image_scope(&database, Some(&photos)).unwrap();
+        let adapted = saved_index_scope(&legacy).unwrap().unwrap();
+        assert_eq!(adapted.content_roots, Some(vec![root.clone()]));
+        assert_eq!(documents(&database), 1);
+        drop(legacy);
         fs::remove_dir_all(root).unwrap();
     }
 }

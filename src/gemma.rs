@@ -20,11 +20,19 @@ use std::{
 pub const DIMENSIONS: usize = 768;
 pub const ID: &str = "gemma2/text/q8_0/b11457/retrieval-v1/768/l2/2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135";
 const MODEL_FILE: &str = "embeddinggemma-2-Q8_0.gguf";
+const PROJECTOR_FILE: &str = "mmproj-embeddinggemma-2-Q8_0.gguf";
 const VERIFICATION_CACHE: &str = ".verified-assets-v1.json";
 const MAX_CACHE_BYTES: u64 = 64 * 1024;
-const MAX_FRAME: usize = 128 * 1024;
+// Sixteen 768-dimensional JSON vectors stay well below this reply limit.
+const MAX_FRAME: usize = 2 * 1024 * 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 const ENCODE_TIMEOUT: Duration = Duration::from_secs(8);
+const MAX_PASSAGE_BYTES: usize = 8192;
+/// Passages sent per `POST /v1/embeddings` request.
+pub(crate) const PASSAGE_BATCH: usize = 16;
+const PASSAGE_BATCH_BYTES: usize = 12_000;
+const PARALLEL_SLOTS: usize = 4;
+const SLOT_CONTEXT: usize = 2048;
 pub(crate) const IMAGE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const IMAGE_TIMEOUT: Duration = Duration::from_secs(12);
 
@@ -117,6 +125,11 @@ impl GemmaModel {
         Ok(hashed)
     }
 
+    /// Whether the optional image projector sits beside the text model.
+    pub(crate) fn has_image_projector(&self) -> bool {
+        fs::symlink_metadata(self.home.join(PROJECTOR_FILE)).is_ok_and(|meta| meta.is_file())
+    }
+
     pub(crate) fn start(&self) -> Result<GemmaWorker> {
         self.start_profile(None)
     }
@@ -169,6 +182,7 @@ IFS= read -r owner || :
         if let Some(projector) = &projector {
             command.arg("--mmproj").arg(projector);
         }
+        let cpus = thread::available_parallelism().map_or(4, |n| n.get());
         let child = command
             .arg("--host")
             .arg(&worker.socket)
@@ -178,21 +192,22 @@ IFS= read -r owner || :
                 "--embd-normalize",
                 "2",
                 "--no-ui",
-                "--parallel",
-                "1",
-                "--ctx-size",
-                "2048",
                 "--batch-size",
-                "2048",
+                "4096",
                 "--ubatch-size",
                 "2048",
                 "--gpu-layers",
                 "99",
-                "--threads",
-                "2",
-                "--threads-batch",
-                "2",
             ])
+            // llama-server splits the context across slots; keep 2048 tokens per slot.
+            .arg("--parallel")
+            .arg(PARALLEL_SLOTS.to_string())
+            .arg("--ctx-size")
+            .arg((PARALLEL_SLOTS * SLOT_CONTEXT).to_string())
+            .arg("--threads")
+            .arg((cpus / 2).clamp(2, 6).to_string())
+            .arg("--threads-batch")
+            .arg(cpus.clamp(4, 8).to_string())
             // Give the supervisor and runtime a group entirely owned by this worker.
             .process_group(0)
             .current_dir(&worker.private)
@@ -491,7 +506,7 @@ pub(crate) struct GemmaWorker {
 
 impl GemmaWorker {
     pub(crate) fn encode(&mut self, role: Role, text: &str) -> Result<Vec<f32>> {
-        if text.trim().is_empty() || text.len() > 8192 {
+        if !encodable(text) {
             return Err(Unencodable.into());
         }
         let input = match role {
@@ -513,8 +528,63 @@ impl GemmaWorker {
         )
     }
 
+    /// Encodes passages in batched requests. `None` marks an unencodable
+    /// passage; `Err` is a hard runtime failure.
+    pub(crate) fn encode_passages(&mut self, texts: &[&str]) -> Result<Vec<Option<Vec<f32>>>> {
+        let mut vectors = vec![None; texts.len()];
+        let valid: Vec<usize> = (0..texts.len()).filter(|&i| encodable(texts[i])).collect();
+        let mut start = 0;
+        while start < valid.len() {
+            let mut end = start;
+            let mut bytes = 0;
+            while end < valid.len()
+                && end - start < PASSAGE_BATCH
+                && (end == start || bytes + texts[valid[end]].len() <= PASSAGE_BATCH_BYTES)
+            {
+                bytes += texts[valid[end]].len();
+                end += 1;
+            }
+            let group: Vec<&str> = valid[start..end].iter().map(|&i| texts[i]).collect();
+            for (&i, vector) in valid[start..end].iter().zip(self.encode_bisect(&group)?) {
+                vectors[i] = vector;
+            }
+            start = end;
+        }
+        Ok(vectors)
+    }
+
+    // Split rejected requests so one unencodable passage never fails its neighbors.
+    fn encode_bisect(&self, texts: &[&str]) -> Result<Vec<Option<Vec<f32>>>> {
+        let inputs: Vec<String> = texts
+            .iter()
+            .map(|text| format!("title: none | text: {text}"))
+            .collect();
+        let timeout = ENCODE_TIMEOUT + Duration::from_secs(2) * texts.len() as u32;
+        match self.embed(serde_json::json!(inputs), texts.len(), timeout) {
+            Err(error) if error.is::<Unencodable>() && texts.len() == 1 => Ok(vec![None]),
+            Err(error) if error.is::<Unencodable>() => {
+                let mid = texts.len() / 2;
+                let mut vectors = self.encode_bisect(&texts[..mid])?;
+                vectors.extend(self.encode_bisect(&texts[mid..])?);
+                Ok(vectors)
+            }
+            result => Ok(result?.into_iter().map(Some).collect()),
+        }
+    }
+
     fn encode_input(&self, input: serde_json::Value, timeout: Duration) -> Result<Vec<f32>> {
-        let payload = serde_json::to_vec(&serde_json::json!({"input":[input]}))?;
+        Ok(self
+            .embed(serde_json::json!([input]), 1, timeout)?
+            .swap_remove(0))
+    }
+
+    fn embed(
+        &self,
+        inputs: serde_json::Value,
+        count: usize,
+        timeout: Duration,
+    ) -> Result<Vec<Vec<f32>>> {
+        let payload = serde_json::to_vec(&serde_json::json!({"input":inputs}))?;
         let (status, body) =
             self.request("POST /v1/embeddings", &payload, Instant::now() + timeout)?;
         if status == 400
@@ -529,21 +599,34 @@ impl GemmaWorker {
         );
         #[derive(Deserialize)]
         struct Response {
-            data: [Embedding; 1],
+            data: Vec<Embedding>,
         }
         #[derive(Deserialize)]
         struct Embedding {
             embedding: Vec<f32>,
-            index: u32,
+            index: usize,
         }
-        let Response { data: [row] } =
+        let Response { data } =
             serde_json::from_slice(&body).context("invalid Gemma embedding reply")?;
-        let length: f32 = row.embedding.iter().map(|x| x * x).sum();
         ensure!(
-            row.index == 0 && row.embedding.len() == DIMENSIONS && (length - 1.0).abs() < 0.01,
-            "Gemma returned an invalid 768-dimensional normalized vector"
+            data.len() == count,
+            "Gemma returned a mismatched embedding count"
         );
-        Ok(row.embedding)
+        let mut vectors = vec![None; count];
+        for row in data {
+            let length: f32 = row.embedding.iter().map(|x| x * x).sum();
+            ensure!(
+                row.embedding.len() == DIMENSIONS && (length - 1.0).abs() < 0.01,
+                "Gemma returned an invalid 768-dimensional normalized vector"
+            );
+            let slot = vectors
+                .get_mut(row.index)
+                .filter(|slot| slot.is_none())
+                .context("Gemma returned an invalid embedding index")?;
+            *slot = Some(row.embedding);
+        }
+        // Every slot is filled: `count` rows each claimed a distinct index below `count`.
+        Ok(vectors.into_iter().flatten().collect())
     }
 
     pub(crate) fn probe(&mut self) -> Result<()> {
@@ -591,7 +674,12 @@ impl GemmaWorker {
         let mut response = Vec::new();
         let mut buffer = [0; 8192];
         loop {
-            stream.set_read_timeout(Some(remaining(deadline)?))?;
+            // macOS rejects socket options with EINVAL once the server has hung
+            // up; buffered reply bytes and EOF remain readable without blocking.
+            match stream.set_read_timeout(Some(remaining(deadline)?)) {
+                Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
+                result => result?,
+            }
             let count = stream.read(&mut buffer)?;
             if count == 0 {
                 break;
@@ -629,6 +717,10 @@ impl GemmaWorker {
         ensure!(body.len() == length, "truncated Gemma response body");
         Ok((status, body))
     }
+}
+
+fn encodable(text: &str) -> bool {
+    !text.trim().is_empty() && text.len() <= MAX_PASSAGE_BYTES
 }
 
 fn image_base64(bytes: &[u8]) -> String {
@@ -855,5 +947,149 @@ mod tests {
         assert!(model.check_assets(&manifest, true, None).is_err());
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    type Reply = fn(&[String]) -> (u16, String);
+
+    // Serves llama.cpp-shaped `/v1/embeddings` replies on a private Unix socket
+    // and records the number of inputs in every request.
+    fn stub_worker(name: &str, reply: Reply) -> (GemmaWorker, std::sync::mpsc::Receiver<usize>) {
+        use std::os::unix::net::UnixListener;
+        let private = PathBuf::from(format!(
+            "/private/tmp/lumen-gemma-stub-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&private);
+        DirBuilder::new().mode(0o700).create(&private).unwrap();
+        let socket = private.join("worker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (sizes, received) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut request = Vec::new();
+                let mut buffer = [0; 8192];
+                let body = loop {
+                    let count = stream.read(&mut buffer).unwrap();
+                    request.extend_from_slice(&buffer[..count]);
+                    let Some(end) = request.windows(4).position(|b| b == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = std::str::from_utf8(&request[..end]).unwrap();
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Content-Length: "))
+                        .unwrap()
+                        .trim()
+                        .parse()
+                        .unwrap();
+                    if request.len() >= end + 4 + length {
+                        break request[end + 4..end + 4 + length].to_vec();
+                    }
+                };
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let inputs: Vec<String> = serde_json::from_value(json["input"].clone()).unwrap();
+                let _ = sizes.send(inputs.len());
+                let (status, reply) = reply(&inputs);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        });
+        let worker = GemmaWorker {
+            owner: None,
+            private,
+            socket,
+            key: "test".into(),
+        };
+        (worker, received)
+    }
+
+    // Input `t<k> ...` embeds as the unit vector on axis k.
+    fn one_hot(input: &str) -> Vec<f32> {
+        let text = input.strip_prefix("title: none | text: t").unwrap();
+        let axis: usize = text.split(' ').next().unwrap().parse().unwrap();
+        let mut vector = vec![0.0; DIMENSIONS];
+        vector[axis] = 1.0;
+        vector
+    }
+
+    fn rows(inputs: &[String], index: impl Fn(usize) -> usize) -> String {
+        let data: Vec<_> = inputs
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(i, input)| serde_json::json!({"index": index(i), "embedding": one_hot(input)}))
+            .collect();
+        serde_json::json!({ "data": data }).to_string()
+    }
+
+    #[test]
+    fn batched_passages_map_reply_indices_and_bisect_around_unencodable_inputs() {
+        let (mut worker, sizes) = stub_worker("batch", |inputs| {
+            if inputs.iter().any(|input| input.ends_with("BAD")) {
+                return (
+                    400,
+                    r#"{"error":{"message":"input exceeds the context size"}}"#.into(),
+                );
+            }
+            (200, rows(inputs, |i| i))
+        });
+        let long = "x".repeat(MAX_PASSAGE_BYTES + 1);
+        let texts: Vec<String> = (0..20)
+            .map(|k| match k {
+                3 => "  ".into(),
+                5 => long.clone(),
+                7 => "t7 BAD".into(),
+                _ => format!("t{k}"),
+            })
+            .collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let vectors = worker.encode_passages(&refs).unwrap();
+        assert_eq!(vectors.len(), 20);
+        for (k, vector) in vectors.iter().enumerate() {
+            if [3, 5, 7].contains(&k) {
+                assert!(vector.is_none(), "item {k} must be skipped");
+            } else {
+                let vector = vector.as_ref().unwrap();
+                assert_eq!(vector[k], 1.0, "item {k} must keep its own vector");
+            }
+        }
+        // 18 locally valid passages: a 16-item request bisects down to the one
+        // rejected passage, then the 2 remaining passages share one request.
+        let sent: Vec<usize> = sizes.try_iter().collect();
+        assert_eq!(sent, [16, 8, 4, 4, 2, 1, 1, 2, 8, 2]);
+
+        // Requests stay below the UTF-8 byte budget.
+        let padded: Vec<String> = (0..4)
+            .map(|k| format!("t{k} {}", "y".repeat(5000)))
+            .collect();
+        let refs: Vec<&str> = padded.iter().map(String::as_str).collect();
+        let vectors = worker.encode_passages(&refs).unwrap();
+        assert!((0..4).all(|k| vectors[k].as_ref().unwrap()[k] == 1.0));
+        assert_eq!(sizes.try_iter().collect::<Vec<_>>(), [2, 2]);
+
+        // Single-item callers keep the prior contract.
+        assert_eq!(worker.encode(Role::Passage, "t9").unwrap()[9], 1.0);
+        assert!(
+            worker
+                .encode(Role::Passage, "t1 BAD")
+                .unwrap_err()
+                .is::<Unencodable>()
+        );
+    }
+
+    #[test]
+    fn batched_passages_reject_duplicate_indices_and_server_failures() {
+        let (mut worker, _) = stub_worker("index", |inputs| (200, rows(inputs, |_| 0)));
+        let error = worker.encode_passages(&["t1", "t2"]).unwrap_err();
+        assert!(!error.is::<Unencodable>());
+        assert!(error.to_string().contains("index"), "{error}");
+
+        let (mut worker, _) = stub_worker("failure", |_| (500, "{}".into()));
+        let error = worker.encode_passages(&["t1", "t2"]).unwrap_err();
+        assert!(!error.is::<Unencodable>());
     }
 }

@@ -52,7 +52,9 @@ enum LocalFile {
             defer { _ = Darwin.close(fd) }
             var opened = stat()
             var volume = statfs()
-            guard fstatfs(fd, &volume) == 0, volume.f_flags & UInt32(MNT_LOCAL) != 0 else {
+            // Kernel-anchored boundary: local volumes, or a mounted network filesystem type the kernel reports.
+            guard fstatfs(fd, &volume) == 0,
+                  volume.f_flags & UInt32(MNT_LOCAL) != 0 || Self.isAllowedNetworkFilesystem(Self.fsTypeName(of: volume)) else {
                 throw PreviewFailure.notLocal
             }
             guard fstat(fd, &opened) == 0, opened.st_mode & S_IFMT == S_IFREG else {
@@ -62,6 +64,17 @@ enum LocalFile {
                 throw Placeholder()
             }
             return try work()
+        }
+    }
+
+    static func isAllowedNetworkFilesystem(_ fsTypeName: String) -> Bool {
+        ["smbfs", "nfs", "afpfs", "webdav"].contains(fsTypeName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }
+
+    /// `statfs.f_fstypename` is a fixed C char tuple; read it up to the first NUL.
+    static func fsTypeName(of volume: statfs) -> String {
+        withUnsafeBytes(of: volume.f_fstypename) { raw in
+            String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
         }
     }
 

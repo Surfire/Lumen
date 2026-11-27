@@ -3864,6 +3864,8 @@ static const struct { const void *replacement; const void *original; } hook = {d
         }
         fs::write(first.join("slow.pdf"), "%PDF-synthetic").unwrap();
         fs::write(second.join("later.md"), "later pending prose").unwrap();
+        // Jobs run newest first: the failing PDF is the newest.
+        set_age(&second.join("later.md"), 60);
         let helper = f.0.join("extractor");
         executable(
             &helper,
@@ -3901,6 +3903,16 @@ printf 'stale extraction'
             Serve::new(&f).names("later pending prose", "text"),
             ["later.md"]
         );
+    }
+
+    /// Backdate a file's mtime by `seconds`.
+    fn set_age(path: &Path, seconds: u64) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(seconds))
+            .unwrap();
     }
 
     fn pause_lstat(
@@ -4706,6 +4718,9 @@ static const struct { const void *replacement; const void *original; } interpose
         fs::write(&timeout_pdf, "%PDF-1.4\n").unwrap();
         fs::write(&denied_doc, "denied poison pill document").unwrap();
         fs::write(&healthy_doc, "healthy document after poison pills").unwrap();
+        // Jobs run newest first: both poison pills are newer than the healthy file.
+        set_age(&denied_doc, 60);
+        set_age(&healthy_doc, 120);
         let helper = f.0.join("pdf-timeout-helper");
         executable(&helper, "#!/bin/sh\ncat >/dev/null\nwhile :; do :; done\n");
 
@@ -4871,4 +4886,184 @@ static const struct { const void *replacement; const void *original; } interpose
         assert_eq!(image_lines[0]["processed"], 0);
         assert_eq!(image_lines[0]["next_after"], Value::Null);
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn unmounted_network_and_legacy_volume_catalogs_report_kind_and_fail_closed() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let local = f.0.join("local");
+    fs::create_dir(&local).unwrap();
+    f.run(&["index", "--root", local.to_str().unwrap()]);
+    let folder = f.0.join("test.sqlite-external");
+    fs::create_dir(&folder).unwrap();
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+    let nas = "277c4245-278e-cdeb-a5bc-0e32d5fe1ddc";
+    let legacy = "01234567-89ab-cdef-0123-456789abcdef";
+    let catalogs = [
+        (
+            nas,
+            "/Volumes/Lumen-CLI-NAS",
+            r#""mount_kind":"network","protocol":"smb","sanitized_source":"smb://nas/share""#,
+        ),
+        // Written before `mount_kind` existed.
+        (
+            legacy,
+            "/Volumes/Lumen-CLI-Legacy",
+            r#""filesystem_id":[1,2],"media_id":3,"boot":"stale-boot","source":"/dev/disk9s1""#,
+        ),
+    ];
+    let mut files = Vec::new();
+    for (uuid, root, identity) in catalogs {
+        let sidecar = folder.join(format!("{uuid}.sqlite"));
+        let created = Command::new(env!("CARGO_BIN_EXE_lumen"))
+            .arg("--db")
+            .arg(&sidecar)
+            .args(["index", "--root"])
+            .arg(&local)
+            .output()
+            .unwrap();
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let db = rusqlite::Connection::open(&sidecar).unwrap();
+        let file = format!("{root}/cli-netvol-report.txt");
+        db.execute(
+            "INSERT INTO item(path,display,kind,availability,name,full,initials,searchable_path)
+             VALUES(?1,'cli-netvol-report.txt','file','local','cli-netvol-report.txt','','',?1)",
+            [&file],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO name_fts(rowid,name,full,initials,searchable_path)
+             SELECT id,name,full,initials,searchable_path FROM item WHERE path=?1",
+            [&file],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT OR REPLACE INTO info(key,value) VALUES('external_volume',?1)",
+            [format!(r#"{{"path":"{root}","uuid":"{uuid}",{identity}}}"#)],
+        )
+        .unwrap();
+        files.push(file);
+    }
+    let volumes = f.run(&["volumes"]);
+    let status = |uuid: &str| {
+        volumes
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|volume| volume["uuid"] == uuid)
+            .unwrap_or_else(|| panic!("{uuid} missing from {volumes}"))
+            .clone()
+    };
+    let network = status(nas);
+    assert_eq!(network["kind"], "network");
+    assert_eq!(network["protocol"], "smb");
+    let external = status(legacy);
+    assert_eq!(external["kind"], "external");
+    assert_eq!(external["protocol"], Value::Null);
+    for volume in [network, external] {
+        assert_eq!(volume["available"], false);
+        assert_eq!(volume["indexed"], false);
+        assert_eq!(volume["needs_refresh"], true);
+    }
+    // Neither share is mounted: no hits, no validation, no diagnosis.
+    assert_eq!(
+        f.run(&["query", "cli-netvol-report"]),
+        serde_json::json!([])
+    );
+    for file in &files {
+        assert_eq!(
+            f.run(&[
+                "validate-hit",
+                "--kind",
+                "file",
+                "--availability",
+                "local",
+                "--",
+                file
+            ]),
+            serde_json::json!({"valid": false}),
+        );
+        assert_eq!(
+            f.run(&["diagnose", "--", file])["name"],
+            "index_unavailable"
+        );
+    }
+}
+
+#[test]
+fn content_filter_json_survives_restarts_and_preview_reads_the_catalog() {
+    let f = Fixture::new();
+    let docs = fs::canonicalize(&f.0).unwrap().join("docs");
+    for name in ["notes.md", "dist/bundle.md", "src/lib.rs", "tools/run.py"] {
+        let path = docs.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "content").unwrap();
+    }
+    let docs = docs.to_str().unwrap();
+    f.run(&["index", "--root", docs, "--separate-content"]);
+    let raw: String = rusqlite::Connection::open(f.0.join("test.sqlite"))
+        .unwrap()
+        .query_row("SELECT value FROM info WHERE key='scope'", [], |r| r.get(0))
+        .unwrap();
+    assert!(!raw.contains("content_filter"), "{raw}");
+    let filter = r#"{"enable_code":true,"deny_folders":["src"]}"#;
+    let scoped = f.run(&[
+        "content-scope",
+        "--content-root",
+        docs,
+        "--content-filter-json",
+        filter,
+    ]);
+    assert_eq!(scoped["scope"]["content_filter"]["enable_code"], true);
+    // notes.md and tools/run.py; dist/ is noise and src/ is denied.
+    assert_eq!(scoped["content"]["pending"], 2);
+    // Restarting with an explicit scope but no filter keeps the saved filter.
+    f.run(&[
+        "index",
+        "--root",
+        docs,
+        "--separate-content",
+        "--content-root",
+        docs,
+    ]);
+    let status = f.run(&["status", "--include-scope"]);
+    assert_eq!(
+        status["scope"]["content_filter"]["deny_folders"],
+        serde_json::json!(["src"])
+    );
+    assert_eq!(status["content"]["total"], 2);
+    let preview = f.run(&[
+        "preview-content-scope",
+        "--content-root",
+        docs,
+        "--content-filter-json",
+        "{}",
+    ]);
+    assert_eq!(preview["total_files"], 1);
+    assert_eq!(
+        preview["by_category"],
+        serde_json::json!({"pdf":0,"docx":0,"text":1,"images":0,"code":0})
+    );
+    let saved = f.run(&["preview-content-scope"]);
+    assert_eq!(saved["total_files"], 2);
+    assert_eq!(saved["by_category"]["code"], 1);
+    assert_eq!(saved["top_subfolders"][0]["name"], "tools");
+    let rejected = f
+        .cli()
+        .args([
+            "content-scope",
+            "--content-root",
+            docs,
+            "--content-filter-json",
+            "{bad",
+        ])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
 }

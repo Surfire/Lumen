@@ -7,9 +7,24 @@ struct ExternalVolume: Decodable, Identifiable {
     let available: Bool
     let indexed: Bool
     let needs_refresh: Bool
+    /// `"external"` or `"network"`; absent from older engines.
+    let kind: String?
+    let `protocol`: String?
 
     var id: String { uuid }
     var name: String { URL(fileURLWithPath: path).lastPathComponent }
+    var isNetwork: Bool { kind == "network" }
+
+    var protocolBadge: String? {
+        switch `protocol`?.lowercased() {
+        case "smb", "smbfs": return "SMB"
+        case "nfs": return "NFS"
+        case "afp", "afpfs": return "AFP"
+        case "webdav": return "WebDAV"
+        case let other?: return other.isEmpty ? nil : other.uppercased()
+        case nil: return isNetwork ? "NET" : nil
+        }
+    }
 }
 
 @MainActor
@@ -87,11 +102,23 @@ struct LauncherExternalVolumes: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text(launcher.t(
-                "选择要搜索的本机外置卷。Lumen 只索引文件名，文件有变化时可手动更新。",
-                "Choose a local external volume to search. Lumen indexes file names. Refresh the index when files change."
-            ))
-            .foregroundStyle(.secondary)
+            HStack(alignment: .firstTextBaseline) {
+                Text(launcher.t(
+                    "选择要搜索的外置卷或网络共享（SMB、NFS、AFP、WebDAV）。Lumen 只索引文件名，文件有变化时可手动更新。",
+                    "Choose an external volume or network share (SMB, NFS, AFP, WebDAV) to search. Lumen indexes file names. Refresh the index when files change."
+                ))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 8)
+                Button {
+                    catalog.reload()
+                } label: {
+                    Label(launcher.t("刷新", "Refresh"), systemImage: "arrow.clockwise")
+                }
+                .controlSize(.small)
+                .disabled(catalog.refreshing || catalog.editing != nil)
+                .accessibilityIdentifier("settings.external-volumes.refresh")
+            }
             if !canIndex {
                 Text(launcher.t("主索引就绪后可添加或更新外置卷。", "You can add or refresh volumes when the main index is ready."))
                     .foregroundStyle(.secondary)
@@ -104,7 +131,7 @@ struct LauncherExternalVolumes: View {
                 if catalog.refreshing {
                     ProgressView().controlSize(.small)
                 } else {
-                    Text(launcher.t("没有可用的外置卷。", "No external volumes available."))
+                    Text(launcher.t("没有可用的外置卷或网络共享。", "No external volumes or network shares available."))
                         .foregroundStyle(.secondary)
                 }
             } else {
@@ -116,11 +143,20 @@ struct LauncherExternalVolumes: View {
 
     private func row(_ volume: ExternalVolume) -> some View {
         HStack(spacing: 12) {
-            Image(systemName: "externaldrive")
+            Image(systemName: volume.isNetwork ? "externaldrive.connected.to.line.below" : "externaldrive")
                 .foregroundStyle(.secondary)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
-                Text(volume.name).lineLimit(1).truncationMode(.middle).help(volume.path)
+                HStack(spacing: 6) {
+                    Text(volume.name).lineLimit(1).truncationMode(.middle).help(volume.path)
+                    if let badge = volume.protocolBadge {
+                        Text(badge)
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Color.secondary.opacity(0.15), in: Capsule())
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 Text(label(volume)).font(.caption).foregroundStyle(.secondary)
             }
             Spacer()

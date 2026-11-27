@@ -307,6 +307,7 @@ impl Coverage {
                 .or_else(|| scope.pdf_helper.as_ref().map(|_| PdfHelperPolicy::Manual)),
             image_ocr: scope.image_ocr,
             image_ocr_helper: None,
+            content_filter: scope.content_filter.clone(),
         };
         let database = platform::filesystem_spelling(&database);
         let sidecars = INDEX_SIDECARS.map(|suffix| with_suffix(&database, suffix));
@@ -550,6 +551,8 @@ pub(super) fn restrict_scope(conn: &mut Connection, coverage: &Coverage) -> Resu
         write_info(&tx, NAME_POLICY, &true)?;
     }
     write_info(&tx, "scope", &coverage.scope)?;
+    // Image vectors follow the same content scope; drop those it no longer covers.
+    crate::image_search::prune(&tx, &coverage.scope)?;
     if !content_reconciled {
         write_info(&tx, CONTENT_POLICY, &true)?;
     }
@@ -1617,9 +1620,15 @@ pub(super) enum DocumentKind {
 impl DocumentKind {
     pub(super) fn for_path(path: &Path) -> Option<Self> {
         match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
-            "txt" | "md" | "markdown" => Some(Self::Text),
             "docx" => Some(Self::Docx),
             "pdf" => Some(Self::Pdf),
+            // Source and config files are plain UTF-8 text; ContentFilter
+            // decides whether they are eligible.
+            ext if crate::PROSE_EXTENSIONS.contains(&ext)
+                || crate::CODE_EXTENSIONS.contains(&ext) =>
+            {
+                Some(Self::Text)
+            }
             _ if crate::image_decode::supported_path(path) => Some(Self::Image),
             _ => None,
         }

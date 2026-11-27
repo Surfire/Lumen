@@ -19,7 +19,8 @@ mod vector;
 mod watch;
 
 pub use content::{
-    ContentBatch, apply_content_scope, apply_content_scope_with_image_ocr, index_content,
+    ContentBatch, apply_content_scope, apply_content_scope_with_filter,
+    apply_content_scope_with_image_ocr, index_content, preview_content_scope,
 };
 pub use diagnose::verify_cached_access;
 pub use diagnose::{Diagnosis, Reason as DiagnoseReason, diagnose, validate_hit};
@@ -79,6 +80,196 @@ pub struct Scope {
     #[doc(hidden)]
     #[serde(skip)]
     pub image_ocr_helper: Option<std::convert::Infallible>,
+    /// Which files below `content_roots` have their content (text, images)
+    /// indexed. Filename search is never affected.
+    #[serde(default, skip_serializing_if = "ContentFilter::is_default")]
+    pub content_filter: ContentFilter,
+}
+
+/// Content-only selection rules. Every field is optional in JSON.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContentFilter {
+    pub enable_pdf: bool,
+    pub enable_docx: bool,
+    pub enable_text: bool,
+    pub enable_images: bool,
+    pub enable_code: bool,
+    pub allow_extensions: Vec<String>,
+    pub deny_extensions: Vec<String>,
+    /// Absolute folder paths (prefix match) or bare folder names (matched
+    /// case-insensitively against any directory below a content root).
+    pub deny_folders: Vec<String>,
+}
+
+impl Default for ContentFilter {
+    fn default() -> Self {
+        Self {
+            enable_pdf: true,
+            enable_docx: true,
+            enable_text: true,
+            enable_images: true,
+            enable_code: false,
+            allow_extensions: Vec::new(),
+            deny_extensions: Vec::new(),
+            deny_folders: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContentCategory {
+    Pdf,
+    Docx,
+    Text,
+    Image,
+    Code,
+}
+
+/// Generated, dependency, cache and build output directories. Their files keep
+/// their names in the filename index but their content is never extracted.
+const CONTENT_NOISE_DIRS: &[&str] = &[
+    "node_modules",
+    "dist",
+    "build",
+    "out",
+    ".next",
+    ".nuxt",
+    "coverage",
+    "vendor",
+    "site-packages",
+    "__pycache__",
+    ".venv",
+    "venv",
+    // Build `target` dirs are already dropped from names by the marker-checked
+    // development_noise; a user folder named "Target" keeps its content.
+    "logs",
+    "tmp",
+    "temp",
+    ".cache",
+    "pods",
+    "deriveddata",
+    "paddleocr",
+    "ocr_output",
+    "cmakefiles",
+    "bower_components",
+    "wandb",
+    "checkpoints",
+];
+const CONTENT_NOISE_NAMES: &[&str] = &[
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "cargo.lock",
+    "poetry.lock",
+];
+const CONTENT_NOISE_SUFFIXES: &[&str] = &[
+    ".lock",
+    ".min.js",
+    ".min.css",
+    ".map",
+    ".ocr.txt",
+    ".dom.txt",
+    ".transcript.md",
+    ".summary.md",
+    ".response.md",
+];
+pub(crate) const PROSE_EXTENSIONS: &[&str] = &["txt", "md", "markdown", "log", "csv", "tsv"];
+pub(crate) const CODE_EXTENSIONS: &[&str] = &[
+    "rs", "swift", "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "cpp", "h", "hpp", "m", "mm",
+    "rb", "php", "kt", "lua", "dart", "vue", "svelte", "sh", "zsh", "bash", "sql", "json", "yaml",
+    "yml", "toml", "xml", "html", "htm", "css", "scss",
+];
+
+fn listed(list: &[String], extension: &str) -> bool {
+    list.iter().any(|item| {
+        item.trim()
+            .trim_start_matches('.')
+            .eq_ignore_ascii_case(extension)
+    })
+}
+
+pub(crate) fn content_noise_dir(name: &str) -> bool {
+    CONTENT_NOISE_DIRS
+        .iter()
+        .any(|noise| name.eq_ignore_ascii_case(noise))
+}
+
+impl ContentFilter {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The category this filter enables for `path`, from its name alone.
+    pub(crate) fn category(&self, path: &Path) -> Option<ContentCategory> {
+        let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+        let category = match extension.as_str() {
+            "pdf" => ContentCategory::Pdf,
+            "docx" => ContentCategory::Docx,
+            ext if PROSE_EXTENSIONS.contains(&ext) => ContentCategory::Text,
+            ext if CODE_EXTENSIONS.contains(&ext) => ContentCategory::Code,
+            _ if image_decode::supported_path(path) => ContentCategory::Image,
+            _ => return None,
+        };
+        if listed(&self.allow_extensions, &extension) {
+            return Some(category);
+        }
+        match category {
+            ContentCategory::Pdf => self.enable_pdf,
+            ContentCategory::Docx => self.enable_docx,
+            ContentCategory::Text => self.enable_text,
+            ContentCategory::Image => self.enable_images,
+            ContentCategory::Code => self.enable_code,
+        }
+        .then_some(category)
+    }
+
+    /// Noise folders/files and explicit denials, judged below the deepest
+    /// matching root so a content root may itself live under e.g. `tmp`.
+    /// Pure path inspection: never touches the filesystem.
+    pub(crate) fn excludes(&self, path: &Path, roots: &[PathBuf]) -> bool {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return true;
+        };
+        let lower = name.to_ascii_lowercase();
+        if CONTENT_NOISE_NAMES.contains(&lower.as_str())
+            || CONTENT_NOISE_SUFFIXES
+                .iter()
+                .any(|suffix| lower.ends_with(suffix))
+        {
+            return true;
+        }
+        if let Some(extension) = path.extension().and_then(|ext| ext.to_str())
+            && listed(&self.deny_extensions, extension)
+        {
+            return true;
+        }
+        let relative = roots
+            .iter()
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.as_os_str().len())
+            .and_then(|root| path.strip_prefix(root).ok())
+            .unwrap_or(path);
+        let folders: Vec<&str> = relative
+            .parent()
+            .into_iter()
+            .flat_map(Path::components)
+            .filter_map(|part| part.as_os_str().to_str())
+            .collect();
+        folders.iter().any(|folder| content_noise_dir(folder))
+            || self.deny_folders.iter().any(|denied| {
+                let denied = denied.trim().trim_end_matches('/');
+                if denied.is_empty() {
+                    false
+                } else if denied.starts_with('/') {
+                    path.starts_with(denied)
+                } else {
+                    folders
+                        .iter()
+                        .any(|folder| folder.eq_ignore_ascii_case(denied))
+                }
+            })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,6 +563,7 @@ fn open_write(path: &Path, exclusive_indexer: bool) -> Result<(Connection, Optio
         }
         _ => bail!("not a supported Lumen index; no changes made"),
     }
+    image_search::migrate_legacy_scope(&mut conn)?;
     Ok((conn, lease))
 }
 
@@ -902,6 +1094,7 @@ pub fn status_with_scope(conn: &Connection, include_scope: bool) -> Result<serde
             "deny": scope.deny,
             "documents": scope.documents,
             "content_roots": scope.content_roots,
+            "content_filter": scope.content_filter,
         });
     }
     Ok(report)
@@ -1029,6 +1222,28 @@ fn excerpt_window(
 #[cfg(test)]
 mod scope_tests {
     use super::*;
+
+    #[test]
+    fn scope_json_without_a_content_filter_keeps_defaults_and_round_trips_unchanged() {
+        let legacy = r#"{"roots":["/Users/a"],"allow":[],"deny":[],"documents":true,"content_roots":["/Users/a/Docs"],"pdf_helper":null}"#;
+        let scope: Scope = serde_json::from_str(legacy).unwrap();
+        assert_eq!(scope.content_filter, ContentFilter::default());
+        assert_eq!(serde_json::to_string(&scope).unwrap(), legacy);
+        let partial: ContentFilter = serde_json::from_str(r#"{"enable_code":true}"#).unwrap();
+        assert!(partial.enable_code && partial.enable_pdf && partial.enable_images);
+        let roots = [PathBuf::from("/Users/a/tmp/Docs")];
+        let filter = ContentFilter::default();
+        // Noise is judged below the content root, which may itself sit under `tmp`.
+        assert!(!filter.excludes(Path::new("/Users/a/tmp/Docs/x.md"), &roots));
+        assert!(filter.excludes(Path::new("/Users/a/tmp/Docs/Build/x.md"), &roots));
+        assert!(filter.excludes(Path::new("/Users/a/tmp/Docs/package-lock.json"), &roots));
+        assert_eq!(
+            filter.category(Path::new("/d/a.TXT")),
+            Some(ContentCategory::Text)
+        );
+        assert_eq!(filter.category(Path::new("/d/a.swift")), None);
+        assert_eq!(filter.category(Path::new("/d/a.bin")), None);
+    }
 
     #[test]
     fn system_and_user_library_noise_leave_app_and_cloud_paths_traversable() {

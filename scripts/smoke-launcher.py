@@ -618,6 +618,8 @@ def main():
     parser.add_argument("--image-fixtures", type=Path, help="Directory of opaque-filename image fixtures")
     parser.add_argument("--image-projector", type=Path, help="Pinned local vision projector (requires --real-gemma)")
     parser.add_argument("--snapshots", type=Path, help="Save offscreen PNGs to this directory")
+    parser.add_argument("--only", choices=["content", "actions", "resident", "real", "controlled", "auto-index", "settings"],
+                        help="Run only one scenario during debugging (full suite runs when omitted)")
     args = parser.parse_args()
     if args.watch_engine and not args.watch_engine.is_file():
         parser.error("--watch-engine must point to a lumen binary")
@@ -640,90 +642,100 @@ def main():
                            check=True, timeout=15, capture_output=True)
             run(root, "en")
         return
-    verify_content_pipeline(args.snapshots)
-    if args.content_only:
-        return
-    with tempfile.TemporaryDirectory(prefix="lumen-gui-actions-") as tmp:
-        root = Path(tmp).resolve()
-        make_corpus(root)
-        make_action_probe(root)
-        (root / "corpus/Lumen Action Probe notes.txt").write_text("Synthetic unified search fixture.", encoding="utf-8")
-        (root / "action-scenario").touch()
-        (root / "quicklinks-scenario").touch()
-        if args.query_syntax:
-            fixtures = root / "corpus"
-            for name in ("成都 卫健委.PPTX", "卫健委成都方案.pptx", "Other project.pptx",
-                         "成都 卫健委.pptx.bak", "成都情况.txt"):
-                (fixtures / name).write_text("Synthetic query fixture.", encoding="utf-8")
-            (fixtures / "成都 卫健委目录.pptx").mkdir()
-            (root / "syntax-scenario").touch()
+    only = args.only
+    if only in (None, "content"):
+        verify_content_pipeline(args.snapshots)
+        if args.content_only or only == "content":
+            return
+    if only in (None, "actions"):
+        with tempfile.TemporaryDirectory(prefix="lumen-gui-actions-") as tmp:
+            root = Path(tmp).resolve()
+            make_corpus(root)
+            make_action_probe(root)
+            (root / "corpus/Lumen Action Probe notes.txt").write_text("Synthetic unified search fixture.", encoding="utf-8")
+            (root / "action-scenario").touch()
+            (root / "quicklinks-scenario").touch()
+            if args.query_syntax:
+                fixtures = root / "corpus"
+                for name in ("成都 卫健委.PPTX", "卫健委成都方案.pptx", "Other project.pptx",
+                             "成都 卫健委.pptx.bak", "成都情况.txt"):
+                    (fixtures / name).write_text("Synthetic query fixture.", encoding="utf-8")
+                (fixtures / "成都 卫健委目录.pptx").mkdir()
+                (root / "syntax-scenario").touch()
 
-        if args.snapshots:
-            (root / "capture-icons").touch()
-        verify_gui_translation(root, "zh")
-        if args.snapshots:
-            args.snapshots.mkdir(parents=True, exist_ok=True)
-            for image in root.glob("lumen-*.png"):
-                shutil.copyfile(image, args.snapshots / image.name)
-    with tempfile.TemporaryDirectory(prefix="lumen-gui-") as tmp:
-        root = Path(tmp)
-        make_corpus(root)
-        environment = os.environ.copy()
-        environment.pop("LUMEN_GEMMA_TEST_HOME", None)
-        subprocess.run([str(APP), "--verify-resident-startup", str(root), "en"], check=True, env=environment, timeout=10)
-        run(root, "en")
-        run(root, "zh")
-    with tempfile.TemporaryDirectory(prefix="lumen-gui-") as tmp:
-        root = Path(tmp)
-        make_corpus(root)
-        if args.snapshots:
-            (root / "capture-snapshots").touch()
-            design = root / "corpus/Design"
-            design.mkdir()
-            for name in ("Design brief.md", "Design notes.txt", "Design review.md", "Design spec.md",
-                         "Design references.md", "Design accessibility.md", "Design decisions.md",
-                         "Design prototype.md", "Design options.md"):
-                (design / name).write_text("Synthetic design fixture.", encoding="utf-8")
-        crowd = root / "corpus/Examples crowded needle fixtures"
-        crowd.mkdir()
-        for index in range(70):
-            (crowd / f"item-{index:02}.txt").write_text("Weak path fixture.", encoding="utf-8")
-        (root / "corpus/crowded needle spec.txt").write_text("Strong filename fixture.", encoding="utf-8")
-        (root / "corpus/body-match.md").write_text("A crowded needle reference in the body.", encoding="utf-8")
-        install_fixture(root)
-        run(root, "zh")
-        if args.snapshots:
-            args.snapshots.mkdir(parents=True, exist_ok=True)
-            for name in ("lumen-idle-light.png", "lumen-results-light.png", "lumen-results-dark.png"):
-                shutil.copyfile(root / name, args.snapshots / name)
-        run(root, "en")
-    with tempfile.TemporaryDirectory(prefix="lumen-gui-auto-index-") as tmp:
-        root = Path(tmp).resolve()
-        make_corpus(root)
-        install_fixture(root)
-        (root / "automatic-index-scenario").touch()
-        run(root, "en")
-    with tempfile.TemporaryDirectory(prefix="lumen-gui-settings-") as tmp:
-        root = Path(tmp).resolve()
-        make_corpus(root)
-        protected = root / "corpus/Scoped/Allowed Child"
-        protected.mkdir(parents=True)
-        (protected / "protected-neighbor.md").write_text("Synthetic scope test.", encoding="utf-8")
-        fixture = install_fixture(root)
-        (root / "settings-scenario").touch()
-        if args.snapshots:
-            (root / "capture-settings").touch()
-        subprocess.run([str(fixture), "--db", str(root / "index.sqlite"), "index",
-                        "--root", str(root / "corpus"), "--deny", str(root / "corpus/Excluded")],
-                       check=True, timeout=15, capture_output=True)
-        public_status = subprocess.check_output([str(BUNDLE / "Resources/lumen"), "--db",
-                                                 str(root / "index.sqlite"), "status"], timeout=10)
-        assert "scope" not in json.loads(public_status), "ordinary status exposed directory rules"
-        run(root, "en")
-        if args.snapshots:
-            for image in root.glob("settings-*.png"):
-                shutil.copyfile(image, args.snapshots / image.name)
-    if args.watch_engine:
+            if args.snapshots:
+                (root / "capture-icons").touch()
+            verify_gui_translation(root, "zh")
+            if args.snapshots:
+                args.snapshots.mkdir(parents=True, exist_ok=True)
+                for image in root.glob("lumen-*.png"):
+                    shutil.copyfile(image, args.snapshots / image.name)
+    if only in (None, "resident", "real"):
+        with tempfile.TemporaryDirectory(prefix="lumen-gui-") as tmp:
+            root = Path(tmp)
+            make_corpus(root)
+            environment = os.environ.copy()
+            environment.pop("LUMEN_GEMMA_TEST_HOME", None)
+            if only in (None, "resident"):
+                subprocess.run([str(APP), "--verify-resident-startup", str(root), "en"], check=True, env=environment, timeout=10)
+            if only in (None, "real"):
+                run(root, "en")
+                run(root, "zh")
+    if only in (None, "controlled"):
+        with tempfile.TemporaryDirectory(prefix="lumen-gui-") as tmp:
+            root = Path(tmp)
+            make_corpus(root)
+            if args.snapshots:
+                (root / "capture-snapshots").touch()
+                design = root / "corpus/Design"
+                design.mkdir()
+                for name in ("Design brief.md", "Design notes.txt", "Design review.md", "Design spec.md",
+                             "Design references.md", "Design accessibility.md", "Design decisions.md",
+                             "Design prototype.md", "Design options.md"):
+                    (design / name).write_text("Synthetic design fixture.", encoding="utf-8")
+            crowd = root / "corpus/Examples crowded needle fixtures"
+            crowd.mkdir()
+            for index in range(70):
+                (crowd / f"item-{index:02}.txt").write_text("Weak path fixture.", encoding="utf-8")
+            (root / "corpus/crowded needle spec.txt").write_text("Strong filename fixture.", encoding="utf-8")
+            (root / "corpus/body-match.md").write_text("A crowded needle reference in the body.", encoding="utf-8")
+            install_fixture(root)
+            run(root, "zh")
+            if args.snapshots:
+                args.snapshots.mkdir(parents=True, exist_ok=True)
+                for name in ("lumen-idle-light.png", "lumen-results-light.png", "lumen-results-dark.png"):
+                    shutil.copyfile(root / name, args.snapshots / name)
+            run(root, "en")
+    if only in (None, "auto-index"):
+        with tempfile.TemporaryDirectory(prefix="lumen-gui-auto-index-") as tmp:
+            root = Path(tmp).resolve()
+            make_corpus(root)
+            install_fixture(root)
+            (root / "automatic-index-scenario").touch()
+            run(root, "en")
+    if only in (None, "settings"):
+        with tempfile.TemporaryDirectory(prefix="lumen-gui-settings-") as tmp:
+            root = Path(tmp).resolve()
+            make_corpus(root)
+            protected = root / "corpus/Scoped/Allowed Child"
+            protected.mkdir(parents=True)
+            (protected / "protected-neighbor.md").write_text("Synthetic scope test.", encoding="utf-8")
+            fixture = install_fixture(root)
+            (root / "settings-scenario").touch()
+            if args.snapshots:
+                (root / "capture-settings").touch()
+            subprocess.run([str(fixture), "--db", str(root / "index.sqlite"), "index",
+                            "--root", str(root / "corpus"), "--deny", str(root / "corpus/Excluded")],
+                           check=True, timeout=15, capture_output=True)
+            public_status = subprocess.check_output([str(BUNDLE / "Resources/lumen"), "--db",
+                                                     str(root / "index.sqlite"), "status"], timeout=10)
+            assert "scope" not in json.loads(public_status), "ordinary status exposed directory rules"
+            run(root, "en")
+            if args.snapshots:
+                args.snapshots.mkdir(parents=True, exist_ok=True)
+                for image in root.glob("settings-*.png"):
+                    shutil.copyfile(image, args.snapshots / image.name)
+    if only is None and args.watch_engine:
         help_text = subprocess.check_output([str(args.watch_engine.resolve()), "watch", "--help"], text=True, timeout=10)
         with tempfile.TemporaryDirectory(prefix="lumen-gui-") as tmp:
             root = Path(tmp)
@@ -747,8 +759,7 @@ def main():
             (root / "watch-engine").symlink_to(args.watch_engine.resolve())
             run(root, "en")
 
-
-    if args.real_gemma:
+    if only is None and args.real_gemma:
         with tempfile.TemporaryDirectory(prefix="lumen-gui-gemma-") as tmp:
             root = Path(tmp).resolve()
             corpus = root / "corpus"

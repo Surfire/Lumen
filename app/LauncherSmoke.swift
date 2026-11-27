@@ -1098,6 +1098,7 @@ final class LauncherSmoke {
         try await verifyPhase2Regressions(app)
         try await verifyPhase3Regressions(app)
         try await verifyBuild33Phase1Regressions(app)
+        try await verifyBuild33Phase2Regressions(app)
         try check(model.indexPhase == .needsIndex && !model.canSearch, "action smoke unexpectedly had a file index")
         func chosen() -> LaunchAction? {
             if case .action(let action)? = model.selectedResult { return action }
@@ -5592,6 +5593,190 @@ final class LauncherSmoke {
             NSApp.appearance == nil && appearanceDefaults.string(forKey: "appearance") == "system"
         }
         print("Build 33 Phase 1 regressions passed (plainText UTF-8/NUL, clipboard migration + rich preview, portrait thirds/autoTile/restore, AppearanceMode)")
+    }
+
+    private func verifyBuild33Phase2Regressions(_ app: AppDelegate) async throws {
+        let model = app.model
+        let fm = FileManager.default
+        let root = URL(fileURLWithPath: IndexScope.folderPath(directory), isDirectory: true)
+            .appendingPathComponent("phase2-b33-regressions-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        // 1. Network filesystem f_fstypename allowlist & resident-file boundary.
+        for allowed in ["smbfs", "SMBFS", "nfs", "afpfs", "webdav"] {
+            try check(LocalFile.isAllowedNetworkFilesystem(allowed), "expected \(allowed) to be an allowed network filesystem")
+        }
+        var netStat = statfs()
+        withUnsafeMutableBytes(of: &netStat.f_fstypename) { buffer in
+            let bytes = Array("SMBFS\0".utf8)
+            buffer.copyBytes(from: bytes)
+        }
+        try check(LocalFile.fsTypeName(of: netStat) == "SMBFS" && LocalFile.isAllowedNetworkFilesystem(LocalFile.fsTypeName(of: netStat)),
+                  "fsTypeName(of:) did not NUL-terminate statfs.f_fstypename cleanly")
+        for rejected in ["apfs", "hfs", "autofs", "devfs", ""] {
+            try check(!LocalFile.isAllowedNetworkFilesystem(rejected), "expected \(rejected) to be rejected by network filesystem allowlist")
+        }
+        let residentFile = root.appendingPathComponent("hello.txt")
+        try Data("hello".utf8).write(to: residentFile)
+        try check(try LocalFile.withResidentFile(residentFile) { 42 } == 42, "withResidentFile rejected a regular local file")
+        var rejectedMissing = false
+        do { _ = try LocalFile.withResidentFile(root.appendingPathComponent("missing.txt")) { 1 } } catch { rejectedMissing = true }
+        try check(rejectedMissing, "withResidentFile did not reject missing file")
+        var rejectedRemoteURL = false
+        do { _ = try LocalFile.withResidentFile(URL(string: "https://example.com/hello.txt")!) { 1 } } catch { rejectedRemoteURL = true }
+        try check(rejectedRemoteURL, "withResidentFile did not reject non-file URL")
+
+        // 2. Bundled gemma-assets.json manifest, mirror URLs, SHA-256 verification, and file classification.
+        guard let manifest = GemmaAssetManager.loadManifest() else {
+            throw Failure("GemmaAssetManager.loadManifest() returned nil")
+        }
+        try check(manifest.model.name == "embeddinggemma-2-Q8_0.gguf", "unexpected manifest model name")
+        try check(manifest.image_projector.name == "mmproj-embeddinggemma-2-Q8_0.gguf", "unexpected manifest projector name")
+        try check(manifest.runtime.count == 12, "expected 12 pinned Gemma runtime entries, got \(manifest.runtime.count)")
+        for asset in GemmaAsset.allCases {
+            for mirror in GemmaMirror.allCases {
+                guard let url = GemmaAssetManager.downloadURL(asset: asset, mirror: mirror, manifest: manifest) else {
+                    throw Failure("missing downloadURL for \(asset.rawValue) / \(mirror.rawValue)")
+                }
+                let host = url.host ?? ""
+                switch (asset, mirror) {
+                case (.runtimeArchive, _):
+                    try check(host.contains("github"), "expected GitHub runtime URL, got \(url)")
+                case (_, .huggingFace):
+                    try check(host.contains("huggingface.co"), "expected huggingface.co URL, got \(url)")
+                case (_, .hfMirror):
+                    try check(host.contains("hf-mirror.com"), "expected hf-mirror.com URL, got \(url)")
+                }
+            }
+        }
+        let helloSHA = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        try check(GemmaAssetManager.verifyFileSHA256(at: residentFile, expectedSHA256: helloSHA, expectedSize: 5),
+                  "verifyFileSHA256 failed on valid regular file")
+        try check(!GemmaAssetManager.verifyFileSHA256(at: residentFile, expectedSHA256: helloSHA, expectedSize: 6),
+                  "verifyFileSHA256 accepted wrong size")
+        let tamperedFile = root.appendingPathComponent("tampered.txt")
+        try Data("jello".utf8).write(to: tamperedFile)
+        try check(!GemmaAssetManager.verifyFileSHA256(at: tamperedFile, expectedSHA256: helloSHA, expectedSize: 5),
+                  "verifyFileSHA256 accepted 1-byte tampered file")
+        let symlinkFile = root.appendingPathComponent("hello-link.txt")
+        try fm.createSymbolicLink(at: symlinkFile, withDestinationURL: residentFile)
+        try check(!GemmaAssetManager.verifyFileSHA256(at: symlinkFile, expectedSHA256: helloSHA, expectedSize: 5),
+                  "verifyFileSHA256 accepted symlink")
+
+        let archiveName = manifest.archive.name ?? "llama-b11457-bin-macos-arm64.tar.gz"
+        let fakeArchive = root.appendingPathComponent(archiveName)
+        fm.createFile(atPath: fakeArchive.path, contents: nil)
+        let archiveHandle = try FileHandle(forWritingTo: fakeArchive)
+        try archiveHandle.truncate(atOffset: UInt64(manifest.archive.size))
+        try archiveHandle.close()
+        let wrongSizeArchive = root.appendingPathComponent("wrong-\(archiveName)")
+        try Data("bad".utf8).write(to: wrongSizeArchive)
+        let symlinkArchive = root.appendingPathComponent("link-\(archiveName)")
+        try fm.createSymbolicLink(at: symlinkArchive, withDestinationURL: fakeArchive)
+        let classified = GemmaAssetManager.classify([fakeArchive, wrongSizeArchive, symlinkArchive], manifest: manifest)
+        try check(classified[.runtimeArchive] == fakeArchive && classified.count == 1,
+                  "GemmaAssetManager.classify misclassified local files: \(classified)")
+
+        // 3. ContentFilter defaults/round-trip, IndexScope.contentArguments, and ExternalVolume decoding.
+        let defaultFilter = ContentFilter()
+        try check(defaultFilter.enable_pdf && defaultFilter.enable_docx && defaultFilter.enable_text
+                  && defaultFilter.enable_images && !defaultFilter.enable_code
+                  && defaultFilter.allow_extensions.isEmpty && defaultFilter.deny_extensions.isEmpty
+                  && defaultFilter.deny_folders.isEmpty, "ContentFilter defaults changed unexpectedly")
+        let decodedEmpty = try JSONDecoder().decode(ContentFilter.self, from: Data("{}".utf8))
+        try check(decodedEmpty == defaultFilter, "empty JSON did not decode to ContentFilter defaults")
+        var customFilter = ContentFilter()
+        customFilter.enable_code = true
+        customFilter.allow_extensions = ["swift", "json"]
+        customFilter.deny_extensions = ["tmp"]
+        customFilter.deny_folders = ["dist"]
+        let encodedFilter = try JSONEncoder().encode(customFilter)
+        try check(try JSONDecoder().decode(ContentFilter.self, from: encodedFilter) == customFilter,
+                  "ContentFilter JSON round-trip mismatch")
+        let probeScope = IndexScope(roots: [], allow: [], deny: [], documents: true,
+                                    content_roots: [root.path], content_filter: customFilter)
+        let contentArgs = probeScope.contentArguments
+        try check(contentArgs.first == "content-scope"
+                  && contentArgs.contains("--content-root")
+                  && contentArgs.contains(root.path)
+                  && contentArgs.contains("--bundled-pdf-helper")
+                  && contentArgs.contains("--content-filter-json"),
+                  "IndexScope.contentArguments missing expected flags: \(contentArgs)")
+
+        let networkVolumeJSON = Data(#"{"uuid":"net-1","path":"/Volumes/movie","available":true,"indexed":false,"needs_refresh":false,"kind":"network","protocol":"smb"}"#.utf8)
+        let networkVolume = try JSONDecoder().decode(ExternalVolume.self, from: networkVolumeJSON)
+        try check(networkVolume.isNetwork && networkVolume.protocolBadge == "SMB", "ExternalVolume failed to decode network SMB badge")
+        let legacyVolumeJSON = Data(#"{"uuid":"ext-1","path":"/Volumes/USB","available":true,"indexed":false,"needs_refresh":false}"#.utf8)
+        let legacyVolume = try JSONDecoder().decode(ExternalVolume.self, from: legacyVolumeJSON)
+        try check(!legacyVolume.isNetwork && legacyVolume.protocolBadge == nil, "ExternalVolume failed legacy decoding")
+
+        // 4. Bundled lumen preview-content-scope & volumes check on isolated temp corpus.
+        guard let lumenURL = Bundle.main.url(forResource: "lumen", withExtension: nil) else {
+            throw Failure("missing bundled Resources/lumen binary")
+        }
+        let corpus = root.appendingPathComponent("corpus", isDirectory: true)
+        for rel in ["docs", "src", "node_modules/pkg", "notes"] {
+            try fm.createDirectory(at: corpus.appendingPathComponent(rel, isDirectory: true), withIntermediateDirectories: true)
+        }
+        try Data("%PDF-1.4\n".utf8).write(to: corpus.appendingPathComponent("docs/a.pdf"))
+        try Data("struct Demo {}\n".utf8).write(to: corpus.appendingPathComponent("src/main.swift"))
+        try Data("ignored\n".utf8).write(to: corpus.appendingPathComponent("node_modules/pkg/b.txt"))
+        try Data("# Note\nhello\n".utf8).write(to: corpus.appendingPathComponent("notes/note.md"))
+        let probeDB = root.appendingPathComponent("probe.sqlite")
+        func runLumen(_ args: [String]) throws -> Data {
+            let process = Process()
+            process.executableURL = lumenURL
+            process.arguments = args
+            let stdout = Pipe()
+            let stderr = Pipe()
+            process.standardOutput = stdout
+            process.standardError = stderr
+            try process.run()
+            let outData = stdout.fileHandleForReading.readDataToEndOfFile()
+            let errData = stderr.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                let err = String(data: errData, encoding: .utf8) ?? ""
+                throw Failure("lumen \(args.first ?? "") failed (\(process.terminationStatus)): \(err)")
+            }
+            return outData
+        }
+        _ = try runLumen(["index", "--db", probeDB.path, "--allow", corpus.path])
+        let previewDefaultData = try runLumen(["preview-content-scope", "--db", probeDB.path, "--content-root", corpus.path])
+        let previewDefault = try JSONDecoder().decode(ContentScopePreview.self, from: previewDefaultData)
+        try check(previewDefault.by_category.pdf == 1 && previewDefault.by_category.text == 1
+                  && previewDefault.by_category.code == 0,
+                  "unexpected preview-content-scope default breakdown: \(previewDefault)")
+        try check(!previewDefault.top_subfolders.contains { $0.name == "node_modules" }
+                  && previewDefault.top_subfolders.contains { $0.name == "docs" && !$0.suggested_noise }
+                  && previewDefault.top_subfolders.contains { $0.name == "notes" && !$0.suggested_noise },
+                  "preview-content-scope unexpected subfolders: \(previewDefault.top_subfolders)")
+        var codeFilter = ContentFilter()
+        codeFilter.enable_code = true
+        let previewCodeData = try runLumen(["preview-content-scope", "--db", probeDB.path, "--content-root", corpus.path] + codeFilter.arguments)
+        let previewCode = try JSONDecoder().decode(ContentScopePreview.self, from: previewCodeData)
+        try check(previewCode.by_category.code == 1, "preview-content-scope with enable_code=true did not count src/main.swift: \(previewCode)")
+        var denyDocsFilter = ContentFilter()
+        denyDocsFilter.deny_folders = [corpus.appendingPathComponent("docs").path]
+        let previewDenyData = try runLumen(["preview-content-scope", "--db", probeDB.path, "--content-root", corpus.path] + denyDocsFilter.arguments)
+        let previewDeny = try JSONDecoder().decode(ContentScopePreview.self, from: previewDenyData)
+        try check(previewDeny.by_category.pdf == 0 && previewDeny.by_category.text == 1,
+                  "preview-content-scope with deny_folders did not exclude docs: \(previewDeny)")
+        let volumesData = try runLumen(["volumes", "--db", probeDB.path])
+        let decodedVolumes = try JSONDecoder().decode([ExternalVolume].self, from: volumesData)
+        for volume in decodedVolumes where volume.isNetwork {
+            try check(!volume.path.contains("@") && !volume.path.contains("://"), "network volume path leaked URI/credentials")
+        }
+
+        // 5. SettingsSession progressive-disclosure contentFilter draft toggle & discard.
+        let session = SettingsSession(model: model, manageLoginItem: false, pageChanged: { _, _ in })
+        let hadChanges = session.hasChanges
+        session.updateContentFilter { $0.enable_code = true }
+        try check(session.hasChanges && session.contentFilter.enable_code, "SettingsSession.updateContentFilter did not mark draft changed")
+        session.discard()
+        try check(session.hasChanges == hadChanges && !session.contentFilter.enable_code, "SettingsSession.discard did not restore contentFilter")
+        print("Build 33 Phase 2 regressions passed (network f_fstypename, GemmaAssetManager, ContentFilter, preview-content-scope, ExternalVolume, SettingsSession)")
     }
 
     private struct Failure: Error, CustomStringConvertible {

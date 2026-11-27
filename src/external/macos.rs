@@ -1,4 +1,4 @@
-use super::{Mount, Mounted, uuid_valid};
+use super::{Mount, MountKind, Mounted, uuid_valid};
 use std::{
     ffi::{CStr, OsStr, c_char, c_void},
     mem::{MaybeUninit, size_of},
@@ -168,12 +168,20 @@ pub(super) fn mounted() -> Option<Mounted> {
         let path = Path::new(OsStr::from_bytes(path.to_bytes()));
         result.points.push(path.to_owned());
         if path.parent() != Some(Path::new("/Volumes"))
-            || mount.f_flags & libc::MNT_LOCAL as u32 == 0
             || mount.f_flags & libc::MNT_DONTBROWSE as u32 != 0
         {
             continue;
         }
         let source = unsafe { CStr::from_ptr(mount.f_mntfromname.as_ptr()) };
+        if mount.f_flags & libc::MNT_LOCAL as u32 == 0 {
+            let fstype = unsafe { CStr::from_ptr(mount.f_fstypename.as_ptr()) };
+            if let Some(volume) =
+                network_mount(path, &fstype.to_string_lossy(), &source.to_string_lossy())
+            {
+                result.eligible.push(volume);
+            }
+            continue;
+        }
         let Some((uuid, media_id)) = physical_identity(&session, source) else {
             continue;
         };
@@ -183,11 +191,85 @@ pub(super) fn mounted() -> Option<Mounted> {
         result.eligible.push(Mount {
             path: path.to_owned(),
             uuid,
-            filesystem_id,
-            media_id,
-            boot: boot.clone(),
-            source: source.to_string_lossy().into_owned(),
+            kind: MountKind::Physical {
+                filesystem_id,
+                media_id,
+                boot: boot.clone(),
+            },
         });
     }
     Some(result)
+}
+
+fn network_protocol(fstype: &str) -> Option<&'static str> {
+    Some(match fstype {
+        "smbfs" => "smb",
+        "nfs" => "nfs",
+        "afpfs" => "afp",
+        "webdav" => "webdav",
+        _ => return None,
+    })
+}
+
+/// Drop any `user[:password]@` userinfo from the URL authority (RFC 3986:
+/// the authority ends at the first `/`), so credentials never reach a
+/// registration, catalog, status reply or log line.
+pub(super) fn sanitize_source(source: &str) -> String {
+    let (scheme, rest) = match source.find("://") {
+        Some(at) => source.split_at(at + 3),
+        None if source.starts_with("//") => source.split_at(2),
+        None => ("", source),
+    };
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    format!(
+        "{}{}{path}",
+        scheme.to_ascii_lowercase(),
+        host.to_ascii_lowercase()
+    )
+}
+
+unsafe extern "C" {
+    // CommonCrypto ships in libSystem.
+    fn CC_SHA256(data: *const c_void, len: u32, md: *mut u8) -> *mut u8;
+}
+
+/// Deterministic UUID-shaped identity for a share, derived only from its
+/// protocol and credential-free source.
+pub(super) fn network_uuid(protocol: &str, sanitized_source: &str) -> Option<String> {
+    let input = format!("lumen-netvol:{protocol}:{sanitized_source}");
+    let mut digest = [0_u8; 32];
+    let len = u32::try_from(input.len()).ok()?;
+    unsafe { CC_SHA256(input.as_ptr().cast(), len, digest.as_mut_ptr()) };
+    let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+    let uuid = format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    );
+    uuid_valid(&uuid).then_some(uuid)
+}
+
+/// A browsable `/Volumes/<name>` SMB/NFS/AFP/WebDAV share. Time Machine
+/// destinations and hidden mount points are never offered.
+pub(super) fn network_mount(path: &Path, fstype: &str, source: &str) -> Option<Mount> {
+    let protocol = network_protocol(fstype)?;
+    let name = path.file_name()?.as_bytes();
+    if name.starts_with(b".") || name.starts_with(b"com.apple.TimeMachine") {
+        return None;
+    }
+    let sanitized_source = sanitize_source(source);
+    Some(Mount {
+        path: path.to_owned(),
+        uuid: network_uuid(protocol, &sanitized_source)?,
+        kind: MountKind::Network {
+            protocol: protocol.into(),
+            sanitized_source,
+        },
+    })
 }

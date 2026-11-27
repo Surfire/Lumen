@@ -2,7 +2,11 @@ import SwiftUI
 
 struct ImageSearchScope: Decodable {
     let root: String?
+    /// Present once image indexing follows the unified `content_roots` scope.
+    let roots: [String]?
     let vectors: Int
+
+    var hasFolders: Bool { root != nil || !(roots ?? []).isEmpty }
 }
 
 @MainActor
@@ -24,6 +28,8 @@ final class LauncherImageSearch: ObservableObject {
 
     private let engine: LauncherEngine
     private let defaults: UserDefaults?
+    /// True only when the user picked a projector; the installed default is detected instead of stored.
+    private(set) var customProjector = false
     private var readAttempted = false
     private var process: Process?
     private var generation = 0
@@ -32,12 +38,25 @@ final class LauncherImageSearch: ObservableObject {
         self.engine = engine
         self.defaults = defaults
         projector = defaults?.string(forKey: "launcher.imageProjector.v1").map { URL(fileURLWithPath: $0) }
+        customProjector = projector != nil
+        adoptInstalledProjector()
     }
 
-    var readyProjector: URL? { !loading && scope?.root != nil && (scope?.vectors ?? 0) > 0 ? projector : nil }
+    // Vectors exist only for folders inside the unified content scope, so they alone mark readiness.
+    var readyProjector: URL? { !loading && (scope?.vectors ?? 0) > 0 ? projector : nil }
+
+    /// Uses the one-click installed `Gemma2/mmproj-embeddinggemma-2-Q8_0.gguf` unless the user picked another file.
+    func adoptInstalledProjector() {
+        guard !customProjector, !building, let home = engine.installedGemmaHome else { return }
+        let installed = GemmaAssetManager.installedProjector(home: home)
+        guard installed != projector else { return }
+        if projector != nil { engine.closeImages() }
+        projector = installed
+    }
 
     func ensureStatus() {
         guard !readAttempted else { return }
+        adoptInstalledProjector()
         refresh()
     }
 
@@ -56,6 +75,7 @@ final class LauncherImageSearch: ObservableObject {
         guard !building, url.isFileURL else { return }
         engine.closeImages()
         projector = url
+        customProjector = true
         failed = false
         defaults?.set(url.path, forKey: "launcher.imageProjector.v1")
     }
@@ -79,7 +99,7 @@ final class LauncherImageSearch: ObservableObject {
     }
 
     func build() {
-        guard let projector, scope?.root != nil, !loading, !building else { return }
+        guard let projector, !loading, !building else { return }
         generation += 1
         building = true
         checked = 0
@@ -145,51 +165,24 @@ final class LauncherImageSearch: ObservableObject {
     }
 }
 
+/// Image-embedding status inside the unified Semantic & Content Index card; folders come from `content_roots`.
 struct LauncherImageSettings: View {
     @ObservedObject var launcher: Launcher
-    @ObservedObject var indexStatus: IndexStatusState
     @ObservedObject var images: LauncherImageSearch
-    let chooseFolder: () -> Void
-    let chooseProjector: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Text(launcher.t("仅在所选目录为已下载到本机的 PNG 和 JPEG 建立画面索引。输入「img 画面描述」搜索。",
-                            "Index resident PNG and JPEG pixels in one selected folder. Search with “img description”."))
-                .foregroundStyle(.secondary)
-            LabeledContent(launcher.t("目录", "Folder")) {
-                if let root = images.scope?.root {
-                    Text((root as NSString).abbreviatingWithTildeInPath).lineLimit(1).truncationMode(.middle)
-                } else {
-                    Text(launcher.t("未选择", "Not selected")).foregroundStyle(.secondary)
-                }
-            }
-            LabeledContent(launcher.t("图像模型", "Image Model")) {
-                Text(images.projector?.lastPathComponent ?? launcher.t("未选择", "Not selected"))
-                    .lineLimit(1).truncationMode(.middle)
-            }
-            HStack {
-                Button(launcher.t("选目录…", "Choose Folder…"), action: chooseFolder)
-                Button(launcher.t("选择图像模型…", "Choose Image Model…"), action: chooseProjector)
-                if images.scope?.root != nil {
-                    Button(launcher.t("移除", "Remove")) { images.setFolder(nil) }
-                }
-            }
-            .disabled(images.loading || images.building || !launcher.canSearch || indexStatus.scopePending)
-            HStack {
+        VStack(alignment: .leading, spacing: 6) {
+            LabeledContent(launcher.t("图像画面", "Image Pixels")) {
                 if images.building {
-                    ProgressView().controlSize(.small)
                     Text(launcher.t("已处理 \(images.checked) 张", "Prepared \(images.checked) images"))
-                    Button(launcher.t("停止", "Stop")) { images.stop() }
+                } else if images.projector == nil {
+                    Text(launcher.t("需要图像多模态模型", "Needs the image multimodal model")).foregroundStyle(.secondary)
                 } else {
                     Text(launcher.t("已索引 \(images.scope?.vectors ?? 0) 张", "Indexed \(images.scope?.vectors ?? 0) images"))
                         .foregroundStyle(.secondary)
-                    Button(launcher.t("建立或刷新图像索引", "Build or Refresh Image Index")) { images.build() }
-                        .disabled(images.scope?.root == nil || images.projector == nil || images.loading ||
-                                  !launcher.canSearch || indexStatus.scopePending || indexStatus.indexWork != nil)
                 }
             }
-            if images.failed { Text(launcher.t("操作失败。请检查目录和图像模型。", "Check the folder and image model, then retry.")).foregroundStyle(.secondary) }
+            if images.failed { Text(launcher.t("图像索引失败。请检查目录和图像模型。", "Image indexing failed. Check the folders and image model, then retry.")).foregroundStyle(.secondary) }
             if images.limited { Text(launcher.t("已达图像索引容量上限。", "The image index is at its storage limit.")).foregroundStyle(.secondary) }
         }
     }

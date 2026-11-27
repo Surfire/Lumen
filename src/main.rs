@@ -1,13 +1,18 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use lumen::{GemmaModel, Mode, Model, ModelBackend, PdfHelperPolicy, Scope};
+use lumen::{ContentFilter, GemmaModel, Mode, Model, ModelBackend, PdfHelperPolicy, Scope};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     io::{self, BufRead, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
+
+/// Parse the content filter at the CLI boundary. Omitted fields keep defaults.
+fn parse_content_filter(raw: &str) -> Result<ContentFilter, String> {
+    serde_json::from_str(raw).map_err(|error| format!("invalid content filter JSON: {error}"))
+}
 
 static STOP_STREAM: AtomicBool = AtomicBool::new(false);
 
@@ -87,6 +92,28 @@ struct ScopeArgs {
     /// Use this app bundle's PDF extractor and its stable extraction format.
     #[arg(long, conflicts_with = "pdf_helper")]
     bundled_pdf_helper: bool,
+    /// Content filter JSON (categories, allow/deny extensions, deny folders).
+    /// Without it an explicit scope keeps the saved filter.
+    #[arg(long, value_name = "JSON", value_parser = parse_content_filter)]
+    content_filter_json: Option<ContentFilter>,
+}
+
+impl ScopeArgs {
+    /// An explicit scope without `--content-filter-json` keeps the saved
+    /// filter, so restarting the indexer never silently resets it.
+    fn into_scope(self, database: &Path) -> Scope {
+        let explicit = self.content_filter_json.is_some();
+        let mut scope = Scope::from(self);
+        if !explicit
+            && scope != Scope::default()
+            && let Some(saved) = lumen::open_read(database)
+                .ok()
+                .and_then(|conn| lumen::saved_index_scope(&conn).ok().flatten())
+        {
+            scope.content_filter = saved.content_filter;
+        }
+        scope
+    }
 }
 
 impl From<ScopeArgs> for Scope {
@@ -111,6 +138,7 @@ impl From<ScopeArgs> for Scope {
             pdf_helper_policy,
             image_ocr: args.image_ocr,
             image_ocr_helper: None,
+            content_filter: args.content_filter_json.unwrap_or_default(),
         }
     }
 }
@@ -208,6 +236,18 @@ enum Action {
         /// Also index text in local images using the app's Apple Vision helper.
         #[arg(long, requires = "content_root")]
         image_ocr: bool,
+        /// Replace the saved content filter (JSON); omitted keeps it.
+        #[arg(long, value_name = "JSON", value_parser = parse_content_filter)]
+        content_filter_json: Option<ContentFilter>,
+    },
+    /// Estimate a content scope from the saved filename catalog (read-only, no file access).
+    PreviewContentScope {
+        /// Candidate content folder (repeatable); defaults to the saved content folders.
+        #[arg(long)]
+        content_root: Vec<PathBuf>,
+        /// Candidate content filter JSON; defaults to the saved filter.
+        #[arg(long, value_name = "JSON", value_parser = parse_content_filter)]
+        content_filter_json: Option<ContentFilter>,
     },
     /// Extract a resumable batch from the saved document scope.
     Content {
@@ -531,7 +571,8 @@ fn main() -> Result<()> {
     match cli.command {
         Action::Index(args) => {
             let progress = scan_progress(args.progress)?;
-            let stats = lumen::scan_with_progress(&db, &args.into(), progress.as_ref())?;
+            let scope = args.into_scope(&db);
+            let stats = lumen::scan_with_progress(&db, &scope, progress.as_ref())?;
             drop(progress);
             println!("{}", serde_json::to_string_pretty(&stats)?);
         }
@@ -540,9 +581,10 @@ fn main() -> Result<()> {
             cached_start,
         } => {
             let progress = scan_progress(scope.progress)?;
+            let scope = scope.into_scope(&db);
             lumen::watch_with_launch_progress(
                 &db,
-                &scope.into(),
+                &scope,
                 progress.as_ref(),
                 cached_start,
                 |event| {
@@ -613,15 +655,30 @@ fn main() -> Result<()> {
             content_root,
             bundled_pdf_helper,
             image_ocr,
+            content_filter_json,
         } => {
             println!(
                 "{}",
-                lumen::apply_content_scope_with_image_ocr(
+                lumen::apply_content_scope_with_filter(
                     &db,
                     content_root,
                     bundled_pdf_helper,
-                    image_ocr
+                    image_ocr,
+                    content_filter_json,
                 )?
+            );
+        }
+        Action::PreviewContentScope {
+            content_root,
+            content_filter_json,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string(&lumen::preview_content_scope(
+                    &db,
+                    content_root,
+                    content_filter_json
+                )?)?
             );
         }
         Action::Content { max } => {
@@ -782,6 +839,7 @@ fn main() -> Result<()> {
                     "deny": scope.deny,
                     "documents": scope.documents,
                     "content_roots": scope.content_roots,
+                    "content_filter": scope.content_filter,
                 });
             }
             println!("{}", serde_json::to_string_pretty(&report)?);

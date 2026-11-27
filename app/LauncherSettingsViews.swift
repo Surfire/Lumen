@@ -46,7 +46,7 @@ enum ScopeFolders {
         switch self {
         case .include: return model.t("仅包括", "Include Only")
         case .exclude: return model.t("排除", "Exclude")
-        case .content: return model.t("正文与语义目录", "Text and Semantic Folders")
+        case .content: return model.t("内容目录", "Content Folders")
         }
     }
 }
@@ -63,7 +63,11 @@ final class SettingsSession: ObservableObject {
     @Published private(set) var launchAtLogin = false
     @Published private(set) var loginItemNeedsApproval = false
     @Published private(set) var loginItemFailed = false
+    @Published private(set) var contentPreview: ContentScopePreview?
+    @Published private(set) var previewLoading = false
     let canManageLoginItem: Bool
+    private var previewProcess: Process?
+    private var previewGeneration = 0
 
     init(model: Launcher, indexStatus: IndexStatusState? = nil, manageLoginItem: Bool,
          pageChanged: @escaping (SettingsPage?, SettingsPage?) -> Void) {
@@ -121,15 +125,60 @@ final class SettingsSession: ObservableObject {
         let paths = urls.filter(\.isFileURL).map(IndexScope.folderPath)
         next[keyPath: group.paths].append(contentsOf: paths.filter { seen.insert($0).inserted })
         if next != scope { draft = next }
+        if group == .content { refreshContentPreview() }
     }
 
     func remove(_ path: String, from group: ScopeFolders) {
         var next = scope
         next[keyPath: group.paths].removeAll { $0 == path }
         if next != scope { draft = next }
+        if group == .content { refreshContentPreview() }
     }
 
-    func discard() { draft = nil }
+    func discard() {
+        draft = nil
+        refreshContentPreview()
+    }
+
+    var contentFilter: ContentFilter { scope.content_filter ?? ContentFilter() }
+
+    func updateContentFilter(_ change: (inout ContentFilter) -> Void) {
+        var filter = contentFilter
+        change(&filter)
+        var next = scope
+        // Leave an untouched default unset so a saved scope without a filter shows no pending change.
+        next.content_filter = filter == ContentFilter() && baseline.content_filter == nil ? nil : filter
+        guard next != scope else { return }
+        draft = next
+        refreshContentPreview()
+    }
+
+    func excludeNoise(_ folder: ContentScopePreview.Subfolder) {
+        updateContentFilter { filter in
+            if !filter.deny_folders.contains(folder.path) { filter.deny_folders.append(folder.path) }
+        }
+    }
+
+    /// Settings-only, read-only engine query; never runs on the launcher hot path.
+    func refreshContentPreview() {
+        previewGeneration &+= 1
+        let generation = previewGeneration
+        if previewProcess?.isRunning == true { previewProcess?.terminate() }
+        previewProcess = nil
+        let roots = scope.contentFolders
+        guard !roots.isEmpty else {
+            contentPreview = nil
+            previewLoading = false
+            return
+        }
+        previewLoading = true
+        previewProcess = model.previewContentScope(roots: roots, filter: scope.content_filter) { [weak self] preview in
+            guard let self, self.previewGeneration == generation else { return }
+            self.previewProcess = nil
+            self.previewLoading = false
+            self.contentPreview = preview
+        }
+    }
 
     func apply() {
         guard canApply else { return }
@@ -429,21 +478,33 @@ struct LauncherSettings: View {
     }
 
     @ViewBuilder private var indexAndPrivacy: some View {
-        group(model.t("正文索引", "Document Text")) {
-            folderRows(.content, empty: model.t("请选择要建立正文和语义索引的目录。", "Choose folders to index for text and semantic search."))
-            note(model.t("所选目录内的 TXT、Markdown、DOCX 和 PDF 文本层可检索（包括已下载到本机的云盘文件；仅在线占位文件仍只索引名称）。",
-                         "Search TXT, Markdown, DOCX, and PDF text in selected folders, including downloaded cloud files. Online-only placeholders remain name-only."))
-            if let coverage = indexStatus.contentCoverage, coverage.total > 0 {
-                ProgressView(value: Double(coverage.checked), total: Double(coverage.total)) {
-                    Text(model.t("已处理 \(coverage.checked) / \(coverage.total) 份文档", "\(coverage.checked) of \(coverage.total) documents checked"))
-                }
-                if indexStatus.contentPaused || indexStatus.contentFailed {
-                    Button(model.t("继续正文索引", "Resume Document Indexing")) { model.setContentPaused(false) }
-                } else if coverage.pending > 0 {
-                    Button(model.t("暂停正文索引", "Pause Document Indexing")) { model.setContentPaused(true) }
-                }
+        group(model.t("语义与内容索引", "Semantic & Content Index")) {
+            GemmaAssetSettings(launcher: model, assets: GemmaAssetManager.shared) { _ in
+                model.verifyLocalModel()
+                images.adoptInstalledProjector()
             }
+            Divider().accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 10) {
+                folderRows(.content, empty: model.t("请选择要建立正文、语义和图像索引的目录。",
+                                                    "Choose folders to index for text, semantic, and image search."))
+                contentScopeSummary
+                Toggle(model.t("包含源代码", "Include source code"), isOn: Binding(
+                    get: { session.contentFilter.enable_code },
+                    set: { value in session.updateContentFilter { $0.enable_code = value } }
+                ))
+                .accessibilityIdentifier("settings.content.code")
+                note(model.t("自动跳过 node_modules、dist、build、*.lock、*.min.* 等开发产物；仅在线占位文件只索引名称。",
+                             "Dev artifacts such as node_modules, dist, build, *.lock, and *.min.* are skipped automatically. Online-only placeholders stay name-only."))
+                DisclosureGroup(model.t("高级过滤规则…", "Advanced filter rules…")) {
+                    advancedContentFilters
+                }
+                .accessibilityIdentifier("settings.content.advanced")
+            }
+            .disabled(!session.canEditScope)
+            Divider().accessibilityHidden(true)
+            contentProgress
         }
+        .onAppear { session.refreshContentPreview() }
         group(model.t("索引范围", "Index Scope")) {
             note(model.t("只扫描 macOS 允许访问的位置。排除规则优先，包括已添加的子目录。",
                          "Lumen scans locations macOS allows it to access. Exclusions take priority, including over included subfolders."))
@@ -462,16 +523,148 @@ struct LauncherSettings: View {
             folderRows(.exclude, empty: model.t("没有手动排除的目录。", "No folders excluded manually."))
         }
         .disabled(!session.canEditScope)
-        group(model.t("图像内容", "Image Content")) {
-            LauncherImageSettings(launcher: model, indexStatus: indexStatus, images: images, chooseFolder: chooseImageFolder,
-                                  chooseProjector: chooseImageProjector)
-        }
-        group(model.t("外置卷", "External Volumes")) {
+        group(model.t("外置卷与网络共享", "External & Network Volumes")) {
             LauncherExternalVolumes(launcher: model, catalog: volumes, changed: model.externalVolumesChanged)
                 .accessibilityIdentifier("settings.external-volumes")
         }
         if let notice = indexStatus.indexNotice {
             NoticeView(model: model, notice: notice)
+        }
+    }
+
+    @ViewBuilder private var contentScopeSummary: some View {
+        if let preview = session.contentPreview {
+            let counts = preview.by_category
+            note(model.t("约 \(preview.total_files.formatted()) 个文件 · PDF \(counts.pdf.formatted()) · DOCX \(counts.docx.formatted()) · 文本 \(counts.text.formatted()) · 图片 \(counts.images.formatted()) · 代码 \(counts.code.formatted())",
+                         "About \(preview.total_files.formatted()) files · PDF \(counts.pdf.formatted()) · DOCX \(counts.docx.formatted()) · Text \(counts.text.formatted()) · Images \(counts.images.formatted()) · Code \(counts.code.formatted())"))
+                .accessibilityIdentifier("settings.content.preview")
+            let noise = preview.top_subfolders.filter { $0.suggested_noise && !session.contentFilter.deny_folders.contains($0.path) }
+            if !noise.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        Text(model.t("排除噪音子目录", "Exclude noisy subfolders")).font(.caption).foregroundStyle(.secondary)
+                        ForEach(noise) { folder in
+                            Button {
+                                session.excludeNoise(folder)
+                            } label: {
+                                Label("\(folder.name) · \(folder.count.formatted())", systemImage: "minus.circle")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .help(folder.path)
+                        }
+                    }
+                }
+            }
+        } else if session.previewLoading {
+            ProgressView().controlSize(.small)
+        }
+    }
+
+    @ViewBuilder private var advancedContentFilters: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 14) {
+                filterToggle("PDF", \.enable_pdf)
+                filterToggle("DOCX", \.enable_docx)
+                filterToggle(model.t("文本", "Text"), \.enable_text)
+                filterToggle(model.t("图片", "Images"), \.enable_images)
+            }
+            .toggleStyle(.checkbox)
+            CommaListField(title: model.t("额外包含扩展名", "Also include extensions"), prompt: "swift, json",
+                           values: session.contentFilter.allow_extensions) { values in
+                session.updateContentFilter { $0.allow_extensions = values.map(Self.extensionToken) }
+            }
+            CommaListField(title: model.t("排除扩展名", "Exclude extensions"), prompt: "log, csv",
+                           values: session.contentFilter.deny_extensions) { values in
+                session.updateContentFilter { $0.deny_extensions = values.map(Self.extensionToken) }
+            }
+            CommaListField(title: model.t("排除目录", "Exclude folders"), prompt: "/Users/me/Archive",
+                           values: session.contentFilter.deny_folders) { values in
+                session.updateContentFilter { $0.deny_folders = values }
+            }
+            LabeledContent(model.t("图像模型", "Image Model")) {
+                HStack(spacing: 8) {
+                    Text(images.projector?.lastPathComponent ?? model.t("未安装", "Not installed"))
+                        .lineLimit(1).truncationMode(.middle).foregroundStyle(.secondary)
+                    Button(model.t("选择…", "Choose…"), action: chooseImageProjector)
+                        .controlSize(.small)
+                        .disabled(images.building)
+                }
+            }
+        }
+        .padding(.vertical, 6)
+        .font(.callout)
+    }
+
+    private static func extensionToken(_ value: String) -> String {
+        var token = value.lowercased()
+        while token.hasPrefix(".") || token.hasPrefix("*") { token.removeFirst() }
+        return token
+    }
+
+    private func filterToggle(_ title: String, _ key: WritableKeyPath<ContentFilter, Bool>) -> some View {
+        Toggle(title, isOn: Binding(
+            get: { session.contentFilter[keyPath: key] },
+            set: { value in session.updateContentFilter { $0[keyPath: key] = value } }
+        ))
+    }
+
+    private var contentActive: Bool {
+        indexStatus.contentRunning
+            || (indexStatus.contentCoverage?.pending ?? 0) > 0 && !indexStatus.contentPaused && !indexStatus.contentFailed
+    }
+
+    private var embeddingActive: Bool {
+        [.verifying, .running, .pausing].contains(indexStatus.embeddingState)
+    }
+
+    private var contentResumable: Bool {
+        (indexStatus.contentCoverage?.pending ?? 0) > 0 && (indexStatus.contentPaused || indexStatus.contentFailed)
+    }
+
+    private var embeddingResumable: Bool {
+        indexStatus.gemmaCoverage?.pending == true && indexStatus.gemmaCoverage?.limited == false && model.canBuildEmbeddings
+    }
+
+    private var imageResumable: Bool {
+        images.projector != nil && session.contentFilter.enable_images && !(indexStatus.savedScope?.contentFolders ?? []).isEmpty
+            && !images.loading && model.canSearch && !indexStatus.scopePending && indexStatus.indexWork == nil
+    }
+
+    /// One progress block and one Pause/Resume for content extraction, text embeddings, and image embeddings.
+    @ViewBuilder private var contentProgress: some View {
+        if let coverage = indexStatus.contentCoverage, coverage.total > 0 {
+            ProgressView(value: Double(coverage.checked), total: Double(coverage.total)) {
+                Text(model.t("正文：已处理 \(coverage.checked) / \(coverage.total) 份文档",
+                             "Text: \(coverage.checked) of \(coverage.total) documents checked"))
+                    .font(.callout)
+            }
+        }
+        semanticIndexStatus.font(.callout).foregroundStyle(.secondary)
+        LauncherImageSettings(launcher: model, images: images).font(.callout)
+        if let notice = indexStatus.embeddingNotice { NoticeView(model: model, notice: notice) }
+        HStack(spacing: 10) {
+            if contentActive || embeddingActive || images.building {
+                Button(model.t("暂停索引", "Pause Indexing")) {
+                    model.setContentPaused(true)
+                    if embeddingActive { model.pauseEmbeddings(userInitiated: true) }
+                    if images.building { images.stop() }
+                }
+                .disabled(indexStatus.embeddingState == .pausing)
+                .accessibilityIdentifier("settings.content.pause")
+            } else if contentResumable || embeddingResumable {
+                Button(model.t("继续索引", "Resume Indexing")) {
+                    if contentResumable { model.setContentPaused(false) }
+                    if embeddingResumable { model.buildEmbeddings() }
+                }
+                .accessibilityIdentifier("settings.content.resume")
+            } else if imageResumable {
+                Button(model.t("建立或刷新图像索引", "Build or Refresh Image Index")) { images.build() }
+                    .accessibilityIdentifier("settings.content.images")
+            }
+            if indexStatus.embeddingState == .pausing {
+                note(model.t("正在完成当前批次，随后暂停。", "Indexing will pause after the current batch."))
+            }
         }
     }
 
@@ -840,6 +1033,37 @@ struct LauncherSettings: View {
         case .running: return model.t("正在监听文件变化。", "Lumen is watching for file changes.")
         case .failed: return model.t("文件监听未运行。", "File watching is stopped.")
         }
+    }
+}
+
+/// Comma-separated list editor that commits on Return or focus loss, so typing a comma never re-parses mid-edit.
+private struct CommaListField: View {
+    let title: String
+    let prompt: String
+    let values: [String]
+    let commit: ([String]) -> Void
+    @State private var text = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        LabeledContent(title) {
+            TextField(title, text: $text, prompt: Text(prompt))
+                .labelsHidden()
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: 260)
+                .focused($focused)
+                .onSubmit(apply)
+                .onChange(of: focused) { _, now in if !now { apply() } }
+        }
+        .onAppear { text = values.joined(separator: ", ") }
+        .onChange(of: values) { _, now in if !focused { text = now.joined(separator: ", ") } }
+    }
+
+    private func apply() {
+        let parsed = text.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        var seen = Set<String>()
+        let unique = parsed.filter { seen.insert($0).inserted }
+        if unique != values { commit(unique) }
     }
 }
 

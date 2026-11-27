@@ -279,11 +279,36 @@ fn gemma_limit() -> i64 {
 
 trait PassageEncoder {
     fn encode_passage(&mut self, text: &str) -> Result<Vec<f32>>;
+
+    /// Passages handed to one `encode_passages` call between stop checks.
+    fn batch_size(&self) -> usize {
+        1
+    }
+
+    /// `None` marks an unencodable passage; `Err` is a hard runtime failure.
+    fn encode_passages(&mut self, texts: &[&str]) -> Result<Vec<Option<Vec<f32>>>> {
+        texts
+            .iter()
+            .map(|text| match self.encode_passage(text) {
+                Ok(vector) => Ok(Some(vector)),
+                Err(error) if error.is::<Unencodable>() => Ok(None),
+                Err(error) => Err(error),
+            })
+            .collect()
+    }
 }
 
-impl PassageEncoder for crate::model::Encoder<'_> {
+impl PassageEncoder for gemma::GemmaWorker {
     fn encode_passage(&mut self, text: &str) -> Result<Vec<f32>> {
         self.encode(Role::Passage, text)
+    }
+
+    fn batch_size(&self) -> usize {
+        gemma::PASSAGE_BATCH
+    }
+
+    fn encode_passages(&mut self, texts: &[&str]) -> Result<Vec<Option<Vec<f32>>>> {
+        gemma::GemmaWorker::encode_passages(self, texts)
     }
 }
 
@@ -318,17 +343,19 @@ fn embed_gemma_batch(
         }
         let remaining = (max - items.len()) as i64;
         let mut stmt = conn.prepare_cached(&format!(
-            "WITH next AS (SELECT c.id,c.document_id,c.start_byte,c.end_byte {GEMMA_QUEUE} AND c.id>?2 ORDER BY c.id LIMIT ?3)
+            "WITH next AS (SELECT c.id,c.document_id,c.start_byte,c.end_byte,i.mtime {GEMMA_QUEUE} AND c.id>?2 ORDER BY i.mtime DESC,c.id LIMIT ?3)
              SELECT c.id, CAST(substr(CAST(d.body AS BLOB),c.start_byte+1,c.end_byte-c.start_byte) AS TEXT)
-             FROM next c JOIN document d ON d.id=c.document_id ORDER BY c.id"
+             FROM next c JOIN document d ON d.id=c.document_id ORDER BY c.mtime DESC,c.id"
         ))?;
         let rows = stmt.query_map(params![gemma::ID, after, remaining], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
         })?;
+        // A short fetch drains the queue, so later chunks come from newly
+        // prepared documents whose AUTOINCREMENT ids exceed every fetched id.
         let mut fetched = 0;
         for row in rows {
             let (id, text) = row?;
-            after = id;
+            after = after.max(id);
             items.push((id, text));
             fetched += 1;
         }
@@ -359,7 +386,7 @@ fn embed_gemma_batch(
     let mut encoded = Vec::with_capacity(items.len());
     let mut valid_encoded = 0usize;
     let mut stopped = false;
-    for (id, text) in items {
+    for group in items.chunks(encoder.batch_size().max(1)) {
         if stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
             stopped = true;
             break;
@@ -367,15 +394,18 @@ fn embed_gemma_batch(
         if valid_encoded >= remaining_cap {
             break;
         }
-        let vector = match encoder.encode_passage(&text) {
-            Ok(vector) => {
-                valid_encoded += 1;
-                Some(pack(&vector))
-            }
-            Err(error) if error.is::<Unencodable>() => None,
-            Err(error) => return Err(error).context("compute next Gemma document chunk"),
-        };
-        encoded.push((id, vector));
+        let texts: Vec<&str> = group.iter().map(|(_, text)| text.as_str()).collect();
+        let vectors = encoder
+            .encode_passages(&texts)
+            .context("compute next Gemma document chunk")?;
+        ensure!(
+            vectors.len() == group.len(),
+            "Gemma returned a mismatched passage batch"
+        );
+        for ((id, _), vector) in group.iter().zip(vectors) {
+            valid_encoded += usize::from(vector.is_some());
+            encoded.push((*id, vector.map(|vector| pack(&vector))));
+        }
     }
 
     let mut report = EmbedBatch::default();
@@ -426,7 +456,7 @@ fn embed_gemma(conn: &mut Connection, model: &crate::GemmaModel, max: usize) -> 
     if gemma_count(conn)? >= gemma_limit() || !gemma_pending(conn)? {
         return Ok(EmbedBatch::default());
     }
-    let mut encoder = ModelBackend::Gemma(model).connect()?;
+    let mut encoder = model.start()?;
     Ok(embed_gemma_batch(conn, &mut encoder, max, None, None)?.0)
 }
 
@@ -488,6 +518,29 @@ pub struct GemmaSearchSession {
     conn: Connection,
     worker: GemmaQuery,
     matrix: MatrixCache<Paragraph>,
+    /// Present when the Gemma image projector is installed: stored image
+    /// vectors are blended into unified semantic results.
+    images: Option<crate::image_search::ImageCache>,
+}
+
+/// At most this share of a semantic result list comes from image vectors.
+const IMAGE_BLEND_DIVISOR: usize = 4;
+
+/// Insert image hits among document hits by score, keeping the document
+/// order intact. Callers cap images so they never crowd out documents.
+fn blend_image_hits(hits: &mut Vec<Hit>, images: Vec<Hit>, limit: usize) {
+    for image in images {
+        if hits.iter().any(|hit| hit.path == image.path) {
+            continue;
+        }
+        let score = image.score.unwrap_or(f64::MIN);
+        let at = hits
+            .iter()
+            .position(|hit| hit.score.unwrap_or(f64::MIN) < score)
+            .unwrap_or(hits.len());
+        hits.insert(at, image);
+    }
+    hits.truncate(limit);
 }
 
 impl GemmaSearchSession {
@@ -507,6 +560,7 @@ impl GemmaSearchSession {
             conn,
             worker: GemmaQuery::Worker(worker),
             matrix: MatrixCache::default(),
+            images: model.has_image_projector().then(Default::default),
         })
     }
 
@@ -515,13 +569,25 @@ impl GemmaSearchSession {
         if query.is_empty() || query.len() > 512 || !crate::query_allows_semantic(query) {
             return Ok(Vec::new());
         }
-        let mut hits = search_gemma(
-            &self.conn,
-            query,
-            limit.clamp(1, 100),
-            &mut self.worker,
-            &mut self.matrix,
-        )?;
+        let limit = limit.clamp(1, 100);
+        let Some(images) = &mut self.images else {
+            let mut hits =
+                search_gemma(&self.conn, query, limit, &mut self.worker, &mut self.matrix)?;
+            hits.retain(|hit| !crate::external::is_external(Path::new(&hit.path)));
+            return Ok(hits);
+        };
+        // One query vector ranks both paragraphs and images.
+        let vector = match self.worker.encode(query) {
+            Ok(vector) => vector,
+            Err(error) if error.is::<Unencodable>() => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut hits = read_snapshot(&self.conn, |snapshot| {
+            rank_gemma(snapshot, &vector, limit, &mut self.matrix)
+        })?;
+        let cap = (limit / IMAGE_BLEND_DIVISOR).max(1);
+        let image_hits = crate::image_search::rank_with_query(&self.conn, images, &vector, cap)?;
+        blend_image_hits(&mut hits, image_hits, limit);
         hits.retain(|hit| !crate::external::is_external(Path::new(&hit.path)));
         Ok(hits)
     }
@@ -639,13 +705,7 @@ impl EmbedBatch {
                     "Gemma requires explicit document indexing scope"
                 );
                 let (mut conn, _lease) = open_write(&database, false)?;
-                stream_gemma_with(
-                    &mut conn,
-                    max,
-                    stop,
-                    || ModelBackend::Gemma(model).connect(),
-                    &mut emit,
-                )
+                stream_gemma_with(&mut conn, max, stop, || model.start(), &mut emit)
             }
             other => {
                 let (mut conn, _lease) = open_write(&database, false)?;
@@ -797,21 +857,39 @@ fn save_skip(
     Ok(new)
 }
 
+const PREPARE_DOCUMENTS: i64 = 16;
+
+/// Chunks the newest pending documents; one ordered scan prepares several.
 fn prepare_next_document(conn: &mut Connection, require_stamp: bool) -> Result<bool> {
-    let document: Option<(i64, String)> = conn
+    let documents: Vec<i64> = conn
         .prepare_cached(
-            "SELECT d.id,d.body FROM semantic_document p
-             JOIN document d ON d.id=p.document_id JOIN item i ON i.id=d.id
+            "SELECT p.document_id FROM semantic_document p JOIN item i ON i.id=p.document_id
              WHERE p.prepared=0 AND i.availability IN ('local','provider_metadata_only')
+             AND EXISTS(SELECT 1 FROM document d WHERE d.id=p.document_id)
              AND (NOT ?1 OR EXISTS(SELECT 1 FROM document_state ds WHERE ds.id=p.document_id))
-             ORDER BY p.document_id LIMIT 1",
+             ORDER BY i.mtime DESC,p.document_id LIMIT ?2",
         )?
-        .query_row([require_stamp], |r| Ok((r.get(0)?, r.get(1)?)))
-        .optional()?;
-    let Some((id, body)) = document else {
+        .query_map(params![require_stamp, PREPARE_DOCUMENTS], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if documents.is_empty() {
         return Ok(false);
-    };
+    }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for id in documents {
+        let Some(body) = tx
+            .prepare_cached("SELECT body FROM document WHERE id=?1")?
+            .query_row([id], |r| r.get::<_, String>(0))
+            .optional()?
+        else {
+            continue;
+        };
+        prepare_document(&tx, id, &body, require_stamp)?;
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+fn prepare_document(tx: &Connection, id: i64, body: &str, require_stamp: bool) -> Result<()> {
     let new = tx
         .prepare_cached(
             "UPDATE semantic_document SET prepared=1 WHERE document_id=?1 AND prepared=0
@@ -821,9 +899,9 @@ fn prepare_next_document(conn: &mut Connection, require_stamp: bool) -> Result<b
         )?
         .execute(params![id, body, require_stamp])?;
     if new != 0 {
-        let pages = crate::content::pages(&tx, id)?;
+        let pages = crate::content::pages(tx, id)?;
         let ranges = if pages.is_empty() {
-            chunk_ranges(&body)
+            chunk_ranges(body)
         } else {
             let ranges = pages
                 .iter()
@@ -843,8 +921,7 @@ fn prepare_next_document(conn: &mut Connection, require_stamp: bool) -> Result<b
             insert.execute(params![id, range.start as i64, range.end as i64])?;
         }
     }
-    tx.commit()?;
-    Ok(true)
+    Ok(())
 }
 
 fn save_vector(
@@ -1208,6 +1285,32 @@ fn split_paragraph(mut text: &str, mut offset: usize, ranges: &mut Vec<Range<usi
 #[cfg(test)]
 mod tests {
     #[test]
+    fn image_hits_blend_by_score_without_reordering_documents() {
+        let hit = |path: &str, matched_by: &str, score: f64| Hit {
+            path: path.into(),
+            name: path.into(),
+            kind: "file".into(),
+            availability: "local".into(),
+            matched_by: matched_by.into(),
+            snippet: None,
+            document_stamp: None,
+            pdf_page: None,
+            score: Some(score),
+        };
+        let mut hits = vec![
+            hit("/d/a.md", "semantic", 0.9),
+            hit("/d/b.md", "semantic", 0.8),
+            hit("/d/c.md", "semantic", 0.7),
+        ];
+        blend_image_hits(&mut hits, vec![hit("/p/x.png", "image_embedding", 0.85)], 4);
+        let order: Vec<_> = hits.iter().map(|hit| hit.path.as_str()).collect();
+        assert_eq!(order, ["/d/a.md", "/p/x.png", "/d/b.md", "/d/c.md"]);
+        blend_image_hits(&mut hits, vec![hit("/p/y.png", "image_embedding", 0.1)], 4);
+        assert_eq!(hits.len(), 4);
+        assert!(hits.iter().all(|hit| hit.path != "/p/y.png"));
+    }
+
+    #[test]
     fn gemma_eligibility_uses_current_model_visible_stamp_and_vector_shape() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE item(id INTEGER PRIMARY KEY,availability TEXT);
@@ -1308,6 +1411,7 @@ mod tests {
             conn: crate::open_read(&database).unwrap(),
             worker: GemmaQuery::Fixture(Box::new(query_vector)),
             matrix: MatrixCache::default(),
+            images: None,
         };
         let lookup = |session: &mut GemmaSearchSession| {
             session
@@ -1678,6 +1782,75 @@ mod tests {
     }
 
     #[test]
+    fn gemma_batch_encodes_newest_documents_first_in_one_call() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-gemma-newest-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let docs = root.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        let day = std::time::Duration::from_secs(86_400);
+        // Creation order differs from age order so ids cannot fake recency.
+        for (name, age) in [("middle", 2), ("newest", 1), ("oldest", 3)] {
+            let path = docs.join(format!("{name}.txt"));
+            fs::write(&path, format!("Paragraph {name}")).unwrap();
+            let time = std::time::SystemTime::now() - day * age;
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_accessed(time).set_modified(time))
+                .unwrap();
+        }
+        let database = root.join("index.sqlite");
+        crate::scan(
+            &database,
+            &Scope {
+                roots: vec![docs],
+                documents: true,
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+
+        struct BatchEncoder {
+            calls: Vec<Vec<String>>,
+        }
+        impl PassageEncoder for BatchEncoder {
+            fn encode_passage(&mut self, _: &str) -> Result<Vec<f32>> {
+                unreachable!("batched encoders receive whole groups")
+            }
+            fn batch_size(&self) -> usize {
+                16
+            }
+            fn encode_passages(&mut self, texts: &[&str]) -> Result<Vec<Option<Vec<f32>>>> {
+                self.calls
+                    .push(texts.iter().map(|text| text.to_string()).collect());
+                Ok(texts
+                    .iter()
+                    .map(|text| (!text.contains("middle")).then(query_vector))
+                    .collect())
+            }
+        }
+
+        let (mut conn, _lease) = open_write(&database, false).unwrap();
+        let mut encoder = BatchEncoder { calls: Vec::new() };
+        let (batch, yielded) = embed_gemma_batch(&mut conn, &mut encoder, 8, None, None).unwrap();
+        assert!(!yielded);
+        assert_eq!(
+            encoder.calls,
+            [["Paragraph newest", "Paragraph middle", "Paragraph oldest"]]
+        );
+        assert_eq!((batch.new_embeddings, batch.skipped_chunks), (2, 1));
+        let coverage = gemma_coverage(&conn).unwrap();
+        assert_eq!((coverage.embedded_chunks, coverage.skipped_chunks), (2, 1));
+        assert!(!coverage.pending);
+
+        drop(conn);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn gemma_corpus_floor_rejects_low_cosine_noise_and_skips_micro_chunks() {
         let root = fs::canonicalize(std::env::temp_dir())
             .unwrap()
@@ -1730,6 +1903,7 @@ mod tests {
             conn: crate::open_read(&database).unwrap(),
             worker: GemmaQuery::Fixture(Box::new(query_vector)),
             matrix: MatrixCache::default(),
+            images: None,
         };
         let hits = session.search("临床受试者筛选", 12).unwrap();
         assert_eq!(hits.len(), 1);

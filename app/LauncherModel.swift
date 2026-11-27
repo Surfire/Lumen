@@ -1130,6 +1130,12 @@ final class Launcher: ObservableObject {
         }
     }
 
+    @discardableResult
+    func previewContentScope(roots: [String], filter: ContentFilter?,
+                             complete: @escaping @MainActor (ContentScopePreview?) -> Void) -> Process? {
+        engine.previewContentScope(roots: roots, filter: filter, complete: complete)
+    }
+
     func setContentPaused(_ paused: Bool) {
         defaults?.set(paused, forKey: "contentIndexingPaused")
         indexStatus.set(\.contentPaused, to: paused)

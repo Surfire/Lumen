@@ -167,12 +167,94 @@ struct IndexProgress: Decodable, Equatable {
     }
 }
 
+/// Mirrors Rust `ContentFilter` (`#[serde(default)]`); missing keys decode to the engine defaults.
+struct ContentFilter: Codable, Equatable, Sendable {
+    var enable_pdf = true
+    var enable_docx = true
+    var enable_text = true
+    var enable_images = true
+    var enable_code = false
+    var allow_extensions: [String] = []
+    var deny_extensions: [String] = []
+    var deny_folders: [String] = []
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let fallback = ContentFilter()
+        enable_pdf = try values.decodeIfPresent(Bool.self, forKey: .enable_pdf) ?? fallback.enable_pdf
+        enable_docx = try values.decodeIfPresent(Bool.self, forKey: .enable_docx) ?? fallback.enable_docx
+        enable_text = try values.decodeIfPresent(Bool.self, forKey: .enable_text) ?? fallback.enable_text
+        enable_images = try values.decodeIfPresent(Bool.self, forKey: .enable_images) ?? fallback.enable_images
+        enable_code = try values.decodeIfPresent(Bool.self, forKey: .enable_code) ?? fallback.enable_code
+        allow_extensions = try values.decodeIfPresent([String].self, forKey: .allow_extensions) ?? []
+        deny_extensions = try values.decodeIfPresent([String].self, forKey: .deny_extensions) ?? []
+        deny_folders = try values.decodeIfPresent([String].self, forKey: .deny_folders) ?? []
+    }
+
+    var json: String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return (try? encoder.encode(self)).map { String(decoding: $0, as: UTF8.self) } ?? "{}"
+    }
+
+    var arguments: [String] { ["--content-filter-json", json] }
+}
+
+/// `lumen preview-content-scope` reply: a read-only breakdown of already-indexed files under candidate roots.
+struct ContentScopePreview: Decodable, Equatable {
+    struct Categories: Decodable, Equatable {
+        var pdf = 0, docx = 0, text = 0, images = 0, code = 0
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            pdf = try values.decodeIfPresent(Int.self, forKey: .pdf) ?? 0
+            docx = try values.decodeIfPresent(Int.self, forKey: .docx) ?? 0
+            text = try values.decodeIfPresent(Int.self, forKey: .text) ?? 0
+            images = try values.decodeIfPresent(Int.self, forKey: .images) ?? 0
+            code = try values.decodeIfPresent(Int.self, forKey: .code) ?? 0
+        }
+
+        private enum CodingKeys: String, CodingKey { case pdf, docx, text, images, code }
+    }
+
+    struct Subfolder: Decodable, Equatable, Identifiable {
+        let path: String
+        let name: String
+        let count: Int
+        let suggested_noise: Bool
+
+        var id: String { path }
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            path = try values.decode(String.self, forKey: .path)
+            name = try values.decodeIfPresent(String.self, forKey: .name) ?? (path as NSString).lastPathComponent
+            count = try values.decodeIfPresent(Int.self, forKey: .count) ?? 0
+            suggested_noise = try values.decodeIfPresent(Bool.self, forKey: .suggested_noise) ?? false
+        }
+
+        private enum CodingKeys: String, CodingKey { case path, name, count, suggested_noise }
+    }
+
+    let total_files: Int
+    let by_category: Categories
+    let top_subfolders: [Subfolder]
+
+    static func arguments(roots: [String], filter: ContentFilter?) -> [String] {
+        ["preview-content-scope"] + roots.flatMap { ["--content-root", $0] } + (filter?.arguments ?? [])
+    }
+}
+
 struct IndexScope: Decodable, Equatable {
     var roots: [String] = []
     var allow: [String] = []
     var deny: [String] = []
     var documents = false
     var content_roots: [String]? = nil
+    /// nil keeps the engine's saved/default filter; a value is sent with `--content-filter-json`.
+    var content_filter: ContentFilter? = nil
 
     var contentFolders: [String] {
         get { content_roots ?? [] }
@@ -219,16 +301,17 @@ struct IndexScope: Decodable, Equatable {
 
     var arguments: [String] {
         let name = allow.flatMap { ["--allow", $0] } + deny.flatMap { ["--deny", $0] }
+        let filter = content_filter?.arguments ?? []
         if let content_roots {
             return name + ["--separate-content"] + content_roots.flatMap { ["--content-root", $0] }
-                + (content_roots.isEmpty ? [] : ["--bundled-pdf-helper"])
+                + (content_roots.isEmpty ? [] : ["--bundled-pdf-helper"]) + filter
         }
-        return name + (documents ? ["--documents", "--bundled-pdf-helper"] : [])
+        return name + (documents ? ["--documents", "--bundled-pdf-helper"] : []) + filter
     }
 
     var contentArguments: [String] {
         ["content-scope"] + contentFolders.flatMap { ["--content-root", $0] }
-            + (contentFolders.isEmpty ? [] : ["--bundled-pdf-helper"])
+            + (contentFolders.isEmpty ? [] : ["--bundled-pdf-helper"]) + (content_filter?.arguments ?? [])
     }
 
 }
@@ -542,6 +625,22 @@ final class LauncherEngine {
     func discardQueuedImages() { imageConnection?.discardQueued() }
 
     var gemmaOptions: [String] { gemmaHome.map { ["--gemma-home", $0.path] } ?? [] }
+
+    /// Where Gemma assets live for this engine: an explicit home, or the default install for the bundled engine.
+    var installedGemmaHome: URL? { gemmaHome ?? (usesCoreLibrary ? GemmaAssetManager.defaultHome : nil) }
+
+    /// Read-only pre-Apply breakdown; the engine answers from already-indexed rows without touching files.
+    @discardableResult
+    func previewContentScope(roots: [String], filter: ContentFilter?,
+                             complete: @escaping @MainActor (ContentScopePreview?) -> Void) -> Process? {
+        guard hasDatabase, !roots.isEmpty else {
+            DispatchQueue.main.async { complete(nil) }
+            return nil
+        }
+        return run(ContentScopePreview.arguments(roots: roots, filter: filter), priority: .userInitiated) { response in
+            complete(response.succeeded ? try? JSONDecoder().decode(ContentScopePreview.self, from: response.output) : nil)
+        }
+    }
 
     private func submit(_ query: String, mode: String, limit: Int,
                         to lane: ReferenceWritableKeyPath<LauncherEngine, SearchConnection?>,

@@ -19,14 +19,128 @@ mod macos;
 
 const KEY: &str = "external_volume";
 
+/// How a mount instance is identified. Physical media are bound to one boot
+/// session and IOKit registry entry; network shares are bound to their
+/// credential-free source so a NAS reboot or reconnect keeps the catalog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum MountKind {
+    Physical {
+        media_id: u64,
+        filesystem_id: [i32; 2],
+        boot: String,
+    },
+    Network {
+        protocol: String,
+        sanitized_source: String,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "MountWire", into = "MountWire")]
 pub(super) struct Mount {
     pub(super) path: PathBuf,
     uuid: String,
-    filesystem_id: [i32; 2],
-    media_id: u64,
-    boot: String,
-    source: String,
+    kind: MountKind,
+}
+
+impl Mount {
+    fn kind_label(&self) -> &'static str {
+        match self.kind {
+            MountKind::Physical { .. } => "external",
+            MountKind::Network { .. } => "network",
+        }
+    }
+
+    fn protocol(&self) -> Option<&str> {
+        match &self.kind {
+            MountKind::Physical { .. } => None,
+            MountKind::Network { protocol, .. } => Some(protocol),
+        }
+    }
+}
+
+/// Sidecar registration JSON. Registrations written before `mount_kind`
+/// existed carry top-level physical fields (and an ignored `source`).
+#[derive(Serialize, Deserialize)]
+struct MountWire {
+    path: PathBuf,
+    uuid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mount_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    filesystem_id: Option<[i32; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    media_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sanitized_source: Option<String>,
+}
+
+impl TryFrom<MountWire> for Mount {
+    type Error = &'static str;
+
+    fn try_from(wire: MountWire) -> std::result::Result<Self, Self::Error> {
+        let kind = match wire.mount_kind.as_deref() {
+            None | Some("physical") => MountKind::Physical {
+                media_id: wire.media_id.ok_or("physical mount without media_id")?,
+                filesystem_id: wire
+                    .filesystem_id
+                    .ok_or("physical mount without filesystem_id")?,
+                boot: wire.boot.ok_or("physical mount without boot session")?,
+            },
+            Some("network") => MountKind::Network {
+                protocol: wire.protocol.ok_or("network mount without protocol")?,
+                sanitized_source: wire
+                    .sanitized_source
+                    .ok_or("network mount without source")?,
+            },
+            Some(_) => return Err("unknown mount kind"),
+        };
+        Ok(Self {
+            path: wire.path,
+            uuid: wire.uuid,
+            kind,
+        })
+    }
+}
+
+impl From<Mount> for MountWire {
+    fn from(mount: Mount) -> Self {
+        let mut wire = Self {
+            path: mount.path,
+            uuid: mount.uuid,
+            mount_kind: None,
+            filesystem_id: None,
+            media_id: None,
+            boot: None,
+            protocol: None,
+            sanitized_source: None,
+        };
+        match mount.kind {
+            MountKind::Physical {
+                media_id,
+                filesystem_id,
+                boot,
+            } => {
+                wire.mount_kind = Some("physical".into());
+                wire.media_id = Some(media_id);
+                wire.filesystem_id = Some(filesystem_id);
+                wire.boot = Some(boot);
+            }
+            MountKind::Network {
+                protocol,
+                sanitized_source,
+            } => {
+                wire.mount_kind = Some("network".into());
+                wire.protocol = Some(protocol);
+                wire.sanitized_source = Some(sanitized_source);
+            }
+        }
+        wire
+    }
 }
 
 #[derive(Clone)]
@@ -70,6 +184,10 @@ impl Mounted {
         }
     }
 
+    /// Physical identities include the boot session and media registry entry,
+    /// so equality is a strict mount-instance check. Network identities hold
+    /// only uuid, path, protocol and sanitized source, so the same share
+    /// reconnected at the same mount point (e.g. after a NAS reboot) matches.
     fn matches(&self, volume: &Mount) -> bool {
         let mut matches = self
             .eligible
@@ -487,7 +605,13 @@ mod test_counters {
 pub struct VolumeStatus {
     uuid: String,
     path: PathBuf,
-    /// An eligible physical volume is mounted here now.
+    /// "external" for physical media, "network" for SMB/NFS/AFP/WebDAV shares.
+    #[serde(default)]
+    pub kind: String,
+    /// Normalized network protocol ("smb", "nfs", "afp", "webdav").
+    #[serde(default)]
+    pub protocol: Option<String>,
+    /// An eligible physical or network volume is mounted here now.
     available: bool,
     /// A valid catalog is bound to this mount instance.
     indexed: bool,
@@ -530,13 +654,16 @@ pub fn volumes(database: &Path) -> Vec<VolumeStatus> {
                 .iter()
                 .find(|volume| &volume.uuid == uuid && attached.matches(volume));
             let indexed = old.is_some() && old == current;
-            let path = &current.or(old)?.path;
+            let volume = current.or(old)?;
+            let path = &volume.path;
             if !permitted(&deny, path) {
                 return None;
             }
             Some(VolumeStatus {
                 uuid: uuid.clone(),
                 path: path.clone(),
+                kind: volume.kind_label().into(),
+                protocol: volume.protocol().map(str::to_owned),
                 available: current.is_some(),
                 indexed,
                 needs_refresh: old.is_some() && !indexed,
@@ -569,7 +696,7 @@ pub fn index_volume(
     let root = absolute(root)?;
     ensure!(
         root.parent() == Some(Path::new("/Volumes")),
-        "select the mount point of a local external volume"
+        "select the mount point of an external or network volume"
     );
     ensure!(
         database.try_exists()?,
@@ -586,7 +713,7 @@ pub fn index_volume(
         .iter()
         .filter(|volume| volume.path == root);
     let Some(volume) = matches.next() else {
-        bail!("select the mount point of a supported local external volume");
+        bail!("select the mount point of a supported external or network volume");
     };
     ensure!(
         matches.next().is_none() && attached.matches(volume),
@@ -656,6 +783,17 @@ pub(super) fn append_hits(
     limit: usize,
     hits: &mut Vec<Hit>,
 ) {
+    append_hits_with(database, query, mode, limit, hits, mounted);
+}
+
+fn append_hits_with(
+    database: &Path,
+    query: &str,
+    mode: Mode,
+    limit: usize,
+    hits: &mut Vec<Hit>,
+    mount_state: impl Fn() -> Mounted,
+) {
     let mut paths = MetadataBatch::default();
     append_mounted(
         database,
@@ -663,8 +801,16 @@ pub(super) fn append_hits(
         mode,
         limit,
         hits,
-        mounted,
-        |conn, catalog, found, mut remaining| {
+        mount_state,
+        |conn, catalog, volume, found, mut remaining| {
+            // Keystroke search never stats across the network: a slow or hung
+            // share must not stall typing. The non-blocking mount identity and
+            // the catalog gate these rows; validate_batch and diagnose stay
+            // strict before any action.
+            if matches!(volume.kind, MountKind::Network { .. }) {
+                found.truncate(remaining);
+                return;
+            }
             #[cfg(target_os = "macos")]
             let Ok(_io) = crate::platform::NoMaterialization::enter() else {
                 found.clear();
@@ -694,7 +840,7 @@ fn append_mounted(
     limit: usize,
     hits: &mut Vec<Hit>,
     mount_state: impl Fn() -> Mounted,
-    mut check: impl FnMut(&Connection, &Path, &mut Vec<Hit>, usize),
+    mut check: impl FnMut(&Connection, &Path, &Mount, &mut Vec<Hit>, usize),
 ) {
     // Old releases allowed raw /Volumes scopes in the main catalog. Only
     // the separately opted-in catalog can now publish one of those paths.
@@ -730,11 +876,11 @@ fn append_mounted(
         candidates,
         mount_state,
         |hit| Path::new(&hit.path),
-        |conn, catalog, found| {
+        |conn, catalog, volume, found| {
             if remaining == 0 {
                 found.clear();
             } else {
-                check(conn, catalog, found, remaining);
+                check(conn, catalog, volume, found, remaining);
                 remaining -= found.len();
             }
         },
@@ -782,7 +928,7 @@ fn filter_mounted<T>(
     mut candidates: Vec<Candidates<T>>,
     mount_state: impl Fn() -> Mounted,
     path_of: impl Fn(&T) -> &Path,
-    mut check: impl FnMut(&Connection, &Path, &mut Vec<T>),
+    mut check: impl FnMut(&Connection, &Path, &Mount, &mut Vec<T>),
 ) -> impl Iterator<Item = T> {
     if !candidates.is_empty()
         && let Some(initial) = Visibility::read(database, cache, &mount_state)
@@ -796,7 +942,12 @@ fn filter_mounted<T>(
                 .retain(|value| initial.allows(&boundary, path_of(value)));
             if !group.found.is_empty() {
                 let sidecar = &cache.sidecars[group.sidecar];
-                check(&sidecar.conn, &sidecar.path, &mut group.found);
+                check(
+                    &sidecar.conn,
+                    &sidecar.path,
+                    &group.volume,
+                    &mut group.found,
+                );
             }
             !group.found.is_empty()
         });
@@ -889,7 +1040,7 @@ pub(super) fn validate_batch(
         candidates,
         mounted,
         |&(_, &(path, ..))| Path::new(path),
-        |conn, catalog, selected| {
+        |conn, catalog, _, selected| {
             check_rows(
                 conn,
                 catalog,
@@ -935,7 +1086,7 @@ pub(super) fn diagnose(database: &Path, path: &Path) -> Option<crate::Diagnosis>
         candidates,
         mounted,
         |&(path, _)| path,
-        |_, catalog, selected| {
+        |_, catalog, _, selected| {
             selected[0].1 = Some(crate::diagnose::diagnose_catalog(catalog, path));
         },
     )
@@ -1004,11 +1155,23 @@ mod tests {
     fn mount(path: PathBuf, filesystem_id: [i32; 2]) -> Mount {
         Mount {
             path,
-            filesystem_id,
             uuid: UUID.into(),
-            boot: "test-boot".into(),
-            source: "test-device".into(),
-            media_id: 1,
+            kind: MountKind::Physical {
+                filesystem_id,
+                boot: "test-boot".into(),
+                media_id: 1,
+            },
+        }
+    }
+
+    fn physical_mut(volume: &mut Mount) -> (&mut [i32; 2], &mut u64) {
+        match &mut volume.kind {
+            MountKind::Physical {
+                filesystem_id,
+                media_id,
+                ..
+            } => (filesystem_id, media_id),
+            MountKind::Network { .. } => unreachable!("test volume is physical"),
         }
     }
 
@@ -1058,7 +1221,7 @@ mod tests {
                 20,
                 &mut hits,
                 resolver,
-                |_, _, candidates, limit| {
+                |_, _, _, candidates, limit| {
                     candidates.truncate(limit);
                     candidates.iter().for_each(validate);
                 },
@@ -1084,10 +1247,10 @@ mod tests {
         replacement.uuid = "01234567-89ab-cdef-0123-456789abcdee".into();
         assert!(query(&|| state(vec![replacement.clone()])).is_empty());
         let mut reconnected = volume.clone();
-        reconnected.filesystem_id[0] += 1;
+        physical_mut(&mut reconnected).0[0] += 1;
         assert!(query(&|| state(vec![reconnected.clone()])).is_empty());
         let mut reused_mount = volume.clone();
-        reused_mount.media_id += 1;
+        *physical_mut(&mut reused_mount).1 += 1;
         assert!(query(&|| state(vec![reused_mount.clone()])).is_empty());
         assert!(query(&|| state(vec![volume.clone(), volume.clone()])).is_empty());
         let calls = Cell::new(0);
@@ -1298,7 +1461,7 @@ mod tests {
                 20,
                 &mut hits,
                 state,
-                |_, _, _, _| {},
+                |_, _, _, _, _| {},
             );
             hits.into_iter().map(|hit| hit.name).collect::<Vec<_>>()
         };
@@ -1349,5 +1512,228 @@ mod tests {
         drop(sidecar_conn);
         fs::remove_file(&sidecar).unwrap();
         assert!(run_query().is_empty());
+    }
+
+    #[test]
+    fn network_identity_strips_credentials_and_is_deterministic() {
+        let path = Path::new("/Volumes/share");
+        let volume = macos::network_mount(path, "smbfs", "smb://alice:secret@NAS/share").unwrap();
+        assert_eq!(
+            volume.kind,
+            MountKind::Network {
+                protocol: "smb".into(),
+                sanitized_source: "smb://nas/share".into(),
+            }
+        );
+        // SHA-256("lumen-netvol:smb:smb://nas/share"), first 16 bytes.
+        assert_eq!(volume.uuid, "277c4245-278e-cdeb-a5bc-0e32d5fe1ddc");
+        let json = serde_json::to_string(&volume).unwrap();
+        assert!(
+            !json.contains("alice") && !json.contains("secret"),
+            "{json}"
+        );
+        assert!(json.contains(r#""mount_kind":"network""#), "{json}");
+        assert_eq!(serde_json::from_str::<Mount>(&json).unwrap(), volume);
+        // Another account on the same share keeps the same catalog identity.
+        let other = macos::network_mount(path, "smbfs", "smb://bob@nas/share").unwrap();
+        assert_eq!(other, volume);
+        let darwin = macos::network_mount(path, "smbfs", "//alice:secret@nas/share").unwrap();
+        assert_eq!(
+            macos::sanitize_source("//alice:secret@nas/share"),
+            "//nas/share"
+        );
+        assert_ne!(
+            darwin.uuid,
+            macos::network_mount(path, "smbfs", "//nas/other")
+                .unwrap()
+                .uuid
+        );
+        assert_eq!(
+            macos::sanitize_source("alice@filer:/export/home"),
+            "filer:/export/home"
+        );
+        for (fstype, protocol) in [
+            ("smbfs", "smb"),
+            ("nfs", "nfs"),
+            ("afpfs", "afp"),
+            ("webdav", "webdav"),
+        ] {
+            let volume = macos::network_mount(path, fstype, "//nas/share").unwrap();
+            assert_eq!(volume.protocol(), Some(protocol));
+            assert_eq!(volume.kind_label(), "network");
+            assert!(uuid_valid(&volume.uuid));
+        }
+        for fstype in ["apfs", "msdos", "exfat", "autofs"] {
+            assert!(macos::network_mount(path, fstype, "//nas/share").is_none());
+        }
+        for hidden in [
+            "/Volumes/.timemachine",
+            "/Volumes/com.apple.TimeMachine.nas",
+        ] {
+            assert!(macos::network_mount(Path::new(hidden), "smbfs", "//nas/tm").is_none());
+        }
+    }
+
+    #[test]
+    fn legacy_physical_registration_still_deserializes() {
+        let legacy = format!(
+            r#"{{"path":"/Volumes/Legacy","uuid":"{UUID}","filesystem_id":[7,8],"media_id":9,"boot":"b","source":"/dev/disk4s1"}}"#
+        );
+        let volume: Mount = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(volume.path, Path::new("/Volumes/Legacy"));
+        assert_eq!(
+            volume.kind,
+            MountKind::Physical {
+                media_id: 9,
+                filesystem_id: [7, 8],
+                boot: "b".into(),
+            }
+        );
+        assert_eq!(volume.kind_label(), "external");
+        assert_eq!(volume.protocol(), None);
+        let json = serde_json::to_string(&volume).unwrap();
+        assert!(json.contains(r#""mount_kind":"physical""#), "{json}");
+        assert_eq!(serde_json::from_str::<Mount>(&json).unwrap(), volume);
+        // Incomplete or unknown registrations fail closed.
+        for broken in [
+            format!(
+                r#"{{"path":"/Volumes/Legacy","uuid":"{UUID}","filesystem_id":[7,8],"boot":"b"}}"#
+            ),
+            format!(
+                r#"{{"path":"/Volumes/Nas","uuid":"{UUID}","mount_kind":"network","protocol":"smb"}}"#
+            ),
+            format!(r#"{{"path":"/Volumes/Nas","uuid":"{UUID}","mount_kind":"cloud"}}"#),
+        ] {
+            assert!(serde_json::from_str::<Mount>(&broken).is_err(), "{broken}");
+        }
+    }
+
+    #[test]
+    fn network_catalog_reconnects_by_source_and_fails_closed_when_unmounted() {
+        let scratch = Scratch::new();
+        let primary = scratch.0.join("index.sqlite");
+        let root = PathBuf::from("/Volumes/Lumen-Synthetic-NAS");
+        let volume =
+            macos::network_mount(&root, "smbfs", "//alice:secret@nas.invalid/share").unwrap();
+        let directory = folder(&primary).unwrap();
+        crate::secure_dir(&directory).unwrap();
+        let sidecar = directory.join(format!("{}.sqlite", volume.uuid));
+        let (conn, lease) = crate::open_write(&sidecar, true).unwrap();
+        let file = root.join("quarterly-nas.txt");
+        conn.execute(
+            "INSERT INTO item(path,display,kind,availability,name,full,initials,searchable_path)
+             VALUES(?1,'quarterly-nas.txt','file','local','quarterly-nas.txt','','',?1)",
+            [file.to_str().unwrap()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO name_fts(rowid,name,full,initials,searchable_path)
+             SELECT id,name,full,initials,searchable_path FROM item",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO info(key,value) VALUES(?1,?2)",
+            params![KEY, serde_json::to_string(&volume).unwrap()],
+        )
+        .unwrap();
+        drop((conn, lease));
+        let (primary_conn, _primary_lease) = crate::open_write(&primary, true).unwrap();
+        let scope = crate::Scope {
+            roots: vec![scratch.0.clone()],
+            ..crate::Scope::default()
+        };
+        primary_conn
+            .execute(
+                "INSERT INTO info(key,value) VALUES('scope',?1)",
+                [serde_json::to_string(&scope).unwrap()],
+            )
+            .unwrap();
+        // The stored registration and catalog never contain the credentials.
+        let stored = fs::read(&sidecar).unwrap();
+        let stored = String::from_utf8_lossy(&stored);
+        assert!(!stored.contains("alice") && !stored.contains("secret"));
+        assert!(stored.contains("smb"));
+
+        let query = |eligible: Vec<Mount>| {
+            let mut hits = Vec::new();
+            append_mounted(
+                &primary,
+                "quarterly",
+                Mode::Name,
+                20,
+                &mut hits,
+                || Mounted {
+                    eligible: eligible.clone(),
+                    points: vec![root.clone()],
+                },
+                |_, _, _, _, _| {},
+            );
+            hits.into_iter().map(|hit| hit.name).collect::<Vec<_>>()
+        };
+        assert_eq!(query(vec![volume.clone()]), ["quarterly-nas.txt"]);
+        // The real keystroke path publishes the catalog row without statting
+        // the share (this synthetic file does not exist on disk).
+        let mut typed = Vec::new();
+        append_hits_with(&primary, "quarterly", Mode::Name, 20, &mut typed, || {
+            Mounted {
+                eligible: vec![volume.clone()],
+                points: vec![root.clone()],
+            }
+        });
+        assert_eq!(typed.len(), 1);
+        assert_eq!(typed[0].path, file.to_str().unwrap());
+        // A physical volume still goes through the per-hit catalog validator,
+        // which fails closed for this synthetic catalog.
+        let mut physical = volume.clone();
+        physical.kind = MountKind::Physical {
+            media_id: 1,
+            filesystem_id: [1, 2],
+            boot: "b".into(),
+        };
+        let mut checked = Vec::new();
+        append_hits_with(&primary, "quarterly", Mode::Name, 20, &mut checked, || {
+            Mounted {
+                eligible: vec![physical.clone()],
+                points: vec![root.clone()],
+            }
+        });
+        assert!(checked.is_empty());
+        // A NAS reboot remounts the same share with a new fsid/device: still
+        // the same network identity, so the catalog reconnects.
+        let reconnected = macos::network_mount(&root, "smbfs", "//nas.invalid/share").unwrap();
+        assert_eq!(query(vec![reconnected]), ["quarterly-nas.txt"]);
+        assert!(query(Vec::new()).is_empty());
+        let mut moved = volume.clone();
+        moved.path = PathBuf::from("/Volumes/Lumen-Synthetic-NAS-1");
+        assert!(query(vec![moved]).is_empty());
+        let mut other_share = volume.clone();
+        other_share.kind = MountKind::Network {
+            protocol: "smb".into(),
+            sanitized_source: "//nas.invalid/other".into(),
+        };
+        assert!(query(vec![other_share]).is_empty());
+
+        // The real mount table has no such share: status, hit validation and
+        // diagnosis all fail closed.
+        let statuses = volumes(&primary);
+        let status = statuses
+            .iter()
+            .find(|status| status.uuid == volume.uuid)
+            .expect("registered network volume is listed");
+        assert_eq!(status.kind, "network");
+        assert_eq!(status.protocol.as_deref(), Some("smb"));
+        assert!(!status.available && !status.indexed && status.needs_refresh);
+        let listed = serde_json::to_string(&statuses).unwrap();
+        assert!(!listed.contains("alice") && !listed.contains("secret"));
+        let mut visible = [false];
+        validate_batch(
+            &primary,
+            &[(file.to_str().unwrap(), "file", "local", None, None)],
+            &mut visible,
+            &mut MetadataBatch::default(),
+        );
+        assert!(!visible[0]);
+        assert!(diagnose(&primary, &file).is_none());
     }
 }

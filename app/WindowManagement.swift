@@ -102,41 +102,196 @@ struct WindowLayoutPlanner {
         return Placement(frame: Placement.clamp(axFrame(frame), to: axFrame(bounds)), bounds: axFrame(bounds))
     }
 
+    enum AutoTileLayout: Equatable {
+        case single(CGRect)
+        case columns([CGRect])
+        case rows([CGRect])
+        case masterStack(master: CGRect, stack: [CGRect])
+        case grid(columns: Int, rows: Int, cells: [CGRect])
+
+        var cells: [CGRect] {
+            switch self {
+            case .single(let rect): return [rect]
+            case .columns(let rects), .rows(let rects): return rects
+            case .masterStack(let master, let stack): return [master] + stack
+            case .grid(_, _, let cells): return cells
+            }
+        }
+    }
+
     // Cells for `windowCount` windows on one display, in AX coordinates, ordered top-to-bottom then
-    // left-to-right. Fewer cells than windows means the extra windows are left alone.
+    // left-to-right (and master-first for 3-window master+stack).
     func autoTilePlan(windowCount: Int, on displayIndex: Int) -> [CGRect] {
-        guard windowCount > 0, displays.indices.contains(displayIndex) else { return [] }
+        autoTileLayout(windowCount: windowCount, on: displayIndex)?.cells ?? []
+    }
+
+    func autoTileLayout(windowCount: Int, on displayIndex: Int) -> AutoTileLayout? {
+        guard windowCount > 0, displays.indices.contains(displayIndex) else { return nil }
         let visible = displays[displayIndex].visibleFrame
+        let bounds = axFrame(visible)
         let isPortrait = visible.height > visible.width
-        let cells: [CGRect]
+        let clamp: ([CGRect]) -> [CGRect] = { rects in
+            rects.map { Placement.clamp(self.axFrame($0), to: bounds) }
+        }
         switch windowCount {
         case 1:
-            cells = [visible.width >= 1700
+            let rect = visible.width >= 1700
                 ? centered(size: CGSize(width: floor(visible.width * 0.9), height: floor(visible.height * 0.9)), in: visible)
-                : visible]
+                : visible
+            return .single(Placement.clamp(axFrame(rect), to: bounds))
         case 2:
-            cells = isPortrait ? Self.rows(2, in: visible) : Self.columns(2, in: visible)
+            if isPortrait {
+                return .rows(clamp(Self.rows(2, in: visible)))
+            }
+            return .columns(clamp(Self.columns(2, in: visible)))
         case 3:
             if isPortrait {
-                cells = Self.rows(3, in: visible)
+                return .rows(clamp(Self.rows(3, in: visible)))
             } else if visible.width >= 2200 || visible.width / max(visible.height, 1) >= 2.0 {
-                cells = Self.columns(3, in: visible)
+                return .columns(clamp(Self.columns(3, in: visible)))
             } else {
                 let split = visible.minX + floor(visible.width * 0.55)
+                let left = CGRect(x: visible.minX, y: visible.minY, width: split - visible.minX, height: visible.height)
                 let right = CGRect(x: split, y: visible.minY, width: visible.maxX - split, height: visible.height)
-                cells = [CGRect(x: visible.minX, y: visible.minY, width: split - visible.minX, height: visible.height)]
-                    + Self.rows(2, in: right)
+                return .masterStack(master: Placement.clamp(axFrame(left), to: bounds),
+                                    stack: clamp(Self.rows(2, in: right)))
             }
         case 4:
             // Four stacked bands keep a narrow portrait display usable; otherwise a 2x2 grid.
-            cells = isPortrait && visible.width < 1000 ? Self.rows(4, in: visible) : Self.grid(columns: 2, rows: 2, in: visible)
+            if isPortrait && visible.width < 1000 {
+                return .rows(clamp(Self.rows(4, in: visible)))
+            }
+            return .grid(columns: 2, rows: 2, cells: clamp(Self.grid(columns: 2, rows: 2, in: visible)))
         default:
-            guard visible.width >= 2000 && !isPortrait else { return autoTilePlan(windowCount: 4, on: displayIndex) }
-            cells = Array(Self.grid(columns: 3, rows: 2, in: visible).prefix(windowCount))
+            guard visible.width >= 2000 && !isPortrait else { return autoTileLayout(windowCount: 4, on: displayIndex) }
+            let cells = Array(Self.grid(columns: 3, rows: 2, in: visible).prefix(windowCount))
+            return .grid(columns: 3, rows: 2, cells: clamp(cells))
         }
-        let bounds = axFrame(visible)
-        return cells.map { Placement.clamp(axFrame($0), to: bounds) }
-            .sorted { ($0.minY, $0.minX) < ($1.minY, $1.minX) }
+    }
+
+    /// Rebalances flexible window slots in AX coordinates when any app enforces a larger minimum size.
+    /// Returns `nil` when all windows already fit within `<= 4pt` of their initial cells.
+    func reflow(_ layout: AutoTileLayout, actualSizes: [CGSize], bounds: CGRect) -> [CGRect]? {
+        switch layout {
+        case .single:
+            return nil
+        case .columns(let cells):
+            guard actualSizes.count == cells.count,
+                  let widths = Self.distribute1D(total: bounds.width, initial: cells.map(\.width),
+                                                 actual: actualSizes.map(\.width), minFlexible: 240) else { return nil }
+            var x = bounds.minX
+            return widths.map { width in
+                let rect = Placement.clamp(CGRect(x: x, y: bounds.minY, width: width, height: bounds.height), to: bounds)
+                x = min(x + width, bounds.maxX)
+                return rect
+            }
+        case .rows(let cells):
+            guard actualSizes.count == cells.count,
+                  let heights = Self.distribute1D(total: bounds.height, initial: cells.map(\.height),
+                                                  actual: actualSizes.map(\.height), minFlexible: 180) else { return nil }
+            var y = bounds.minY
+            return heights.map { height in
+                let rect = Placement.clamp(CGRect(x: bounds.minX, y: y, width: bounds.width, height: height), to: bounds)
+                y = min(y + height, bounds.maxY)
+                return rect
+            }
+        case .masterStack(let master, let stack):
+            guard stack.count == 2, actualSizes.count == 3 else { return nil }
+            let colW = Self.distribute1D(total: bounds.width,
+                                          initial: [master.width, stack[0].width],
+                                          actual: [actualSizes[0].width, max(actualSizes[1].width, actualSizes[2].width)],
+                                          minFlexible: 280)
+            let rowH = Self.distribute1D(total: bounds.height,
+                                          initial: [stack[0].height, stack[1].height],
+                                          actual: [actualSizes[1].height, actualSizes[2].height],
+                                          minFlexible: 180)
+            guard colW != nil || rowH != nil else { return nil }
+            let w0 = colW?[0] ?? master.width
+            let w1 = colW?[1] ?? stack[0].width
+            let h1 = rowH?[0] ?? stack[0].height
+            let h2 = rowH?[1] ?? stack[1].height
+            let rightX = min(bounds.minX + w0, max(bounds.minX, bounds.maxX - w1))
+            let bottomY = min(bounds.minY + h1, max(bounds.minY, bounds.maxY - h2))
+            return [
+                Placement.clamp(CGRect(x: bounds.minX, y: bounds.minY, width: w0, height: bounds.height), to: bounds),
+                Placement.clamp(CGRect(x: rightX, y: bounds.minY, width: w1, height: h1), to: bounds),
+                Placement.clamp(CGRect(x: rightX, y: bottomY, width: w1, height: h2), to: bounds),
+            ]
+        case .grid(let columns, let rows, let cells):
+            guard columns > 0, rows > 0, !actualSizes.isEmpty, actualSizes.count <= cells.count else { return nil }
+            let initColW = (0..<columns).map { cells[$0].width }
+            let actColW = (0..<columns).map { col in
+                (0..<rows).compactMap { row -> CGFloat? in
+                    let idx = row * columns + col
+                    return idx < actualSizes.count ? actualSizes[idx].width : nil
+                }.max() ?? initColW[col]
+            }
+            let initRowH = (0..<rows).map { cells[$0 * columns].height }
+            let actRowH = (0..<rows).map { row in
+                (0..<columns).compactMap { col -> CGFloat? in
+                    let idx = row * columns + col
+                    return idx < actualSizes.count ? actualSizes[idx].height : nil
+                }.max() ?? initRowH[row]
+            }
+            let colW = Self.distribute1D(total: bounds.width, initial: initColW, actual: actColW, minFlexible: 240)
+            let rowH = Self.distribute1D(total: bounds.height, initial: initRowH, actual: actRowH, minFlexible: 180)
+            guard colW != nil || rowH != nil else { return nil }
+            let finalW = colW ?? initColW
+            let finalH = rowH ?? initRowH
+            var result: [CGRect] = []
+            var y = bounds.minY
+            for row in 0..<rows {
+                var x = bounds.minX
+                let h = finalH[row]
+                for col in 0..<columns {
+                    if result.count == actualSizes.count { return result }
+                    let w = finalW[col]
+                    result.append(Placement.clamp(CGRect(x: x, y: y, width: w, height: h), to: bounds))
+                    x = min(x + w, bounds.maxX)
+                }
+                y = min(y + h, bounds.maxY)
+            }
+            return result
+        }
+    }
+
+    private static func distribute1D(total: CGFloat, initial: [CGFloat], actual: [CGFloat], minFlexible: CGFloat) -> [CGFloat]? {
+        guard initial.count == actual.count, !initial.isEmpty else { return nil }
+        var constrained = Set<Int>()
+        for index in initial.indices where actual[index] > initial[index] + 4 {
+            constrained.insert(index)
+        }
+        guard !constrained.isEmpty else { return nil }
+
+        var result = Array(repeating: CGFloat(0), count: initial.count)
+        var lockedSum: CGFloat = 0
+        for index in constrained {
+            let clamped = min(actual[index], total)
+            result[index] = clamped
+            lockedSum += clamped
+        }
+        let flexible = initial.indices.filter { !constrained.contains($0) }
+        guard !flexible.isEmpty else { return result }
+
+        let remaining = max(total - lockedSum, 0)
+        if remaining > 0 {
+            let floorMin = min(minFlexible, floor(remaining / CGFloat(flexible.count)))
+            let weightSum = flexible.reduce(CGFloat(0)) { $0 + max(initial[$1], 1) }
+            var allocated: CGFloat = 0
+            for (pos, index) in flexible.enumerated() {
+                let share: CGFloat
+                if pos == flexible.count - 1 {
+                    share = max(floor(remaining - allocated), floorMin)
+                } else {
+                    share = max(floor(remaining * max(initial[index], 1) / weightSum), floorMin)
+                }
+                result[index] = share
+                allocated += share
+            }
+        } else {
+            for index in flexible { result[index] = minFlexible }
+        }
+        return result
     }
 
     // AppKit-coordinate slices of `rect`; the last slice absorbs the rounding remainder.

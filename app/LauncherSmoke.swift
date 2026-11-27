@@ -5623,6 +5623,86 @@ final class LauncherSmoke {
                   tileAdapter.states[3]?.frame == f3,
                   "batch restore did not return all auto-tiled windows to their original frames")
 
+        // Adaptive autoTile regressions: edge clamping + shrink-first, AXEnhancedUserInterface,
+        // portrait/master-stack/ultrawide minimum-size reflow, master slot assignment, and batch restore.
+        let fullLandscape = WindowLayoutPlanner(displays: [
+            .init(frame: CGRect(x: 0, y: 0, width: 1800, height: 1169),
+                  visibleFrame: CGRect(x: 0, y: 62, width: 1800, height: 1068)),
+        ])
+        let fullBounds = fullLandscape.axFrame(fullLandscape.displays[0].visibleFrame) // (0, 39, 1800, 1068)
+        let adaptive = SmokeWindowAccess()
+        adaptive.trusted = true
+        adaptive.focused = 2
+        let g1Orig = CGRect(x: 0, y: 39, width: 1800, height: 1068)
+        let g2Orig = CGRect(x: 500, y: 120, width: 1300, height: 900)
+        let g3Orig = CGRect(x: 700, y: 400, width: 1100, height: 700)
+        adaptive.states = [
+            1: .init(frame: g1Orig, edgeClampBounds: fullBounds, enhancedUI: true),
+            2: .init(frame: g2Orig, edgeClampBounds: fullBounds),
+            3: .init(frame: g3Orig, minimumWidth: 900, edgeClampBounds: fullBounds, enhancedUI: true),
+        ]
+        adaptive.onScreen = [2, 1, 3] // Window 2 is frontmost, window 1 is top-left, window 3 enforces 900pt min width.
+        let adaptiveAccess = AXWindowAccess(adapter: adaptive)
+        try check(adaptiveAccess.perform(.autoTile, targetPID: 42_001, planner: fullLandscape) == nil,
+                  "adaptive master-stack autoTile failed")
+        // Master is frontmost window 2; window 3 forces 900pt right width so master becomes 900x1068 & stack 900x534 each.
+        try check(adaptive.states[2]?.frame == CGRect(x: 0, y: 39, width: 900, height: 1068) &&
+                  adaptive.states[1]?.frame == CGRect(x: 900, y: 39, width: 900, height: 534) &&
+                  adaptive.states[3]?.frame == CGRect(x: 900, y: 573, width: 900, height: 534) &&
+                  adaptive.states[1]?.enhancedUI == true &&
+                  adaptive.states[3]?.enhancedUI == true,
+                  "adaptive master-stack did not reflow around minWidth / enhancedUI / edgeClamp: \(adaptive.states)")
+        try check(adaptiveAccess.perform(.restore, targetPID: 42_001, planner: fullLandscape) == nil &&
+                  adaptive.states[1]?.frame == g1Orig &&
+                  adaptive.states[2]?.frame == g2Orig &&
+                  adaptive.states[3]?.frame == g3Orig,
+                  "adaptive batch restore did not return all edge-clamped windows to originals")
+
+        // Master-stack vertical reflow: right-top enforces minHeight 640 on 1800x1068 -> right-bottom gets 428.
+        adaptive.states = [
+            1: .init(frame: CGRect(x: 20, y: 50, width: 800, height: 600), edgeClampBounds: fullBounds),
+            2: .init(frame: CGRect(x: 400, y: 100, width: 700, height: 640), minimumHeight: 640, edgeClampBounds: fullBounds),
+            3: .init(frame: CGRect(x: 600, y: 600, width: 700, height: 500), edgeClampBounds: fullBounds),
+        ]
+        adaptive.onScreen = [1, 2, 3]
+        try check(adaptiveAccess.perform(.autoTile, targetPID: nil, planner: fullLandscape) == nil &&
+                  adaptive.states[1]?.frame == CGRect(x: 0, y: 39, width: 990, height: 1068) &&
+                  adaptive.states[2]?.frame == CGRect(x: 990, y: 39, width: 810, height: 640) &&
+                  adaptive.states[3]?.frame == CGRect(x: 990, y: 679, width: 810, height: 428),
+                  "adaptive master-stack did not reflow vertically around minimumHeight: \(adaptive.states)")
+
+        // Portrait 3-row reflow: window 1 enforces minimumHeight 760 on 1080x1842 -> others rebalance to 541 each.
+        let pBounds = portraitPlanner.axFrame(portraitPlanner.displays[0].visibleFrame)
+        adaptive.states = [
+            1: .init(frame: CGRect(x: 0, y: 100, width: 900, height: 760), minimumHeight: 760, edgeClampBounds: pBounds),
+            2: .init(frame: CGRect(x: 0, y: 600, width: 900, height: 500), edgeClampBounds: pBounds),
+            3: .init(frame: CGRect(x: 0, y: 1200, width: 900, height: 500), edgeClampBounds: pBounds),
+        ]
+        adaptive.onScreen = [1, 2, 3]
+        try check(adaptiveAccess.perform(.autoTile, targetPID: nil, planner: portraitPlanner) == nil &&
+                  adaptive.states[1]?.frame == CGRect(x: 0, y: 38, width: 1080, height: 760) &&
+                  adaptive.states[2]?.frame == CGRect(x: 0, y: 798, width: 1080, height: 541) &&
+                  adaptive.states[3]?.frame == CGRect(x: 0, y: 1339, width: 1080, height: 541),
+                  "portrait 3-row autoTile did not reflow around minimumHeight: \(adaptive.states)")
+
+        // Ultrawide 3-column reflow: 3008x1662 with 1 column minWidth 1200 -> others rebalance to 904 each.
+        let ultrawide = WindowLayoutPlanner(displays: [
+            .init(frame: CGRect(x: 0, y: 0, width: 3008, height: 1692),
+                  visibleFrame: CGRect(x: 0, y: 0, width: 3008, height: 1662)),
+        ])
+        let uBounds = ultrawide.axFrame(ultrawide.displays[0].visibleFrame)
+        adaptive.states = [
+            1: .init(frame: CGRect(x: 0, y: 30, width: 1200, height: 1000), minimumWidth: 1200, edgeClampBounds: uBounds),
+            2: .init(frame: CGRect(x: 1100, y: 30, width: 1000, height: 1000), edgeClampBounds: uBounds),
+            3: .init(frame: CGRect(x: 2000, y: 30, width: 1000, height: 1000), edgeClampBounds: uBounds),
+        ]
+        adaptive.onScreen = [1, 2, 3]
+        try check(adaptiveAccess.perform(.autoTile, targetPID: nil, planner: ultrawide) == nil &&
+                  adaptive.states[1]?.frame == CGRect(x: 0, y: 30, width: 1200, height: 1662) &&
+                  adaptive.states[2]?.frame == CGRect(x: 1200, y: 30, width: 904, height: 1662) &&
+                  adaptive.states[3]?.frame == CGRect(x: 2104, y: 30, width: 904, height: 1662),
+                  "ultrawide 3-column autoTile did not rebalance around minWidth: \(adaptive.states)")
+
         // 5. AppearanceMode persistence + NSApp.appearance synchronization.
         let model = app.model
         let appearanceDefaults = shortcutFixturePreferences ?? UserDefaults.standard
@@ -5847,6 +5927,9 @@ private final class SmokeWindowAccess: WindowAccessAdapter, @unchecked Sendable 
         var sizeSettable = true
         var frame = CGRect(x: 120, y: 400, width: 600, height: 400)
         var minimumWidth: CGFloat = 0
+        var minimumHeight: CGFloat = 0
+        var edgeClampBounds: CGRect? = nil
+        var enhancedUI = false
     }
 
     enum Write: Equatable {
@@ -5891,6 +5974,13 @@ private final class SmokeWindowAccess: WindowAccessAdapter, @unchecked Sendable 
         }
     }
 
+    func withFrameMutation<T>(on window: Int, _ body: () -> T) -> T {
+        let wasEnhanced = states[window]?.enhancedUI == true
+        if wasEnhanced { states[window]?.enhancedUI = false }
+        defer { if wasEnhanced { states[window]?.enhancedUI = true } }
+        return body()
+    }
+
     func inspect(_ window: Int) -> WindowAttributes? {
         states[window].map { state in
             WindowAttributes(role: state.role, subrole: state.subrole, minimized: state.minimized, fullScreen: state.fullScreen,
@@ -5902,15 +5992,31 @@ private final class SmokeWindowAccess: WindowAccessAdapter, @unchecked Sendable 
 
     func setPosition(_ position: CGPoint, of window: Int) -> Bool {
         writes.append(.position(window, position))
-        states[window]?.frame.origin = position
+        if var state = states[window] {
+            var next = CGRect(origin: position, size: state.frame.size)
+            if let bounds = state.edgeClampBounds {
+                next = WindowLayoutPlanner.Placement.clamp(next, to: bounds)
+            }
+            state.frame = next
+            states[window] = state
+        }
         return true
     }
 
     func setSize(_ size: CGSize, of window: Int) -> Bool {
         writes.append(.size(window, size))
         if var state = states[window] {
-            state.frame.size = CGSize(width: max(size.width, state.minimumWidth), height: size.height)
-            state.frame.origin.y += 20 // Simulate WindowServer shifting the origin on resize.
+            if state.enhancedUI { return true }
+            var width = max(size.width, state.minimumWidth)
+            var height = max(size.height, state.minimumHeight)
+            if let bounds = state.edgeClampBounds {
+                width = min(width, max(bounds.maxX - state.frame.minX, state.minimumWidth))
+                height = min(height, max(bounds.maxY - state.frame.minY, state.minimumHeight))
+                state.frame.size = CGSize(width: width, height: height)
+            } else {
+                state.frame.size = CGSize(width: width, height: height)
+                state.frame.origin.y += 20 // Simulate WindowServer shifting the origin on resize.
+            }
             states[window] = state
         }
         return true

@@ -13,10 +13,12 @@ protocol WindowAccessAdapter: Sendable {
     func setSize(_ size: CGSize, of window: Window) -> Bool
     // Eligible, visible windows of other apps, front to back.
     func onScreenWindows(excludingPID: pid_t) -> [(window: Window, attributes: WindowAttributes, frame: CGRect)]
+    func withFrameMutation<T>(on window: Window, _ body: () -> T) -> T
 }
 
 extension WindowAccessAdapter {
     func onScreenWindows(excludingPID: pid_t) -> [(window: Window, attributes: WindowAttributes, frame: CGRect)] { [] }
+    func withFrameMutation<T>(on window: Window, _ body: () -> T) -> T { body() }
 }
 
 struct WindowAttributes {
@@ -76,13 +78,7 @@ final class AXWindowAccess<Adapter: WindowAccessAdapter>: @unchecked Sendable {
             return nil
         }
 
-        // Move first so the destination display constrains the resize, then correct any
-        // origin shift from the app or WindowServer when the new size was applied.
-        let moved = adapter.setPosition(placement.frame.origin, of: window)
-        let resized = adapter.setSize(placement.frame.size, of: window)
-        let size = validFrame(of: window)?.size ?? placement.frame.size
-        let positioned = adapter.setPosition(placement.position(for: size), of: window)
-        let actual = validFrame(of: window)
+        let (moved, resized, positioned, actual) = applyFrame(placement, from: original, to: window)
         // Verify against the requested frame, including the exact target of a spanning restore.
         let applied = actual.map { approximatelyEqual($0, placement.frame) } ?? false
         if command == .restore {
@@ -98,34 +94,93 @@ final class AXWindowAccess<Adapter: WindowAccessAdapter>: @unchecked Sendable {
         return applied ? nil : .couldNotMove
     }
 
+    private func applyFrame(_ placement: WindowLayoutPlanner.Placement, from current: CGRect,
+                            to window: Adapter.Window) -> (moved: Bool, resized: Bool, positioned: Bool, actual: CGRect?) {
+        adapter.withFrameMutation(on: window) {
+            // Shrink first when contracting so the move does not hit screen-edge clamping.
+            if placement.frame.width < current.width - 1 || placement.frame.height < current.height - 1 {
+                _ = adapter.setSize(CGSize(width: min(current.width, placement.frame.width),
+                                           height: min(current.height, placement.frame.height)), of: window)
+            }
+            let moved = adapter.setPosition(placement.frame.origin, of: window)
+            let resized = adapter.setSize(placement.frame.size, of: window)
+            let size = validFrame(of: window)?.size ?? placement.frame.size
+            let positioned = adapter.setPosition(placement.position(for: size), of: window)
+            var actual = validFrame(of: window)
+            // Retry size once if WindowServer clamped pass-1 resize while near an opposite display edge.
+            if let frame = actual,
+               abs(frame.width - placement.frame.width) > 2 || abs(frame.height - placement.frame.height) > 2 {
+                _ = adapter.setSize(placement.frame.size, of: window)
+                if let afterRetry = validFrame(of: window) {
+                    actual = afterRetry
+                    let clampedOrigin = placement.position(for: afterRetry.size)
+                    if abs(afterRetry.minX - clampedOrigin.x) > 1 || abs(afterRetry.minY - clampedOrigin.y) > 1 {
+                        _ = adapter.setPosition(clampedOrigin, of: window)
+                        actual = validFrame(of: window) ?? actual
+                    }
+                }
+            }
+            return (moved, resized, positioned, actual)
+        }
+    }
+
     private func autoTile(targetPID: pid_t?, planner: WindowLayoutPlanner) -> WindowActionIssue? {
         let candidates = adapter.onScreenWindows(excludingPID: ProcessInfo.processInfo.processIdentifier)
             .filter { $0.attributes.isEligible }
         guard let first = candidates.first else { return .noWindow }
-        let anchor = targetPID.flatMap { eligibleWindow(in: $0)?.1 } ?? first.frame
+        let target = targetPID.flatMap { eligibleWindow(in: $0) }
+        let anchor = target?.1 ?? first.frame
         guard let display = planner.displayIndex(for: planner.appKitFrame(anchor)) else { return .couldNotMove }
-        // Front-most windows win the available cells; they then keep their relative on-screen order.
+        // Front-most windows win the available slots; active window takes Master in master+stack.
         let onDisplay = candidates.filter { planner.displayIndex(for: planner.appKitFrame($0.frame)) == display }
-        let cells = planner.autoTilePlan(windowCount: onDisplay.count, on: display)
-        let selected = onDisplay.prefix(cells.count)
-            .sorted { ($0.frame.minY, $0.frame.minX) < ($1.frame.minY, $1.frame.minX) }
-        guard !selected.isEmpty else { return .noWindow }
+        guard let layout = planner.autoTileLayout(windowCount: onDisplay.count, on: display) else { return .noWindow }
+        let initialCells = layout.cells
+        let displayCandidates = Array(onDisplay.prefix(initialCells.count))
+        guard !displayCandidates.isEmpty else { return .noWindow }
+
+        let selected: [(window: Adapter.Window, attributes: WindowAttributes, frame: CGRect)]
+        switch layout {
+        case .masterStack:
+            let masterIndex = target.flatMap { t in displayCandidates.firstIndex { $0.window == t.0 } } ?? 0
+            var rest = displayCandidates
+            let master = rest.remove(at: masterIndex)
+            rest.sort { ($0.frame.minY, $0.frame.minX) < ($1.frame.minY, $1.frame.minX) }
+            selected = [master] + rest
+        case .columns:
+            selected = displayCandidates.sorted { ($0.frame.minX, $0.frame.minY) < ($1.frame.minX, $1.frame.minY) }
+        case .rows, .grid, .single:
+            selected = displayCandidates.sorted { ($0.frame.minY, $0.frame.minX) < ($1.frame.minY, $1.frame.minX) }
+        }
 
         // Keep the oldest saved frame of windows tiled again so one restore returns to the original layout.
         let saved = Dictionary(batchHistory.map { ($0.window, $0.frame) }, uniquingKeysWith: { first, _ in first })
         batchHistory = selected.map { ($0.window, saved[$0.window] ?? $0.frame) }
 
         let bounds = planner.axFrame(planner.displays[display].visibleFrame)
+        var actualFrames: [CGRect] = []
         var applied = 0
-        for (entry, cell) in zip(selected, cells) {
+        for (entry, cell) in zip(selected, initialCells) {
             let placement = WindowLayoutPlanner.Placement(frame: cell, bounds: bounds)
-            if approximatelyEqual(entry.frame, cell) { applied += 1; continue }
-            _ = adapter.setPosition(cell.origin, of: entry.window)
-            _ = adapter.setSize(cell.size, of: entry.window)
-            let size = validFrame(of: entry.window)?.size ?? cell.size
-            _ = adapter.setPosition(placement.position(for: size), of: entry.window)
-            // An app with a minimum size may not reach the cell exactly; the move still counts.
-            if validFrame(of: entry.window).map({ $0 != entry.frame }) ?? false { applied += 1 }
+            if approximatelyEqual(entry.frame, cell) {
+                actualFrames.append(entry.frame)
+                applied += 1
+                continue
+            }
+            let result = applyFrame(placement, from: entry.frame, to: entry.window)
+            let actual = result.actual ?? cell
+            actualFrames.append(actual)
+            if actual != entry.frame { applied += 1 }
+        }
+
+        // Pass 2: if any app enforced a larger minimum size, rebalance flexible siblings to avoid overlap.
+        if let reflowed = planner.reflow(layout, actualSizes: actualFrames.map(\.size), bounds: bounds) {
+            for (index, (entry, cell)) in zip(selected, reflowed).enumerated() {
+                let current = actualFrames[index]
+                if approximatelyEqual(current, cell) { continue }
+                let result = applyFrame(WindowLayoutPlanner.Placement(frame: cell, bounds: bounds),
+                                        from: current, to: entry.window)
+                if result.actual.map({ $0 != entry.frame }) ?? false { applied += 1 }
+            }
         }
         return applied > 0 ? nil : .couldNotMove
     }
@@ -137,10 +192,7 @@ final class AXWindowAccess<Adapter: WindowAccessAdapter>: @unchecked Sendable {
         for entry in entries {
             guard let current = validFrame(of: entry.window),
                   let placement = planner.placement(for: .restore, currentAX: current, previousAX: entry.frame) else { continue }
-            _ = adapter.setPosition(placement.frame.origin, of: entry.window)
-            _ = adapter.setSize(placement.frame.size, of: entry.window)
-            let size = validFrame(of: entry.window)?.size ?? placement.frame.size
-            _ = adapter.setPosition(placement.position(for: size), of: entry.window)
+            _ = applyFrame(placement, from: current, to: entry.window)
             restored += 1
         }
         return restored > 0 ? nil : .noPreviousFrame
@@ -216,6 +268,26 @@ struct NativeWindowAccessAdapter: WindowAccessAdapter {
         return AXUIElementSetAttributeValue(window, Self.size as CFString, value) == .success
     }
 
+    func withFrameMutation<T>(on window: AXUIElement, _ body: () -> T) -> T {
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(window, &pid) == .success, pid > 0 else { return body() }
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.5)
+        let enhancedAttr = "AXEnhancedUserInterface" as CFString
+        var value: CFTypeRef?
+        let wasEnhanced = AXUIElementCopyAttributeValue(app, enhancedAttr, &value) == .success
+            && (value as? Bool) == true
+        if wasEnhanced {
+            _ = AXUIElementSetAttributeValue(app, enhancedAttr, kCFBooleanFalse)
+        }
+        defer {
+            if wasEnhanced {
+                _ = AXUIElementSetAttributeValue(app, enhancedAttr, kCFBooleanTrue)
+            }
+        }
+        return body()
+    }
+
     func onScreenWindows(excludingPID: pid_t) -> [(window: AXUIElement, attributes: WindowAttributes, frame: CGRect)] {
         guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
                 as? [[String: Any]] else { return [] }
@@ -247,10 +319,18 @@ struct NativeWindowAccessAdapter: WindowAccessAdapter {
         var result: [(window: AXUIElement, attributes: WindowAttributes, frame: CGRect)] = []
         var seen = Set<AXUIElement>()
         for entry in ordered {
-            // CGWindow bounds and AX frames share the same top-left global coordinates.
-            guard let match = eligible[entry.pid]?.first(where: {
+            let pool = eligible[entry.pid] ?? []
+            // CGWindow bounds and AX frames share top-left global coordinates; allow minor chrome/IoU slack.
+            let match = pool.first {
                 !seen.contains($0.window) && Self.matches($0.attributes.frame, entry.bounds)
-            }) else { continue }
+            } ?? pool.filter { !seen.contains($0.window) }
+                .compactMap { item -> ((window: AXUIElement, attributes: WindowAttributes), CGFloat)? in
+                    let iou = Self.intersectionOverUnion(item.attributes.frame, entry.bounds)
+                    return iou >= 0.75 ? (item, iou) : nil
+                }
+                .max { $0.1 < $1.1 }?
+                .0
+            guard let match else { continue }
             seen.insert(match.window)
             result.append((match.window, match.attributes, match.attributes.frame))
         }
@@ -258,8 +338,16 @@ struct NativeWindowAccessAdapter: WindowAccessAdapter {
     }
 
     private static func matches(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
-        abs(lhs.minX - rhs.minX) <= 2 && abs(lhs.minY - rhs.minY) <= 2
-            && abs(lhs.width - rhs.width) <= 2 && abs(lhs.height - rhs.height) <= 2
+        abs(lhs.minX - rhs.minX) <= 4 && abs(lhs.minY - rhs.minY) <= 4
+            && abs(lhs.width - rhs.width) <= 4 && abs(lhs.height - rhs.height) <= 4
+    }
+
+    private static func intersectionOverUnion(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
+        let inter = lhs.intersection(rhs)
+        guard !inter.isNull, !inter.isEmpty else { return 0 }
+        let interArea = inter.width * inter.height
+        let unionArea = lhs.width * lhs.height + rhs.width * rhs.height - interArea
+        return unionArea > 0 ? interArea / unionArea : 0
     }
 
     private func isSettable(_ attribute: String, of element: AXUIElement) -> Bool {

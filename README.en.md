@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Surfire/Lumen/releases/tag/v0.5.1"><img src="https://img.shields.io/badge/Release-v0.5.1_(Build_33)-e11d48?style=flat-square" alt="Release v0.5.1"></a>
+  <a href="https://github.com/Surfire/Lumen/releases/tag/v0.5.4"><img src="https://img.shields.io/badge/Release-v0.5.4_(Build_36)-e11d48?style=flat-square" alt="Release v0.5.4"></a>
   <a href="https://github.com/Surfire/Lumen/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Surfire/Lumen/ci.yml?branch=main&style=flat-square&label=CI" alt="CI Status"></a>
   <img src="https://img.shields.io/badge/Platform-Apple_Silicon_%7C_macOS_14%2B-1e293b?style=flat-square" alt="Platform">
   <img src="https://img.shields.io/badge/Engine-Rust_%2B_AppKit%2FSwiftUI-0f172a?style=flat-square" alt="Stack">
@@ -39,7 +39,7 @@
 | :--- | :--- |
 | `Q4 plan pdf` | Multi-keyword match filtered by real PDF extension; quote for `"exact phrases"` |
 | `luming` / `lm` | Full Chinese pinyin or initials lookup directly matching Chinese filenames |
-| `img sailboat` | Offline multimodal image & document search with zero data leaving your Mac |
+| `deer` / `img sailboat` | Single-Han visual recall (`鹿`) or explicit `img` multimodal search—zero data leaves your Mac |
 | `Bluetooth` / `25 km in mi` | Jump straight to System Settings or evaluate math/unit conversions—no index wait |
 | `?` / `win` | Discover built-in commands & adaptive Accessibility window tiling / batch restore |
 | `cb` | Rich opt-in clipboard history previewing images, code files, URLs, and colors |
@@ -58,8 +58,9 @@
 - **Jump Straight to the Matched PDF Page**: Rather than dumping disconnected raw text snippets, PDF results open directly to the matching page rendered with translucent amber passage highlights above the text context.
 - **Content-Proportional Quick Look (`⌘Y` / `Space`)**: Pressing `Space` while browsing results (while still typing normally while editing) or `⌘Y` shares one unified cloud-safe preview pipeline; Quick Look windows resize automatically to each item's true PDF CropBox, EXIF orientation, image dimensions, code, or media ratio.
 
-### 3. Unified Multimodal Semantic Index, Smart Filters & 1-Click Gemma Downloader
-- **Single Source of Truth for Text & Images**: Documents and images live in a unified **Semantic & Content Index** (`content_roots`, with one-time migration from legacy image scopes). Batched EmbeddingGemma 2 encoding prioritizes newest files first and blends image vectors seamlessly when `mmproj` is installed.
+### 3. Unified Multimodal Semantic Index, Quiet Thermal Pacing & 1-Click Gemma
+- **Unified Engine & Fair Turn Interleaving**: Documents and images share one **Semantic & Content Index** (`content_roots`, with one-time migration from legacy image scopes) and scale vector budgets to physical RAM (~699k text chunks / ~349k images on 128 GiB Macs). Cold start warms `64` newest images first, then alternates **100 text batches ↔ 16 image batches** sequentially while blending single-Han visual recall seamlessly once `mmproj` is installed.
+- **Quiet Thermal/Battery Pacing & Faster Vision Pipeline (v0.5.4)**: Darwin `thermalpressurelevel` and IOKit power-source pacing yields GPU cooldown slices between `--stream` batches; `llama-server` drops unused 8 GiB prompt caching and busy polling (`--cache-ram 0 --poll 0`, cutting RSS in half); `gemma_pending_chunk` eliminates $O(N^2)$ SQLite table scans; opaque thumbnails use JPEG `0.85` (preserving PNG alpha) with 2-slot concurrent encoding.
 - **Smart Build-Noise Skip & Progressive Rules**: Read-only pre-Apply folder scanning previews counts by category (`PDF` / `DOCX` / `Text` / `Images` / `Code`) and highlights noisy subfolders. Automatically skips `node_modules`, `target`, `dist`, `build`, lockfiles, minified bundles, and OCR sidecars, keeping **source code off by default** with custom allow/deny rules tucked inside a collapsed `DisclosureGroup`.
 - **1-Click Verified Model Installer**: Pick **HuggingFace** or **HF-Mirror** right inside Settings (respecting system proxies) or import local weights; every binary, GGUF model, and runtime dylib is verified by exact size and SHA-256 before activation.
 
@@ -72,7 +73,7 @@
 - **Solves Real macOS Resize Quirks**: Temporarily disables `AXEnhancedUserInterface` on Chromium/Electron/IDE windows during frame mutation and restores it safely via `defer`, contracts before moving to avoid screen-edge clamping, retries post-move resizes, prioritizes the active window for the Master slot, and runs 2-pass **minimum-size Reflow** when an app enforces a `minWidth` or `minHeight` larger than its initial slot.
 
 ### 6. Native Launcher Hub & 24h Verified Auto-Updates
-- Unifies **rich private clipboard history** (5 password-manager privacy markers, ~1.1 ms p95 across 500 items, inline image/code/URL/color previews), **Light / Dark / System appearance**, streaming `tr` / `qa`, quicklinks, calc/unit conversion, local scripts & Apple Shortcuts, and cohesive 24-hour update checks inside `LauncherUpdater` (CMS + SHA-256 **Install & Relaunch** for signed builds; safe download-page prompt for ad-hoc builds).
+- Unifies **rich private clipboard history** (5 password-manager privacy markers, ~1.1 ms p95 across 500 items, inline image/code/URL/color previews), **Light / Dark / System appearance**, streaming `tr` / `qa`, quicklinks, calc/unit conversion, local scripts & Apple Shortcuts, and cohesive 24h updates in `LauncherUpdater` (CMS + SHA-256 **Install & Relaunch** for signed builds; strict HTTP-404 fallback to `lumen-update.json` opening the GitHub Release page safely for ad-hoc builds).
 
 ---
 
@@ -151,6 +152,17 @@ Hardware: **Apple M5 Max · 128 GiB RAM · macOS 27.0.1 · commit `81385f7`**. B
 
 </details>
 
+### 3. v0.5.4 Background Multimodal Indexing & Thermal-Pacing Telemetry (Apple M5 Max · 128 GiB)
+Measured on the live 1.67M-item corpus (76k documents, 18,696 indexed local images, `embeddinggemma-2-Q8_0`):
+
+| Metric | Before (`v0.5.3`) | After (`v0.5.4`) | Notes |
+| :--- | :--- | :--- | :--- |
+| `llama-server` RSS footprint | `2,660 MB` (~2.66 GB) | **`1,182–1,266 MB`** | `--cache-ram 0 --poll 0` eliminates unused cache bloat (**-52% to -55%**) |
+| Pending chunk SQLite query | `82 ms` full 323k scan | **`0.05 ms`** (`ROWID` search) | Materialized `gemma_pending_chunk` queue eliminates $O(N^2)$ scans |
+| `lumen embed` host CPU | `5%–38%` | **`0.8%–2.5%`** | Eliminates repeated queue scans & polling; zero thermal warnings |
+| `sample` stack sleep ratio | `0%` (nonstop GPU burn) | **`~66%` resting** (950 vs 489) | Darwin thermal/battery pacer yields cooldown slices between batches |
+| Net text throughput | ~`64 chunks/s` | **~`72 chunks/s`** (+2,080 in 29s) | Faster net progress despite resting >50% of wall time |
+
 ---
 
 ## Detailed Comparison
@@ -211,7 +223,7 @@ open -a "$HOME/Applications/Lumen.app"
 
 ### 4. Auto-Updates & Configuration Docs
 
-- **24h Auto-Update Checks**: Configurable under **Settings → Advanced & Diagnostics** and the menu bar item. Release-signed copies verify CMS signature + ZIP SHA-256 before atomic **Install & Relaunch** (with automatic backup rollback); community ad-hoc builds open the Release page safely.
+- **24h Auto-Update Checks**: Configurable under **Settings → Advanced & Diagnostics** and the menu bar item. Release-signed copies verify CMS signature + ZIP SHA-256 before atomic **Install & Relaunch** (with automatic backup rollback); community ad-hoc builds fall back strictly on HTTP 404 to `lumen-update.json` and open the GitHub Release page safely.
 - **Model & Endpoint Guides**: [Offline Semantics](docs/offline-gemma.md) · [Multimodal Image Search](docs/offline-image-search.md) · [Translation & Q&A Providers](docs/TRANSLATION.md)
 
 ---

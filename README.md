@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Surfire/Lumen/releases/tag/v0.5.1"><img src="https://img.shields.io/badge/Release-v0.5.1_(Build_33)-e11d48?style=flat-square" alt="Release v0.5.1"></a>
+  <a href="https://github.com/Surfire/Lumen/releases/tag/v0.5.4"><img src="https://img.shields.io/badge/Release-v0.5.4_(Build_36)-e11d48?style=flat-square" alt="Release v0.5.4"></a>
   <a href="https://github.com/Surfire/Lumen/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Surfire/Lumen/ci.yml?branch=main&style=flat-square&label=CI" alt="CI Status"></a>
   <img src="https://img.shields.io/badge/Platform-Apple_Silicon_%7C_macOS_14%2B-1e293b?style=flat-square" alt="Platform">
   <img src="https://img.shields.io/badge/Engine-Rust_%2B_AppKit%2FSwiftUI-0f172a?style=flat-square" alt="Stack">
@@ -39,7 +39,7 @@
 | :--- | :--- |
 | `年报 复盘 pdf` | 多关键词同框秒查 + 真实扩展名过滤；支持双引号 `"精确短语"` |
 | `luming` / `lm` | 全拼或首字母直接定位中文文件名「鹿鸣」及路径目录 |
-| `img 帆船` | 基于本地多模态模型按画面与文档语义搜索，全过程零数据上传 |
+| `鹿` / `img 帆船` | 主框单字直接防抖唤起高相关视觉召回，或以 `img` 显式跨模态搜图与文档，全程零数据上传 |
 | `蓝牙` / `25 km in mi` | 无需等待文件索引，直接跳转系统设置或本地实时计算/单位换算 |
 | `?` / `win` | 浏览内置命令与自适应窗口管理（智能分屏、竖屏三分之一、批量恢复） |
 | `cb` | 富媒体私密剪贴板历史，方向键选中即出图片、代码文件与色值预览 |
@@ -59,8 +59,9 @@
 - **比例自适应悬浮窗**：按 **`⌘Y`** 呼出独立 Quick Look 悬浮窗（打字时不抢空格，浏览结果时按 **`空格`** 即可触发内联/悬浮预览），自动识别 PDF CropBox、页面旋转角、图片像素/EXIF 方向与文档/代码比例。
 - **统一的云盘按需同步边界**：无论在普通搜索还是剪贴板文件列表中按 `空格` 或 `⌘Y`，遇到未下载云端文件均执行同一套安全同步流程，显示进度环并支持随时按 `Esc` 取消。
 
-### 3. 统一多模态语义索引、智能降噪过滤与一键下载 Gemma
-- **正文与图片合并为同一引擎**：将文档与图片目录收口至单一的「语义与内容索引」配置（打开数据库时自动迁移旧目录状态），按文件修改时间倒序批量调用 EmbeddingGemma 2，近期文档最先具备语义召回能力；安装 `mmproj` 视觉投影器后，语义检索自动融合图像结果。
+### 3. 统一多模态语义索引、静音温控、智能降噪与一键下载 Gemma
+- **正文与图片统一引擎 & 公平调度**：将文档与图片目录收口至同一「语义与内容索引」配置，按文件修改时间倒序推进并采用随物理内存动态伸缩的向量预算（128 GiB 机型约 69.9 万正文片段 / 34.9 万图像向量）。冷启动先预热 `64` 张最新图片，随后在后台按「正文 `100` 批 ↔ 图像 `16` 批」公平交替推进；安装 `mmproj` 后支持主框单字视觉召回与跨模态结果融合。
+- **后台静音温控与算力优化（v0.5.4）**：基于 Darwin `thermalpressurelevel` 与 IOKit 电源状态在批间自动让出 GPU，消除长期风扇狂转；`llama-server` 禁用无用的 8 GiB Prompt Cache 与忙等轮询（`--cache-ram 0 --poll 0`，常驻内存直接减半），`gemma_pending_chunk` 物化队列消除 $O(N^2)$ 全表扫，不透明图像改传 JPEG `0.85` 缩略图并启用双槽并发编码。
 - **默认跳过开发噪音 + 渐进式规则**：添加工程/工作目录时支持先只读预扫目录文件分布，一键排除高噪音子目录；默认跳过 `node_modules`、`target`、`dist`、`build`、锁文件、压缩产物与中间文本，且**默认关闭源码索引**；其余自定义扩展名与路径规则统一折叠于「高级过滤规则…」。
 - **内置 1-Click Gemma 下载与校验器**：无需命令行配置 Python/脚本，在设置页选择 **HuggingFace** 或国内 **HF-Mirror** 源即可一键下载模型、多模态投影器与推理运行时（保留系统代理），全程强制验证 SHA-256 与精确字节大小；也支持本地已下载文件一键导入。
 
@@ -73,7 +74,7 @@
 - **解决真实窗口调整顽疾**：针对 Electron / Chromium / IDE 窗口调整期间临时关闭 `AXEnhancedUserInterface` 并在完成后精确恢复；收缩窗口时先缩再移防贴边夹紧；若某些应用强制最小宽高（`minWidth` / `minHeight`）超出初始格子，两阶段 **Reflow 重排** 会读回真实尺寸并自动重算相邻窗口比例，不留重叠或大块空隙。
 
 ### 6. 全能原生效率中枢 & 24h 自动校验更新
-- 整合：**私密剪贴板历史**（默认关闭隐私保护、屏蔽 5 类密码管理器标记、500 条模糊搜 p95 ~1.1 ms、图片/文件/URL/色值即时预览）、**浅色/深色/跟随系统**外观、**流式翻译与问答（`tr` / `qa`）**、**快捷链接 & 本地脚本 / Apple 快捷指令**、以及内聚于 `LauncherUpdater` 的 **24 小时自动检查更新**（正式签名版校验 CMS 签名 + SHA-256 后支持一键「安装并重启」，失败自动回滚备份）。
+- 整合：**私密剪贴板历史**（默认关闭隐私保护、屏蔽 5 类密码管理器标记、500 条模糊搜 p95 ~1.1 ms、图片/文件/URL/色值即时预览）、**浅色/深色/跟随系统**外观、**流式翻译与问答（`tr` / `qa`）**、**快捷链接 & 本地脚本 / Apple 快捷指令**、以及内聚于 `LauncherUpdater` 的 **24 小时自动检查更新**（正式签名版校验 CMS + SHA-256 后一键「安装并重启」并支持回滚备份；社区 ad-hoc 构建在 `.cms` 返回 404 时严格只读降级 `lumen-update.json` 提示并跳转 Release 页面）。
 
 ---
 
@@ -152,6 +153,17 @@
 
 </details>
 
+### 3. v0.5.4 后台多模态索引静音与内存实测（Apple M5 Max · 128 GiB）
+在真实 166.7 万文件（7.6 万文档、18,696 张已索引图片、`embeddinggemma-2-Q8_0`）工作库上的对比实测：
+
+| 指标 | 优化前（`v0.5.3`） | 优化后（`v0.5.4`） | 变化说明 |
+| :--- | :--- | :--- | :--- |
+| `llama-server` 内存（RSS） | `2,660 MB`（~2.66 GB） | **`1,182–1,266 MB`** | `--cache-ram 0 --poll 0` 砍掉缓存与忙等（**-52%~-55%**） |
+| 待嵌队列 SQL 查询 | `82 ms` 全扫描 32.3 万行 | **`0.05 ms`**（`ROWID` 驱动） | `gemma_pending_chunk` 物化表消除 $O(N^2)$ 扫表 |
+| `lumen embed` CPU 占用 | `5%–38%` | **`0.8%–2.5%`** | 消除重复扫表与盲等，无任何热告警 |
+| `sample` 调用栈休眠占比 | `0%`（零休眠死跑 GPU） | **`~66%` 休眠**（950 vs 489 样） | Darwin 温控/电源节流批间自动冷却 GPU |
+| 文本向量实际推进速度 | ~`64 段/秒` | **~`72 段/秒`**（实测 29s +2,080 段） | 省下 SQLite 扫表时间后降功耗同时仍更快 |
+
 ---
 
 ## 同类工具深度对比
@@ -212,7 +224,7 @@ open -a "$HOME/Applications/Lumen.app"
 
 ### 4. 自动检查更新与模型配置
 
-- **24 小时自动检查更新**：在 **「设置 → 高级与诊断」** 与菜单栏提供入口；正式签名版本支持 CMS 清单验签 + ZIP SHA-256 校验后一键 **「安装并重启」**（失败自动回滚备份），Path B 社区版则会安全提醒并打开 Release 下载页。
+- **24 小时自动检查更新**：在 **「设置 → 高级与诊断」** 与菜单栏提供入口；正式签名版本支持 CMS 清单验签 + ZIP SHA-256 校验后一键 **「安装并重启」**（失败自动回滚备份），Path B 社区 ad-hoc 构建会在 `.cms` 404 时严格安全降级读取 `lumen-update.json` 并提示打开 Release 下载页。
 - **离线模型与翻译配置**：[离线语义配置](docs/offline-gemma.md) · [多模态图像模型说明](docs/offline-image-search.md) · [翻译与问答（oMLX / OpenAI）](docs/TRANSLATION.md)
 
 ---

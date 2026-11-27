@@ -5002,6 +5002,15 @@ final class LauncherSmoke {
         try check(!streamImages.failed && streamImages.checked == 4 && imgLaunches == 1,
                   "streaming image-index failed or launched multiple processes (\(imgLaunches))")
 
+        streamImages.build(maxBatches: 1)
+        try await until("bounded streaming image-index bootstrap did not settle after batch 1") {
+            !streamImages.building && !streamImages.loading
+        }
+        let boundedLaunches = try String(contentsOf: streamDir.appendingPathComponent("img-launches"), encoding: .utf8)
+            .split(separator: "\n").count
+        try check(!streamImages.failed && !streamImages.noProgressExhausted && streamImages.checked == 3 && boundedLaunches == 2,
+                  "bounded image bootstrap failed: failed=\(streamImages.failed) exhausted=\(streamImages.noProgressExhausted) checked=\(streamImages.checked) launches=\(boundedLaunches)")
+
         // 5. Option A: single-Han visual recall (`mode: "image"`) & slot 6-7 placement.
         try check(Launcher.qualifiesForImageRecall("鹿") &&
                   Launcher.qualifiesForImageRecall("deer") &&

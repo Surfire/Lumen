@@ -190,6 +190,7 @@ final class Launcher: ObservableObject {
     var imageCoverage: ImageCoverage? { indexStatus.imageCoverage }
     var onCoverageAccepted: ((IndexReport) -> Void)?
     var isImageIndexingActive: (() -> Bool)?
+    var canBootstrapImages: (() -> Bool)?
     var isEmbeddingIndexingPaused: Bool { defaults?.bool(forKey: "gemmaIndexingPaused") == true }
     var indexPhase: IndexPhase { indexStatus.indexPhase }
     var indexWork: IndexWork? { indexStatus.indexWork }
@@ -1427,7 +1428,13 @@ final class Launcher: ObservableObject {
             automaticBuildAttempted = false
         }
         // The saved scope in the database decides whether documents are eligible.
-        if !automaticBuildAttempted, embeddingState == .idle, canBuildEmbeddings,
+        let needsImageBootstrap = report.images?.enabled == true
+            && report.images?.vectors == 0
+            && report.images?.pending == true
+            && report.images?.limited == false
+            && canBootstrapImages?() == true
+        if !needsImageBootstrap,
+           !automaticBuildAttempted, embeddingState == .idle, canBuildEmbeddings,
            !isEmbeddingIndexingPaused, isImageIndexingActive?() != true,
            defaults?.bool(forKey: "gemmaIndexingEnabled") == true {
             automaticBuildAttempted = true

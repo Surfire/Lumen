@@ -133,7 +133,7 @@ final class LauncherImageSearch: ObservableObject {
         }
     }
 
-    func build() {
+    func build(maxBatches: Int? = nil) {
         guard let projector, !loading, !building else { return }
         generation += 1
         building = true
@@ -143,9 +143,9 @@ final class LauncherImageSearch: ObservableObject {
         limited = false
         failed = false
         if engine.supportsStreamingBatches {
-            streamBuild(projector: projector, generation: generation)
+            streamBuild(projector: projector, generation: generation, maxBatches: maxBatches)
         } else {
-            batch(after: nil, projector: projector, generation: generation)
+            batch(after: nil, projector: projector, generation: generation, remainingBatches: maxBatches)
         }
     }
 
@@ -158,9 +158,11 @@ final class LauncherImageSearch: ObservableObject {
         if refreshStatus { refresh() }
     }
 
-    private func finishBuild(succeeded: Bool) {
+    private func finishBuild(succeeded: Bool, bounded: Bool = false) {
         if succeeded, indexedInCurrentBuild == 0, !limited {
             noProgressExhausted = true
+        } else if bounded {
+            noProgressExhausted = false
         }
         if let onBuildFinished {
             onBuildFinished()
@@ -169,16 +171,25 @@ final class LauncherImageSearch: ObservableObject {
         }
     }
 
-    private func streamBuild(projector: URL, generation: Int) {
+    private func streamBuild(projector: URL, generation: Int, maxBatches: Int?) {
         let args = ["image-index", "--projector", projector.path, "--stream", "--max", "16"] + engine.gemmaOptions
         var sawBatch = false
+        var batchesSeen = 0
         process = engine.run(args, onLine: { [weak self] line in
             guard let self, self.generation == generation,
                   let batch = try? JSONDecoder().decode(Batch.self, from: line) else { return }
             sawBatch = true
+            batchesSeen += 1
             self.indexedInCurrentBuild += batch.indexed
             self.checked += batch.indexed + batch.reused
             self.limited = batch.limited
+            if let maxBatches, batchesSeen >= maxBatches {
+                self.generation += 1
+                self.process?.terminate()
+                self.process = nil
+                self.building = false
+                self.finishBuild(succeeded: true, bounded: true)
+            }
         }, priority: .background) { [weak self] response in
             guard let self, self.generation == generation else { return }
             self.process = nil
@@ -192,7 +203,7 @@ final class LauncherImageSearch: ObservableObject {
         if let process { _ = setpriority(PRIO_PROCESS, UInt32(process.processIdentifier), 10) }
     }
 
-    private func batch(after cursor: String?, projector: URL, generation: Int) {
+    private func batch(after cursor: String?, projector: URL, generation: Int, remainingBatches: Int? = nil) {
         let args = ["image-index", "--projector", projector.path, "--max", "16"] + engine.gemmaOptions
             + (cursor.map { ["--after", $0] } ?? [])
         process = engine.run(args, priority: .background) { [weak self] response in
@@ -207,11 +218,13 @@ final class LauncherImageSearch: ObservableObject {
             self.indexedInCurrentBuild += batch.indexed
             self.checked += batch.indexed + batch.reused
             self.limited = batch.limited
-            if !batch.limited, let next = batch.next_after, next != cursor {
-                self.batch(after: next, projector: projector, generation: generation)
+            let exhaustedLimit = remainingBatches.map { $0 <= 1 } ?? false
+            if !exhaustedLimit, !batch.limited, let next = batch.next_after, next != cursor {
+                self.batch(after: next, projector: projector, generation: generation,
+                           remainingBatches: remainingBatches.map { $0 - 1 })
             } else {
                 self.building = false
-                self.finishBuild(succeeded: true)
+                self.finishBuild(succeeded: true, bounded: exhaustedLimit && batch.next_after != nil && !batch.limited)
             }
         }
         if let process { _ = setpriority(PRIO_PROCESS, UInt32(process.processIdentifier), 10) }

@@ -395,6 +395,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
         }.store(in: &cancellables)
         model.isImageIndexingActive = { [weak self] in self?.imageSearch.building == true }
+        model.canBootstrapImages = { [weak self] in
+            guard let self else { return false }
+            if case .unavailable = self.model.localModelState { return false }
+            return self.imageSearch.canAutoBuild
+        }
         model.onCoverageAccepted = { [weak self] report in
             guard let self else { return }
             let roots = report.scope?.contentFolders ?? self.model.settingsScope.contentFolders
@@ -1812,7 +1817,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
               !model.isEmbeddingIndexingPaused,
               model.imageCoverage?.pending == true, model.imageCoverage?.limited == false,
               imageSearch.canAutoBuild else { return }
-        imageSearch.build()
+        if model.imageCoverage?.vectors == 0,
+           model.gemmaCoverage?.pending == true,
+           model.gemmaCoverage?.limited == false {
+            imageSearch.build(maxBatches: 4)
+        } else {
+            imageSearch.build()
+        }
     }
 
     private func updateSearchPresentation() {

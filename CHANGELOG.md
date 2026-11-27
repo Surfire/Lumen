@@ -1,5 +1,13 @@
 # 更新记录
 
+## 0.6.0（build 38）
+
+- **向量检索内存减半 + AArch64 NEON/并行 38× 加速**：`src/vector.rs` 将 `Matrix<T>` 内存存储由解包 `Vec<f32>` 改为紧凑 IEEE-754 `f16`（`Vec<u16>`，兼容旧 `f32` Blob 导入），在 ARM64 上采用 NEON `fcvtl`/`fcvtl2` + `vfmaq_f32` 寄存器内转累加并在 `>= 4096` 行时多线程分片并行，同时服务文本与图片语义搜索。在 Apple M5 Max 实测 `699,050 × 768` 向量矩阵：常驻内存从 **`2048.0 MiB` 降至 `1024.0 MiB`（-50%）**，单次评分中位耗时从 **`215.23 ms` 降至 `5.65 ms`（实测加速 `38.07×`，最大误差 `1.05e-05`）**；正文提取并行度也改为按核心数动态伸缩 `(cpus * 2 / 3).clamp(4, 12)`。
+- **流式 ZIP 解析百兆 `.pptx` + 跨分片解压防炸弹**：`src/platform.rs` 新增统一内核校验句柄 `open_local_checked`（持有 `NoMaterialization`、`SF_DATALESS == 0`、`O_NOFOLLOW_ANY` 与读写前后 stamp 校验），`src/docx.rs` 直接以 `Read + Seek` 流式读取 `ZipArchive` 并跳过 `ppt/media/*`，`.pptx` 支持上限提升至 **256 MiB**（`.docx`/`.xlsx` 为 **64 MiB**，隔离测试 21 MiB 含媒体 `.pptx` 仅 **11.8 ms** / 峰值 RSS **10.7 MiB**），并补齐跨 part 总解压 XML 预算 `32 MiB`。
+- **零子进程纯 Rust 旧版 Office & 字幕支持**：新增 `src/legacy_office.rs`，在进程内通过纯 Rust OLE2/CFBF、Word 97–2003 FIB/`Clx`、Excel BIFF8 `SST`+`CONTINUE`、PowerPoint Atoms 与 CoreFoundation 代码页解码支持 **`.doc` / `.xls` / `.ppt` / `.rtf`** 全文提取（拒绝加密与环路畸形包）；同步支持 **`.srt` / `.vtt`** 干净字幕提取（保留 `.transcript.md` 过滤防噪），并在上下文操作中为命中字幕提供无感检测的「打开关联媒体（`.mp4`/`.m4a` 等）」快捷入口。
+- **查询级哈希 Frecency + 应用首字母与高频别名**：扩展 `LauncherFrecency` 新增「查询词 + 目标」哈希亲和键（`q:<sha256>`，512 条 LRU 上限，偏好设置零明文路径/查询词）；`LaunchCatalog` 自动生成分词/驼峰首字母（`vsc`、`am`、`wc`、`st`、`it`）并内置常用别名（`ps`、`ai`、`pr`、`ae`、`wx`、`vscode` 等）。
+- **AI 工作站 & 序列帧噪声智能标注 + FSEvents 突发合并**：`preview-content-scope` 保持纯目录 SQL 只读扫描并展示 `ai_runtime`、`sequential_frames`、`image_dump` 等局部降噪理由（`obsidian`/`notes`/`vault`/`wiki`/`knowledge` 等知识库目录 `< 5000` 项自动豁免）；`watch` 新增 `BurstCoalescer` 对单父目录 `> 64 events/s` 的高噪写入合并退避（3s 静默 / 10s 强制落盘，普通修改维持 `<= 300 ms` 且未落盘前绝不推进检查点）。
+
 ## 0.5.5（build 37）
 
 - **默认噪音与 Python 虚拟环境精准过滤（`scope_policy_v5`）**：默认排除 `/Users/Deleted Users`、`site-packages`/`dist-packages` 与 `*venv*` 变体目录，并通过 PEP 405 `pyvenv.cfg` 真实文件系统标记停止下钻（对云占位目录豁免多余检测）。

@@ -1618,11 +1618,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         NSApp.activate()
         #endif
         if settings == nil {
-            let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 800, height: 640),
+            let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 780, height: 620),
                                  styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
             window.hidesOnDeactivate = false
-            window.contentMinSize = NSSize(width: 700, height: 540)
+            window.contentMinSize = NSSize(width: 740, height: 560)
             window.delegate = self
             let updates: UpdateSettings? = updateSettings
             window.contentView = NSHostingView(rootView: LauncherSettings(

@@ -240,6 +240,12 @@ final class GemmaAssetManager: ObservableObject {
         case .image:
             guard let projector = Self.downloadURL(asset: .imageProjector, mirror: mirror, manifest: manifest) else { return }
             sources = [.imageProjector: .remote(projector)]
+            if !textInstalled,
+               let model = Self.downloadURL(asset: .model, mirror: mirror, manifest: manifest),
+               let archive = Self.downloadURL(asset: .runtimeArchive, mirror: mirror, manifest: manifest) {
+                sources[.model] = .remote(model)
+                sources[.runtimeArchive] = .remote(archive)
+            }
         }
         start(sources, manifest: manifest, completion: completion)
     }
@@ -552,59 +558,119 @@ private final class GemmaDownload: NSObject, URLSessionDownloadDelegate, @unchec
     }
 }
 
-/// Model status rows + one-click installer, shown at the top of the unified Semantic & Content Index card.
+/// Model status rows + one-click installer for built-in Gemma 2 text and multimodal assets.
 struct GemmaAssetSettings: View {
+    enum Scope { case all, textOnly, imageOnly }
+
     @ObservedObject var launcher: Launcher
     @ObservedObject var assets: GemmaAssetManager
+    var scope: Scope = .all
     let installed: (GemmaComponent) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            row(launcher.t("文本语义模型", "Text Semantic Model"), bytes: assets.textBytes,
-                ready: assets.textInstalled, component: .text, identifier: "settings.gemma.text")
-            row(launcher.t("图像多模态（可选）", "Image Multimodal (Optional)"), bytes: assets.imageBytes,
-                ready: assets.imageInstalled, component: .image, identifier: "settings.gemma.image")
-            if assets.busy {
-                HStack(spacing: 8) {
-                    if case .downloading = assets.phase, let fraction = assets.fraction {
-                        ProgressView(value: fraction) {
-                            Text("\(ByteCountFormatter.string(fromByteCount: assets.downloadedBytes, countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: assets.totalBytes, countStyle: .file))")
-                                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                        }
-                    } else {
-                        ProgressView().controlSize(.small)
-                        Text(phaseLabel).font(.callout).foregroundStyle(.secondary)
-                        Spacer()
+        VStack(alignment: .leading, spacing: 10) {
+            LumenSettingsWell(padding: 12) {
+                VStack(alignment: .leading, spacing: 10) {
+                    if scope == .all || scope == .textOnly {
+                        row(launcher.t("文本语义模型", "Text Semantic Model"),
+                            bytes: assets.textBytes,
+                            ready: assets.textInstalled,
+                            component: .text,
+                            identifier: "settings.gemma.text")
                     }
-                    Button(launcher.t("取消", "Cancel"), action: assets.cancel)
-                        .controlSize(.small)
-                        .accessibilityIdentifier("settings.gemma.cancel")
+                    if scope == .all {
+                        LumenSettingsHairline()
+                    }
+                    if scope == .all || scope == .imageOnly {
+                        let imageRequiredBytes = assets.textInstalled ? assets.imageBytes : (assets.textBytes + assets.imageBytes)
+                        row(launcher.t("图像多模态模型 (mmproj)", "Image Multimodal Model (mmproj)"),
+                            bytes: imageRequiredBytes,
+                            ready: assets.imageInstalled && assets.textInstalled,
+                            component: .image,
+                            identifier: "settings.gemma.image")
+                    }
                 }
             }
+
+            if assets.busy {
+                LumenSettingsWell(padding: 10) {
+                    HStack(spacing: 10) {
+                        if case .downloading = assets.phase, let fraction = assets.fraction {
+                            ProgressView(value: fraction) {
+                                Text("\(ByteCountFormatter.string(fromByteCount: assets.downloadedBytes, countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: assets.totalBytes, countStyle: .file))")
+                                    .font(.system(size: 11.5).monospacedDigit())
+                                    .foregroundStyle(SettingsTheme.textSecondary)
+                            }
+                            .tint(SettingsTheme.amber)
+                        } else {
+                            ProgressView().controlSize(.small)
+                            Text(phaseLabel)
+                                .font(.system(size: 12))
+                                .foregroundStyle(SettingsTheme.textSecondary)
+                            Spacer()
+                        }
+                        Button(launcher.t("取消", "Cancel"), action: assets.cancel)
+                            .buttonStyle(LumenSecondaryButtonStyle())
+                            .accessibilityIdentifier("settings.gemma.cancel")
+                    }
+                }
+            }
+
             HStack(spacing: 10) {
-                Picker(launcher.t("下载源", "Source"), selection: $assets.mirror) {
-                    ForEach(GemmaMirror.allCases) { Text($0.title).tag($0) }
-                }
-                .pickerStyle(.segmented)
-                .fixedSize()
-                .disabled(assets.busy)
-                Spacer()
+                mirrorSelector
+                Spacer(minLength: 8)
                 Button(launcher.t("从本地导入…", "Import Local Files…")) {
-                    assets.importLocalFiles { ok in if ok { installed(.text) } }
+                    assets.importLocalFiles { ok in
+                        if ok { installed(scope == .imageOnly ? .image : .text) }
+                    }
                 }
-                .controlSize(.small)
+                .buttonStyle(LumenSecondaryButtonStyle())
                 .disabled(assets.busy || assets.manifest == nil)
                 .accessibilityIdentifier("settings.gemma.import")
             }
+
             if assets.phase == .unrecognizedImport {
                 Text(launcher.t("未识别所选文件。请同时选择模型 .gguf 与 llama 运行库压缩包。",
                                 "The selected files were not recognized. Choose the model .gguf and the llama runtime archive."))
-                    .font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+                    .font(.system(size: 12))
+                    .foregroundStyle(SettingsTheme.red)
+                    .fixedSize(horizontal: false, vertical: true)
             } else if case .failed(let message) = assets.phase {
                 Text(launcher.t("安装失败：\(message)", "Install failed: \(message)"))
-                    .font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+                    .font(.system(size: 12))
+                    .foregroundStyle(SettingsTheme.red)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+
+    private var mirrorSelector: some View {
+        HStack(spacing: 2) {
+            ForEach(GemmaMirror.allCases) { mirror in
+                let selected = assets.mirror == mirror
+                Button {
+                    assets.mirror = mirror
+                } label: {
+                    Text(mirror.title)
+                        .font(.system(size: 11.5, weight: selected ? .semibold : .medium))
+                        .foregroundStyle(selected ? SettingsTheme.navActiveTitle : SettingsTheme.textSecondary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(
+                            RoundedRectangle(cornerRadius: SettingsTheme.cornerSM, style: .continuous)
+                                .fill(selected ? SettingsTheme.navActiveBackground : Color.clear)
+                        )
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(3)
+        .background(
+            RoundedRectangle(cornerRadius: SettingsTheme.cornerMD, style: .continuous)
+                .fill(SettingsTheme.wellBackground)
+        )
+        .disabled(assets.busy)
     }
 
     private var phaseLabel: String {
@@ -616,20 +682,23 @@ struct GemmaAssetSettings: View {
     }
 
     private func row(_ title: String, bytes: Int64, ready: Bool, component: GemmaComponent, identifier: String) -> some View {
-        HStack(spacing: 8) {
-            Circle().fill(ready ? Color(nsColor: .systemGreen) : Color.secondary.opacity(0.5))
-                .frame(width: 8, height: 8).accessibilityHidden(true)
-            Text(title)
-            Text("~\(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file))")
-                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-            Spacer()
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(SettingsTheme.textPrimary)
+                Text("~\(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file))")
+                    .font(.system(size: 11).monospacedDigit())
+                    .foregroundStyle(SettingsTheme.textTertiary)
+            }
+            Spacer(minLength: 8)
             if ready {
-                Text(launcher.t("已安装", "Installed")).font(.callout).foregroundStyle(.secondary)
+                LumenStatusPill(text: launcher.t("已安装", "Installed"), color: SettingsTheme.green)
             } else {
                 Button(launcher.t("下载", "Download")) {
                     assets.install(component) { ok in if ok { installed(component) } }
                 }
-                .controlSize(.small)
+                .buttonStyle(LumenSecondaryButtonStyle())
                 .disabled(assets.busy || assets.manifest == nil)
                 .accessibilityIdentifier(identifier)
             }

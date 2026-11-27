@@ -36,9 +36,11 @@ enum LocalModelProblem: Equatable {
     }
 }
 
-private struct LocalModelStatus: Decodable {
+struct LocalModelStatus: Decodable, Equatable {
     let available: Bool
     let verified: Bool
+    let signature: String?
+    let dimensions: Int?
     let diagnostic: String?
 }
 
@@ -178,6 +180,7 @@ final class Launcher: ObservableObject {
     }
 
     @Published var appearanceMode: AppearanceMode
+    @Published var textEmbeddingBackend: TextEmbeddingBackendConfig
 
     func setAppearanceMode(_ mode: AppearanceMode) {
         guard appearanceMode != mode else { return }
@@ -344,12 +347,16 @@ final class Launcher: ObservableObject {
     var relatedExcerptsLabel: String { t("相关原文", "Related Excerpts") }
     var canBuildEmbeddings: Bool {
         canSearch && !scopePending && !contentRunning && indexWork == nil && localModelState != .checking && embeddingState != .verifying &&
+            (textEmbeddingBackend.mode == .builtin || textEmbeddingBackend.isValidLocalOpenAI) &&
             gemmaCoverage?.documents_enabled == true && gemmaCoverage?.pending == true && gemmaCoverage?.limited == false
     }
 
     init(engine: LauncherEngine, defaults: UserDefaults?, locale: String? = nil) {
         self.engine = engine
         self.defaults = defaults
+        let loadedBackend = TextEmbeddingBackendConfig.load(from: defaults)
+        self.textEmbeddingBackend = loadedBackend
+        engine.setTextEmbeddingBackend(loadedBackend)
         let frecency = LauncherFrecency(defaults: defaults)
         self.frecency = frecency
         shortcuts = ShortcutLibrary(defaults: defaults)
@@ -492,6 +499,10 @@ final class Launcher: ObservableObject {
     }
 
     func modelDiagnostic(_ issue: LocalModelProblem) -> String {
+        if textEmbeddingBackend.mode == .localOpenAI {
+            return t("无法连接本机嵌入服务，请检查服务是否启动以及地址和模型配置。",
+                     "Could not reach the local embedding endpoint. Check that the server is running and the URL/model are valid.")
+        }
         switch issue {
         case .unsupported: return t("当前设备或搜索引擎不支持本机 EmbeddingGemma 2。",
                                      "This device or search engine does not support local EmbeddingGemma 2.")
@@ -926,7 +937,8 @@ final class Launcher: ObservableObject {
 
     private func relatedSearchKind(directCount: Int) -> RelatedSearchKind? {
         guard !scopePending else { return nil }
-        if gemmaCoverage?.hasResults == true && Self.qualifiesForRelatedExcerpts(query, directCount: directCount) {
+        let textBackendReady = textEmbeddingBackend.mode == .builtin || textEmbeddingBackend.isValidLocalOpenAI
+        if textBackendReady && gemmaCoverage?.hasResults == true && Self.qualifiesForRelatedExcerpts(query, directCount: directCount) {
             return .semantic
         }
         if imageCoverage?.hasResults == true && hasInstalledImageProjector && Self.qualifiesForImageRecall(query) {
@@ -1012,8 +1024,83 @@ final class Launcher: ObservableObject {
         }
     }
 
+    func applyTextEmbeddingBackend(_ config: TextEmbeddingBackendConfig) {
+        var normalized = config
+        normalized.baseURL = config.trimmedBaseURL
+        normalized.model = config.trimmedModel
+        if normalized.mode == .builtin {
+            normalized.dimensions = nil
+            normalized.signature = nil
+        }
+        pauseEmbeddings(userInitiated: false)
+        cancelModelCheck()
+        if modelInspection?.isRunning == true {
+            modelInspection?.terminate()
+            modelInspection = nil
+        }
+        textEmbeddingBackend = normalized
+        normalized.save(to: defaults)
+        engine.setTextEmbeddingBackend(normalized)
+        indexStatus.set(\.localModelState, to: .unchecked)
+        indexStatus.set(\.embeddingState, to: .idle)
+        indexStatus.set(\.embeddingBatch, to: nil)
+        indexStatus.set(\.embeddingNotice, to: nil)
+        automaticBuildAttempted = false
+        if !isImageSearch && hits.contains(where: \.isRelatedHit) {
+            publishWithRelated([])
+        }
+        verifyLocalModel()
+        refreshCoverage()
+    }
+
+    func fetchOpenAIEmbeddingModels(url: String) async -> Result<[String], SearchFailure> {
+        let trimmedURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isLoopbackEndpointURL(trimmedURL) else {
+            return .failure(SearchFailure(t("仅支持本机回环地址。", "Only loopback addresses are supported.")))
+        }
+        struct ModelsReply: Decodable { let models: [String] }
+        return await withCheckedContinuation { continuation in
+            _ = engine.run(["openai-models", "--url", trimmedURL], priority: .userInitiated) { [weak self] response in
+                if response.succeeded, let decoded = try? JSONDecoder().decode(ModelsReply.self, from: response.output) {
+                    continuation.resume(returning: .success(decoded.models))
+                } else {
+                    let detail = response.diagnostic.isEmpty
+                        ? (self?.t("无法从本机服务获取模型列表。", "Could not fetch models from the local server.") ?? "Could not fetch models.")
+                        : response.diagnostic
+                    continuation.resume(returning: .failure(SearchFailure(detail)))
+                }
+            }
+        }
+    }
+
+    func verifyOpenAIEmbeddingEndpoint(url: String, model modelID: String) async -> Result<LocalModelStatus, SearchFailure> {
+        let trimmedURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedModel = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let probeConfig = TextEmbeddingBackendConfig(mode: .localOpenAI, baseURL: trimmedURL, model: trimmedModel)
+        guard probeConfig.isValidLocalOpenAI else {
+            return .failure(SearchFailure(t("请填写有效的本机回环地址和模型 ID。", "Enter a valid loopback endpoint URL and model ID.")))
+        }
+        return await withCheckedContinuation { continuation in
+            _ = engine.run(["model-status"] + probeConfig.openAICliArguments + ["--verify"], priority: .userInitiated) { [weak self] response in
+                if let status = try? JSONDecoder().decode(LocalModelStatus.self, from: response.output) {
+                    continuation.resume(returning: .success(status))
+                } else {
+                    let detail = response.diagnostic.isEmpty
+                        ? (self?.t("连接验证失败。", "Connection verification failed.") ?? "Verification failed.")
+                        : response.diagnostic
+                    continuation.resume(returning: .failure(SearchFailure(detail)))
+                }
+            }
+        }
+    }
+
     private func inspectLocalResources() {
-        modelInspection = engine.run(["model-status", "--gemma"] + engine.gemmaOptions) { [weak self] response in
+        if textEmbeddingBackend.mode == .localOpenAI && !textEmbeddingBackend.isValidLocalOpenAI {
+            indexStatus.set(\.localModelState, to: .unavailable(.verification))
+            set(\.semanticBusy, to: false)
+            return
+        }
+        modelInspection = engine.run(engine.modelStatusArguments(verify: false)) { [weak self] response in
             guard let self, !self.closed, self.localModelState == .unchecked else { return }
             let status = try? JSONDecoder().decode(LocalModelStatus.self, from: response.output)
             let nextState: LocalModelState = response.succeeded && status?.available == true
@@ -1026,14 +1113,31 @@ final class Launcher: ObservableObject {
 
     func verifyLocalModel(then complete: ((Bool) -> Void)? = nil) {
         guard localModelState != .checking else { return }
+        if textEmbeddingBackend.mode == .localOpenAI && !textEmbeddingBackend.isValidLocalOpenAI {
+            indexStatus.set(\.localModelState, to: .unavailable(.verification))
+            cancelRelatedExcerpts()
+            if !isImageSearch && hits.contains(where: \.isRelatedHit) { publishWithRelated([]) }
+            complete?(false)
+            return
+        }
         modelCheckGeneration &+= 1
         let current = modelCheckGeneration
         indexStatus.set(\.localModelState, to: .checking)
-        modelCheck = engine.run(["model-status", "--gemma", "--verify"] + engine.gemmaOptions) { [weak self] response in
+        modelCheck = engine.run(engine.modelStatusArguments(verify: true)) { [weak self] response in
             guard let self, !self.closed, self.modelCheckGeneration == current else { return }
             self.modelCheck = nil
             let status = try? JSONDecoder().decode(LocalModelStatus.self, from: response.output)
             if response.succeeded, let status, status.available, status.verified {
+                if self.textEmbeddingBackend.mode == .localOpenAI &&
+                    (status.dimensions != self.textEmbeddingBackend.dimensions ||
+                     status.signature != self.textEmbeddingBackend.signature) {
+                    var updated = self.textEmbeddingBackend
+                    updated.dimensions = status.dimensions ?? updated.dimensions
+                    updated.signature = status.signature ?? updated.signature
+                    self.textEmbeddingBackend = updated
+                    updated.save(to: self.defaults)
+                    self.engine.setTextEmbeddingBackend(updated)
+                }
                 self.indexStatus.set(\.localModelState, to: .ready)
                 complete?(true)
                 self.queueRelatedExcerpts()
@@ -1068,7 +1172,7 @@ final class Launcher: ObservableObject {
         let generation = diagnosisGeneration
         let name = file.lastPathComponent
         indexStatus.set(\.fileDiagnosis, to: .checking(name))
-        diagnosisProcess = engine.run(["diagnose", "--", file.path]) { [weak self] response in
+        diagnosisProcess = engine.run(engine.diagnoseArguments(path: file.path)) { [weak self] response in
             guard let self, !self.closed, !self.scopePending, self.diagnosisGeneration == generation else { return }
             self.diagnosisProcess = nil
             if response.succeeded, let report = try? JSONDecoder().decode(FileDiagnosis.self, from: response.output) {
@@ -1300,7 +1404,7 @@ final class Launcher: ObservableObject {
             return
         }
         let maxBatches = batchesSeen == 0 ? (maxBatches ?? maxEmbeddingBatchesPerTurn?()) : maxBatches
-        let arguments = ["embed", "--gemma", "--max", "32"] + engine.gemmaOptions
+        let arguments = engine.embedArguments(stream: false, max: 32)
         writer = engine.run(arguments, priority: .background) { [weak self] response in
             guard let self, !self.closed else { return }
             self.writer = nil
@@ -1350,7 +1454,7 @@ final class Launcher: ObservableObject {
         embeddingStreamGeneration &+= 1
         let generation = embeddingStreamGeneration
         let maxBatches = maxEmbeddingBatchesPerTurn?()
-        let arguments = ["embed", "--gemma", "--stream", "--max", "32"] + engine.gemmaOptions
+        let arguments = engine.embedArguments(stream: true, max: 32)
         var lastBatch: EmbeddingBatch?
         var batchesSeen = 0
         var noProgress = false

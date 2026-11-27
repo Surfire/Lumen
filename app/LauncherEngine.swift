@@ -361,6 +361,13 @@ final class LauncherEngine {
     private let requestTimeout: Duration
     private var nextID: UInt64 = 0
     private(set) var checksCachedHitAccess = false
+    private(set) var textEmbeddingBackend = TextEmbeddingBackendConfig()
+
+    func setTextEmbeddingBackend(_ config: TextEmbeddingBackendConfig) {
+        guard textEmbeddingBackend != config else { return }
+        textEmbeddingBackend = config
+        closeSemantic()
+    }
 
     func setCachedHitAccess(_ enabled: Bool) {
         guard checksCachedHitAccess != enabled else { return }
@@ -514,13 +521,12 @@ final class LauncherEngine {
 
     @discardableResult
     func status(includeScope: Bool, complete: @escaping @MainActor (EngineResponse) -> Void) -> Process? {
-        if let core {
+        if !textEmbeddingBackend.isValidLocalOpenAI, let core {
             nextID &+= 1
             core.status(SearchRequest(id: nextID, op: "status", include_scope: includeScope), complete: complete)
             return nil
         }
-        let command = includeScope ? ["status", "--include-scope"] : ["status"]
-        return run(command, complete: complete)
+        return run(statusArguments(includeScope: includeScope), complete: complete)
     }
 
     func warmNameSearch() {
@@ -612,12 +618,12 @@ final class LauncherEngine {
 
     func searchSemantic(_ query: String, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
         submit(query, mode: "semantic", limit: 12, to: \.semanticConnection,
-               command: ["semantic-serve"] + gemmaOptions, idleTimeout: .seconds(300), complete: complete)
+               command: semanticServeArguments(), idleTimeout: .seconds(300), complete: complete)
     }
 
     func searchSemanticImages(_ query: String, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
         submit(query, mode: "image", limit: 3, to: \.semanticConnection,
-               command: ["semantic-serve"] + gemmaOptions, idleTimeout: .seconds(300), complete: complete)
+               command: semanticServeArguments(), idleTimeout: .seconds(300), complete: complete)
     }
 
     func excerpt(path: String, query: String?, snippet: String?, maxChars: Int = 1600) async -> String? {
@@ -634,7 +640,7 @@ final class LauncherEngine {
 
     func searchImages(_ query: String, projector: URL, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
         submit(query, mode: "semantic", limit: 5, to: \.imageConnection,
-               command: ["image-serve", "--projector", projector.path] + gemmaOptions,
+               command: imageServeArguments(projector: projector),
                idleTimeout: .seconds(45), complete: complete)
     }
 
@@ -646,6 +652,59 @@ final class LauncherEngine {
     func discardQueuedImages() { imageConnection?.discardQueued() }
 
     var gemmaOptions: [String] { gemmaHome.map { ["--gemma-home", $0.path] } ?? [] }
+
+    func modelStatusArguments(verify: Bool) -> [String] {
+        var args = ["model-status"]
+        if textEmbeddingBackend.mode == .localOpenAI {
+            args += textEmbeddingBackend.openAICliArguments
+            if verify { args.append("--verify") }
+            return args
+        }
+        args.append("--gemma")
+        if verify { args.append("--verify") }
+        return args + gemmaOptions
+    }
+
+    func embedArguments(stream: Bool, max: Int = 32) -> [String] {
+        var args = ["embed"]
+        if textEmbeddingBackend.mode == .localOpenAI {
+            args += textEmbeddingBackend.openAICliArguments
+            if stream { args.append("--stream") }
+            args += ["--max", "\(max)"]
+            return args
+        }
+        args.append("--gemma")
+        if stream { args.append("--stream") }
+        args += ["--max", "\(max)"]
+        return args + gemmaOptions
+    }
+
+    func semanticServeArguments() -> [String] {
+        // Always pass gemmaOptions so image recall in semantic-serve keeps using built-in Gemma 2.
+        ["semantic-serve"] + textEmbeddingBackend.openAICliArguments + gemmaOptions
+    }
+
+    func statusArguments(includeScope: Bool) -> [String] {
+        var args = includeScope ? ["status", "--include-scope"] : ["status"]
+        args += textEmbeddingBackend.openAICliArguments
+        return args
+    }
+
+    func diagnoseArguments(path: String) -> [String] {
+        ["diagnose"] + textEmbeddingBackend.openAICliArguments + ["--", path]
+    }
+
+    func imageIndexArguments(projector: URL, after: String? = nil, stream: Bool, max: Int = 16) -> [String] {
+        var args = ["image-index", "--projector", projector.path]
+        if stream { args.append("--stream") }
+        args += ["--max", "\(max)"] + gemmaOptions
+        if let after { args += ["--after", after] }
+        return args
+    }
+
+    func imageServeArguments(projector: URL) -> [String] {
+        ["image-serve", "--projector", projector.path] + gemmaOptions
+    }
 
     /// Where Gemma assets live for this engine: an explicit home, or the default install for the bundled engine.
     var installedGemmaHome: URL? { gemmaHome ?? (usesCoreLibrary ? GemmaAssetManager.defaultHome : nil) }

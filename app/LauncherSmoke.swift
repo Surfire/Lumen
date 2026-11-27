@@ -3950,6 +3950,7 @@ final class LauncherSmoke {
             }
             return false
         }
+        try await verifyV061SettingsAndLocalEmbedding(app, settings: settings, session: session)
         settings.close()
         if case .idle = model.fileDiagnosis {} else { throw Failure("closing settings retained a selected file report") }
         try signal("fail-watch")
@@ -5524,8 +5525,8 @@ final class LauncherSmoke {
         }
         view.layoutSubtreeIfNeeded()
         let bounds = view.convert(view.bounds, to: nil)
-        // The button is on the right side of the banner, just below the General heading.
-        let point = CGPoint(x: bounds.maxX - 90, y: bounds.maxY - 105)
+        let point = accessibilityButtonPoint(identifier: "window-accessibility-settings", in: view, window: window)
+            ?? CGPoint(x: bounds.maxX - 95, y: bounds.maxY - 134)
         for type: NSEvent.EventType in [.leftMouseDown, .leftMouseUp] {
             window.sendEvent(try mouseEvent(type, count: 1, at: point, in: window))
         }
@@ -5533,6 +5534,35 @@ final class LauncherSmoke {
             openedAccessibilitySettings.map(\.absoluteString) ==
                 ["x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"]
         }
+    }
+
+    private func accessibilityButtonPoint(identifier: String, in root: NSView, window: NSWindow) -> CGPoint? {
+        var visited = Set<ObjectIdentifier>()
+        func visit(_ element: AnyObject) -> CGPoint? {
+            let oid = ObjectIdentifier(element)
+            guard visited.insert(oid).inserted else { return nil }
+            if let acc = element as? NSAccessibilityProtocol {
+                if acc.accessibilityIdentifier() == identifier {
+                    let screenRect = acc.accessibilityFrame()
+                    if !screenRect.isEmpty {
+                        let winRect = window.convertFromScreen(screenRect)
+                        return CGPoint(x: winRect.midX, y: winRect.midY)
+                    }
+                }
+                if let children = acc.accessibilityChildren() {
+                    for child in children {
+                        if let hit = visit(child as AnyObject) { return hit }
+                    }
+                }
+            }
+            if let view = element as? NSView {
+                for sub in view.subviews {
+                    if let hit = visit(sub) { return hit }
+                }
+            }
+            return nil
+        }
+        return visit(root)
     }
 
     private func click(count: Int, at point: NSPoint, in window: NSWindow) throws {
@@ -6053,6 +6083,167 @@ final class LauncherSmoke {
         session.discard()
         try check(session.hasChanges == hadChanges && !session.contentFilter.enable_code, "SettingsSession.discard did not restore contentFilter")
         print("Build 33 Phase 2 regressions passed (network f_fstypename, GemmaAssetManager, ContentFilter, preview-content-scope, ExternalVolume, SettingsSession)")
+    }
+
+    private func verifyV061SettingsAndLocalEmbedding(_ app: AppDelegate, settings: NSPanel, session: SettingsSession) async throws {
+        // 1. Config roundtrip under isolated UserDefaults (zero secrets).
+        let suite = "io.github.surfire.lumen.smoke.v061.embedding.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            throw Failure("failed to create isolated UserDefaults suite for v061 embedding smoke")
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let defaultConfig = TextEmbeddingBackendConfig.load(from: defaults)
+        try check(defaultConfig.mode == .builtin && defaultConfig.baseURL == "http://127.0.0.1:8000/v1"
+                  && defaultConfig.model.isEmpty && defaultConfig.dimensions == nil && defaultConfig.signature == nil,
+                  "unexpected default TextEmbeddingBackendConfig: \(defaultConfig)")
+
+        let savedConfig = TextEmbeddingBackendConfig(
+            mode: .localOpenAI,
+            baseURL: "http://127.0.0.1:11434/v1",
+            model: "bge-m3",
+            dimensions: 1024,
+            signature: "openai-local:bge-m3@1024"
+        )
+        savedConfig.save(to: defaults)
+        let reloadedConfig = TextEmbeddingBackendConfig.load(from: defaults)
+        try check(reloadedConfig == savedConfig, "TextEmbeddingBackendConfig roundtrip mismatch: \(reloadedConfig)")
+        if let rawData = defaults.data(forKey: TextEmbeddingBackendConfig.defaultsKey),
+           let rawText = String(data: rawData, encoding: .utf8) {
+            for forbidden in ["apiKey", "api_key", "secret", "token", "Bearer"] {
+                try check(!rawText.contains(forbidden), "unexpected secret field '\(forbidden)' in UserDefaults config")
+            }
+        } else {
+            throw Failure("TextEmbeddingBackendConfig did not persist under \(TextEmbeddingBackendConfig.defaultsKey)")
+        }
+
+        // 2. Loopback URL validation (matching Rust local_openai::validate_loopback_url).
+        for validURL in [
+            "http://127.0.0.1:8000/v1",
+            "http://127.0.0.1:11434",
+            "http://localhost:11434/v1",
+            "http://[::1]:8000/v1",
+            "unix:///tmp/omlx.sock",
+        ] {
+            try check(isLoopbackEndpointURL(validURL), "isLoopbackEndpointURL rejected valid loopback URL: \(validURL)")
+        }
+        for invalidURL in [
+            "",
+            "https://api.openai.com",
+            "https://api.openai.com/v1",
+            "https://127.0.0.1:8000/v1",
+            "http://192.168.1.5:8000",
+            "http://192.168.1.5:8000/v1",
+            "http://user:pass@127.0.0.1:8000/v1",
+            "http://127.0.0.1:8000/v1?token=1",
+            "http://127.0.0.1:8000/v1#frag",
+            "http://127.0.0.1:/v1",
+            "unix://relative.sock",
+            "unix://127.0.0.1/tmp/a.sock",
+        ] {
+            try check(!isLoopbackEndpointURL(invalidURL), "isLoopbackEndpointURL accepted non-loopback/unsafe URL: \(invalidURL)")
+        }
+
+        // 3. Decoupled CLI argument generation (text backend vs built-in Gemma image search).
+        let fakeGemma = directory.appendingPathComponent("fake-gemma-home", isDirectory: true)
+        let fakeProjector = fakeGemma.appendingPathComponent("mmproj-embeddinggemma-2-Q8_0.gguf")
+        let cliEngine = LauncherEngine(
+            executable: Bundle.main.url(forResource: "lumen", withExtension: nil) ?? directory,
+            database: directory.appendingPathComponent("v061-cli-args.sqlite"),
+            gemmaHome: fakeGemma
+        )
+        try check(cliEngine.embedArguments(stream: false) == ["embed", "--gemma", "--max", "32", "--gemma-home", fakeGemma.path]
+                  && cliEngine.modelStatusArguments(verify: true) == ["model-status", "--gemma", "--verify", "--gemma-home", fakeGemma.path]
+                  && cliEngine.semanticServeArguments() == ["semantic-serve", "--gemma-home", fakeGemma.path]
+                  && cliEngine.imageIndexArguments(projector: fakeProjector, stream: true) == ["image-index", "--projector", fakeProjector.path, "--stream", "--max", "16", "--gemma-home", fakeGemma.path]
+                  && cliEngine.imageServeArguments(projector: fakeProjector) == ["image-serve", "--projector", fakeProjector.path, "--gemma-home", fakeGemma.path],
+                  "default builtin CLI arguments mismatch")
+
+        cliEngine.setTextEmbeddingBackend(savedConfig)
+        let expectedOpenAI = ["--openai-url", "http://127.0.0.1:11434/v1", "--openai-model", "bge-m3"]
+        try check(cliEngine.embedArguments(stream: true) == ["embed"] + expectedOpenAI + ["--stream", "--max", "32"]
+                  && cliEngine.modelStatusArguments(verify: true) == ["model-status"] + expectedOpenAI + ["--verify"]
+                  && cliEngine.statusArguments(includeScope: true) == ["status", "--include-scope"] + expectedOpenAI
+                  && cliEngine.diagnoseArguments(path: "/tmp/doc.pdf") == ["diagnose"] + expectedOpenAI + ["--", "/tmp/doc.pdf"]
+                  && cliEngine.semanticServeArguments() == ["semantic-serve"] + expectedOpenAI + ["--gemma-home", fakeGemma.path]
+                  && cliEngine.imageIndexArguments(projector: fakeProjector, stream: false) == ["image-index", "--projector", fakeProjector.path, "--max", "16", "--gemma-home", fakeGemma.path]
+                  && cliEngine.imageServeArguments(projector: fakeProjector) == ["image-serve", "--projector", fakeProjector.path, "--gemma-home", fakeGemma.path],
+                  "localOpenAI CLI arguments failed to decouple text vs image")
+
+        // Verify invalid non-loopback config in Launcher never passes --openai-url or falls back to --gemma.
+        let invalidBackend = TextEmbeddingBackendConfig(mode: .localOpenAI, baseURL: "https://api.openai.com/v1", model: "text-embedding-3-small")
+        try check(!invalidBackend.isValidLocalOpenAI && invalidBackend.openAICliArguments.isEmpty,
+                  "non-loopback TextEmbeddingBackendConfig reported valid")
+
+        // 4. Settings UI structure, zero "鹿鸣" branding, window dimensions, and live Light/Dark rendering across all 6 pages.
+        try check(LauncherSettings.aboutDisplayTitle() == "Lumen", "About title must be strictly Lumen")
+        try check(settings.contentMinSize.width >= 740 && settings.contentMinSize.height >= 560,
+                  "Settings min size too small: \(settings.contentMinSize)")
+        let expectedRawPages: Set<String> = ["general", "index", "quicklinks", "translation", "scripts", "advanced"]
+        try check(Set(SettingsPage.allCases.map(\.rawValue)) == expectedRawPages,
+                  "SettingsPage cases changed: \(SettingsPage.allCases.map(\.rawValue))")
+        let model = app.model
+        for pageCase in SettingsPage.allCases {
+            for isZH in [true, false] {
+                let savedLang = model.language
+                model.language = isZH ? "zh" : "en"
+                let title = pageCase.title(model)
+                let subtitle = pageCase.subtitle(model)
+                model.language = savedLang
+                try check(!title.isEmpty && !subtitle.isEmpty && !title.contains("鹿鸣") && !subtitle.contains("鹿鸣"),
+                          "Invalid page title/subtitle for \(pageCase.rawValue): \(title) / \(subtitle)")
+            }
+        }
+
+        // Verify TextEmbeddingBackendConfig wiring on an isolated Launcher instance.
+        let isoSuite = "io.github.surfire.lumen.smoke.v061.launcher.\(UUID().uuidString)"
+        if let isoDefaults = UserDefaults(suiteName: isoSuite) {
+            defer { isoDefaults.removePersistentDomain(forName: isoSuite) }
+            let isoEngine = LauncherEngine(executable: fakeGemma, database: directory.appendingPathComponent("iso.sqlite"), gemmaHome: fakeGemma)
+            let isoLauncher = Launcher(engine: isoEngine, defaults: isoDefaults, locale: "en")
+            defer { isoLauncher.close() }
+            try check(isoLauncher.textEmbeddingBackend.mode == .builtin, "Launcher did not default to .builtin")
+            isoLauncher.applyTextEmbeddingBackend(savedConfig)
+            try check(isoLauncher.textEmbeddingBackend == savedConfig && isoEngine.textEmbeddingBackend == savedConfig,
+                      "applyTextEmbeddingBackend did not update Launcher and LauncherEngine")
+            try check(TextEmbeddingBackendConfig.load(from: isoDefaults) == savedConfig,
+                      "applyTextEmbeddingBackend did not persist config to UserDefaults")
+        }
+
+        let savedPage = session.page
+        let savedAppearance = settings.appearance
+        defer {
+            session.page = savedPage
+            settings.appearance = savedAppearance
+        }
+        for pageCase in SettingsPage.allCases {
+            session.page = pageCase
+            try await Task.sleep(for: .milliseconds(40))
+            let light = try render(.aqua, window: settings)
+            let dark = try render(.darkAqua, window: settings)
+            if let contentView = settings.contentView {
+                try check(settings.frame.width <= 780.5 && contentView.frame.width <= 780.5,
+                          "SettingsPage.\(pageCase.rawValue) expanded window past 780pt: window=\(settings.frame.width) view=\(contentView.frame.width)")
+            }
+            let sidebarMarginX = max(1, Int(Double(light.pixelsWide) * 0.005))
+            let sidebarHeaderY = max(1, Int(Double(light.pixelsHigh) * 0.04))
+            if let margin = light.colorAt(x: sidebarMarginX, y: sidebarHeaderY)?.usingColorSpace(.sRGB) {
+                let marginLuma = 0.2126 * margin.redComponent + 0.7152 * margin.greenComponent + 0.0722 * margin.blueComponent
+                try check(marginLuma > 0.90,
+                          "SettingsPage.\(pageCase.rawValue) clipped sidebar left margin (luma=\(marginLuma))")
+            }
+            let canvasX = max(1, Int(Double(light.pixelsWide) * 0.75))
+            let canvasY = max(1, Int(Double(light.pixelsHigh) * 0.08))
+            if let lc = light.colorAt(x: canvasX, y: canvasY)?.usingColorSpace(.sRGB),
+               let dc = dark.colorAt(x: canvasX, y: canvasY)?.usingColorSpace(.sRGB) {
+                let lightLuma = 0.2126 * lc.redComponent + 0.7152 * lc.greenComponent + 0.0722 * lc.blueComponent
+                let darkLuma = 0.2126 * dc.redComponent + 0.7152 * dc.greenComponent + 0.0722 * dc.blueComponent
+                try check(lightLuma > 0.85 && darkLuma < 0.25,
+                          "SettingsPage.\(pageCase.rawValue) did not adapt dynamically to Light/Dark (light=\(lightLuma), dark=\(darkLuma))")
+            }
+        }
+        try check(!settings.isVisible && !NSApp.isActive, "Settings verification activated the app or showed a window")
+        print("v0.6.1 Settings UI & Local OpenAI Embedding smoke passed (config roundtrip, loopback validation, decoupled CLI args, zero 鹿鸣, Light/Dark rendering)")
     }
 
     private func verifyV060SwiftUXRegressions(_ app: AppDelegate) async throws {

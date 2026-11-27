@@ -299,27 +299,55 @@ struct ClipboardSettingsView: View {
     let chinese: Bool
 
     var body: some View {
-        Toggle(t("启用剪贴板历史", "Enable Clipboard History"), isOn: Binding(
-            get: { clipboard.enabled }, set: { clipboard.setEnabled($0) }
-        ))
-        Text(t("文本、图片和文件路径仅保存在本机。关闭记录不会删除已有历史。",
-               "Text, images, and file paths are kept on this Mac. Turning off capture does not delete existing history."))
-            .font(.callout).foregroundStyle(.secondary)
-        LabeledContent(t("保留条数", "Retention Limit")) {
-            Picker(t("保留条数", "Retention Limit"), selection: Binding(get: { clipboard.limit }, set: { clipboard.setLimit($0) })) {
-                ForEach(Array(Set([50, 100, 200, 500, clipboard.limit])).sorted(), id: \.self) { limit in
-                    Text(limit.formatted()).tag(limit)
+        VStack(alignment: .leading, spacing: 10) {
+            LumenSettingsWell(padding: 12) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Toggle(t("启用剪贴板历史", "Enable Clipboard History"), isOn: Binding(
+                        get: { clipboard.enabled }, set: { clipboard.setEnabled($0) }
+                    ))
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(SettingsTheme.textPrimary)
+
+                    Text(t("文本、图片和文件路径仅保存在本机。关闭记录不会删除已有历史。",
+                           "Text, images, and file paths are kept on this Mac. Turning off capture does not delete existing history."))
+                        .font(.system(size: 12))
+                        .foregroundStyle(SettingsTheme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    LumenSettingsHairline()
+
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(t("保留条数", "Retention Limit"))
+                                .font(.system(size: 13))
+                                .foregroundStyle(SettingsTheme.textPrimary)
+                            Text(t("固定项目不会被自动删除，并计入保留条数。",
+                                   "Pinned clips are never pruned and count toward the limit."))
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(SettingsTheme.textTertiary)
+                        }
+                        Spacer(minLength: 8)
+                        Picker(t("保留条数", "Retention Limit"), selection: Binding(get: { clipboard.limit }, set: { clipboard.setLimit($0) })) {
+                            ForEach(Array(Set([50, 100, 200, 500, clipboard.limit])).sorted(), id: \.self) { limit in
+                                Text(limit.formatted()).tag(limit)
+                            }
+                        }
+                        .labelsHidden()
+                        .fixedSize()
+                    }
                 }
             }
-            .labelsHidden()
-        }
-        Text(t("固定项目不会被自动删除，并计入保留条数。",
-               "Pinned clips are never pruned and count toward the limit."))
-            .font(.callout).foregroundStyle(.secondary)
-        ClipboardClearButton(clipboard: clipboard, chinese: chinese)
-        if clipboard.failed {
-            Text(t("无法更新剪贴板历史。", "Could not update clipboard history."))
-                .font(.callout).foregroundStyle(.secondary)
+
+            HStack {
+                ClipboardClearButton(clipboard: clipboard, chinese: chinese, styled: true)
+                Spacer()
+            }
+
+            if clipboard.failed {
+                Text(t("无法更新剪贴板历史。", "Could not update clipboard history."))
+                    .font(.system(size: 12))
+                    .foregroundStyle(SettingsTheme.red)
+            }
         }
     }
 
@@ -331,9 +359,19 @@ private struct ClipboardClearButton: View {
     @ObservedObject var clipboard: ClipboardManager
     let chinese: Bool
     var short = false
+    var styled = false
     @State private var confirm = false
 
     var body: some View {
+        if styled {
+            button
+                .buttonStyle(LumenSecondaryButtonStyle())
+        } else {
+            button
+        }
+    }
+
+    private var button: some View {
         Button(short ? t("全部清除…", "Clear All…") : t("清除剪贴板历史…", "Clear Clipboard History…")) { confirm = true }
             .disabled(clipboard.items.isEmpty && !clipboard.failed)
             .confirmationDialog(t("清除全部剪贴板历史（包括固定项目）？", "Clear all clipboard history, including pinned clips?"),

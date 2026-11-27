@@ -3,19 +3,29 @@ import ServiceManagement
 import SwiftUI
 
 enum SettingsPage: String, CaseIterable, Identifiable {
-    case general, index, quicklinks, translation
-    case advanced, scripts
+    case general, index, translation, quicklinks, scripts, advanced
 
     var id: Self { self }
 
     @MainActor func title(_ model: Launcher) -> String {
         switch self {
-        case .general: return model.t("通用与快捷键", "General & Shortcuts")
-        case .index: return model.t("索引与隐私", "Index & Privacy")
+        case .general: return model.t("通用", "General")
+        case .index: return model.t("索引", "Index")
+        case .translation: return model.t("AI 与模型", "AI & Models")
         case .quicklinks: return model.t("快捷链接", "Quicklinks")
-        case .translation: return model.t("翻译", "Translation")
-        case .advanced: return model.t("高级与诊断", "Advanced & Diagnostics")
-        case .scripts: return model.t("脚本与快捷指令", "Scripts & Shortcuts")
+        case .scripts: return model.t("脚本与指令", "Scripts")
+        case .advanced: return model.t("状态与关于", "Status & About")
+        }
+    }
+
+    @MainActor func subtitle(_ model: Launcher) -> String {
+        switch self {
+        case .general: return model.t("快捷键、外观与剪贴板", "Shortcut, appearance & clipboard")
+        case .index: return model.t("目录范围、过滤与外置盘", "Folders, filters & volumes")
+        case .translation: return model.t("语义、搜图与翻译服务", "Embeddings, images & AI")
+        case .quicklinks: return model.t("搜索别名与常用网页", "Aliases & web shortcuts")
+        case .scripts: return model.t("本地脚本与快捷指令", "Local scripts & Shortcuts")
+        case .advanced: return model.t("监听、诊断、更新与版本", "Watch, diagnostics & updates")
         }
     }
 
@@ -23,10 +33,10 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         switch self {
         case .general: return "gearshape"
         case .index: return "folder.badge.gearshape"
+        case .translation: return "sparkles"
         case .quicklinks: return "link"
-        case .translation: return "character.bubble"
-        case .advanced: return "waveform.path.ecg"
         case .scripts: return "terminal"
+        case .advanced: return "waveform.path.ecg"
         }
     }
 }
@@ -212,35 +222,42 @@ struct LauncherSettings: View {
 
     private var page: SettingsPage { session.page ?? .general }
 
+    static func aboutDisplayTitle() -> String { "Lumen" }
+
     var body: some View {
         HStack(spacing: 0) {
             sidebar
+            LumenSettingsHairline()
+                .frame(width: 1)
+                .frame(maxHeight: .infinity)
             VStack(spacing: 0) {
                 switch page {
                 case .quicklinks:
-                    pageHeading.padding(.horizontal, 28).padding(.top, 26)
-                    QuicklinksView(model: model, library: model.shortcuts, chooseFolder: chooseQuicklinkFolder)
+                    VStack(alignment: .leading, spacing: 0) {
+                        pageHeader
+                            .padding(.horizontal, 28)
+                            .padding(.top, 24)
+                            .padding(.bottom, 10)
+                        QuicklinksView(model: model, library: model.shortcuts, chooseFolder: chooseQuicklinkFolder)
+                            .scrollContentBackground(.hidden)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 default:
                     ScrollView {
-                        VStack(alignment: .leading, spacing: 19) {
-                            pageHeading
+                        VStack(alignment: .leading, spacing: SettingsTheme.spacingLG) {
+                            pageHeader
                             switch page {
                             case .general: general
                             case .index: indexAndPrivacy
+                            case .translation: aiAndModels
                             case .scripts: scriptsAndShortcuts
-                            case .translation:
-                                group(model.t("模型与提供商", "Model & Providers")) {
-                                    TranslationSettingsView(model: translation, chinese: model.zh)
-                                }
-                            case .advanced:
-                                background
-                                about
-                            default: EmptyView()
+                            case .advanced: statusAndAbout
+                            case .quicklinks: EmptyView()
                             }
                         }
                         .frame(maxWidth: 640, alignment: .leading)
                         .padding(.horizontal, 28)
-                        .padding(.vertical, 26)
+                        .padding(.vertical, 24)
                         .frame(maxWidth: .infinity)
                     }
                     .id(page)
@@ -248,97 +265,124 @@ struct LauncherSettings: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color(nsColor: .windowBackgroundColor))
+            .background(SettingsTheme.canvasBackground)
         }
-        .frame(minWidth: 700, minHeight: 540)
+        .frame(minWidth: 740, minHeight: 560)
         .toggleStyle(.switch)
         .labeledContentStyle(SettingsValueStyle())
     }
 
-    private var pageHeading: some View {
-        Text(page.title(model))
-            .font(.system(size: 26, weight: .semibold))
-            .accessibilityAddTraits(.isHeader)
-            .frame(maxWidth: .infinity, alignment: .leading)
-    }
+    // MARK: - Sidebar (198pt Warm Editorial)
 
     private var sidebar: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Image(nsImage: NSApp.applicationIconImage)
-                    .resizable()
-                    .interpolation(.high)
-                    .frame(width: 30, height: 30)
-                    .shadow(color: .black.opacity(0.16), radius: 2, y: 1)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Lumen")
-                        .font(.system(size: 13.5, weight: .semibold))
-                    Text("v\(version)")
-                        .font(.system(size: 10.5).monospacedDigit())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-                Spacer(minLength: 0)
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("LUMEN")
+                    .font(.system(size: 11, weight: .bold))
+                    .tracking(2.0)
+                    .foregroundStyle(SettingsTheme.textTertiary)
+                Text(model.t("偏好设置", "Preferences"))
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(SettingsTheme.textPrimary)
             }
-            .padding(.horizontal, 14)
-            .padding(.top, 14)
-            .padding(.bottom, 10)
-            Divider().padding(.horizontal, 12).accessibilityHidden(true)
+            .padding(.horizontal, 16)
+            .padding(.top, 20)
+            .padding(.bottom, 14)
+
             ScrollView {
                 VStack(spacing: 3) {
                     ForEach(SettingsPage.allCases) { item in
-                        let selected = item == page
-                        Button {
-                            session.page = item
-                        } label: {
-                            HStack(spacing: 9) {
-                                Image(systemName: item.symbol)
-                                    .font(.system(size: 12, weight: .medium))
-                                    .foregroundStyle(selected ? Color.accentColor : .secondary)
-                                    .frame(width: 22, height: 22)
-                                    .background(
-                                        selected ? Color.accentColor.opacity(0.16) : Color.primary.opacity(0.055),
-                                        in: RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                    )
-                                Text(item.title(model))
-                                    .font(.system(size: 13, weight: selected ? .semibold : .medium))
-                                    .lineLimit(2)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                            .foregroundStyle(.primary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 6)
-                            .background {
-                                if selected {
-                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                        .fill(Color.primary.opacity(0.08))
-                                }
-                            }
-                            .overlay {
-                                if sidebarFocus == item {
-                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                        .strokeBorder(Color.accentColor.opacity(0.6), lineWidth: 1.5)
-                                }
-                            }
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .focused($sidebarFocus, equals: item)
-                        .accessibilityAddTraits(selected ? .isSelected : [])
-                        .accessibilityIdentifier("settings.page.\(item.rawValue)")
+                        navPill(item)
                     }
                 }
                 .padding(.horizontal, 10)
-                .padding(.top, 10)
-                .padding(.bottom, 14)
+                .padding(.bottom, 12)
                 .onMoveCommand(perform: navigateSidebar)
             }
+
+            Spacer(minLength: 0)
+
+            LumenSettingsHairline()
+                .padding(.horizontal, 14)
+
+            HStack(spacing: 7) {
+                Image(nsImage: NSApp.applicationIconImage)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 18, height: 18)
+                    .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                    .accessibilityHidden(true)
+                Text("v\(version)")
+                    .font(.system(size: 11, weight: .medium).monospacedDigit())
+                    .foregroundStyle(SettingsTheme.textSecondary)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(model.t("设置页面", "Settings Pages"))
-        .frame(width: 204)
-        .background(Color(nsColor: .underPageBackgroundColor))
+        .frame(width: 198)
+        .background(SettingsTheme.sidebarBackground)
+    }
+
+    private func navPill(_ item: SettingsPage) -> some View {
+        let selected = item == page
+        let showUpdateDot = item == .advanced && updates?.release != nil
+        return Button {
+            session.page = item
+        } label: {
+            HStack(spacing: 6) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.title(model))
+                        .font(.system(size: 13, weight: selected ? .semibold : .medium))
+                        .foregroundStyle(selected ? SettingsTheme.navActiveTitle : SettingsTheme.textPrimary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Text(item.subtitle(model))
+                        .font(.system(size: 10))
+                        .foregroundStyle(selected ? SettingsTheme.navActiveSubtitle : SettingsTheme.textTertiary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
+                        .truncationMode(.tail)
+                }
+                Spacer(minLength: 2)
+                if showUpdateDot {
+                    Circle()
+                        .fill(SettingsTheme.amber)
+                        .frame(width: 6, height: 6)
+                        .accessibilityHidden(true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: SettingsTheme.cornerMD, style: .continuous)
+                    .fill(selected ? SettingsTheme.navActiveBackground : Color.clear)
+            )
+            .overlay(alignment: .leading) {
+                if selected {
+                    RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                        .fill(SettingsTheme.navActiveIndicator)
+                        .frame(width: 3, height: 24)
+                        .padding(.leading, 3)
+                        .accessibilityHidden(true)
+                }
+            }
+            .overlay {
+                if sidebarFocus == item {
+                    RoundedRectangle(cornerRadius: SettingsTheme.cornerMD, style: .continuous)
+                        .strokeBorder(SettingsTheme.amber.opacity(0.65), lineWidth: 1.5)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .focused($sidebarFocus, equals: item)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityIdentifier("settings.page.\(item.rawValue)")
     }
 
     private func navigateSidebar(_ direction: MoveCommandDirection) {
@@ -355,163 +399,241 @@ struct LauncherSettings: View {
         session.page = destination
     }
 
-    @ViewBuilder private var scriptsAndShortcuts: some View {
-        group(model.t("本地脚本", "Local Scripts")) {
-            Toggle(model.t("启用本地脚本", "Enable Local Scripts"), isOn: Binding(
-                get: { scriptCatalog.scriptsEnabled }, set: { scriptCatalog.setScriptsEnabled($0) }
-            ))
-            .disabled(scriptCatalog.folder == nil)
-            .accessibilityIdentifier("settings.scripts.enabled")
-            if let folder = scriptCatalog.folder {
-                LabeledContent(model.t("脚本文件夹", "Scripts Folder")) {
-                    Text((folder as NSString).abbreviatingWithTildeInPath).textSelection(.enabled)
-                }
-            }
-            HStack {
-                Button(model.t("选择文件夹…", "Choose Folder…"), action: chooseScriptsFolder)
-                    .accessibilityIdentifier("settings.scripts.choose")
-                if scriptCatalog.folder == nil {
-                    Button(model.t("创建默认文件夹并启用", "Create Default Folder & Enable"), action: scriptCatalog.createAndEnable)
-                        .disabled(scriptCatalog.scriptLoading)
-                }
-                Button(model.t("重新载入脚本", "Reload Scripts"), action: scriptCatalog.reloadScripts)
-                    .disabled(!scriptCatalog.scriptsEnabled || scriptCatalog.scriptLoading)
-            }
-            if scriptCatalog.scriptLoading { note(model.t("正在读取脚本…", "Loading scripts…")) }
-            else if scriptCatalog.scriptFailed {
-                note(model.t("无法读取该文件夹。请选择本机非链接目录。", "Could not read the folder. Choose a resident folder that is not a link."))
-            } else {
-                note(model.t("\(scriptCatalog.scripts.count) 个脚本", "Scripts available: \(scriptCatalog.scripts.count)"))
-            }
-            note(model.t("仅搜索该文件夹内的可执行文件。脚本拥有您的权限；请仅启用您信任的脚本。将直接在所选文件夹内运行，工作目录为该文件夹。",
-                         "Only executables directly inside the folder are listed. Scripts run with your permissions; enable only scripts you trust. Scripts run directly with the selected folder as their working directory."))
-        }
-        group(model.t("Apple 快捷指令", "Apple Shortcuts")) {
-            Toggle(model.t("启用 Apple 快捷指令", "Enable Apple Shortcuts"), isOn: Binding(
-                get: { scriptCatalog.shortcutsEnabled }, set: { scriptCatalog.setShortcutsEnabled($0) }
-            ))
-            .accessibilityIdentifier("settings.apple-shortcuts.enabled")
-            Button(model.t("刷新快捷指令", "Refresh Shortcuts"), action: scriptCatalog.refreshShortcuts)
-                .disabled(!scriptCatalog.shortcutsEnabled || scriptCatalog.shortcutLoading)
-            if scriptCatalog.shortcutLoading { note(model.t("正在读取快捷指令…", "Loading Shortcuts…")) }
-            else if scriptCatalog.shortcutFailed { note(model.t("无法读取快捷指令。", "Could not list Shortcuts.")) }
-            else { note(model.t("\(scriptCatalog.shortcuts.count) 个快捷指令", "Shortcuts available: \(scriptCatalog.shortcuts.count)")) }
+    @ViewBuilder private var pageHeader: some View {
+        switch page {
+        case .general:
+            LumenSettingsHeader(
+                kicker: "GENERAL",
+                title: model.t("通用", "General"),
+                description: model.t("全局快捷键、外观主题、语言与剪贴板历史。",
+                                     "Global shortcut, appearance theme, language, and clipboard history.")
+            )
+        case .index:
+            LumenSettingsHeader(
+                kicker: "INDEX",
+                title: model.t("索引与目录范围", "Index & Scope"),
+                description: model.t("管理内容与语义目录、文件名搜索范围及外置存储。",
+                                     "Manage content & semantic folders, filename scope, and external drives.")
+            )
+        case .translation:
+            LumenSettingsHeader(
+                kicker: "AI & MODELS",
+                title: model.t("AI 与模型", "AI & Models"),
+                description: model.t("配置文本语义嵌入引擎、以文搜图视觉模型与翻译问答提供商。",
+                                     "Configure text embedding engines, visual image search models, and AI translation providers.")
+            )
+        case .quicklinks:
+            LumenSettingsHeader(
+                kicker: "QUICKLINKS",
+                title: model.t("快捷链接", "Quicklinks"),
+                description: model.t("自定义搜索别名、固定应用与网页直达命令。",
+                                     "Custom search aliases, pinned apps, and web shortcuts.")
+            )
+        case .scripts:
+            LumenSettingsHeader(
+                kicker: "SCRIPTS & SHORTCUTS",
+                title: model.t("脚本与指令", "Scripts & Shortcuts"),
+                description: model.t("启用本地可执行脚本与 Apple 快捷指令。",
+                                     "Enable local executable scripts and Apple Shortcuts.")
+            )
+        case .advanced:
+            LumenSettingsHeader(
+                kicker: "STATUS & ABOUT",
+                title: model.t("状态与关于", "Status & About"),
+                description: model.t("文件监听健康状态、索引统计、单文件诊断与软件更新。",
+                                     "File watching health, index counts, single-file diagnostics, and updates.")
+            )
         }
     }
+
+    // MARK: - General
 
     @ViewBuilder private var general: some View {
         if windowManagement.issue == .permissionRequired {
             WindowAccessibilityBanner(model: model, openSettings: windowManagement.openAccessibilitySettings)
         }
-        group(model.t("启动", "Startup")) {
-            Toggle(model.t("登录时启动", "Launch at Login"), isOn: Binding(
-                get: { session.launchAtLogin }, set: { session.setLaunchAtLogin($0) }
-            ))
-            .disabled(!session.canManageLoginItem)
-            .accessibilityIdentifier("settings.launch-at-login")
-            .onAppear { session.refreshLoginItem() }
-            if session.loginItemNeedsApproval {
-                Button(model.t("打开登录项设置…", "Open Login Items Settings…")) {
-                    SMAppService.openSystemSettingsLoginItems()
+
+        LumenSettingsCard(title: model.t("启动与快捷键", "Startup & Shortcut"), icon: "command") {
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 12) {
+                    startupWell
+                        .frame(width: 192)
+                        .frame(maxHeight: .infinity, alignment: .topLeading)
+                    shortcutWell
+                        .frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    startupWell
+                    shortcutWell
                 }
             }
-            if session.loginItemFailed {
-                note(model.t("无法更改登录项。请检查 macOS 登录项设置。",
-                             "Could not change this login item. Check macOS Login Items settings."))
-            }
-        }
-        group(model.t("外观与语言", "Appearance & Language")) {
-            LabeledContent(model.t("外观", "Appearance")) {
-                Picker(model.t("外观", "Appearance"),
-                       selection: Binding(get: { model.appearanceMode }, set: { model.setAppearanceMode($0) })) {
-                    Text(model.t("跟随系统", "System")).tag(AppearanceMode.system)
-                    Text(model.t("浅色", "Light")).tag(AppearanceMode.light)
-                    Text(model.t("深色", "Dark")).tag(AppearanceMode.dark)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .fixedSize()
-                .accessibilityIdentifier("settings.appearance")
-            }
-            LabeledContent(model.t("界面语言", "Interface Language")) {
-                Picker(model.t("界面语言", "Interface Language"),
-                       selection: Binding(get: { model.language }, set: { model.set(\.language, to: $0) })) {
-                    Text(model.t("跟随系统", "System")).tag("system")
-                    Text("简体中文").tag("zh")
-                    Text("English").tag("en")
-                }
-                .labelsHidden()
-            }
-        }
-        group(model.t("打开搜索", "Open Search")) {
-            LabeledContent(model.t("全局快捷键", "Global Shortcut")) {
-                HStack(spacing: 9) {
-                    if let hotKey = model.hotKey {
-                        ShortcutKeycaps(label: hotKey.label)
-                            .fixedSize()
-                            .accessibilityIdentifier("settings.shortcut.value")
-                    } else {
-                        Text(model.t("未设置", "Off"))
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .accessibilityIdentifier("settings.shortcut.value")
-                    }
-                    ShortcutControl(model: model, record: recordShortcut).fixedSize()
-                    Button(model.t("停用", "Disable"), action: disableShortcut)
-                        .fixedSize()
-                        .disabled(model.hotKey == nil && model.hotKeyIssue == nil)
-                }
-            }
+
             if let issue = model.hotKeyIssue {
                 Label(issue.title(model), systemImage: "exclamationmark.circle")
-                    .font(.callout).foregroundStyle(.secondary)
+                    .font(.system(size: 12))
+                    .foregroundStyle(SettingsTheme.amber)
             }
             if model.hotKey?.cyclesMacWindows == true {
                 note(model.t("macOS 也使用 ⌘` 切换窗口。", "macOS also uses ⌘` to cycle windows."))
             }
             note(model.t("菜单栏中的「打开搜索」始终可用。", "Open Search is always available in the menu bar."))
         }
-        group(model.t("剪贴板历史", "Clipboard History")) {
+
+        LumenSettingsCard(title: model.t("外观与语言", "Appearance & Language"), icon: "paintbrush") {
+            HStack(alignment: .top, spacing: 12) {
+                LumenSettingsWell(padding: 12) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(model.t("外观主题", "APPEARANCE").uppercased())
+                            .font(.system(size: 10, weight: .semibold))
+                            .tracking(0.8)
+                            .foregroundStyle(SettingsTheme.textTertiary)
+                        Picker(model.t("外观", "Appearance"),
+                               selection: Binding(get: { model.appearanceMode }, set: { model.setAppearanceMode($0) })) {
+                            Text(model.t("跟随系统", "System")).tag(AppearanceMode.system)
+                            Text(model.t("浅色", "Light")).tag(AppearanceMode.light)
+                            Text(model.t("深色", "Dark")).tag(AppearanceMode.dark)
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .accessibilityIdentifier("settings.appearance")
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+
+                LumenSettingsWell(padding: 12) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(model.t("界面语言", "LANGUAGE").uppercased())
+                            .font(.system(size: 10, weight: .semibold))
+                            .tracking(0.8)
+                            .foregroundStyle(SettingsTheme.textTertiary)
+                        Picker(model.t("界面语言", "Interface Language"),
+                               selection: Binding(get: { model.language }, set: { model.set(\.language, to: $0) })) {
+                            Text(model.t("跟随系统", "System")).tag("system")
+                            Text("简体中文").tag("zh")
+                            Text("English").tag("en")
+                        }
+                        .labelsHidden()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+            }
+        }
+
+        LumenSettingsCard(title: model.t("剪贴板历史", "Clipboard History"), icon: "clipboard") {
             ClipboardSettingsView(clipboard: clipboard, chinese: model.zh)
         }
         .onAppear { clipboard.loadHistory() }
     }
 
-    @ViewBuilder private var indexAndPrivacy: some View {
-        group(model.t("语义与内容索引", "Semantic & Content Index")) {
-            GemmaAssetSettings(launcher: model, assets: GemmaAssetManager.shared) { _ in
-                model.verifyLocalModel()
-                images.adoptInstalledProjector()
-                model.refreshCoverageAfterImageBuild()
+    private var startupWell: some View {
+        LumenSettingsWell(padding: 10) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(model.t("启动行为", "STARTUP").uppercased())
+                    .font(.system(size: 10, weight: .semibold))
+                    .tracking(0.8)
+                    .foregroundStyle(SettingsTheme.textTertiary)
+                HStack(spacing: 8) {
+                    Text(model.t("登录时启动", "Launch at Login"))
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(SettingsTheme.textPrimary)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Toggle(model.t("登录时启动", "Launch at Login"), isOn: Binding(
+                        get: { session.launchAtLogin }, set: { session.setLaunchAtLogin($0) }
+                    ))
+                    .labelsHidden()
+                    .disabled(!session.canManageLoginItem)
+                    .accessibilityIdentifier("settings.launch-at-login")
+                    .onAppear { session.refreshLoginItem() }
+                }
+                if session.loginItemNeedsApproval {
+                    Button(model.t("打开登录项设置…", "Open Login Items Settings…")) {
+                        SMAppService.openSystemSettingsLoginItems()
+                    }
+                    .buttonStyle(LumenSecondaryButtonStyle())
+                }
+                if session.loginItemFailed {
+                    note(model.t("无法更改登录项。请检查 macOS 登录项设置。",
+                                 "Could not change this login item. Check macOS Login Items settings."))
+                }
             }
-            Divider().accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 10) {
+        }
+    }
+
+    private var shortcutWell: some View {
+        LumenSettingsWell(padding: 10) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(model.t("全局快捷键", "GLOBAL SHORTCUT").uppercased())
+                    .font(.system(size: 10, weight: .semibold))
+                    .tracking(0.8)
+                    .foregroundStyle(SettingsTheme.textTertiary)
+                HStack(spacing: 6) {
+                    if let hotKey = model.hotKey {
+                        ShortcutKeycaps(label: hotKey.label)
+                            .fixedSize()
+                            .accessibilityIdentifier("settings.shortcut.value")
+                    } else {
+                        Text(model.t("未设置", "Off"))
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(SettingsTheme.textSecondary)
+                            .accessibilityIdentifier("settings.shortcut.value")
+                    }
+                    Spacer(minLength: 4)
+                    ShortcutControl(model: model, record: recordShortcut).fixedSize()
+                    Button(model.t("停用", "Disable"), action: disableShortcut)
+                        .buttonStyle(LumenSecondaryButtonStyle())
+                        .fixedSize()
+                        .disabled(model.hotKey == nil && model.hotKeyIssue == nil)
+                }
+            }
+        }
+    }
+
+    // MARK: - Index & Scope
+
+    @ViewBuilder private var indexAndPrivacy: some View {
+        LumenSettingsCard(
+            title: model.t("内容与语义目录", "Content & Semantic Folders"),
+            icon: "doc.text.magnifyingglass",
+            trailing: { activeEngineBadgeLink }
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
                 folderRows(.content, empty: model.t("请选择要建立正文、语义和图像索引的目录。",
                                                     "Choose folders to index for text, semantic, and image search."))
                 contentScopeSummary
-                Toggle(model.t("包含源代码", "Include source code"), isOn: Binding(
-                    get: { session.contentFilter.enable_code },
-                    set: { value in session.updateContentFilter { $0.enable_code = value } }
-                ))
-                .accessibilityIdentifier("settings.content.code")
+                LumenSettingsWell(padding: 10) {
+                    Toggle(model.t("包含源代码", "Include source code"), isOn: Binding(
+                        get: { session.contentFilter.enable_code },
+                        set: { value in session.updateContentFilter { $0.enable_code = value } }
+                    ))
+                    .accessibilityIdentifier("settings.content.code")
+                }
                 note(model.t("自动跳过 node_modules、dist、build、*.lock、*.min.* 等开发产物；仅在线占位文件只索引名称。",
                              "Dev artifacts such as node_modules, dist, build, *.lock, and *.min.* are skipped automatically. Online-only placeholders stay name-only."))
                 DisclosureGroup(model.t("高级过滤规则…", "Advanced filter rules…")) {
                     advancedContentFilters
                 }
+                .font(.system(size: 12.5, weight: .medium))
+                .foregroundStyle(SettingsTheme.textSecondary)
                 .accessibilityIdentifier("settings.content.advanced")
             }
             .disabled(!session.canEditScope)
-            Divider().accessibilityHidden(true)
+
+            LumenSettingsHairline()
             contentProgress
         }
         .onAppear { session.refreshContentPreview() }
-        group(model.t("索引范围", "Index Scope")) {
+
+        LumenSettingsCard(title: model.t("文件名搜索范围", "Filename Search Scope"), icon: "folder.badge.gearshape") {
             note(model.t("只扫描 macOS 允许访问的位置。排除规则优先，包括已添加的子目录。",
                          "Lumen scans locations macOS allows it to access. Exclusions take priority, including over included subfolders."))
             if !session.scope.roots.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(model.t("现有扫描根目录", "Existing Scan Roots")).font(.callout.weight(.medium))
+                LumenSettingsWell(padding: 10) {
+                    Text(model.t("现有扫描根目录", "Existing Scan Roots"))
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(SettingsTheme.textPrimary)
                     ForEach(Array(Set(session.scope.roots)).sorted(), id: \.self) { path in
                         pathLabel(path)
                     }
@@ -520,17 +642,58 @@ struct LauncherSettings: View {
             }
             folderRows(.include, empty: model.t("留空时索引启动盘的可访问位置。", "Leave empty to include accessible locations on the startup disk."),
                        constrainedEmpty: model.t("当前扫描根目录内的所有可访问位置。", "All accessible locations within the current scan roots."))
-            Divider().accessibilityHidden(true)
+            LumenSettingsHairline()
             folderRows(.exclude, empty: model.t("没有手动排除的目录。", "No folders excluded manually."))
         }
         .disabled(!session.canEditScope)
-        group(model.t("外置卷与网络共享", "External & Network Volumes")) {
+
+        LumenSettingsCard(title: model.t("外置卷与网络共享", "External & Network Volumes"), icon: "externaldrive.connected.to.line.below") {
             LauncherExternalVolumes(launcher: model, catalog: volumes, changed: model.externalVolumesChanged)
                 .accessibilityIdentifier("settings.external-volumes")
         }
+
         if let notice = indexStatus.indexNotice {
             NoticeView(model: model, notice: notice)
         }
+    }
+
+    private var activeEngineBadgeLink: some View {
+        let cfg = model.textEmbeddingBackend
+        let label: String
+        let color: Color
+        if cfg.mode == .localOpenAI {
+            let shortModel = cfg.trimmedModel.isEmpty ? model.t("未选模型", "Unconfigured") : cfg.trimmedModel
+            label = model.t("本机服务 · \(shortModel)", "Local · \(shortModel)")
+            color = model.localModelState == .ready ? SettingsTheme.green : SettingsTheme.amber
+        } else {
+            switch model.localModelState {
+            case .ready:
+                label = "Gemma 2 · \(model.t("已就绪", "Ready"))"
+                color = SettingsTheme.green
+            case .available:
+                label = "Gemma 2 · \(model.t("已安装", "Installed"))"
+                color = SettingsTheme.green
+            case .checking:
+                label = "Gemma 2 · \(model.t("校验中", "Checking"))"
+                color = SettingsTheme.amber
+            case .unchecked, .unavailable:
+                label = "Gemma 2 · \(model.t("前往配置", "Configure"))"
+                color = SettingsTheme.textTertiary
+            }
+        }
+        return Button {
+            session.page = .translation
+        } label: {
+            HStack(spacing: 5) {
+                LumenStatusPill(text: label, color: color)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(SettingsTheme.textTertiary)
+                    .accessibilityHidden(true)
+            }
+        }
+        .buttonStyle(.plain)
+        .help(model.t("前往「AI 与模型」配置文本语义与图像模型", "Open AI & Models to configure text and image models"))
     }
 
     @ViewBuilder private var contentScopeSummary: some View {
@@ -543,7 +706,9 @@ struct LauncherSettings: View {
             if !noise.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
-                        Text(model.t("排除噪音子目录", "Exclude noisy subfolders")).font(.caption).foregroundStyle(.secondary)
+                        Text(model.t("排除噪音子目录", "Exclude noisy subfolders"))
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(SettingsTheme.textTertiary)
                         ForEach(noise) { folder in
                             Button {
                                 session.excludeNoise(folder)
@@ -554,8 +719,7 @@ struct LauncherSettings: View {
                                     Label("\(folder.name) · \(folder.count.formatted())", systemImage: "minus.circle")
                                 }
                             }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
+                            .buttonStyle(LumenSecondaryButtonStyle())
                             .help(folder.path)
                         }
                     }
@@ -578,39 +742,32 @@ struct LauncherSettings: View {
     }
 
     @ViewBuilder private var advancedContentFilters: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 14) {
-                filterToggle("PDF", \.enable_pdf)
-                filterToggle("Office", \.enable_docx)
-                    .help("DOCX / XLSX / PPTX / DOC / XLS / PPT / RTF")
-                filterToggle(model.t("文本", "Text"), \.enable_text)
-                filterToggle(model.t("图片", "Images"), \.enable_images)
-            }
-            .toggleStyle(.checkbox)
-            CommaListField(title: model.t("额外包含扩展名", "Also include extensions"), prompt: "swift, json",
-                           values: session.contentFilter.allow_extensions) { values in
-                session.updateContentFilter { $0.allow_extensions = values.map(Self.extensionToken) }
-            }
-            CommaListField(title: model.t("排除扩展名", "Exclude extensions"), prompt: "log, csv",
-                           values: session.contentFilter.deny_extensions) { values in
-                session.updateContentFilter { $0.deny_extensions = values.map(Self.extensionToken) }
-            }
-            CommaListField(title: model.t("排除目录", "Exclude folders"), prompt: "/Users/me/Archive",
-                           values: session.contentFilter.deny_folders) { values in
-                session.updateContentFilter { $0.deny_folders = values }
-            }
-            LabeledContent(model.t("图像模型", "Image Model")) {
-                HStack(spacing: 8) {
-                    Text(images.projector?.lastPathComponent ?? model.t("未安装", "Not installed"))
-                        .lineLimit(1).truncationMode(.middle).foregroundStyle(.secondary)
-                    Button(model.t("选择…", "Choose…"), action: chooseImageProjector)
-                        .controlSize(.small)
-                        .disabled(images.building)
+        LumenSettingsWell(padding: 12) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 14) {
+                    filterToggle("PDF", \.enable_pdf)
+                    filterToggle("Office", \.enable_docx)
+                        .help("DOCX / XLSX / PPTX / DOC / XLS / PPT / RTF")
+                    filterToggle(model.t("文本", "Text"), \.enable_text)
+                    filterToggle(model.t("图片", "Images"), \.enable_images)
+                }
+                .toggleStyle(.checkbox)
+                CommaListField(title: model.t("额外包含扩展名", "Also include extensions"), prompt: "swift, json",
+                               values: session.contentFilter.allow_extensions) { values in
+                    session.updateContentFilter { $0.allow_extensions = values.map(Self.extensionToken) }
+                }
+                CommaListField(title: model.t("排除扩展名", "Exclude extensions"), prompt: "log, csv",
+                               values: session.contentFilter.deny_extensions) { values in
+                    session.updateContentFilter { $0.deny_extensions = values.map(Self.extensionToken) }
+                }
+                CommaListField(title: model.t("排除目录", "Exclude folders"), prompt: "/Users/me/Archive",
+                               values: session.contentFilter.deny_folders) { values in
+                    session.updateContentFilter { $0.deny_folders = values }
                 }
             }
         }
-        .padding(.vertical, 6)
-        .font(.callout)
+        .padding(.top, 6)
+        .font(.system(size: 12.5))
     }
 
     private static func extensionToken(_ value: String) -> String {
@@ -652,48 +809,63 @@ struct LauncherSettings: View {
             && !images.loading && model.canSearch && !indexStatus.scopePending && indexStatus.indexWork == nil
     }
 
-    /// One progress block and one Pause/Resume for content extraction, text embeddings, and image embeddings.
+    /// One unified progress block and one Pause/Resume for content extraction, text embeddings, and image embeddings.
     @ViewBuilder private var contentProgress: some View {
-        if let coverage = indexStatus.contentCoverage, coverage.total > 0 {
-            ProgressView(value: Double(coverage.checked), total: Double(coverage.total)) {
-                Text(model.t("正文：已处理 \(coverage.checked) / \(coverage.total) 份文档",
-                             "Text: \(coverage.checked) of \(coverage.total) documents checked"))
-                    .font(.callout)
-            }
-        }
-        semanticIndexStatus.font(.callout)
-        LauncherImageSettings(launcher: model, images: images).font(.callout)
-        if let notice = indexStatus.embeddingNotice { NoticeView(model: model, notice: notice) }
-        HStack(spacing: 10) {
-            if contentActive || embeddingActive || images.building {
-                Button(model.t("暂停索引", "Pause Indexing")) {
-                    model.setContentPaused(true)
-                    model.pauseEmbeddings(userInitiated: true)
-                    if images.building {
-                        images.stop()
-                        model.setEmbeddingIndexingPaused(true)
+        LumenSettingsWell(padding: 12) {
+            VStack(alignment: .leading, spacing: 8) {
+                if let coverage = indexStatus.contentCoverage, coverage.total > 0 {
+                    ProgressView(value: Double(coverage.checked), total: Double(coverage.total)) {
+                        Text(model.t("正文：已处理 \(coverage.checked) / \(coverage.total) 份文档",
+                                     "Text: \(coverage.checked) of \(coverage.total) documents checked"))
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(SettingsTheme.textPrimary)
+                    }
+                    .tint(SettingsTheme.amber)
+                }
+                semanticIndexStatus
+                    .font(.system(size: 12.5))
+                if images.projector != nil || (indexStatus.imageCoverage?.vectors ?? 0) > 0 || images.building {
+                    LauncherImageSettings(launcher: model, images: images)
+                        .font(.system(size: 12.5))
+                }
+                if let notice = indexStatus.embeddingNotice {
+                    NoticeView(model: model, notice: notice)
+                }
+                HStack(spacing: 10) {
+                    if contentActive || embeddingActive || images.building {
+                        Button(model.t("暂停索引", "Pause Indexing")) {
+                            model.setContentPaused(true)
+                            model.pauseEmbeddings(userInitiated: true)
+                            if images.building {
+                                images.stop()
+                                model.setEmbeddingIndexingPaused(true)
+                            }
+                        }
+                        .buttonStyle(LumenSecondaryButtonStyle())
+                        .disabled(indexStatus.embeddingState == .pausing)
+                        .accessibilityIdentifier("settings.content.pause")
+                    } else if contentResumable || embeddingResumable || (imageResumable && imagePending) {
+                        Button(model.t("继续索引", "Resume Indexing")) {
+                            model.setEmbeddingIndexingPaused(false)
+                            if contentResumable { model.setContentPaused(false) }
+                            if embeddingResumable {
+                                model.buildEmbeddings()
+                            } else if model.embeddingState != .running && imageResumable && imagePending {
+                                images.clearFailure()
+                                images.build()
+                            }
+                        }
+                        .buttonStyle(LumenPrimaryButtonStyle())
+                        .accessibilityIdentifier("settings.content.resume")
+                    } else if imageResumable {
+                        Button(model.t("建立或刷新图像索引", "Build or Refresh Image Index")) { images.build() }
+                            .buttonStyle(LumenSecondaryButtonStyle())
+                            .accessibilityIdentifier("settings.content.images")
+                    }
+                    if indexStatus.embeddingState == .pausing {
+                        note(model.t("正在完成当前批次，随后暂停。", "Indexing will pause after the current batch."))
                     }
                 }
-                .disabled(indexStatus.embeddingState == .pausing)
-                .accessibilityIdentifier("settings.content.pause")
-            } else if contentResumable || embeddingResumable || (imageResumable && imagePending) {
-                Button(model.t("继续索引", "Resume Indexing")) {
-                    model.setEmbeddingIndexingPaused(false)
-                    if contentResumable { model.setContentPaused(false) }
-                    if embeddingResumable {
-                        model.buildEmbeddings()
-                    } else if model.embeddingState != .running && imageResumable && imagePending {
-                        images.clearFailure()
-                        images.build()
-                    }
-                }
-                .accessibilityIdentifier("settings.content.resume")
-            } else if imageResumable {
-                Button(model.t("建立或刷新图像索引", "Build or Refresh Image Index")) { images.build() }
-                    .accessibilityIdentifier("settings.content.images")
-            }
-            if indexStatus.embeddingState == .pausing {
-                note(model.t("正在完成当前批次，随后暂停。", "Indexing will pause after the current batch."))
             }
         }
     }
@@ -701,48 +873,70 @@ struct LauncherSettings: View {
     private func folderRows(_ group: ScopeFolders, empty: String, constrainedEmpty: String? = nil) -> some View {
         let title = group.title(model)
         let paths = Array(Set(session.scope[keyPath: group.paths])).sorted()
-        return VStack(alignment: .leading, spacing: 7) {
+        return VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text(title).font(.callout.weight(.medium)).accessibilityAddTraits(.isHeader)
+                Text(title)
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .foregroundStyle(SettingsTheme.textPrimary)
+                    .accessibilityAddTraits(.isHeader)
                 Spacer()
                 Button {
                     chooseDirectories(group)
                 } label: {
                     Label(model.t("添加目录…", "Add Folder…"), systemImage: "plus")
                 }
-                .controlSize(.small)
+                .buttonStyle(LumenSecondaryButtonStyle())
                 .accessibilityLabel(model.t("添加目录到「\(title)」", "Add Folder to \(title)"))
                 .accessibilityIdentifier(group == .content ? "settings.content.add" : "settings.scope.add")
             }
-            if paths.isEmpty {
-                note(!session.scope.roots.isEmpty ? constrainedEmpty ?? empty : empty)
-            }
-            ForEach(paths, id: \.self) { path in
-                HStack(spacing: 8) {
-                    pathLabel(path)
-                    Button {
-                        session.remove(path, from: group)
-                    } label: {
-                        Image(systemName: "minus.circle")
+
+            LumenSettingsWell(padding: 10) {
+                if paths.isEmpty {
+                    HStack(spacing: 8) {
+                        Image(systemName: "folder")
+                            .foregroundStyle(SettingsTheme.textTertiary)
+                            .accessibilityHidden(true)
+                        Text(!session.scope.roots.isEmpty ? constrainedEmpty ?? empty : empty)
+                            .font(.system(size: 12))
+                            .foregroundStyle(SettingsTheme.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.secondary)
-                    .help(model.t("移除目录", "Remove Folder"))
-                    .accessibilityLabel(model.t("移除目录 \(path)", "Remove Folder \(path)"))
+                    .padding(.vertical, 2)
+                } else {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(Array(paths.enumerated()), id: \.element) { index, path in
+                            if index > 0 { LumenSettingsHairline() }
+                            HStack(spacing: 8) {
+                                pathLabel(path)
+                                Button {
+                                    session.remove(path, from: group)
+                                } label: {
+                                    Image(systemName: "minus.circle")
+                                        .foregroundStyle(SettingsTheme.textTertiary)
+                                }
+                                .buttonStyle(.borderless)
+                                .help(model.t("移除目录", "Remove Folder"))
+                                .accessibilityLabel(model.t("移除目录 \(path)", "Remove Folder \(path)"))
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
                 }
-                .padding(.vertical, 3)
             }
         }
     }
 
     private func pathLabel(_ path: String) -> some View {
         Label {
-            Text(path).lineLimit(1).truncationMode(.middle)
+            Text(path)
+                .lineLimit(1)
+                .truncationMode(.middle)
         } icon: {
             Image(systemName: "folder")
+                .foregroundStyle(SettingsTheme.amber)
         }
-        .font(.callout)
-        .foregroundStyle(.secondary)
+        .font(.system(size: 12.5))
+        .foregroundStyle(SettingsTheme.textPrimary)
         .frame(maxWidth: .infinity, alignment: .leading)
         .help(path)
     }
@@ -750,10 +944,9 @@ struct LauncherSettings: View {
     private var applyBar: some View {
         HStack(spacing: 12) {
             if session.hasChanges {
-                note(model.t("有未应用的更改", "Unapplied changes"))
+                LumenStatusPill(text: model.t("有未应用的更改", "Unapplied changes"), color: SettingsTheme.amber)
                 Button(model.t("还原", "Revert")) { session.discard() }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
+                    .buttonStyle(LumenSecondaryButtonStyle())
             } else if model.isIndexing {
                 note(model.activityTitle)
             } else if !session.canEditScope && indexStatus.indexPhase == .ready {
@@ -762,116 +955,283 @@ struct LauncherSettings: View {
             Spacer()
             Button(indexStatus.indexPhase == .needsIndex ? model.t("建立索引", "Build Index")
                    : model.t("应用并更新索引", "Apply and Update Index")) { session.apply() }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(LumenPrimaryButtonStyle())
                 .disabled(!session.canApply)
                 .accessibilityIdentifier("settings.index.apply")
         }
-        .padding(.horizontal, 28).padding(.vertical, 13)
-        .background(alignment: .top) { Divider() }
+        .padding(.horizontal, 28)
+        .padding(.vertical, 13)
+        .background(SettingsTheme.cardBackground)
+        .overlay(alignment: .top) { LumenSettingsHairline() }
     }
 
-    @ViewBuilder private var background: some View {
-        group(model.t("文件变化与扫描", "File Changes and Scans")) {
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(watchStatusColor)
-                    .frame(width: 8, height: 8)
-                    .accessibilityHidden(true)
-                Text(watchLabel)
+    // MARK: - AI & Models (.translation)
+
+    @ViewBuilder private var aiAndModels: some View {
+        TextEmbeddingEngineCard(model: model, assets: GemmaAssetManager.shared) { _ in
+            model.verifyLocalModel()
+            images.adoptInstalledProjector()
+            model.refreshCoverageAfterImageBuild()
+        }
+
+        imageModelCard
+
+        LumenSettingsCard(title: model.t("翻译与问答提供商", "Translation & Q&A Providers"), icon: "character.bubble") {
+            TranslationSettingsView(model: translation, chinese: model.zh)
+        }
+    }
+
+    private var imageModelCard: some View {
+        let assets = GemmaAssetManager.shared
+        let vectors = indexStatus.imageCoverage?.enabled == true
+            ? (indexStatus.imageCoverage?.vectors ?? 0)
+            : (images.scope?.vectors ?? indexStatus.imageCoverage?.vectors ?? 0)
+        let ready = images.projector != nil && assets.textInstalled
+        let installedInDefaultHome = assets.imageInstalled && assets.textInstalled
+        return LumenSettingsCard(
+            title: model.t("以文搜图模型", "Image Search Model"),
+            icon: "photo.on.rectangle.angled",
+            trailing: {
+                if images.building {
+                    LumenStatusPill(text: model.t("已处理 \(images.checked) 张", "Prepared \(images.checked)"),
+                                    color: SettingsTheme.amber)
+                } else if ready {
+                    LumenStatusPill(text: model.t("已就绪", "Ready"), color: SettingsTheme.green)
+                } else if installedInDefaultHome {
+                    LumenStatusPill(text: model.t("已安装", "Installed"), color: SettingsTheme.green)
+                } else if images.projector != nil {
+                    LumenStatusPill(text: model.t("需基础模型", "Needs Base Model"), color: SettingsTheme.amber)
+                } else {
+                    LumenStatusPill(text: model.t("未安装", "Not Installed"), color: SettingsTheme.textTertiary)
+                }
             }
+        ) {
+            GemmaAssetSettings(launcher: model, assets: GemmaAssetManager.shared, scope: .imageOnly) { _ in
+                model.verifyLocalModel()
+                images.adoptInstalledProjector()
+                model.refreshCoverageAfterImageBuild()
+            }
+
+            LumenSettingsWell(padding: 10) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(model.t("自定义视觉投影模型 (.gguf)", "Custom Image Projector (.gguf)"))
+                                .font(.system(size: 12.5, weight: .medium))
+                                .foregroundStyle(SettingsTheme.textPrimary)
+                            Text(images.projector?.lastPathComponent ?? model.t("使用默认内置 mmproj", "Default built-in mmproj"))
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(SettingsTheme.textTertiary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        Spacer(minLength: 8)
+                        Button(model.t("选择…", "Choose…"), action: chooseImageProjector)
+                            .buttonStyle(LumenSecondaryButtonStyle())
+                            .disabled(images.building)
+                    }
+                    LumenSettingsHairline()
+                    LumenSettingsRow(
+                        label: model.t("已索引图像向量", "Indexed Images"),
+                        value: images.building
+                            ? model.t("已处理 \(images.checked) 张", "Prepared \(images.checked)")
+                            : model.t("\(vectors.formatted()) 张", "\(vectors.formatted()) images"),
+                        statusColor: vectors > 0 ? SettingsTheme.green : SettingsTheme.textSecondary
+                    )
+                }
+            }
+
+            if images.failed {
+                Text(model.t("图像索引失败。请检查目录和图像模型后重试。",
+                             "Image indexing failed. Check the folders and image model, then retry."))
+                    .font(.system(size: 12))
+                    .foregroundStyle(SettingsTheme.red)
+            }
+
+            note(model.t("以文搜图始终使用本机 Gemma 2 多模态模型（mmproj），与上方文本语义引擎相互独立。",
+                         "Image search is always powered locally by built-in Gemma 2 multimodal (mmproj), independent of the text embedding engine above."))
+        }
+    }
+
+    // MARK: - Scripts & Shortcuts
+
+    @ViewBuilder private var scriptsAndShortcuts: some View {
+        LumenSettingsCard(title: model.t("本地脚本", "Local Scripts"), icon: "terminal") {
+            LumenSettingsWell(padding: 12) {
+                Toggle(model.t("启用本地脚本", "Enable Local Scripts"), isOn: Binding(
+                    get: { scriptCatalog.scriptsEnabled }, set: { scriptCatalog.setScriptsEnabled($0) }
+                ))
+                .disabled(scriptCatalog.folder == nil)
+                .accessibilityIdentifier("settings.scripts.enabled")
+
+                if let folder = scriptCatalog.folder {
+                    LumenSettingsHairline()
+                    LumenSettingsRow(
+                        label: model.t("脚本文件夹", "Scripts Folder"),
+                        value: (folder as NSString).abbreviatingWithTildeInPath
+                    )
+                }
+            }
+
+            HStack(spacing: 8) {
+                Button(model.t("选择文件夹…", "Choose Folder…"), action: chooseScriptsFolder)
+                    .buttonStyle(LumenSecondaryButtonStyle())
+                    .accessibilityIdentifier("settings.scripts.choose")
+                if scriptCatalog.folder == nil {
+                    Button(model.t("创建默认文件夹并启用", "Create Default Folder & Enable"), action: scriptCatalog.createAndEnable)
+                        .buttonStyle(LumenPrimaryButtonStyle())
+                        .disabled(scriptCatalog.scriptLoading)
+                }
+                Button(model.t("重新载入脚本", "Reload Scripts"), action: scriptCatalog.reloadScripts)
+                    .buttonStyle(LumenSecondaryButtonStyle())
+                    .disabled(!scriptCatalog.scriptsEnabled || scriptCatalog.scriptLoading)
+            }
+
+            if scriptCatalog.scriptLoading { note(model.t("正在读取脚本…", "Loading scripts…")) }
+            else if scriptCatalog.scriptFailed {
+                Text(model.t("无法读取该文件夹。请选择本机非链接目录。", "Could not read the folder. Choose a resident folder that is not a link."))
+                    .font(.system(size: 12))
+                    .foregroundStyle(SettingsTheme.red)
+            } else {
+                note(model.t("\(scriptCatalog.scripts.count) 个脚本", "Scripts available: \(scriptCatalog.scripts.count)"))
+            }
+
+            note(model.t("仅搜索该文件夹内的可执行文件。脚本拥有您的权限；请仅启用您信任的脚本。将直接在所选文件夹内运行，工作目录为该文件夹。",
+                         "Only executables directly inside the folder are listed. Scripts run with your permissions; enable only scripts you trust. Scripts run directly with the selected folder as their working directory."))
+        }
+
+        LumenSettingsCard(title: model.t("Apple 快捷指令", "Apple Shortcuts"), icon: "square.stack.3d.up") {
+            LumenSettingsWell(padding: 12) {
+                Toggle(model.t("启用 Apple 快捷指令", "Enable Apple Shortcuts"), isOn: Binding(
+                    get: { scriptCatalog.shortcutsEnabled }, set: { scriptCatalog.setShortcutsEnabled($0) }
+                ))
+                .accessibilityIdentifier("settings.apple-shortcuts.enabled")
+            }
+
+            HStack(spacing: 10) {
+                Button(model.t("刷新快捷指令", "Refresh Shortcuts"), action: scriptCatalog.refreshShortcuts)
+                    .buttonStyle(LumenSecondaryButtonStyle())
+                    .disabled(!scriptCatalog.shortcutsEnabled || scriptCatalog.shortcutLoading)
+                if scriptCatalog.shortcutLoading { note(model.t("正在读取快捷指令…", "Loading Shortcuts…")) }
+                else if scriptCatalog.shortcutFailed {
+                    Text(model.t("无法读取快捷指令。", "Could not list Shortcuts."))
+                        .font(.system(size: 12))
+                        .foregroundStyle(SettingsTheme.red)
+                } else {
+                    note(model.t("\(scriptCatalog.shortcuts.count) 个快捷指令", "Shortcuts available: \(scriptCatalog.shortcuts.count)"))
+                }
+            }
+        }
+    }
+
+    // MARK: - Status & About (.advanced)
+
+    @ViewBuilder private var statusAndAbout: some View {
+        LumenSettingsCard(
+            title: model.t("索引健康与统计", "Index Health & Counts"),
+            icon: "waveform.path.ecg",
+            trailing: {
+                LumenStatusPill(text: watchShortBadge, color: watchStatusColor)
+            }
+        ) {
+            Text(watchLabel)
+                .font(.system(size: 12.5))
+                .foregroundStyle(SettingsTheme.textPrimary)
+
             if let metrics = model.activityMetrics {
                 if let progress = model.activeProgress, let fraction = progress.fraction {
                     ProgressView(metrics, value: fraction)
+                        .tint(SettingsTheme.amber)
                 } else {
-                    Text(metrics).font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                    Text(metrics)
+                        .font(.system(size: 12).monospacedDigit())
+                        .foregroundStyle(SettingsTheme.textSecondary)
                 }
             } else if model.isIndexing {
                 ProgressView(model.activityTitle).controlSize(.small)
             }
-            if let notice = indexStatus.watchNotice { NoticeView(model: model, notice: notice) }
-        }
-        group(model.t("本机语义搜索", "On-Device Semantic Search")) {
-            LabeledContent(model.t("模型", "Model"), value: "EmbeddingGemma 2")
-            localModelStatus
-            semanticIndexStatus
-            embeddingControls
-            if let notice = indexStatus.embeddingNotice { NoticeView(model: model, notice: notice) }
-            note(model.t("暂停语义索引时，文件变化仍会自动更新。",
-                         "File changes continue to update while semantic indexing is paused."))
-        }
-    }
 
-    @ViewBuilder private var about: some View {
-        group("Lumen") {
-            HStack(spacing: 14) {
-                Image(nsImage: NSApp.applicationIconImage)
-                    .resizable()
-                    .interpolation(.high)
-                    .frame(width: 56, height: 56)
-                    .shadow(color: .black.opacity(0.18), radius: 3, y: 1.5)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(model.t("Lumen · 鹿鸣", "Lumen"))
-                        .font(.system(size: 16, weight: .semibold))
-                    Text(model.t("版本 \(version)", "Version \(version)"))
-                        .font(.callout.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                    HStack(spacing: 6) {
-                        Circle()
-                            .fill(aboutStatusColor)
-                            .frame(width: 7, height: 7)
-                            .accessibilityHidden(true)
-                        Text(model.activityTitle)
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
+            if let notice = indexStatus.watchNotice {
+                NoticeView(model: model, notice: notice)
+            }
+
+            if let report = indexStatus.indexReport {
+                let columns = [
+                    GridItem(.flexible(), spacing: 10),
+                    GridItem(.flexible(), spacing: 10),
+                ]
+                LazyVGrid(columns: columns, spacing: 10) {
+                    LumenSettingsMetricTile(
+                        label: model.t("索引项目", "Indexed Items"),
+                        value: report.items.formatted(),
+                        subtitle: model.t("名称与路径目录", "Names & paths"),
+                        accent: SettingsTheme.green
+                    )
+                    LumenSettingsMetricTile(
+                        label: model.t("已索引正文", "Indexed Documents"),
+                        value: (report.documents ?? 0).formatted(),
+                        subtitle: "PDF · Office · Text",
+                        accent: SettingsTheme.amber
+                    )
+                    LumenSettingsMetricTile(
+                        label: model.t("语义向量", "Semantic Chunks"),
+                        value: (indexStatus.gemmaCoverage?.embedded_chunks ?? 0).formatted(),
+                        subtitle: activeSemanticTileSubtitle,
+                        accent: SettingsTheme.amber
+                    )
+                    LumenSettingsMetricTile(
+                        label: model.t("仅在线文件", "Online-Only Files"),
+                        value: (report.placeholders ?? 0).formatted(),
+                        subtitle: model.t("图像 \((indexStatus.imageCoverage?.vectors ?? 0).formatted()) 张",
+                                          "\((indexStatus.imageCoverage?.vectors ?? 0).formatted()) images"),
+                        accent: SettingsTheme.textTertiary
+                    )
+                }
+
+                let warnings = [
+                    (model.t("无法访问", "Inaccessible Entries"), report.entries_unreadable ?? 0),
+                    (model.t("暂不可访问", "Unavailable Items"), report.unverified ?? 0),
+                    (model.t("正文未读取", "Documents Without Readable Text"), report.documents_not_read ?? 0),
+                ].filter { $0.1 > 0 }
+                if !warnings.isEmpty {
+                    LumenSettingsWell(padding: 10) {
+                        ForEach(Array(warnings.enumerated()), id: \.offset) { index, item in
+                            if index > 0 { LumenSettingsHairline() }
+                            LumenSettingsRow(label: item.0, value: item.1.formatted(), statusColor: SettingsTheme.amber)
+                        }
                     }
                 }
-                Spacer(minLength: 0)
-            }
-            .padding(.vertical, 2)
-            if let updates {
-                Divider().accessibilityHidden(true)
-                LauncherUpdateControls(updates: updates, model: model)
-            }
-        }
-        group(model.t("索引统计", "Index Counts")) {
-            if let report = indexStatus.indexReport {
-                count(model.t("索引项目", "Indexed Items"), report.items)
-                if let value = report.documents { count(model.t("已索引正文", "Documents with Indexed Text"), value) }
-                if let value = report.placeholders { count(model.t("仅在线文件", "Online-Only Files"), value) }
-                if let value = report.entries_unreadable, value > 0 { count(model.t("无法访问", "Inaccessible Entries"), value) }
-                if let value = report.unverified, value > 0 { count(model.t("暂不可访问", "Unavailable Items"), value) }
-                if let value = report.documents_not_read, value > 0 { count(model.t("正文未读取", "Documents Without Readable Text"), value) }
             } else {
-                note(indexStatus.indexPhase == .checking ? model.activityTitle
-                     : model.t("尚无索引统计。", "Index counts are unavailable."))
+                LumenSettingsWell(padding: 10) {
+                    Text(indexStatus.indexPhase == .checking ? model.activityTitle
+                         : model.t("尚无索引统计。", "Index counts are unavailable."))
+                        .font(.system(size: 12))
+                        .foregroundStyle(SettingsTheme.textSecondary)
+                }
             }
         }
+
         diagnostics
-        DisclosureGroup(model.t("高级维护", "Advanced Maintenance")) {
-            VStack(alignment: .leading, spacing: 8) {
-                note(model.t("按当前已生效的范围重新扫描，保留未应用的设置草稿。",
-                             "Rescan the currently saved scope. Unapplied edits stay in their draft."))
-                Button(model.t("重建索引…", "Rebuild Index…")) { confirmRebuild = true }
-                    .disabled(!session.canRebuild)
-                    .confirmationDialog(model.t("按当前范围重建索引？", "Rebuild the Index Using the Saved Scope?"),
-                                        isPresented: $confirmRebuild, titleVisibility: .visible) {
-                        Button(model.t("重建", "Rebuild")) { model.rebuildSavedIndex() }
-                        Button(model.t("取消", "Cancel"), role: .cancel) {}
-                    }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 8)
+
+        about
+    }
+
+    private var activeSemanticTileSubtitle: String {
+        let cfg = model.textEmbeddingBackend
+        if cfg.mode == .localOpenAI {
+            return cfg.trimmedModel.isEmpty ? model.t("本机服务", "Local Server") : cfg.trimmedModel
         }
-        .font(.callout)
+        return indexStatus.gemmaCoverage?.documents_enabled == true ? "EmbeddingGemma 2" : model.t("未开启正文", "Documents off")
     }
 
     private var diagnostics: some View {
-        group(model.t("文件诊断", "File Diagnostics")) {
-            HStack(alignment: .firstTextBaseline) {
+        LumenSettingsCard(title: model.t("单文件排查诊断", "File Diagnostics"), icon: "magnifyingglass.circle") {
+            HStack(alignment: .center, spacing: 12) {
                 note(model.t("检查所选文件的名称、正文和语义索引状态。",
                              "Check the name, text, and semantic coverage of a selected file."))
                 Spacer(minLength: 12)
                 Button(model.t("选取文件…", "Choose File…"), action: chooseDiagnosticFile)
+                    .buttonStyle(LumenSecondaryButtonStyle())
                     .disabled(indexStatus.scopePending)
                     .accessibilityIdentifier("settings.diagnostics.choose")
             }
@@ -879,22 +1239,114 @@ struct LauncherSettings: View {
             case .idle:
                 EmptyView()
             case .checking(let name):
-                ProgressView(name).controlSize(.small)
-            case .failed(let name):
-                Text(name).font(.callout.weight(.medium)).lineLimit(1).truncationMode(.middle)
-                note(model.t("无法获取此文件的诊断结果。", "Could not read diagnostics for this file."))
-            case .result(let name, let result):
-                Divider().accessibilityHidden(true)
-                HStack {
-                    Text(name).font(.callout.weight(.medium)).lineLimit(1).truncationMode(.middle)
-                    Spacer()
-                    Button(model.t("清除", "Clear")) { model.clearFileDiagnosis() }
-                        .buttonStyle(.borderless)
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(name)
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(SettingsTheme.textSecondary)
+                        .lineLimit(1)
                 }
-                LabeledContent(model.t("名称", "Name"), value: diagnosisText(result.name))
-                LabeledContent(model.t("正文", "Document Text"), value: diagnosisText(result.text))
-                LabeledContent(model.t("语义", "Semantic"), value: diagnosisText(result.semantic))
+            case .failed(let name):
+                LumenSettingsWell(padding: 10) {
+                    Text(name).font(.system(size: 12.5, weight: .medium)).lineLimit(1).truncationMode(.middle)
+                    Text(model.t("无法获取此文件的诊断结果。", "Could not read diagnostics for this file."))
+                        .font(.system(size: 12))
+                        .foregroundStyle(SettingsTheme.red)
+                }
+            case .result(let name, let result):
+                LumenSettingsWell(padding: 12) {
+                    HStack {
+                        Text(name)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(SettingsTheme.textPrimary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer()
+                        Button(model.t("清除", "Clear")) { model.clearFileDiagnosis() }
+                            .buttonStyle(.borderless)
+                            .font(.system(size: 12))
+                            .foregroundStyle(SettingsTheme.textSecondary)
+                    }
+                    LumenSettingsHairline()
+                    LumenSettingsRow(label: model.t("名称", "Name"), value: diagnosisText(result.name),
+                                     statusColor: diagnosisColor(result.name))
+                    LumenSettingsRow(label: model.t("正文", "Document Text"), value: diagnosisText(result.text),
+                                     statusColor: diagnosisColor(result.text))
+                    LumenSettingsRow(label: model.t("语义", "Semantic"), value: diagnosisText(result.semantic),
+                                     statusColor: diagnosisColor(result.semantic))
+                }
             }
+        }
+    }
+
+    @ViewBuilder private var about: some View {
+        LumenSettingsCard(title: model.t("关于 Lumen", "About Lumen"), icon: "sparkles") {
+            HStack(spacing: 14) {
+                Image(nsImage: NSApp.applicationIconImage)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 56, height: 56)
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .shadow(color: .black.opacity(0.16), radius: 3, y: 1.5)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(Self.aboutDisplayTitle())
+                        .font(.system(size: 17, weight: .bold))
+                        .foregroundStyle(SettingsTheme.textPrimary)
+                    Text(model.t("版本 \(version)", "Version \(version)"))
+                        .font(.system(size: 12.5).monospacedDigit())
+                        .foregroundStyle(SettingsTheme.textSecondary)
+                    LumenStatusPill(text: model.activityTitle, color: aboutStatusColor)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, 2)
+
+            LumenSettingsHairline()
+
+            LumenSettingsWell(padding: 12) {
+                LumenSettingsRow(label: model.t("版本", "Version"), value: version)
+                LumenSettingsHairline()
+                LumenSettingsRow(label: model.t("平台", "Platform"), value: "macOS 14+")
+                LumenSettingsHairline()
+                LumenSettingsRow(label: model.t("许可证", "License"), value: "MIT")
+            }
+
+            if let updates {
+                LumenSettingsHairline()
+                LauncherUpdateControls(updates: updates, model: model)
+            }
+
+            LumenSettingsHairline()
+
+            DisclosureGroup(model.t("高级维护", "Advanced Maintenance")) {
+                VStack(alignment: .leading, spacing: 8) {
+                    note(model.t("按当前已生效的范围重新扫描，保留未应用的设置草稿。",
+                                 "Rescan the currently saved scope. Unapplied edits stay in their draft."))
+                    Button(model.t("重建索引…", "Rebuild Index…")) { confirmRebuild = true }
+                        .buttonStyle(LumenSecondaryButtonStyle())
+                        .disabled(!session.canRebuild)
+                        .confirmationDialog(model.t("按当前范围重建索引？", "Rebuild the Index Using the Saved Scope?"),
+                                            isPresented: $confirmRebuild, titleVisibility: .visible) {
+                            Button(model.t("重建", "Rebuild")) { model.rebuildSavedIndex() }
+                            Button(model.t("取消", "Cancel"), role: .cancel) {}
+                        }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 8)
+            }
+            .font(.system(size: 12.5, weight: .medium))
+            .foregroundStyle(SettingsTheme.textSecondary)
+        }
+    }
+
+    // MARK: - Helpers
+
+    private func diagnosisColor(_ reason: String) -> Color {
+        switch reason {
+        case "indexed": return SettingsTheme.green
+        case "stale", "unverified", "pending_gemma": return SettingsTheme.amber
+        case "index_unavailable", "unreadable", "missing", "gemma_limited": return SettingsTheme.red
+        default: return SettingsTheme.textSecondary
         }
     }
 
@@ -932,95 +1384,36 @@ struct LauncherSettings: View {
         return "\(version) (\(build))"
     }
 
-    private func count(_ label: String, _ value: Int) -> some View {
-        LabeledContent(label, value: value.formatted())
-    }
-
-    private func group<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(.system(size: 12.5, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .accessibilityAddTraits(.isHeader)
-            VStack(alignment: .leading, spacing: 10, content: content)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(14)
-                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 11, style: .continuous)
-                        .strokeBorder(Color(nsColor: .separatorColor).opacity(0.45))
-                        .allowsHitTesting(false)
-                }
-        }
-    }
-
     private func note(_ text: String) -> some View {
-        Text(text).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        Text(text)
+            .font(.system(size: 12))
+            .foregroundStyle(SettingsTheme.textSecondary)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     private var watchStatusColor: Color {
         switch indexStatus.watchState {
-        case .running: return Color(nsColor: .systemGreen)
-        case .paused, .failed: return Color(nsColor: .systemOrange)
-        case .checking, .starting, .needsSetup, .unavailable: return .secondary
+        case .running: return SettingsTheme.green
+        case .paused, .failed: return SettingsTheme.amber
+        case .checking, .starting, .needsSetup, .unavailable: return SettingsTheme.textTertiary
+        }
+    }
+
+    private var watchShortBadge: String {
+        switch indexStatus.watchState {
+        case .running: return model.t("监听中", "Watching")
+        case .paused: return model.t("已暂停", "Paused")
+        case .failed: return model.t("已停止", "Stopped")
+        case .starting, .checking: return model.t("检查中", "Checking")
+        case .needsSetup: return model.t("待配置", "Setup Needed")
+        case .unavailable: return model.t("手动", "Manual")
         }
     }
 
     private var aboutStatusColor: Color {
-        if indexStatus.watchState == .failed { return Color(nsColor: .systemOrange) }
-        if indexStatus.watchState == .running || model.canSearch { return Color(nsColor: .systemGreen) }
-        return .secondary
-    }
-
-    @ViewBuilder private var embeddingControls: some View {
-        switch indexStatus.embeddingState {
-        case .verifying, .running, .pausing:
-            Button(model.t("暂停语义索引", "Pause Semantic Indexing")) { model.pauseEmbeddings(userInitiated: true) }
-                .disabled(indexStatus.embeddingState == .pausing)
-            if indexStatus.embeddingState == .pausing {
-                Text(model.t("正在完成当前批次，随后暂停。", "Indexing will pause after the current batch."))
-                    .foregroundStyle(.secondary)
-            }
-        case .idle, .paused, .finished:
-            if indexStatus.gemmaCoverage?.pending == true && indexStatus.gemmaCoverage?.limited == false {
-                Button(indexStatus.embeddingState == .paused
-                       ? model.t("继续生成语义索引", "Resume Semantic Indexing")
-                       : model.t("生成语义索引", "Build Semantic Index")) {
-                    model.buildEmbeddings()
-                }
-                .disabled(!model.canBuildEmbeddings)
-            }
-            if indexStatus.embeddingState == .paused && indexStatus.embeddingNotice == nil {
-                Text(model.t("已暂停。已完成的片段已保存，可以继续生成。",
-                             "Indexing is paused. Completed chunks are saved and indexing can resume."))
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    @ViewBuilder private var localModelStatus: some View {
-        switch indexStatus.localModelState {
-        case .unchecked:
-            EmptyView()
-        case .available:
-            Label(model.t("已找到本机模型和运行环境", "Local model and runtime found"), systemImage: "internaldrive")
-                .foregroundStyle(.secondary)
-        case .checking:
-            ProgressView(model.t("正在校验本机 Gemma 资源…", "Verifying local Gemma resources…")).controlSize(.small)
-        case .ready:
-            HStack(spacing: 7) {
-                Circle().fill(Color(nsColor: .systemGreen)).frame(width: 8, height: 8).accessibilityHidden(true)
-                Text(model.t("本机 Gemma 模型已就绪", "Local Gemma model ready"))
-            }
-        case .unavailable(let issue):
-            HStack(spacing: 7) {
-                Circle().fill(Color(nsColor: .systemOrange)).frame(width: 8, height: 8).accessibilityHidden(true)
-                Text(model.modelDiagnostic(issue)).foregroundStyle(.secondary)
-            }
-            if !model.canBuildEmbeddings && indexStatus.indexWork != .embeddings {
-                Button(model.t("重新检查本机模型", "Recheck Local Model")) { model.verifyLocalModel() }
-            }
-        }
+        if indexStatus.watchState == .failed { return SettingsTheme.amber }
+        if indexStatus.watchState == .running || model.canSearch { return SettingsTheme.green }
+        return SettingsTheme.textTertiary
     }
 
     @ViewBuilder private var semanticIndexStatus: some View {
@@ -1030,47 +1423,51 @@ struct LauncherSettings: View {
             let partial = coverage.documents_enabled && !coverage.complete && !coverage.limited && coverage.pending
             if !coverage.documents_enabled {
                 Text(model.t("启用正文索引才能生成语义索引。", "Enable document indexing to build a semantic index."))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(SettingsTheme.textSecondary)
             } else if coverage.limited && coverage.hasResults {
                 Text(model.t("已达到 \(limit) 段的存储上限。已建立索引的 \(count) 段仍可检索。",
                              "Storage limit reached (\(limit) chunks). The \(count) indexed chunks are still searchable."))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(SettingsTheme.textSecondary)
             } else if coverage.limited {
                 Text(model.t("已达到语义索引存储上限。", "The semantic index reached its storage limit."))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(SettingsTheme.textSecondary)
             } else if coverage.complete {
                 Text(model.t("语义索引已就绪，包含 \(count) 段。", "Semantic index ready with \(count) chunks."))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(SettingsTheme.green)
             } else if partial && [.verifying, .running, .pausing].contains(indexStatus.embeddingState) {
                 let label = indexStatus.embeddingState == .pausing
                     ? model.t("语义向量：正在暂停 · 已完成 \(count) / \(limit) 段", "Semantic vectors: pausing · \(count) / \(limit) chunks")
                     : model.t("语义向量：正在后台生成 · \(count) / \(limit) 段", "Semantic vectors: indexing in background · \(count) / \(limit) chunks")
                 if coverage.chunk_limit > 0 {
                     ProgressView(value: Double(min(coverage.embedded_chunks, coverage.chunk_limit)),
-                                 total: Double(coverage.chunk_limit)) { Text(label).font(.callout) }
+                                 total: Double(coverage.chunk_limit)) {
+                        Text(label).font(.system(size: 12.5))
+                    }
+                    .tint(SettingsTheme.amber)
                 } else {
-                    ProgressView { Text(label).font(.callout) }
+                    ProgressView { Text(label).font(.system(size: 12.5)) }
                 }
             } else if partial && indexStatus.embeddingState == .paused && coverage.hasResults {
                 Text(model.t("语义向量：已暂停 · 已有 \(count) / \(limit) 段可检索",
                              "Semantic vectors: paused · \(count) / \(limit) chunks searchable"))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(SettingsTheme.textSecondary)
             } else if coverage.hasResults {
                 Text(model.t("已有 \(count) / \(limit) 段可检索，仍有正文待处理。",
                              "Partial semantic index: \(count) / \(limit) searchable chunks, with more documents to process."))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(SettingsTheme.textSecondary)
             } else if indexStatus.indexWork == .embeddings || indexStatus.embeddingState == .verifying {
-                Text(model.t("正在准备语义索引…", "Preparing the semantic index…")).foregroundStyle(.secondary)
+                Text(model.t("正在准备语义索引…", "Preparing the semantic index…"))
+                    .foregroundStyle(SettingsTheme.textSecondary)
             } else if coverage.pending {
                 Text(model.t("正文可用于生成本机语义索引。", "Documents are ready for local semantic indexing."))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(SettingsTheme.textSecondary)
             } else if coverage.skipped_chunks > 0 {
                 let skipped = coverage.skipped_chunks.formatted()
                 Text(model.t("已跳过 \(skipped) 段无法索引的正文。", "Skipped \(skipped) chunks that could not be indexed."))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(SettingsTheme.textSecondary)
             } else {
                 Text(model.t("当前范围还没有可建立语义索引的正文。", "There is no document text to index in this scope yet."))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(SettingsTheme.textSecondary)
             }
         }
     }
@@ -1079,8 +1476,8 @@ struct LauncherSettings: View {
         switch indexStatus.watchState {
         case .checking: return model.t("正在检查文件监听支持…", "Checking file watching support…")
         case .unavailable: return model.t("当前版本请手动更新索引。", "Use manual index updates in this version.")
-        case .needsSetup: return model.t("在「索引与隐私」中应用范围后可监听文件变化。",
-                                         "Apply a scope in Index & Privacy to watch for file changes.")
+        case .needsSetup: return model.t("在「索引」中应用范围后可监听文件变化。",
+                                         "Apply a scope in Index to watch for file changes.")
         case .paused: return model.t("索引范围应用成功后恢复文件监听。", "File watching resumes after the scope is applied.")
         case .starting: return model.t("正在核对索引与访问权限…", "Checking the saved index and file access…")
         case .running: return model.t("正在监听文件变化。", "Lumen is watching for file changes.")
@@ -1102,7 +1499,7 @@ private struct CommaListField: View {
         LabeledContent(title) {
             TextField(title, text: $text, prompt: Text(prompt))
                 .labelsHidden()
-                .textFieldStyle(.roundedBorder)
+                .lumenWellField()
                 .frame(maxWidth: 260)
                 .focused($focused)
                 .onSubmit(apply)
@@ -1132,47 +1529,67 @@ private struct LauncherUpdateControls: View {
     }()
 
     var body: some View {
-        Toggle(model.t("每 24 小时自动检查更新", "Automatically check for updates every 24 hours"),
-               isOn: $updates.autoCheckUpdates)
-            .toggleStyle(.switch)
-            .accessibilityIdentifier("settings.updates.autoCheck")
-        if let backup = updates.backup {
-            Text(model.t("更新已安装。正在重新打开 Lumen；若未自动重启，请手动退出并重开。",
-                         "Update installed. Relaunching Lumen; quit and reopen manually if needed."))
-            Text(model.t("旧版本备份：\(backup.path)", "Previous app backup: \(backup.path)"))
-                .font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
-        } else {
-            HStack {
-                Button(model.t("检查更新", "Check for Updates"), action: updates.check)
-                    .accessibilityIdentifier("settings.updates.check")
-                if let release = updates.release {
-                    if updates.canInstallInPlace {
-                        Button(model.t("安装并重启 \(release.version)", "Install & Relaunch \(release.version)"),
-                               action: updates.installAndRelaunch)
-                            .buttonStyle(.borderedProminent)
-                            .accessibilityIdentifier("settings.updates.install")
-                    } else {
-                        Button(model.t("打开下载页 \(release.version)", "Open Download \(release.version)"),
-                               action: updates.openReleasePage)
-                            .buttonStyle(.borderedProminent)
-                            .accessibilityIdentifier("settings.updates.download")
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle(model.t("每 24 小时自动检查更新", "Automatically check for updates every 24 hours"),
+                   isOn: $updates.autoCheckUpdates)
+                .toggleStyle(.switch)
+                .accessibilityIdentifier("settings.updates.autoCheck")
+            if let backup = updates.backup {
+                Text(model.t("更新已安装。正在重新打开 Lumen；若未自动重启，请手动退出并重开。",
+                             "Update installed. Relaunching Lumen; quit and reopen manually if needed."))
+                    .font(.system(size: 12.5))
+                Text(model.t("旧版本备份：\(backup.path)", "Previous app backup: \(backup.path)"))
+                    .font(.system(size: 12))
+                    .foregroundStyle(SettingsTheme.textSecondary)
+                    .textSelection(.enabled)
+            } else {
+                HStack(spacing: 8) {
+                    Button(model.t("检查更新", "Check for Updates"), action: updates.check)
+                        .buttonStyle(LumenSecondaryButtonStyle())
+                        .accessibilityIdentifier("settings.updates.check")
+                    if let release = updates.release {
+                        if updates.canInstallInPlace {
+                            Button(model.t("安装并重启 \(release.version)", "Install & Relaunch \(release.version)"),
+                                   action: updates.installAndRelaunch)
+                                .buttonStyle(LumenPrimaryButtonStyle())
+                                .accessibilityIdentifier("settings.updates.install")
+                        } else {
+                            Button(model.t("打开下载页 \(release.version)", "Open Download \(release.version)"),
+                                   action: updates.openReleasePage)
+                                .buttonStyle(LumenPrimaryButtonStyle())
+                                .accessibilityIdentifier("settings.updates.download")
+                        }
                     }
+                    if updates.busy { ProgressView().controlSize(.small) }
                 }
-                if updates.busy { ProgressView().controlSize(.small) }
-            }
-            .disabled(updates.busy)
-            if let error = updates.error {
-                Text(model.t("更新失败：\(error)", "Update failed: \(error)")).textSelection(.enabled)
-            } else if let release = updates.release {
-                if !release.notes.isEmpty { Text(release.notes).textSelection(.enabled) }
-            } else if updates.checked {
-                Text(model.t("当前已是最新版本。", "Lumen is up to date."))
-            }
-            if let lastCheck = updates.lastUpdateCheckAt {
-                Text(model.t("上次检查：\(Self.checkDateFormatter.string(from: lastCheck))",
-                             "Last checked: \(Self.checkDateFormatter.string(from: lastCheck))"))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                .disabled(updates.busy)
+
+                if let error = updates.error {
+                    Text(model.t("更新失败：\(error)", "Update failed: \(error)"))
+                        .font(.system(size: 12))
+                        .foregroundStyle(SettingsTheme.red)
+                        .textSelection(.enabled)
+                } else if let release = updates.release {
+                    if !release.notes.isEmpty {
+                        LumenSettingsWell(padding: 10) {
+                            Text(release.notes)
+                                .font(.system(size: 12))
+                                .foregroundStyle(SettingsTheme.textSecondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                } else if updates.checked {
+                    Text(model.t("当前已是最新版本。", "Lumen is up to date."))
+                        .font(.system(size: 12))
+                        .foregroundStyle(SettingsTheme.green)
+                }
+
+                if let lastCheck = updates.lastUpdateCheckAt {
+                    Text(model.t("上次检查：\(Self.checkDateFormatter.string(from: lastCheck))",
+                                 "Last checked: \(Self.checkDateFormatter.string(from: lastCheck))"))
+                        .font(.system(size: 11))
+                        .foregroundStyle(SettingsTheme.textTertiary)
+                }
             }
         }
     }
@@ -1201,15 +1618,15 @@ private struct ShortcutKeycaps: View {
             ForEach(Array(tokens.enumerated()), id: \.offset) { _, token in
                 Text(token)
                     .font(.system(size: 11.5, weight: .medium))
-                    .foregroundStyle(.primary)
+                    .foregroundStyle(SettingsTheme.textPrimary)
                     .padding(.horizontal, 6.5)
                     .frame(minWidth: 23, minHeight: 22)
-                    .background(Color(nsColor: .controlColor), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .background(SettingsTheme.cardBackground, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                     .overlay {
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .strokeBorder(Color(nsColor: .separatorColor).opacity(0.6), lineWidth: 0.75)
+                            .strokeBorder(SettingsTheme.cardBorder, lineWidth: 0.9)
                     }
-                    .shadow(color: .black.opacity(0.08), radius: 0.5, y: 1)
+                    .shadow(color: .black.opacity(0.06), radius: 0.5, y: 1)
             }
         }
         .accessibilityElement(children: .ignore)
@@ -1232,14 +1649,22 @@ private struct NoticeView: View {
     let notice: LauncherNotice
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Label(model.title(for: notice), systemImage: "info.circle")
-            if !notice.detail.isEmpty {
-                DisclosureGroup(model.t("技术详情", "Technical Details")) {
-                    Text(notice.detail).font(.caption.monospaced()).textSelection(.enabled).lineLimit(5)
+        LumenSettingsWell(padding: 10) {
+            VStack(alignment: .leading, spacing: 4) {
+                Label(model.title(for: notice), systemImage: "info.circle")
+                    .foregroundStyle(SettingsTheme.amber)
+                if !notice.detail.isEmpty {
+                    DisclosureGroup(model.t("技术详情", "Technical Details")) {
+                        Text(notice.detail)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(SettingsTheme.textSecondary)
+                            .textSelection(.enabled)
+                            .lineLimit(5)
+                    }
                 }
             }
-        }.font(.callout)
+            .font(.system(size: 12))
+        }
     }
 }
 

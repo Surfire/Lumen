@@ -101,13 +101,14 @@ struct LauncherExternalVolumes: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .firstTextBaseline) {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 10) {
                 Text(launcher.t(
                     "选择要搜索的外置卷或网络共享（SMB、NFS、AFP、WebDAV）。Lumen 只索引文件名，文件有变化时可手动更新。",
                     "Choose an external volume or network share (SMB, NFS, AFP, WebDAV) to search. Lumen indexes file names. Refresh the index when files change."
                 ))
-                .foregroundStyle(.secondary)
+                .font(.system(size: 12))
+                .foregroundStyle(SettingsTheme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 8)
                 Button {
@@ -115,27 +116,48 @@ struct LauncherExternalVolumes: View {
                 } label: {
                     Label(launcher.t("刷新", "Refresh"), systemImage: "arrow.clockwise")
                 }
-                .controlSize(.small)
+                .buttonStyle(LumenSecondaryButtonStyle())
                 .disabled(catalog.refreshing || catalog.editing != nil)
                 .accessibilityIdentifier("settings.external-volumes.refresh")
             }
+
             if !canIndex {
                 Text(launcher.t("主索引就绪后可添加或更新外置卷。", "You can add or refresh volumes when the main index is ready."))
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 12))
+                    .foregroundStyle(SettingsTheme.textTertiary)
             }
             if catalog.failed {
                 Text(launcher.t("外置卷操作失败。请检查连接或系统授权，然后重试。", "The volume operation failed. Check the connection or system permissions and try again."))
-                    .foregroundStyle(.red)
+                    .font(.system(size: 12))
+                    .foregroundStyle(SettingsTheme.red)
             }
-            if catalog.volumes.isEmpty {
-                if catalog.refreshing {
-                    ProgressView().controlSize(.small)
+
+            LumenSettingsWell(padding: 10) {
+                if catalog.volumes.isEmpty {
+                    HStack(spacing: 8) {
+                        if catalog.refreshing {
+                            ProgressView().controlSize(.small)
+                            Text(launcher.t("正在扫描外置卷…", "Scanning volumes…"))
+                                .font(.system(size: 12))
+                                .foregroundStyle(SettingsTheme.textSecondary)
+                        } else {
+                            Image(systemName: "externaldrive.badge.questionmark")
+                                .foregroundStyle(SettingsTheme.textTertiary)
+                                .accessibilityHidden(true)
+                            Text(launcher.t("没有可用的外置卷或网络共享。", "No external volumes or network shares available."))
+                                .font(.system(size: 12))
+                                .foregroundStyle(SettingsTheme.textSecondary)
+                        }
+                    }
+                    .padding(.vertical, 4)
                 } else {
-                    Text(launcher.t("没有可用的外置卷或网络共享。", "No external volumes or network shares available."))
-                        .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(Array(catalog.volumes.enumerated()), id: \.element.id) { index, volume in
+                            if index > 0 { LumenSettingsHairline() }
+                            row(volume)
+                        }
+                    }
                 }
-            } else {
-                ForEach(catalog.volumes) { volume in row(volume) }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -144,35 +166,54 @@ struct LauncherExternalVolumes: View {
     private func row(_ volume: ExternalVolume) -> some View {
         HStack(spacing: 12) {
             Image(systemName: volume.isNetwork ? "externaldrive.connected.to.line.below" : "externaldrive")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(volume.indexed ? SettingsTheme.amber : SettingsTheme.textTertiary)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text(volume.name).lineLimit(1).truncationMode(.middle).help(volume.path)
+                    Text(volume.name)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(SettingsTheme.textPrimary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(volume.path)
                     if let badge = volume.protocolBadge {
                         Text(badge)
-                            .font(.caption2.weight(.semibold))
-                            .padding(.horizontal, 5).padding(.vertical, 1)
-                            .background(Color.secondary.opacity(0.15), in: Capsule())
-                            .foregroundStyle(.secondary)
+                            .font(.system(size: 10, weight: .semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1.5)
+                            .background(SettingsTheme.cardBackground, in: Capsule())
+                            .foregroundStyle(SettingsTheme.textSecondary)
                     }
                 }
-                Text(label(volume)).font(.caption).foregroundStyle(.secondary)
+                Text(label(volume))
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(statusColor(volume))
             }
-            Spacer()
+            Spacer(minLength: 8)
             if volume.available {
                 Button(volume.indexed || volume.needs_refresh ? launcher.t("更新", "Refresh") : launcher.t("添加索引", "Add Index")) {
                     catalog.index(volume, changed: changed)
                 }
+                .buttonStyle(LumenSecondaryButtonStyle())
                 .disabled(!canIndex || catalog.editing != nil || catalog.refreshing)
             }
             if volume.indexed || volume.needs_refresh {
                 Button(launcher.t("移除索引", "Remove Index")) {
                     catalog.forget(volume, changed: changed)
                 }
+                .buttonStyle(LumenSecondaryButtonStyle())
                 .disabled(catalog.editing != nil || catalog.refreshing)
             }
         }
+        .padding(.vertical, 2)
+    }
+
+    private func statusColor(_ volume: ExternalVolume) -> Color {
+        if catalog.editing == volume.id { return SettingsTheme.amber }
+        if !volume.available { return SettingsTheme.textTertiary }
+        if volume.indexed { return SettingsTheme.green }
+        if volume.needs_refresh { return SettingsTheme.amber }
+        return SettingsTheme.textSecondary
     }
 
     private func label(_ volume: ExternalVolume) -> String {

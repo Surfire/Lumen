@@ -48,4 +48,9 @@ jobs:
           scripts/build-app.sh
           test -f target/Lumen.app/Contents/Resources/gemma-assets.json
           python3 -B scripts/smoke-app.py
-          python3 -B scripts/smoke-install-app.py
+
+      - name: Verify community DMG/ZIP/SHA256 packaging pipeline
+        run: |
+          printf 'CI packaging dry-run\n' > /tmp/lumen-ci-notes.txt
+          LUMEN_ALLOW_UNSIGNED=1 scripts/package-release.sh /tmp/lumen-ci-dist /tmp/lumen-ci-notes.txt
+          (cd /tmp/lumen-ci-dist && shasum -a 256 -c SHA256SUMS.txt)

@@ -11,7 +11,7 @@
 <p align="center">
   <strong>一个快捷键，秒找全盘文件、打开应用、直达系统设置与文档答案。</strong><br>
   Rust 零倒排 SoA + AArch64 NEON 原生检索引擎，搭配 SwiftUI / AppKit 极简交互。<br>
-  支持全盘文件名与拼音毫秒查找、PDF 匹配页视觉直达、EmbeddingGemma 本地语义搜索，以及不唤醒云端占位文件的安全边界。
+  支持全盘文件名与拼音毫秒查找、PDF 匹配页视觉直达、统一多模态语义检索、SMB/NFS 网络共享发现、智能分屏，以及零误唤醒云盘保护边界。
 </p>
 
 <p align="center">
@@ -36,7 +36,8 @@
 | `蓝牙` / `25 km in mi` | 无需等待文件索引，直接跳转系统设置或本地实时计算/单位换算 |
 | `tr:en 会议改期了` | 同一输入框流式翻译，回车一键复制结果（支持本机 oMLX 与 OpenAI 兼容服务） |
 | `qa 如何整理周报结构` | 本机提问大模型，按 `Esc` 立即取消，不联网抓取、不附带本地文件 |
-| `img 帆船` | 基于本地视觉模型按画面语义搜图，全过程零数据上传 |
+| `img 帆船` | 基于本地多模态模型按画面与文档语义搜索，全过程零数据上传 |
+| `?` / `win` | 浏览内置命令与辅助功能窗口管理（竖屏上/中/下分屏、一键智能平铺与批量恢复） |
 
 ---
 
@@ -72,16 +73,14 @@
 
 - **全盘文件名约 1 ms 极速响应，百万级常驻仅 ~145 MiB**
   在单一轻量核心中采用紧凑结构体数组（SoA）与 **AArch64 NEON SIMD** 并行扫描架构，放弃冗重的内存倒排表，且文本检索通道不再重复持有名称索引。实测在 **166.7 万条真实磁盘文件** 下，全盘名称、拼音与路径热查询稳定在 **0.79–1.75 ms**，常驻内存约 **144.7 MiB**。
-- **语义与全文命中直达页内，不再只看几行冷冰冰的摘录**
-  对 TXT、Markdown、DOCX（正文与表格）及原生 PDF 文本层建立按需本地索引；PDF 命中结果时直接跳转到对应的页码并在原页面上用琥珀色高亮匹配位置。内联预览默认 **先看画面、再看上下文**，不打断当前搜索会话焦点。
-- **自适应比例的原生 Quick Look 悬浮窗**
-  浏览结果时按 **`空格`**（打字时空格保持正常输入）或按 **`⌘Y`** 打开独立预览窗：自动识别 PDF CropBox 与页面旋转角度、图片真实像素与 EXIF 方向、文档/视频/音频等扩展类型比例，避免所有文件千篇一律挤进固定方块。
-- **严格克制的本地 EmbeddingGemma 语义 & 搜图**
-  选配本机 EmbeddingGemma 模型后，可在完全离线环境下按自然语言找文档与图片（`img ...`，支持 PNG/JPEG 及离线图像检索流水线）。语义排序经过相关性校准：无关噪音词返回 0 条虚假相似项，高相关文档再附带原页跳转；纯文件名检索完全不依赖模型。
-- **默认零误触发云端下载的网盘保护边界**
-  底层检索、预览和诊断统一强制启用 `IOPOL_VFS_MATERIALIZE_DATALESS_FILES_OFF`、`SF_DATALESS` 检查与 `O_NOFOLLOW_ANY`。已识别的 iCloud Drive、OneDrive 与 File Provider 目录仅记录系统可见元数据，**绝不因为扫描或预览偷偷下载只存在云端的文件**。
-- **一把称手的日常 macOS 效率中枢**
-  同一个窗口整合：应用与系统设置模糊启动、常用项目固定（空查询即可见）、数学计算与单位换算、快捷链接（`g` 默认开启；`gh`/`wiki`/`map` 及自定义 HTTPS 别名按需开启）、需主动开启的私密剪贴板历史、本地脚本与 Apple 快捷指令、基于 macOS 辅助功能的窗口排版，以及 `tr` / `qa` 流式问答与翻译。
+- **语义与全文命中直达页内，空格与 `⌘Y` 体验一致**
+  对 TXT、Markdown、DOCX（正文与表格）及原生 PDF 文本层建立按需本地索引；PDF 命中结果直接跳转到对应页码并用琥珀色高亮匹配位置。浏览列表时按 **`空格`**（内联）或 **`⌘Y`**（自适应比例 Quick Look 悬浮窗）共享统一本地与云盘按需下载边界，同步展示进度环并支持 `Esc` 随时取消。
+- **统一多模态语义检索、智能过滤与一键下载 Gemma**
+  将文档与图片目录收口为统一的「语义与内容索引」配置：支持批量 EmbeddingGemma 推理加速、预扫目录分布、默认跳过构建产物（如 `node_modules`/`target`/`dist`/锁文件）且默认关闭源码，并提供内置 SHA-256 校验的 **HuggingFace / HF-Mirror 一键下载** 与本地离线导入。
+- **物理外置盘与 SMB / NFS 网络共享 + 云盘零误下载**
+  底层检索与诊断强制启用线程级 `IOPOL_VFS_MATERIALIZE_DATALESS_FILES_OFF` 与 `SF_DATALESS` 隔离（绝不误下载 iCloud/OneDrive 云端占位文件）；同时拆分物理外置盘与 SMB/NFS 网络共享状态管理（基于脱敏来源识别 NAS 挂载、绝不保存密码凭证，预览锚定内核 `f_fstypename` 白名单）。
+- **原生日常效率中枢与智能分屏**
+  同一个窗口整合：应用与系统设置启动、常用项目固定、数学计算与单位换算、快捷链接、带图像/文件/颜色预览的私密剪贴板历史、浅色/深色/跟随系统外观、本地脚本与 Apple 快捷指令、支持横/竖屏与智能自动平铺的窗口管理（`?` 可直接浏览），以及 `tr` / `qa` 流式翻译问答。
 
 ---
 
@@ -153,6 +152,15 @@
 
 ## 快速上手与安装
 
+### 直接下载安装（推荐种子用户）
+
+需要 **Apple Silicon Mac** 与 **macOS 14+**。前往 [GitHub Releases](https://github.com/Surfire/Lumen/releases/latest) 下载 **`Lumen-macos-arm64.dmg`**（或 `.zip`），可选先通过 `shasum -a 256 -c SHA256SUMS.txt` 校验摘要，随后将 `Lumen.app` 拖入 `/Applications`。
+
+> 若使用 GitHub Actions 产出的社区无公证版本（Path B）且首次打开遇到系统拦截提示，只需在终端执行一次：
+> ```sh
+> xattr -dr com.apple.quarantine /Applications/Lumen.app
+> ```
+
 ### 从源码构建
 
 需要 **Apple Silicon Mac**、**macOS 14+**、Xcode 命令行工具与 Rust 工具链：
@@ -162,7 +170,7 @@ scripts/build-app.sh
 open target/Lumen.app
 ```
 
-上述命令生成临时签名（ad-hoc）开发版；日常安装推荐使用命名本地签名身份以保留磁盘权限，并在升级时使用 `install-app.py` 原子替换：
+上述命令生成临时签名（ad-hoc）开发版；日常本机自用推荐绑定命名本地签名身份以保留磁盘与辅助功能授权，并使用 `install-app.py` 原子替换升级：
 
 ```sh
 LUMEN_SIGN_IDENTITY="Lumen Local Code Signing" scripts/build-app.sh
@@ -170,18 +178,16 @@ python3 scripts/install-app.py install target/Lumen.app
 open -a "$HOME/Applications/Lumen.app"
 ```
 
-更多细节、回滚与证书迁移见：[本机签名、安装和回滚](docs/UPGRADING.md)。
+### 自动检查更新与 Homebrew
 
-### 签名发布与 Homebrew
-
-- **应用内签名更新**：对于使用正式发布证书签名并安装在可写「应用程序」目录中的副本，可在 **「设置 → 高级与诊断 → 检查更新」** 手动触发更新；Lumen 会校验清单签名、ZIP 校验和与应用代码签名后再原位替换并备份旧版。
-- **Homebrew**：通过 Homebrew tap 安装的用户可直接执行 `brew upgrade --cask lumen`。普通卸载保留索引与配置；`--zap` 会一并清理偏好设置、脚本与剪贴板历史。
+- **24 小时自动检查更新与自升级**：在 **「设置 → 高级与诊断」** 与状态栏菜单中提供开关与检查入口。使用正式证书签名的版本支持校验 CMS 清单签名、ZIP SHA-256 与应用签名后一键 **「安装并重启」**（失败自动回滚备份）；无公证社区版则会弹窗跳转 Release 下载页，不绕过签名校验。
+- **Homebrew & 发布流程**：模板位于 [`packaging/homebrew/Casks/lumen.rb`](packaging/homebrew/Casks/lumen.rb)（升级 `brew upgrade --cask lumen`；卸载加 `--zap` 清理配置）。发版、签名切换（Path B → Path A）详见：[发布与分发指南](docs/RELEASING.md) · [本机签名、安装和回滚](docs/UPGRADING.md)。
 
 ---
 
 ## 开发、架构与完整回归
 
-[架构文档](docs/ARCHITECTURE.md) · [兼容范围](docs/COMPATIBILITY.md) · [版本变更](CHANGELOG.md) · [第三方依赖](THIRD_PARTY.md)
+[架构文档](docs/ARCHITECTURE.md) · [兼容范围](docs/COMPATIBILITY.md) · [发布指南](docs/RELEASING.md) · [版本变更](CHANGELOG.md) · [第三方依赖](THIRD_PARTY.md)
 
 <details>
 <summary>构建、代码检查与全套自动化验收命令</summary>

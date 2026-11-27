@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Verify Rust formatting, lints, and tests
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+
+      - name: Verify shell and Python scripts
+        run: |
+          sh -n scripts/build-app.sh scripts/package-release.sh
+          python3 -B -m py_compile scripts/*.py
+
+      - name: Build release app bundle and run headless smoke
+        run: |
+          scripts/build-app.sh
+          test -f target/Lumen.app/Contents/Resources/gemma-assets.json
+          python3 -B scripts/smoke-app.py
+          python3 -B scripts/smoke-install-app.py

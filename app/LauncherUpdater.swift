@@ -1,10 +1,11 @@
+import AppKit
 import Combine
 import CryptoKit
 import Darwin
 import Foundation
 import Security
 
-struct LumenRelease: Decodable {
+struct LumenRelease: Decodable, Equatable {
     let version: String
     let build: String
     let url: URL
@@ -19,11 +20,15 @@ private struct UpdateError: LocalizedError {
 
 final class LauncherUpdater: Sendable {
     private static let feed = URL(string: "https://github.com/Surfire/Lumen/releases/latest/download/lumen-update.json.cms")!
+    private static let adHocFeed = URL(string: "https://github.com/Surfire/Lumen/releases/latest/download/lumen-update.json")!
+    private static let manifestByteLimit = 256 * 1024
     private static let validation = SecCSFlags(rawValue: kSecCSCheckAllArchitectures | kSecCSCheckNestedCode | kSecCSStrictValidate)
     private let feed: URL
     private let session: URLSession
     private let transport: UpdateTransport
     private let bundle: URL
+
+    var bundleURL: URL { bundle }
 
     private init(feed: URL, loopbackOnly: Bool) {
         self.feed = feed
@@ -47,17 +52,53 @@ final class LauncherUpdater: Sendable {
 
     deinit { session.finishTasksAndInvalidate() }
 
+    func isReleaseSigned() -> Bool {
+        (try? runningIdentity()) != nil
+    }
+
     func check() async throws -> LumenRelease? {
         let (_, certificate) = try runningIdentity()
-        let file = try await download(feed)
-        defer { try? FileManager.default.removeItem(at: file) }
-        let input = try FileHandle(forReadingFrom: file)
-        defer { try? input.close() }
-        let limit = 256 * 1024
-        guard let cms = try input.read(upToCount: limit + 1), cms.count <= limit else {
-            throw UpdateError("Invalid release manifest size.")
+        let cms = try await downloadBytes(feed, limit: Self.manifestByteLimit, message: "Invalid release manifest size.")
+        return try Self.parseAndCompareManifest(Self.signedContent(cms, certificate), transport: transport)
+    }
+
+    func checkAdHoc() async throws -> LumenRelease? {
+        let payload = try await downloadBytes(Self.adHocFeed, limit: Self.manifestByteLimit, message: "Invalid release manifest size.")
+        return try Self.parseAndCompareManifest(payload, transport: transport)
+    }
+
+    nonisolated static func releasePageURL(for release: LumenRelease?) -> URL {
+        if let release {
+            return URL(string: "https://github.com/Surfire/Lumen/releases/tag/v\(release.version)")
+                ?? URL(string: "https://github.com/Surfire/Lumen/releases/latest")!
         }
-        let release = try JSONDecoder().decode(LumenRelease.self, from: Self.signedContent(cms, certificate))
+        return URL(string: "https://github.com/Surfire/Lumen/releases/latest")!
+    }
+
+    @MainActor
+    static func relaunchBundle(at bundleURL: URL) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [
+            "-c",
+            "i=0; while kill -0 \"$1\" 2>/dev/null && [ \"$i\" -lt 50 ]; do /bin/sleep 0.1; i=$((i+1)); done; /usr/bin/open \"$2\"",
+            "_",
+            String(ProcessInfo.processInfo.processIdentifier),
+            bundleURL.path,
+        ]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            NSApp.terminate(nil)
+        } catch {
+            // Preserve the running process if spawning the helper fails.
+        }
+    }
+
+    private static func parseAndCompareManifest(_ data: Data, transport: UpdateTransport) throws -> LumenRelease? {
+        let release = try JSONDecoder().decode(LumenRelease.self, from: data)
         let current = Bundle.main.infoDictionary ?? [:]
         guard let oldVersion = current["CFBundleShortVersionString"] as? String,
               let oldBuild = current["CFBundleVersion"] as? String,
@@ -68,6 +109,17 @@ final class LauncherUpdater: Sendable {
               }), release.sha256.range(of: #"\A[0-9a-fA-F]{64}\z"#, options: .regularExpression) != nil,
               transport.allows(release.url) else { throw UpdateError("Invalid release manifest.") }
         return b > a && release.version.compare(oldVersion, options: .numeric) != .orderedAscending ? release : nil
+    }
+
+    private func downloadBytes(_ url: URL, limit: Int, message: String) async throws -> Data {
+        let file = try await download(url)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let input = try FileHandle(forReadingFrom: file)
+        defer { try? input.close() }
+        guard let bytes = try input.read(upToCount: limit + 1), bytes.count <= limit else {
+            throw UpdateError(message)
+        }
+        return bytes
     }
 
     #if LUMEN_SMOKE
@@ -249,35 +301,141 @@ final class UpdateTransport: NSObject, URLSessionTaskDelegate {
 
 @MainActor
 final class UpdateSettings: ObservableObject {
+    static let checkInterval: TimeInterval = 24 * 60 * 60
+    private static let autoCheckKey = "updates.autoCheck.v1"
+    private static let lastCheckKey = "updates.lastCheckAt.v1"
+    private nonisolated static let defaultPollInterval: Duration = .seconds(6 * 60 * 60)
+
+    @Published var autoCheckUpdates: Bool {
+        didSet {
+            defaults.set(autoCheckUpdates, forKey: Self.autoCheckKey)
+            if !autoCheckUpdates {
+                autoCheckTask?.cancel()
+                autoCheckTask = nil
+            } else if autoChecksStarted, autoCheckTask == nil {
+                scheduleAutoChecks(initialDelay: .seconds(30), pollInterval: activePollInterval)
+            }
+        }
+    }
+    @Published private(set) var lastUpdateCheckAt: Date?
     @Published private(set) var release: LumenRelease?
     @Published private(set) var busy = false
     @Published private(set) var checked = false
     @Published private(set) var error: String?
     @Published private(set) var backup: URL?
-    private let updater = LauncherUpdater()
+    let canInstallInPlace: Bool
 
-    func check() {
-        run {
-            self.release = nil
-            self.checked = false
-            self.release = try await self.updater.check()
-            self.checked = true
+    private let defaults: UserDefaults
+    private let updater: LauncherUpdater
+    private let relaunch: @MainActor (URL) -> Void
+    private var activeTask: Task<Void, Never>?
+    private var autoCheckTask: Task<Void, Never>?
+    private var autoChecksStarted = false
+    private var activePollInterval: Duration = defaultPollInterval
+
+    init(defaults: UserDefaults = .standard,
+         updater: LauncherUpdater = LauncherUpdater(),
+         relaunch: @escaping @MainActor (URL) -> Void = { LauncherUpdater.relaunchBundle(at: $0) }) {
+        self.defaults = defaults
+        self.updater = updater
+        self.relaunch = relaunch
+        self.canInstallInPlace = updater.isReleaseSigned()
+        self.autoCheckUpdates = defaults.object(forKey: Self.autoCheckKey) as? Bool ?? true
+        if let timestamp = defaults.object(forKey: Self.lastCheckKey) as? Double {
+            self.lastUpdateCheckAt = Date(timeIntervalSince1970: timestamp)
         }
     }
 
-    func install() {
-        guard let release else { return }
-        run { self.backup = try await self.updater.install(release) }
+    deinit {
+        autoCheckTask?.cancel()
+        activeTask?.cancel()
     }
 
-    private func run(_ action: @escaping () async throws -> Void) {
+    func shouldAutoCheck(now: Date = Date()) -> Bool {
+        guard autoCheckUpdates else { return false }
+        guard let lastUpdateCheckAt else { return true }
+        return now.timeIntervalSince(lastUpdateCheckAt) >= Self.checkInterval
+    }
+
+    func startAutomaticChecks(initialDelay: Duration = .seconds(30),
+                              pollInterval: Duration = defaultPollInterval) {
+        guard !autoChecksStarted else { return }
+        autoChecksStarted = true
+        activePollInterval = pollInterval
+        guard autoCheckUpdates else { return }
+        scheduleAutoChecks(initialDelay: initialDelay, pollInterval: pollInterval)
+    }
+
+    func check() {
+        run(userInitiated: true) {
+            try await self.performCheck()
+        }
+    }
+
+    func checkIfIdle() {
+        guard !busy, backup == nil, release == nil else { return }
+        check()
+    }
+
+    func install() {
+        installAndRelaunch()
+    }
+
+    func installAndRelaunch() {
+        guard canInstallInPlace, let release else { return }
+        run(userInitiated: true) {
+            let previous = try await self.updater.install(release)
+            self.backup = previous
+            self.relaunch(self.updater.bundleURL)
+        }
+    }
+
+    func openReleasePage() {
+        NSWorkspace.shared.open(LauncherUpdater.releasePageURL(for: release))
+    }
+
+    func waitForIdle() async {
+        await activeTask?.value
+    }
+
+    private func scheduleAutoChecks(initialDelay: Duration, pollInterval: Duration) {
+        autoCheckTask?.cancel()
+        autoCheckTask = Task { [weak self] in
+            do { try await Task.sleep(for: initialDelay) } catch { return }
+            while !Task.isCancelled {
+                guard let self else { return }
+                if self.shouldAutoCheck(), !self.busy, self.backup == nil {
+                    self.run(userInitiated: false) {
+                        try await self.performCheck()
+                    }
+                    await self.activeTask?.value
+                }
+                do { try await Task.sleep(for: pollInterval) } catch { return }
+            }
+        }
+    }
+
+    private func performCheck() async throws {
+        self.release = nil
+        self.checked = false
+        let found = canInstallInPlace ? try await updater.check() : try await updater.checkAdHoc()
+        self.release = found
+        self.checked = true
+        let now = Date()
+        self.lastUpdateCheckAt = now
+        self.defaults.set(now.timeIntervalSince1970, forKey: Self.lastCheckKey)
+    }
+
+    private func run(userInitiated: Bool, _ action: @escaping @MainActor () async throws -> Void) {
         guard !busy, backup == nil else { return }
         busy = true
-        error = nil
-        Task {
+        if userInitiated { error = nil }
+        activeTask = Task { @MainActor in
             defer { busy = false }
             do { try await action() }
-            catch { self.error = error.localizedDescription }
+            catch {
+                if userInitiated { self.error = error.localizedDescription }
+            }
         }
     }
 }

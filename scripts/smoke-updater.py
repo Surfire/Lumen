@@ -102,7 +102,7 @@ def exercise(work, keychain, password):
             result, output = run(app, 'good' if case.startswith('good') else case, *options)
             assert expected in output, (case, result, output)
             backups = list(app.parent.glob('.Lumen-backup-*'))
-            if case == 'good':
+            if case in ('good', 'good-relaunch'):
                 assert result == 0 and info(app)['CFBundleVersion'] == '21', output
                 [backup] = backups
                 previous = backup / 'Lumen.app'
@@ -117,6 +117,7 @@ def exercise(work, keychain, password):
 
         try:
             transaction('good', 'Installed 0.5.0 (build 21)')
+            transaction('good-relaunch', 'relaunched:', 'relaunch-hook')
             transaction('bad-digest', 'SHA-256 does not match')
             transaction('bad-app-signer', "does not satisfy this installation's signing requirement")
             transaction('bad-feed-signer', "manifest's signature does not match")

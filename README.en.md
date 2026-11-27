@@ -11,7 +11,7 @@
 <p align="center">
   <strong>Find files, launch apps, jump to System Settings, and preview exact answers inside documents from one shortcut.</strong><br>
   Powered by a compact zero-posting SoA + AArch64 NEON Rust engine and a native AppKit / SwiftUI interface.<br>
-  Combines millisecond disk-wide filename &amp; pinyin search, matched-page PDF highlighting, offline EmbeddingGemma retrieval, and strict zero-download cloud boundaries.
+  Combines millisecond disk-wide filename &amp; pinyin search, matched-page PDF highlighting, unified multimodal Gemma retrieval, SMB/NFS share indexing, smart window tiling, and zero-download cloud boundaries.
 </p>
 
 <p align="center">
@@ -36,7 +36,8 @@
 | `Bluetooth` / `25 km in mi` | Jump straight to System Settings or convert units locally—no file index required |
 | `tr:zh Meeting postponed` | Streams translation inside the launcher (`Return` copies output; supports local oMLX or OpenAI-compatible endpoints) |
 | `qa How to structure a review?` | Sends only your explicit prompt to the selected model; `Esc` cancels cleanly with no web or file leakage |
-| `img sailboat` | Searches indexed local photos semantically using on-device vision embeddings |
+| `img sailboat` | Searches indexed local photos and documents semantically with on-device multimodal embeddings |
+| `?` / `win` | Browse all built-in commands & Accessibility window tiling (portrait thirds, smart auto-tile, batch restore) |
 
 ---
 
@@ -72,16 +73,14 @@
 
 - **~1 ms Disk-Wide Filename Search in ~145 MiB Resident RAM**
   Instead of duplicating large inverted posting tables across search lanes, Lumen runs one compact structure-of-arrays (SoA) table scanned in parallel with **AArch64 NEON SIMD**. On a real Apple Silicon index of **1,667,692 disk items**, warm name, pinyin, and path queries finish in **0.79–1.75 ms** inside a **144.7 MiB** resident worker.
-- **Visual-First Document Preview That Jumps to the Matched Page**
-  Lumen extracts local TXT, Markdown, DOCX paragraphs/tables, and native PDF text layers on demand. For PDF hits, both inline preview and the Quick Look window jump directly to the matched page (`Match on page N`) and highlight matching terms in translucent amber—keeping visuals first without stealing search focus.
-- **Content-Proportional Quick Look Windows**
-  `LocalPreviewPanel` adapts its geometry to the inspected item: PDF CropBox & page rotation, image pixel dimensions & EXIF orientation, wide spreadsheets/decks, upright documents/code, video, or audio—instead of forcing every file into a rigid box.
-- **Calibrated Local EmbeddingGemma Semantic & Image Search**
-  With optional locally staged weights, EmbeddingGemma finds related documents cleanly while strict relevance calibration suppresses unrelated noise to **0 false hits**. Local visual search (`img ...`) covers PNG and JPEG (plus HEIC/WebP and opt-in on-device Apple Vision OCR pipelines). Name search needs zero AI models.
-- **Cloud-Safe Zero-Download Guarantee**
-  Every scan, preview, and diagnostic call runs under thread-scoped `IOPOL_VFS_MATERIALIZE_DATALESS_FILES_OFF`, `SF_DATALESS` checks, and `O_NOFOLLOW_ANY`. Recognized iCloud Drive, OneDrive, and File Provider placeholders index visible filenames safely without ever downloading online-only files.
-- **Unified Native macOS Workflow**
-  Pin favorites for empty-query recall, convert units/math, trigger `g` / `gh` / `wiki` / `map` or custom HTTPS quicklinks, browse opt-in private clipboard history, run local scripts & Apple Shortcuts, manage windows via macOS Accessibility, and stream `tr` / `qa` responses.
+- **Visual-First Document Preview With Unified Space & `⌘Y`**
+  Lumen extracts local TXT, Markdown, DOCX paragraphs/tables, and native PDF text layers on demand. PDF hits jump straight to the matched page with amber passage highlights. Both **`Space`** (inline preview while browsing) and **`⌘Y`** (content-proportional Quick Look window) share one cloud-safe hydration path with progress indication and `Esc` cancellation.
+- **Unified Multimodal Semantic Index, Smart Filters & 1-Click Gemma Downloader**
+  Documents and images share a unified **Semantic & Content Index** setup with batched EmbeddingGemma inference, pre-Apply folder breakdowns, default build-noise skipping (`node_modules`, `target`, `dist`, lockfiles), code files off by default, and a 1-click SHA-256 verified downloader (**HuggingFace / HF-Mirror**) plus local file import.
+- **Physical External Drives, SMB / NFS Shares & Cloud-Safe Boundaries**
+  Every scan, preview, and diagnostic call enforces thread-scoped `IOPOL_VFS_MATERIALIZE_DATALESS_FILES_OFF` and `SF_DATALESS` checks so iCloud/OneDrive placeholders never auto-download. Physical drives and SMB/NFS network shares are cleanly separated (credential-free deterministic mount identities and kernel `f_fstypename`-anchored preview checks).
+- **Unified Native macOS Workflow & Smart Window Tiling**
+  Pin favorites, calculate/convert units, trigger quicklinks, browse rich clipboard history (images, files, URLs, colors), switch Light / Dark / System appearance, run scripts & Shortcuts, auto-tile or position windows across portrait and landscape screens (discoverable via `?`), and stream `tr` / `qa` answers.
 
 ---
 
@@ -153,6 +152,15 @@ Scanning 1,000,000 synthetic files took **45,503.66 ms**, warm `lumen serve` use
 
 ## Quick Start & Installation
 
+### Direct Download (Recommended for Early Testers)
+
+Requires an **Apple Silicon Mac** and **macOS 14+**. Download **`Lumen-macos-arm64.dmg`** (or `.zip`) from [GitHub Releases](https://github.com/Surfire/Lumen/releases/latest), optionally verify via `shasum -a 256 -c SHA256SUMS.txt`, and drag `Lumen.app` to `/Applications`.
+
+> For community ad-hoc GitHub Actions builds (Path B without Apple notarization), run once in Terminal if macOS Gatekeeper blocks first launch:
+> ```sh
+> xattr -dr com.apple.quarantine /Applications/Lumen.app
+> ```
+
 ### Build from Source
 
 Requires an **Apple Silicon Mac**, **macOS 14+**, Xcode Command Line Tools, and Rust:
@@ -170,18 +178,16 @@ python3 scripts/install-app.py install target/Lumen.app
 open -a "$HOME/Applications/Lumen.app"
 ```
 
-See [docs/UPGRADING.md](docs/UPGRADING.md) for local signing, installation, and rollback details.
+### Automatic Update Checks & Homebrew
 
-### Signed Releases & Homebrew
-
-- **In-app updates**: Release-signed builds installed in a writable Applications folder support manual checks under **Settings → Advanced & Diagnostics → Check for Updates**, verifying release manifest signature, ZIP SHA-256, and app signature before replacing in place with backup rollback.
-- **Homebrew**: Upgrade via `brew upgrade --cask lumen`. Normal uninstall keeps user data; `--zap` removes preferences, scripts, and clipboard history.
+- **24-hour Auto-Check & Install & Relaunch**: Available in the status menu and **Settings → Advanced & Diagnostics**. Release-signed builds verify CMS manifest signature, ZIP SHA-256, and code signature before atomic swap + automatic relaunch (with backup rollback); ad-hoc community builds prompt and open the release download page without unsigned self-replacement.
+- **Homebrew & Releasing**: Cask template at [`packaging/homebrew/Casks/lumen.rb`](packaging/homebrew/Casks/lumen.rb) (`brew upgrade --cask lumen`; `--zap` wipes preferences and history). See [docs/RELEASING.md](docs/RELEASING.md) and [docs/UPGRADING.md](docs/UPGRADING.md).
 
 ---
 
 ## Development & Verification
 
-[Architecture](docs/ARCHITECTURE.md) · [Compatibility](docs/COMPATIBILITY.md) · [Changelog](CHANGELOG.md) · [Third-Party Dependencies](THIRD_PARTY.md)
+[Architecture](docs/ARCHITECTURE.md) · [Compatibility](docs/COMPATIBILITY.md) · [Releasing](docs/RELEASING.md) · [Changelog](CHANGELOG.md) · [Third-Party Dependencies](THIRD_PARTY.md)
 
 <details>
 <summary>Build, lint, unit, and smoke verification gates</summary>

@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.5.1)'
+        required: true
+        type: string
+      release_notes:
+        description: 'Optional release summary line'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-
+
+      - name: Run core verification gates
+        run: |
+          cargo test --locked
+          scripts/build-app.sh
+          python3 -B scripts/smoke-app.py
+
+      - name: Prepare release notes and signing mode
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_NOTES: ${{ inputs.release_notes }}
+          HAS_CERT: ${{ secrets.APPLE_CERT_P12_BASE64 != '' }}
+          HAS_PASS: ${{ secrets.APPLE_CERT_PASSWORD != '' }}
+          HAS_ID: ${{ secrets.LUMEN_SIGN_IDENTITY != '' }}
+          HAS_MANIFEST_KEY: ${{ secrets.LUMEN_MANIFEST_KEY_PEM != '' }}
+        run: |
+          TAG="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [ -n "$INPUT_NOTES" ]; then
+            printf '%s\n' "$INPUT_NOTES" > /tmp/lumen-notes.txt
+          else
+            printf 'Lumen %s (Apple Silicon / macOS 14+)\n' "$TAG" > /tmp/lumen-notes.txt
+          fi
+          if [ "$HAS_CERT" = "true" ] && [ "$HAS_PASS" = "true" ] && [ "$HAS_ID" = "true" ] && [ "$HAS_MANIFEST_KEY" = "true" ]; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Import Developer ID certificate and setup notarytool (Path A)
+        if: steps.meta.outputs.signed == 'true'
+        env:
+          CERT_B64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          CERT_PASS: ${{ secrets.APPLE_CERT_PASSWORD }}
+          MANIFEST_KEY_PEM: ${{ secrets.LUMEN_MANIFEST_KEY_PEM }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+        run: |
+          RUNNER_TEMP_CLEAN="${RUNNER_TEMP:-/tmp}"
+          KEYCHAIN="$RUNNER_TEMP_CLEAN/lumen-signing.keychain-db"
+          KC_PASS="$(openssl rand -hex 16)"
+          printf '%s' "$CERT_B64" | base64 --decode > "$RUNNER_TEMP_CLEAN/cert.p12"
+          printf '%s\n' "$MANIFEST_KEY_PEM" > "$RUNNER_TEMP_CLEAN/manifest-key.pem"
+          chmod 600 "$RUNNER_TEMP_CLEAN/cert.p12" "$RUNNER_TEMP_CLEAN/manifest-key.pem"
+          security create-keychain -p "$KC_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KC_PASS" "$KEYCHAIN"
+          security import "$RUNNER_TEMP_CLEAN/cert.p12" -P "$CERT_PASS" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KC_PASS" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"' | tr '\n' ' ')
+          echo "LUMEN_SIGN_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          echo "LUMEN_MANIFEST_KEY=$RUNNER_TEMP_CLEAN/manifest-key.pem" >> "$GITHUB_ENV"
+          if [ -n "$NOTARY_KEY_ID" ] && [ -n "$NOTARY_ISSUER_ID" ] && [ -n "$NOTARY_KEY_P8" ]; then
+            printf '%s\n' "$NOTARY_KEY_P8" > "$RUNNER_TEMP_CLEAN/notary.p8"
+            chmod 600 "$RUNNER_TEMP_CLEAN/notary.p8"
+            xcrun notarytool store-credentials "lumen-notary" \
+              --key "$RUNNER_TEMP_CLEAN/notary.p8" \
+              --key-id "$NOTARY_KEY_ID" \
+              --issuer "$NOTARY_ISSUER_ID" \
+              --keychain "$KEYCHAIN"
+            echo "LUMEN_NOTARY_PROFILE=lumen-notary" >> "$GITHUB_ENV"
+          fi
+
+      - name: Package release artifacts
+        env:
+          LUMEN_SIGN_IDENTITY: ${{ secrets.LUMEN_SIGN_IDENTITY }}
+        run: |
+          if [ "${{ steps.meta.outputs.signed }}" = "true" ]; then
+            scripts/package-release.sh dist /tmp/lumen-notes.txt
+          else
+            LUMEN_ALLOW_UNSIGNED=1 scripts/package-release.sh dist /tmp/lumen-notes.txt
+          fi
+          (cd dist && shasum -a 256 -c SHA256SUMS.txt)
+          ls -lh dist
+
+      - name: Cleanup temporary signing material
+        if: always() && steps.meta.outputs.signed == 'true'
+        run: |
+          RUNNER_TEMP_CLEAN="${RUNNER_TEMP:-/tmp}"
+          security delete-keychain "$RUNNER_TEMP_CLEAN/lumen-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP_CLEAN/cert.p12" "$RUNNER_TEMP_CLEAN/manifest-key.pem" "$RUNNER_TEMP_CLEAN/notary.p8"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          SIGNED: ${{ steps.meta.outputs.signed }}
+        run: |
+          cat > /tmp/release-body.md <<'BODY'
+          ### Lumen Release (${TAG})
+          - **Requirements**: Apple Silicon Mac (`arm64`), macOS 14+
+          BODY
+          if [ "$SIGNED" != "true" ]; then
+            cat >> /tmp/release-body.md <<'BODY'
+
+          > **First-launch note (Community ad-hoc build)**:
+          > Open Terminal once after dragging `Lumen.app` to `/Applications`:
+          > ```sh
+          > xattr -dr com.apple.quarantine /Applications/Lumen.app
+          > ```
+          BODY
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "Lumen $TAG" --notes-file /tmp/release-body.md
+          fi

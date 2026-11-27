@@ -150,7 +150,8 @@ final class LauncherSmoke {
         guard args.first == "--updater-smoke" else { return }
         let bundle = Bundle.main.bundleURL.resolvingSymlinksInPath()
         let temp = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().path
-        guard (2...3).contains(args.count), args.count == 2 || args[2] == "fail-after-swap",
+        guard (2...3).contains(args.count),
+              args.count == 2 || args[2] == "fail-after-swap" || args[2] == "relaunch-hook",
               bundle.path.hasPrefix(temp + "/"), bundle.lastPathComponent == "Lumen.app",
               bundle.deletingLastPathComponent().lastPathComponent == "Applications",
               let feed = URL(string: args[1]) else {
@@ -168,6 +169,15 @@ final class LauncherSmoke {
                     throw Failure("Incorrect updater URL policy")
                 }
                 let updater = LauncherUpdater(smokeFeed: feed)
+                if args.count == 3, args[2] == "relaunch-hook" {
+                    let suite = "io.github.surfire.lumen.updater-smoke.\(UUID().uuidString)"
+                    guard let defaults = UserDefaults(suiteName: suite) else {
+                        throw Failure("Failed to create isolated UserDefaults suite")
+                    }
+                    defer { defaults.removePersistentDomain(forName: suite) }
+                    try await verifyUpdateSettingsFlow(updater: updater, defaults: defaults)
+                    exit(0)
+                }
                 if let release = try await updater.check() {
                     let backup = try await updater.install(release, smokeFailAfterSwap: args.count == 3)
                     print("Installed \(release.version) (build \(release.build)); backup: \(backup.path)")
@@ -179,6 +189,47 @@ final class LauncherSmoke {
             }
         }
         dispatchMain()
+    }
+
+    @MainActor
+    private static func verifyUpdateSettingsFlow(updater: LauncherUpdater, defaults: UserDefaults) async throws {
+        var relaunched: URL?
+        let settings = UpdateSettings(defaults: defaults, updater: updater) { relaunched = $0 }
+        guard settings.canInstallInPlace, settings.autoCheckUpdates, settings.shouldAutoCheck() else {
+            throw Failure("Unexpected initial UpdateSettings state")
+        }
+        settings.autoCheckUpdates = false
+        let disabled = UpdateSettings(defaults: defaults, updater: updater) { _ in }
+        guard !disabled.autoCheckUpdates, !disabled.shouldAutoCheck() else {
+            throw Failure("autoCheckUpdates=false was not persisted")
+        }
+        settings.autoCheckUpdates = true
+        settings.check()
+        await settings.waitForIdle()
+        guard settings.error == nil, let release = settings.release, let checkedAt = settings.lastUpdateCheckAt else {
+            throw Failure("UpdateSettings.check() failed: \(settings.error ?? "missing release")")
+        }
+        guard !settings.shouldAutoCheck(now: checkedAt.addingTimeInterval(23 * 3600)),
+              settings.shouldAutoCheck(now: checkedAt.addingTimeInterval(24 * 3600 + 1)) else {
+            throw Failure("24-hour auto-check schedule cadence check failed")
+        }
+        let reloaded = UpdateSettings(defaults: defaults, updater: updater) { _ in }
+        guard let reloadedDate = reloaded.lastUpdateCheckAt,
+              abs(reloadedDate.timeIntervalSince(checkedAt)) < 0.001,
+              !reloaded.shouldAutoCheck(now: checkedAt.addingTimeInterval(23 * 3600)),
+              reloaded.shouldAutoCheck(now: checkedAt.addingTimeInterval(24 * 3600 + 1)) else {
+            throw Failure("lastUpdateCheckAt was not persisted cleanly")
+        }
+        guard LauncherUpdater.releasePageURL(for: nil).absoluteString == "https://github.com/Surfire/Lumen/releases/latest",
+              LauncherUpdater.releasePageURL(for: release).absoluteString == "https://github.com/Surfire/Lumen/releases/tag/v\(release.version)" else {
+            throw Failure("Unexpected releasePageURL output")
+        }
+        settings.installAndRelaunch()
+        await settings.waitForIdle()
+        guard settings.error == nil, let backup = settings.backup, let relaunched, relaunched == updater.bundleURL else {
+            throw Failure("UpdateSettings.installAndRelaunch() failed: \(settings.error ?? "missing relaunch hook")")
+        }
+        print("Installed \(release.version) (build \(release.build)); relaunched: \(relaunched.path); backup: \(backup.path)")
     }
 
     static func configuration() -> LauncherSmoke? {

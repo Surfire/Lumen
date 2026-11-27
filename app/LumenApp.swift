@@ -61,12 +61,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var activityItem: NSMenuItem?
     private var metricsItem: NSMenuItem?
     private var buildIndexItem: NSMenuItem?
+    private var updateItem: NSMenuItem?
     private var presentationScheduled = false
     private var statusMenuUpdateScheduled = false
     let externalVolumes: ExternalVolumeCatalog
     let translation: TranslationPanelModel
     private(set) var settings: NSPanel?
-    private lazy var updateSettings = UpdateSettings()
+    private lazy var updateSettings = UpdateSettings(defaults: defaults ?? .standard)
     private var shouldManageLoginItem: Bool {
         #if LUMEN_SMOKE
         smoke == nil
@@ -410,10 +411,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         updateLanguage()
         #if LUMEN_SMOKE
         model.start(automaticallyIndex: smoke == nil || smoke?.automaticIndexScenario == true)
-        if smoke == nil { observeExternalVolumesAndWarmSearch() }
+        if smoke == nil {
+            observeExternalVolumesAndWarmSearch()
+            startAutomaticUpdates()
+        }
         #else
         model.start(automaticallyIndex: true)
         observeExternalVolumesAndWarmSearch()
+        startAutomaticUpdates()
         #endif
         loadApplicationCatalog()
         #if LUMEN_SMOKE
@@ -1468,6 +1473,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     @objc func showSettings() { presentSettings(page: nil) }
 
+    @objc private func checkForUpdatesFromMenu() {
+        presentSettings(page: .advanced)
+        updateSettings.checkIfIdle()
+    }
+
+    private func startAutomaticUpdates() {
+        updateSettings.startAutomaticChecks()
+        updateSettings.$release.dropFirst().sink { [weak self] _ in
+            self?.scheduleStatusMenuUpdate()
+        }.store(in: &cancellables)
+    }
+
     private var isQuestion: Bool {
         if case .question = commands.resolution { return true }
         return false
@@ -1500,11 +1517,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             window.hidesOnDeactivate = false
             window.contentMinSize = NSSize(width: 700, height: 540)
             window.delegate = self
-            #if LUMEN_SMOKE
-            let updates: UpdateSettings? = smoke == nil ? updateSettings : nil
-            #else
             let updates: UpdateSettings? = updateSettings
-            #endif
             window.contentView = NSHostingView(rootView: LauncherSettings(
                 model: model,
                 indexStatus: model.indexStatus,
@@ -1720,6 +1733,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         menu.addItem(.separator())
         menu.addItem(withTitle: model.t("翻译…", "Translate…"), action: #selector(showTranslation), keyEquivalent: "").target = self
         menu.addItem(withTitle: model.t("设置…", "Settings…"), action: #selector(showSettings), keyEquivalent: "").target = self
+        updateItem = menu.addItem(withTitle: model.t("检查更新…", "Check for Updates…"),
+                                  action: #selector(checkForUpdatesFromMenu), keyEquivalent: "")
+        updateItem?.target = self
         menu.addItem(.separator())
         menu.addItem(withTitle: model.t("退出 Lumen", "Quit Lumen"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "").target = NSApp
         statusItem?.menu = menu
@@ -1747,6 +1763,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if metricsItem?.isHidden != (metrics == nil) { metricsItem?.isHidden = metrics == nil }
         let hidesBuild = !model.canStartIndexFromLauncher
         if buildIndexItem?.isHidden != hidesBuild { buildIndexItem?.isHidden = hidesBuild }
+        #if LUMEN_SMOKE
+        let availableRelease = smoke == nil ? updateSettings.release : nil
+        #else
+        let availableRelease = updateSettings.release
+        #endif
+        let updateTitle = availableRelease.map { model.t("发现新版本 \($0.version)…", "Update Available (\($0.version))…") }
+            ?? model.t("检查更新…", "Check for Updates…")
+        if updateItem?.title != updateTitle { updateItem?.title = updateTitle }
         if let button = statusItem?.button {
             let silent = commands.visibleExecution == nil ? commands.execution : nil
             let symbol = statusBarSymbol

@@ -1071,9 +1071,21 @@ private struct LauncherUpdateControls: View {
     @ObservedObject var updates: UpdateSettings
     let model: Launcher
 
+    private static let checkDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
     var body: some View {
+        Toggle(model.t("每 24 小时自动检查更新", "Automatically check for updates every 24 hours"),
+               isOn: $updates.autoCheckUpdates)
+            .toggleStyle(.switch)
+            .accessibilityIdentifier("settings.updates.autoCheck")
         if let backup = updates.backup {
-            Text(model.t("更新已安装。请退出并重新打开 Lumen。", "Update installed. Quit and reopen Lumen to finish."))
+            Text(model.t("更新已安装。正在重新打开 Lumen；若未自动重启，请手动退出并重开。",
+                         "Update installed. Relaunching Lumen; quit and reopen manually if needed."))
             Text(model.t("旧版本备份：\(backup.path)", "Previous app backup: \(backup.path)"))
                 .font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
         } else {
@@ -1081,7 +1093,17 @@ private struct LauncherUpdateControls: View {
                 Button(model.t("检查更新", "Check for Updates"), action: updates.check)
                     .accessibilityIdentifier("settings.updates.check")
                 if let release = updates.release {
-                    Button(model.t("安装 \(release.version)", "Install \(release.version)"), action: updates.install)
+                    if updates.canInstallInPlace {
+                        Button(model.t("安装并重启 \(release.version)", "Install & Relaunch \(release.version)"),
+                               action: updates.installAndRelaunch)
+                            .buttonStyle(.borderedProminent)
+                            .accessibilityIdentifier("settings.updates.install")
+                    } else {
+                        Button(model.t("打开下载页 \(release.version)", "Open Download \(release.version)"),
+                               action: updates.openReleasePage)
+                            .buttonStyle(.borderedProminent)
+                            .accessibilityIdentifier("settings.updates.download")
+                    }
                 }
                 if updates.busy { ProgressView().controlSize(.small) }
             }
@@ -1092,6 +1114,12 @@ private struct LauncherUpdateControls: View {
                 if !release.notes.isEmpty { Text(release.notes).textSelection(.enabled) }
             } else if updates.checked {
                 Text(model.t("当前已是最新版本。", "Lumen is up to date."))
+            }
+            if let lastCheck = updates.lastUpdateCheckAt {
+                Text(model.t("上次检查：\(Self.checkDateFormatter.string(from: lastCheck))",
+                             "Last checked: \(Self.checkDateFormatter.string(from: lastCheck))"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
     }

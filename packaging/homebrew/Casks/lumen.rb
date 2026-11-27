@@ -1,17 +1,28 @@
 cask "lumen" do
-  # Release template: replace the version and digest from lumen-update.json before publishing.
-  version "0.5.0"
+  # Release template: replace version and sha256 from lumen-update.json / SHA256SUMS.txt before publishing.
+  version "0.5.1"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
 
   url "https://github.com/Surfire/Lumen/releases/download/v#{version}/Lumen-macos-arm64.zip"
   name "Lumen"
-  desc "Local search launcher for files, apps, and system actions"
+  desc "Native macOS fast file, pinyin, and offline semantic search launcher"
   homepage "https://github.com/Surfire/Lumen"
+
+  livecheck do
+    url :url
+    strategy :github_latest
+  end
 
   depends_on arch: :arm64
   depends_on macos: :sonoma
 
   app "Lumen.app"
+
+  caveats <<~EOS
+    Community ad-hoc builds (without Apple Developer ID notarization) may trigger
+    macOS Gatekeeper on first launch. If blocked, run once:
+      xattr -dr com.apple.quarantine "/Applications/Lumen.app"
+  EOS
 
   uninstall quit: "io.github.surfire.lumen"
 

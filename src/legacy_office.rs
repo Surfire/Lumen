@@ -237,8 +237,8 @@ impl<R: Read + Seek> Ole2Archive<R> {
         let mut sec_buf = vec![0u8; sector_size];
         for sid in fat_sector_ids {
             read_sector_into(&mut reader, file_len, sector_size, sid, &mut sec_buf)?;
-            for chunk in sec_buf.chunks_exact(4) {
-                fat.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            for &chunk in sec_buf.as_chunks::<4>().0 {
+                fat.push(u32::from_le_bytes(chunk));
             }
         }
 
@@ -254,7 +254,7 @@ impl<R: Read + Seek> Ole2Archive<R> {
             dir_chain.len() * sector_size,
         )?;
         let mut entries = Vec::with_capacity(dir_bytes.len() / 128);
-        for raw in dir_bytes.chunks_exact(128) {
+        for raw in dir_bytes.as_chunks::<128>().0 {
             let obj_type = raw[66];
             if obj_type == 0 {
                 entries.push(DirEntry {
@@ -268,8 +268,10 @@ impl<R: Read + Seek> Ole2Archive<R> {
             let name_len = (read_u16_le(raw, 64)? as usize).min(64);
             let char_bytes = name_len.saturating_sub(2) & !1;
             let units: Vec<u16> = raw[..char_bytes]
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| u16::from_le_bytes(c))
                 .collect();
             let name = String::from_utf16_lossy(&units);
             let start_sector = read_u32_le(raw, 116)?;
@@ -306,8 +308,8 @@ impl<R: Read + Seek> Ole2Archive<R> {
                 mf_chain.len() * sector_size,
             )?;
             mini_fat.reserve(mf_bytes.len() / 4);
-            for chunk in mf_bytes.chunks_exact(4) {
-                mini_fat.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            for &chunk in mf_bytes.as_chunks::<4>().0 {
+                mini_fat.push(u32::from_le_bytes(chunk));
             }
         }
 
@@ -673,8 +675,10 @@ pub(super) fn doc_text<R: Read + Seek>(reader: R) -> Result<String> {
                 .get(fc_val..end)
                 .context("DOC UTF-16 piece out of bounds")?;
             let units = slice
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]));
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| u16::from_le_bytes(c));
             for decoded in char::decode_utf16(units) {
                 let ch = decoded.unwrap_or('\u{FFFD}');
                 if !push_doc_char(ch) {
@@ -800,8 +804,8 @@ impl<'a> BiffChunkReader<'a> {
                     take > 0,
                     "misaligned UTF-16 BIFF string at CONTINUE boundary"
                 );
-                for pair in chunk[self.off..self.off + take * 2].chunks_exact(2) {
-                    units.push(u16::from_le_bytes([pair[0], pair[1]]));
+                for &pair in chunk[self.off..self.off + take * 2].as_chunks::<2>().0 {
+                    units.push(u16::from_le_bytes(pair));
                 }
                 self.off += take * 2;
                 chars_left -= take;
@@ -1043,8 +1047,10 @@ fn walk_ppt_records(
         match rec_type {
             TEXT_CHARS_ATOM => {
                 let units = payload
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]));
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&c| u16::from_le_bytes(c));
                 let mut text = String::new();
                 for decoded in char::decode_utf16(units) {
                     let ch = decoded.unwrap_or('\u{FFFD}');

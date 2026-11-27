@@ -467,7 +467,9 @@ mod tests {
         let got: Vec<f32> = matrix.scores(&query).collect();
         let expected: Vec<f32> = matrix
             .values
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|row| dot_f16_f32_scalar(row, &query))
             .collect();
         for (g, e) in got.iter().zip(&expected) {

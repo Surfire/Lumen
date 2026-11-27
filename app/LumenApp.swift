@@ -298,6 +298,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         inlinePreview.onQuickLookReady = { [weak self] in self?.updatePresentation() }
+        inlinePreview.excerptProvider = { [weak self] path, query, snippet in
+            await self?.engine.excerpt(path: path, query: query, snippet: snippet)
+        }
         #if LUMEN_SMOKE
         if smoke == nil { configureResidentUI() }
         #else
@@ -1277,7 +1280,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             guard hit.isResident || hit.isPlaceholder else { return }
             model.set(\.selectedID, to: hit.id)
             if inlinePreview.hit == hit { inlinePreview.close() }
-            else { inlinePreview.show(hit, kind: kind, allowCloudDownload: allowCloudDownload) }
+            else { inlinePreview.show(hit, kind: kind, allowCloudDownload: allowCloudDownload, query: model.query) }
             updatePresentation()
             return
         }

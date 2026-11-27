@@ -17,6 +17,7 @@ enum Operation {
     Search,
     Validate,
     Status,
+    Excerpt,
 }
 
 #[derive(Deserialize)]
@@ -30,6 +31,9 @@ struct Request {
     check_access: Option<bool>,
     hits: Option<Vec<ValidationHit>>,
     include_scope: Option<bool>,
+    path: Option<String>,
+    snippet: Option<String>,
+    max_chars: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -47,6 +51,7 @@ enum Reply {
     Search { id: u64, hits: Vec<Hit> },
     Validate { id: u64, valid: Vec<bool> },
     Status { id: u64, status: serde_json::Value },
+    Excerpt { id: u64, context: Option<String> },
 }
 
 // The caller vouches that each non-null pointer is live for the duration of the call.
@@ -151,6 +156,18 @@ unsafe fn request(
                 id: q.id,
                 status: session.status(q.include_scope.unwrap_or(false))?,
             }),
+            Operation::Excerpt => {
+                let path = q.path.context("excerpt requires path")?;
+                Ok(Reply::Excerpt {
+                    id: q.id,
+                    context: session.excerpt(
+                        &path,
+                        q.query.as_deref(),
+                        q.snippet.as_deref(),
+                        q.max_chars.unwrap_or(1600),
+                    )?,
+                })
+            }
         }
     })
 }
@@ -177,6 +194,14 @@ pub unsafe extern "C" fn lumen_session_status_json(
     json: *const c_char,
 ) -> *mut c_char {
     unsafe { request(handle, json, Operation::Status) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lumen_session_excerpt_json(
+    handle: *mut LumenSessionHandle,
+    json: *const c_char,
+) -> *mut c_char {
+    unsafe { request(handle, json, Operation::Excerpt) }
 }
 
 #[unsafe(no_mangle)]
@@ -221,6 +246,7 @@ mod tests {
                 lumen_session_search_json,
                 lumen_session_validate_json,
                 lumen_session_status_json,
+                lumen_session_excerpt_json,
             ] {
                 for json in [null, invalid, c"{broken".as_ptr()] {
                     let response = reply(request(no_handle, json));
@@ -268,9 +294,15 @@ mod tests {
         let c_root = CString::new(root.to_str().unwrap()).unwrap();
         assert!(unsafe { lumen_session_open(c_db.as_ptr(), c_root.as_ptr()) }.is_null());
         fs::create_dir(&root).unwrap();
-        for name in ["match-a.txt", "match-b.txt"] {
-            fs::write(root.join(name), "the fixture needle").unwrap();
-        }
+        let long_prefix: String = (0..18).map(|i| format!("Intro line {i}.\n")).collect();
+        let long_suffix: String = (0..18).map(|i| format!("Tail line {i}.\n")).collect();
+        fs::write(
+            root.join("match-a.txt"),
+            format!("{long_prefix}Middle target line with the fixture needle here.\n{long_suffix}"),
+        )
+        .unwrap();
+        fs::write(root.join("match-b.txt"), "the fixture needle").unwrap();
+        let missing_doc = root.join("outside.txt");
         crate::scan(
             &db,
             &crate::Scope {
@@ -285,6 +317,24 @@ mod tests {
         let text = serve.search("needle", Mode::Text, 20).unwrap();
         assert_eq!(names.len(), 2);
         assert_eq!(text.len(), 2);
+        let match_a = &text.iter().find(|h| h.name == "match-a.txt").unwrap().path;
+        let match_b = &text.iter().find(|h| h.name == "match-b.txt").unwrap().path;
+        let excerpt_hit = CString::new(
+            json!({"id":13,"op":"excerpt","path":match_b,"query":"needle","max_chars":400})
+                .to_string(),
+        )
+        .unwrap();
+        let excerpt_window_hit = CString::new(
+            json!({"id":17,"op":"excerpt","path":match_a,"query":"needle","max_chars":400})
+                .to_string(),
+        )
+        .unwrap();
+        let excerpt_miss = CString::new(
+            json!({"id":14,"op":"excerpt","path":missing_doc,"query":"needle"}).to_string(),
+        )
+        .unwrap();
+        let excerpt_bad = cr#"{"id":15,"op":"search"}"#;
+        let excerpt_empty = cr#"{"id":16}"#;
         fs::remove_file(&names[0].path).unwrap();
         let validation =
             CString::new(json!({"id":4,"op":"validate","hits":names}).to_string()).unwrap();
@@ -355,6 +405,30 @@ mod tests {
                         expected
                     );
                 }
+                assert_eq!(
+                    reply(lumen_session_excerpt_json(handle, excerpt_hit.as_ptr())),
+                    json!({"id":13,"context":"the fixture needle"})
+                );
+                let windowed = reply(lumen_session_excerpt_json(
+                    handle,
+                    excerpt_window_hit.as_ptr(),
+                ));
+                assert_eq!(windowed["id"], json!(17));
+                let context = windowed["context"].as_str().unwrap();
+                assert!(context.contains("Middle target line with the fixture needle here."));
+                assert!(context.contains("Intro line") && context.contains("Tail line"));
+                assert_eq!(
+                    reply(lumen_session_excerpt_json(handle, excerpt_miss.as_ptr())),
+                    json!({"id":14,"context":null})
+                );
+                assert_eq!(
+                    reply(lumen_session_excerpt_json(handle, excerpt_bad.as_ptr())),
+                    json!({"id":15,"error":"request op does not match entry point"})
+                );
+                assert_eq!(
+                    reply(lumen_session_excerpt_json(handle, excerpt_empty.as_ptr())),
+                    json!({"id":16,"error":"excerpt requires path"})
+                );
                 assert!(
                     reply(lumen_session_search_json(handle, semantic.as_ptr()))["error"]
                         .is_string()

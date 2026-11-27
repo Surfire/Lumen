@@ -513,7 +513,19 @@ final class LauncherEngine {
 
     func searchSemantic(_ query: String, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
         submit(query, mode: "semantic", limit: 12, to: \.semanticConnection,
-               command: ["semantic-serve"] + gemmaOptions, idleTimeout: .seconds(45), complete: complete)
+               command: ["semantic-serve"] + gemmaOptions, idleTimeout: .seconds(300), complete: complete)
+    }
+
+    func excerpt(path: String, query: String?, snippet: String?, maxChars: Int = 1600) async -> String? {
+        guard let core else { return nil }
+        nextID &+= 1
+        let request = SearchRequest(id: nextID, query: query, op: "excerpt", path: path,
+                                    snippet: snippet, max_chars: maxChars)
+        return await withCheckedContinuation { continuation in
+            core.excerpt(request) { context in
+                continuation.resume(returning: context)
+            }
+        }
     }
 
     func searchImages(_ query: String, projector: URL, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
@@ -626,6 +638,9 @@ struct SearchRequest: Encodable {
     var op: String? = nil
     var hits: [ValidationHit]? = nil
     var include_scope: Bool? = nil
+    var path: String? = nil
+    var snippet: String? = nil
+    var max_chars: Int? = nil
 }
 
 struct ValidationHit: Encodable {
@@ -726,6 +741,29 @@ final class CoreSearchWorker: @unchecked Sendable {
         guard let statusObject = object["status"] else { throw SearchFailure("Missing status from lumen core") }
         return try JSONSerialization.data(withJSONObject: statusObject)
     }
+
+    func requestExcerpt(_ request: SearchRequest) throws -> String? {
+        guard let handle = open() else { return nil }
+        var bytes = try JSONEncoder().encode(request)
+        bytes.append(0)
+        let output = bytes.withUnsafeBytes { buffer in
+            lumen_session_excerpt_json(handle, buffer.bindMemory(to: CChar.self).baseAddress)
+        }
+        guard let output else { throw SearchFailure("Missing response from lumen core") }
+        defer { lumen_string_free(output) }
+        let data = Data(bytesNoCopy: output, count: strlen(output), deallocator: .none)
+        struct ExcerptReply: Decodable {
+            let id: UInt64?
+            let context: String?
+            let error: String?
+        }
+        let reply = try JSONDecoder().decode(ExcerptReply.self, from: data)
+        guard reply.id == request.id || reply.id == nil && reply.error != nil else {
+            throw SearchFailure("Invalid response from lumen core")
+        }
+        if let error = reply.error { throw SearchFailure(error) }
+        return reply.context
+    }
 }
 
 @MainActor
@@ -739,6 +777,7 @@ final class CoreSearchLane {
     private enum Job {
         case rpc(SearchRequest, ServeCompletion)
         case status(SearchRequest, [@MainActor (EngineResponse) -> Void])
+        case excerpt(SearchRequest, @MainActor (String?) -> Void)
     }
 
     private struct Pending {
@@ -786,26 +825,46 @@ final class CoreSearchLane {
         sendNext()
     }
 
+    func enqueueExcerpt(_ request: SearchRequest, complete: @escaping @MainActor (String?) -> Void) {
+        var superseded: [@MainActor (String?) -> Void] = []
+        queued.removeAll {
+            if case .excerpt(_, let oldComplete) = $0.job {
+                superseded.append(oldComplete)
+                return true
+            }
+            return false
+        }
+        for callback in superseded { callback(nil) }
+        queued.insert(Pending(job: .excerpt(request, complete), explicit: true, discardable: false), at: 0)
+        sendNext()
+    }
+
     func discardQueued() { queued.removeAll { $0.discardable } }
 
     func close() {
         var settledStatusCallbacks: [@MainActor (EngineResponse) -> Void] = []
+        var settledExcerptCallbacks: [@MainActor (String?) -> Void] = []
         if case .status(_, let callbacks) = active?.job {
             settledStatusCallbacks.append(contentsOf: callbacks)
+        } else if case .excerpt(_, let callback) = active?.job {
+            settledExcerptCallbacks.append(callback)
         }
         for pending in queued {
             if case .status(_, let callbacks) = pending.job {
                 settledStatusCallbacks.append(contentsOf: callbacks)
+            } else if case .excerpt(_, let callback) = pending.job {
+                settledExcerptCallbacks.append(callback)
             }
         }
         generation &+= 1
         active = nil
         queued.removeAll()
         worker.queue.async { [worker] in worker.close() }
-        if !settledStatusCallbacks.isEmpty {
+        if !settledStatusCallbacks.isEmpty || !settledExcerptCallbacks.isEmpty {
             let cancelled = Self.cancelledStatus
             DispatchQueue.main.async {
                 for callback in settledStatusCallbacks { callback(cancelled) }
+                for callback in settledExcerptCallbacks { callback(nil) }
             }
         }
     }
@@ -841,6 +900,14 @@ final class CoreSearchLane {
                     for complete in callbacks { complete(response) }
                     self.sendNext()
                 }
+            case .excerpt(let request, let complete):
+                let context = try? worker.requestExcerpt(request)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.generation == generation else { return }
+                    self.active = nil
+                    complete(context)
+                    self.sendNext()
+                }
             }
         }
     }
@@ -868,6 +935,10 @@ final class CoreSearchConnection {
 
     func status(_ request: SearchRequest, complete: @escaping @MainActor (EngineResponse) -> Void) {
         textLane.enqueueStatus(request, complete: complete)
+    }
+
+    func excerpt(_ request: SearchRequest, complete: @escaping @MainActor (String?) -> Void) {
+        textLane.enqueueExcerpt(request, complete: complete)
     }
 
     func discardQueued() {

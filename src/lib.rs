@@ -639,6 +639,47 @@ impl SearchSession {
         })
     }
 
+    /// Return a paragraph-aligned window around a matched snippet or query in a scoped document.
+    pub fn excerpt(
+        &self,
+        path: &str,
+        query: Option<&str>,
+        snippet: Option<&str>,
+        max_chars: usize,
+    ) -> Result<Option<String>> {
+        let path = path.trim();
+        if path.is_empty() {
+            return Ok(None);
+        }
+        diagnose::read_snapshot(&self.conn, |snapshot| {
+            let candidate = Path::new(path);
+            if external::is_external(candidate) {
+                return Ok(None);
+            }
+            let Some(scope) = saved_index_scope(snapshot)? else {
+                return Ok(None);
+            };
+            if !scope.documents
+                || !scope.roots.iter().any(|root| candidate.starts_with(root))
+                || !scope.allows(candidate)
+                || (scope.content_roots.is_some()
+                    && !index::in_explicit_content_root(&scope, candidate))
+            {
+                return Ok(None);
+            }
+            let body: Option<String> = snapshot
+                .prepare_cached(
+                    "SELECT d.body FROM item i JOIN document d ON d.id=i.id
+                     WHERE i.path=?1 AND i.availability IN ('local','provider_metadata_only')",
+                )?
+                .query_row([path], |row| row.get(0))
+                .optional()?;
+            Ok(body
+                .as_deref()
+                .and_then(|text| excerpt_window(text, query, snippet, max_chars)))
+        })
+    }
+
     pub fn search(&mut self, query: &str, mode: Mode, limit: usize) -> Result<Vec<Hit>> {
         let mut hits =
             search_with_names(&self.conn, query, mode, limit, None, Some(&mut self.names))?;
@@ -718,8 +759,9 @@ fn search_with_names(
                      AND i.availability<>'unverified' ORDER BY rank,i.path LIMIT ?3")
         } else {
             format!(
+                // Start at documents instead of scanning all items for ORDER BY i.path.
                 "SELECT i.path,i.display,i.kind,i.availability,d.body,{stamp} AS document_stamp,d.id
-                     FROM document d JOIN item i ON i.id=d.id
+                     FROM document d CROSS JOIN item i ON i.id=d.id
                      {state_join} WHERE ?1 IS NOT NULL AND instr(d.normalized,?2)>0
                      AND i.availability<>'unverified' ORDER BY i.path LIMIT ?3"
             )
@@ -861,6 +903,125 @@ pub fn status_with_scope(conn: &Connection, include_scope: bool) -> Result<serde
     Ok(report)
 }
 
+fn find_excerpt_anchor(text: &str, needle: &str) -> Option<usize> {
+    if let Some(pos) = text.find(needle) {
+        return Some(pos);
+    }
+    let trimmed = needle.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let query_norm = norm(trimmed);
+    let q_chars: Vec<char> = query_norm.chars().collect();
+    if q_chars.is_empty() {
+        return None;
+    }
+    // Bound normalization scan over a single indexed document while preserving UTF-8 byte offsets.
+    let indexed: Vec<(usize, char)> = text
+        .char_indices()
+        .take(262_144)
+        .flat_map(|(byte, ch)| ch.to_lowercase().map(move |lower| (byte, lower)))
+        .collect();
+    indexed
+        .windows(q_chars.len())
+        .find(|win| win.iter().zip(&q_chars).all(|((_, a), b)| a == b))
+        .map(|win| win[0].0)
+}
+
+fn excerpt_window(
+    text: &str,
+    query: Option<&str>,
+    snippet: Option<&str>,
+    max_chars: usize,
+) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let budget = max_chars.clamp(400, 3200);
+    if trimmed.chars().count() <= budget {
+        return Some(trimmed.to_owned());
+    }
+
+    let clean_snippet = snippet
+        .map(|s| s.trim_matches(|c: char| c.is_whitespace() || c == '…' || c == '.'))
+        .filter(|s| !s.is_empty());
+    let anchor = clean_snippet
+        .and_then(|s| {
+            text.find(s).or_else(|| {
+                let prefix: String = s.chars().take(48).collect();
+                (prefix.chars().count() >= 6)
+                    .then(|| text.find(&prefix))
+                    .flatten()
+            })
+        })
+        .or_else(|| {
+            query
+                .map(str::trim)
+                .filter(|q| !q.is_empty())
+                .and_then(|q| {
+                    find_excerpt_anchor(text, q).or_else(|| {
+                        q.split_whitespace()
+                            .find(|w| w.chars().count() >= 2)
+                            .and_then(|w| find_excerpt_anchor(text, w))
+                    })
+                })
+        })
+        .unwrap_or(0);
+
+    let before_target = budget / 3;
+    let mut start = text[..anchor]
+        .char_indices()
+        .rev()
+        .nth(before_target.saturating_sub(1))
+        .map_or(0, |(idx, _)| idx);
+    let mut chars_before = text[start..anchor].chars().count();
+    if start > 0
+        && let Some(rel) = text[start..anchor]
+            .char_indices()
+            .take(160)
+            .find_map(|(i, c)| (c == '\n').then_some(i))
+    {
+        let snapped = start + rel + 1;
+        if snapped <= anchor {
+            start = snapped;
+            chars_before = text[start..anchor].chars().count();
+        }
+    }
+
+    let after_budget = budget.saturating_sub(chars_before);
+    let mut end = text[anchor..]
+        .char_indices()
+        .nth(after_budget)
+        .map_or(text.len(), |(idx, _)| anchor + idx);
+    if end < text.len()
+        && let Some(rel) = text[anchor..end]
+            .char_indices()
+            .rev()
+            .take(160)
+            .find_map(|(i, c)| (c == '\n').then_some(i))
+    {
+        let anchor_min = anchor + text[anchor..].char_indices().nth(64).map_or(0, |(i, _)| i);
+        if anchor + rel > anchor_min {
+            end = anchor + rel;
+        }
+    }
+
+    let window = text[start..end].trim();
+    if window.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    if start > 0 && !text[..start].trim().is_empty() {
+        out.push_str("…\n");
+    }
+    out.push_str(window);
+    if end < text.len() && !text[end..].trim().is_empty() {
+        out.push_str("\n…");
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod scope_tests {
     use super::*;
@@ -946,6 +1107,75 @@ mod scope_tests {
                 "allowed {blocked}"
             );
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn short_text_query_scans_documents_instead_of_full_item_table() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-short-text-plan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let db = root.join("index.sqlite");
+        fs::write(root.join("alpha.txt"), "普通开头段落。").unwrap();
+        fs::write(root.join("方案文档.txt"), "这是临床方案正文。").unwrap();
+        crate::scan(
+            &db,
+            &Scope {
+                roots: vec![root.clone()],
+                documents: true,
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+
+        let conn = open_read(&db).unwrap();
+        let (stamp, state_join) = document_stamp_sql(&conn).unwrap();
+        let plan_sql = format!(
+            "EXPLAIN QUERY PLAN
+             SELECT i.path,i.display,i.kind,i.availability,d.body,{stamp} AS document_stamp,d.id
+             FROM document d CROSS JOIN item i ON i.id=d.id
+             {state_join} WHERE ?1 IS NOT NULL AND instr(d.normalized,?2)>0
+             AND i.availability<>'unverified' ORDER BY i.path LIMIT ?3"
+        );
+        let plan: Vec<String> = conn
+            .prepare(&plan_sql)
+            .unwrap()
+            .query_map(rusqlite::params!["方案", "方案", 24], |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|step| step.contains("SCAN d")),
+            "expected SCAN d, got {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.contains("SCAN i")),
+            "unexpected full item table scan: {plan:?}"
+        );
+        drop(conn);
+
+        let mut session = SearchSession::open(&db).unwrap();
+        let hits = session.search("方案", Mode::Text, 24).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "方案文档.txt");
+
+        let large_prefix: String = (0..60)
+            .map(|i| format!("前置章节内容段落第{i}行。\n"))
+            .collect();
+        let large_suffix: String = (0..60)
+            .map(|i| format!("后续扩展章节第{i}行。\n"))
+            .collect();
+        let large_body = format!("{large_prefix}关键临床方案正文核心段落。\n{large_suffix}");
+        let excerpt = excerpt_window(&large_body, Some("临床方案"), None, 1000).unwrap();
+        assert!(excerpt.contains("关键临床方案正文核心段落"));
+        assert!(excerpt.starts_with("…\n"));
+        assert!(excerpt.ends_with("\n…"));
+        assert!(excerpt.chars().count() <= 1010);
+
         fs::remove_dir_all(root).unwrap();
     }
 }

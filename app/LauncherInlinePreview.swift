@@ -16,14 +16,17 @@ final class LauncherInlinePreview: ObservableObject {
     @Published private(set) var hit: SearchHit?
     private(set) var image: NSImage?
     var onQuickLookReady: (() -> Void)?
+    var excerptProvider: (@Sendable (String, String?, String?) async -> String?)?
     private let downloads: DownloadProvider
 
     init(downloads: DownloadProvider = .system) { self.downloads = downloads }
 
     private lazy var coordinator: InlinePreviewCoordinator = {
         let downloads = downloads
+        let excerptProvider = excerptProvider
         let coordinator = InlinePreviewCoordinator { item, allowCloudDownload, report in
-            try await Self.render(item, downloads: downloads, allowCloudDownload: allowCloudDownload, report: report)
+            try await Self.render(item, downloads: downloads, excerptProvider: excerptProvider,
+                                  allowCloudDownload: allowCloudDownload, report: report)
         }
         coordinator.onChange = { [weak self] state in
             guard let self else { return }
@@ -53,11 +56,14 @@ final class LauncherInlinePreview: ObservableObject {
         return nil
     }
 
-    func show(_ hit: SearchHit, kind: PreviewKind, allowCloudDownload: Bool) {
+    func show(_ hit: SearchHit, kind: PreviewKind, allowCloudDownload: Bool, query: String = "") {
         guard self.hit != hit else { return }
         self.hit = hit
+        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let highlight = hit.isSemanticCandidate ? hit.snippet : (trimmedQuery.isEmpty ? hit.snippet : trimmedQuery)
         let evidence = hit.snippet.map {
-            PreviewEvidence(text: $0, match: hit.isSemanticCandidate ? .related : .literal, page: hit.pdf_page)
+            PreviewEvidence(text: $0, match: hit.isSemanticCandidate ? .related : .literal,
+                            page: hit.pdf_page, highlight: highlight)
         }
         coordinator.show(PreviewSelection(id: hit.path, revision: hit.document_stamp ?? "",
                                           url: URL(fileURLWithPath: hit.path), kind: kind, evidence: evidence),
@@ -87,6 +93,7 @@ final class LauncherInlinePreview: ObservableObject {
     }
 
     nonisolated private static func render(_ item: PreviewSelection, downloads: DownloadProvider,
+                                           excerptProvider: (@Sendable (String, String?, String?) async -> String?)?,
                                            allowCloudDownload: Bool,
                                            report: @escaping InlinePreviewCoordinator.DownloadProgress) async throws -> PreviewDocument {
         let task = Task.detached(priority: .utility) {
@@ -110,8 +117,18 @@ final class LauncherInlinePreview: ObservableObject {
                 throw PreviewFailure.downloadFailed
             }
         }
-        return try await withTaskCancellationHandler(operation: { try await task.value },
-                                                     onCancel: { task.cancel() })
+        let document = try await withTaskCancellationHandler(operation: { try await task.value },
+                                                           onCancel: { task.cancel() })
+        if document.visual == nil, let evidence = document.evidence, evidence.context == nil, let excerptProvider,
+           let bodyContext = await excerptProvider(item.url.path, evidence.highlight, evidence.text) {
+            try Task.checkCancellation()
+            return PreviewDocument(visual: nil, evidence: PreviewEvidence(text: evidence.text,
+                                                                        match: evidence.match,
+                                                                        page: evidence.page,
+                                                                        context: bodyContext,
+                                                                        highlight: evidence.highlight))
+        }
+        return document
     }
 
     // Coordinate on one worker thread; NSFileCoordinator.cancel() is safe from any thread.

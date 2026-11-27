@@ -59,12 +59,20 @@ public struct MacInlinePreviewView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 8) {
                         if let evidence = content.evidence {
-                            Text(evidence.match == .related
-                                ? label("相关片段", "Related excerpt")
-                                : label("文字匹配片段", "Text match excerpt"))
+                            let body = evidence.context ?? evidence.text
+                            Text(evidence.context != nil
+                                ? (evidence.match == .related
+                                    ? label("相关段落上下文", "Related excerpt context")
+                                    : label("文字匹配上下文", "Text match context"))
+                                : (evidence.match == .related
+                                    ? label("相关片段", "Related excerpt")
+                                    : label("文字匹配片段", "Text match excerpt")))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                            Text(verbatim: evidence.text).textSelection(.enabled)
+                            Text(highlighted(body, evidence: evidence))
+                                .font(.callout)
+                                .lineSpacing(3)
+                                .textSelection(.enabled)
                         }
                         if let visual = content.visual {
                             switch visual {
@@ -113,6 +121,41 @@ public struct MacInlinePreviewView: View {
         case .noExcerpt:
             return label("没有可显示的原文片段", "There is no available source excerpt.")
         }
+    }
+
+    private func highlighted(_ body: String, evidence: PreviewEvidence) -> AttributedString {
+        var attributed = AttributedString(body)
+        let needles: [String]
+        if evidence.match == .related {
+            let trimmed = (evidence.highlight ?? evidence.text)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "….").union(.whitespacesAndNewlines))
+            needles = trimmed.isEmpty ? [] : [trimmed]
+        } else {
+            let raw = evidence.highlight ?? ""
+            var terms = raw.split(whereSeparator: \.isWhitespace).map(String.init).filter { term in
+                let lower = term.lowercased()
+                return !lower.isEmpty && !lower.hasPrefix("kind:") && !lower.hasPrefix("path:")
+                    && !lower.hasPrefix("ext:") && !term.hasPrefix("/") && !term.hasPrefix("~/")
+            }
+            if terms.isEmpty && !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                terms = [raw.trimmingCharacters(in: .whitespacesAndNewlines)]
+            }
+            needles = terms.sorted { $0.count > $1.count }
+        }
+        for needle in needles {
+            var searchStart = body.startIndex
+            while searchStart < body.endIndex,
+                  let range = body.range(of: needle, options: [.caseInsensitive, .diacriticInsensitive],
+                                         range: searchStart..<body.endIndex),
+                  !range.isEmpty {
+                if let attrRange = Range(range, in: attributed) {
+                    attributed[attrRange].backgroundColor = Color.accentColor.opacity(0.22)
+                    attributed[attrRange].font = .callout.weight(.semibold)
+                }
+                searchStart = range.upperBound
+            }
+        }
+        return attributed
     }
 }
 #endif

@@ -194,7 +194,9 @@ const GEMMA_LIVE: &str = "FROM semantic_vector v JOIN semantic_chunk c ON c.id=v
     WHERE v.model=?1 AND i.availability IN ('local','provider_metadata_only')";
 const GEMMA_VECTOR: &str = "typeof(v.vector)='blob' AND length(v.vector) IN (?2/2,?2)";
 const GEMMA_MIN_COSINE: f32 = f32::MIN_POSITIVE;
-const GEMMA_Z_THRESHOLD: f64 = 1.0;
+const GEMMA_CORPUS_MIN_COSINE: f32 = 0.78;
+const GEMMA_Z_THRESHOLD: f64 = 2.2;
+const GEMMA_MIN_CHUNK_BYTES: usize = 24;
 
 fn scope_state(conn: &Connection) -> Result<(Option<String>, bool)> {
     let saved: Option<String> = conn
@@ -975,13 +977,14 @@ fn search_gemma(
     })
 }
 
-const LEGACY: &str = "SELECT c.document_id, c.id, i.path, c.vector FROM semantic_chunk c
+const LEGACY: &str = "SELECT c.document_id, c.id, i.path, c.vector, c.end_byte - c.start_byte FROM semantic_chunk c
     JOIN item i ON i.id=c.document_id WHERE i.availability IN ('local','provider_metadata_only') AND c.vector IS NOT NULL";
 
 struct Paragraph {
     document: i64,
     chunk: i64,
     path: Box<str>,
+    bytes: usize,
 }
 
 fn load_paragraphs(
@@ -999,10 +1002,12 @@ fn load_paragraphs(
         if !allows(Path::new(path)) {
             continue;
         }
+        let bytes = row.get::<_, i64>(4)?.max(0) as usize;
         let meta = Paragraph {
             document: row.get(0)?,
             chunk: row.get(1)?,
             path: path.into(),
+            bytes,
         };
         ensure!(
             matrix.push(meta, row.get_ref(3)?.as_blob()?),
@@ -1043,13 +1048,36 @@ fn rank_gemma(
         load_paragraphs(
             snapshot,
             gemma::DIMENSIONS,
-            &format!("SELECT c.document_id,c.id,i.path,v.vector {GEMMA_LIVE} AND {GEMMA_VECTOR} AND i.kind='file'"),
+            &format!("SELECT c.document_id,c.id,i.path,v.vector,c.end_byte-c.start_byte {GEMMA_LIVE} AND {GEMMA_VECTOR} AND i.kind='file'"),
             params![gemma::ID, GEMMA_VECTOR_BYTES],
             |path| paragraph_path_allowed(&scope, path),
         )
     })?;
-    let scores: Vec<_> = matrix.scores(query).collect();
-    let floor = adaptive_floor(&scores, GEMMA_MIN_COSINE, GEMMA_Z_THRESHOLD);
+    let mut substantive_docs = std::collections::HashSet::new();
+    for row in &matrix.rows {
+        if row.bytes >= GEMMA_MIN_CHUNK_BYTES {
+            substantive_docs.insert(row.document);
+        }
+    }
+    let scores: Vec<f32> = matrix
+        .rows
+        .iter()
+        .zip(matrix.scores(query))
+        .map(|(row, score)| {
+            if row.bytes < GEMMA_MIN_CHUNK_BYTES && substantive_docs.contains(&row.document) {
+                f32::NAN
+            } else {
+                score
+            }
+        })
+        .collect();
+    let finite_count = scores.iter().filter(|s| s.is_finite()).count();
+    let min_cosine = if finite_count >= 8 {
+        GEMMA_CORPUS_MIN_COSINE
+    } else {
+        GEMMA_MIN_COSINE
+    };
+    let floor = adaptive_floor(&scores, min_cosine, GEMMA_Z_THRESHOLD);
     rank(
         snapshot,
         matrix,
@@ -1646,6 +1674,98 @@ mod tests {
         assert_eq!(gemma_coverage(&conn).unwrap().embedded_chunks, 5);
 
         drop(conn);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gemma_corpus_floor_rejects_low_cosine_noise_and_skips_micro_chunks() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-gemma-noise-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let docs = root.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        for i in 0..8 {
+            let text = if i == 0 {
+                "附件：\n\n这是一份完整的临床试验受试者筛选标准与伦理说明正文段落。"
+            } else {
+                "这是一份用于验证无关语义查询下限阈值的标准中文测试文档。"
+            };
+            fs::write(docs.join(format!("doc-{i}.txt")), text).unwrap();
+        }
+        let database = root.join("index.sqlite");
+        crate::scan(
+            &database,
+            &Scope {
+                roots: vec![docs],
+                documents: true,
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        let mut writer = Connection::open(&database).unwrap();
+        while prepare_next_document(&mut writer, true).unwrap() {}
+
+        let make_vec = |cosine: f32| {
+            let mut v = vec![0.0_f32; gemma::DIMENSIONS];
+            v[0] = cosine;
+            v[1] = (1.0 - cosine * cosine).sqrt();
+            pack(&v)
+        };
+        // doc-0 has micro-stub ("附件：", 9B) and substantive paragraph; all other chunks <= 0.74.
+        writer
+            .execute(
+                "INSERT INTO semantic_vector
+                 SELECT ?1, c.id, CASE
+                     WHEN i.display='doc-0.txt' AND (c.end_byte-c.start_byte) < 24 THEN ?2
+                     WHEN i.display='doc-0.txt' THEN ?3
+                     ELSE ?4
+                 END
+                 FROM semantic_chunk c JOIN item i ON i.id=c.document_id",
+                params![gemma::ID, make_vec(0.95), make_vec(0.86), make_vec(0.70)],
+            )
+            .unwrap();
+
+        let mut session = GemmaSearchSession {
+            conn: crate::open_read(&database).unwrap(),
+            worker: GemmaQuery::Fixture(Box::new(query_vector)),
+            matrix: MatrixCache::default(),
+        };
+        let hits = session.search("临床受试者筛选", 12).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "doc-0.txt");
+        assert!(
+            hits[0]
+                .snippet
+                .as_deref()
+                .is_some_and(|s| s.contains("临床试验受试者筛选标准")),
+            "expected substantive paragraph instead of micro-stub, got {:?}",
+            hits[0].snippet
+        );
+
+        // Now lower doc-0 substantive chunk to noise levels (<= 0.76); even the 0.76 outlier must be rejected.
+        writer
+            .execute(
+                "UPDATE semantic_vector SET vector=?2
+                 WHERE chunk_id IN (SELECT c.id FROM semantic_chunk c JOIN item i ON i.id=c.document_id WHERE i.display='doc-0.txt' AND c.end_byte-c.start_byte>=24)",
+                params![gemma::ID, make_vec(0.76)],
+            )
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE semantic_vector SET vector=?1
+                 WHERE chunk_id IN (SELECT c.id FROM semantic_chunk c JOIN item i ON i.id=c.document_id WHERE i.display='doc-0.txt' AND c.end_byte-c.start_byte<24)",
+                params![make_vec(0.76)],
+            )
+            .unwrap();
+        let noise_hits = session.search("哈基米", 12).unwrap();
+        assert!(
+            noise_hits.is_empty(),
+            "noise hits should be rejected, got {noise_hits:?}"
+        );
+
+        drop(session);
+        drop(writer);
         fs::remove_dir_all(root).unwrap();
     }
 }

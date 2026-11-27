@@ -5,10 +5,14 @@ public struct PreviewEvidence: Sendable, Equatable {
     public let text: String
     public let match: Match
     public let page: Int?
-    public init(text: String, match: Match, page: Int? = nil) {
+    public let context: String?
+    public let highlight: String?
+    public init(text: String, match: Match, page: Int? = nil, context: String? = nil, highlight: String? = nil) {
         self.text = String(text.prefix(400))
         self.match = match
         self.page = page.flatMap { $0 > 0 ? $0 : nil }
+        self.context = context.map { String($0.prefix(2400)) }
+        self.highlight = highlight.map { String($0.prefix(400)) }
     }
 }
 

@@ -3098,6 +3098,10 @@ final class LauncherSmoke {
         try Data().write(to: provider.appendingPathComponent("cloud-preview-placeholder.png"))
         try Data("Resident Quick Look text fixture.".utf8).write(to: provider.appendingPathComponent("cloud-quick-look-resident.txt"))
         try Data().write(to: provider.appendingPathComponent("cloud-quick-look-placeholder.txt"))
+        let contextIntro = (0..<24).map { "Intro paragraph line \($0) describing background context." }.joined(separator: "\n")
+        let contextTail = (0..<24).map { "Trailing paragraph line \($0) continuing later details." }.joined(separator: "\n")
+        try Data("\(contextIntro)\nTarget context anchor paragraph with matching text.\n\(contextTail)".utf8)
+            .write(to: selected.appendingPathComponent("long-context-fixture.md"))
         model.rebuildSavedIndex()
         try await until("preview fixtures were indexed") { !model.scopePending && model.canSearch && model.watchState == .running }
         app.showSettings()
@@ -3246,6 +3250,20 @@ final class LauncherSmoke {
         try await until("inline text excerpt reused verified evidence") {
             if case .ready(_, let result) = app.inlinePreview.state {
                 return result.visual == nil && result.evidence?.match == .literal
+                    && result.evidence?.context?.contains("Synthetic included note.") == true
+            }
+            return false
+        }
+        try type("Target context anchor", into: app)
+        try await until("long text hit became selectable") { model.selectedHit?.name == "long-context-fixture.md" }
+        try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
+        try await until("inline text preview loaded surrounding paragraphs with highlight") {
+            if case .ready(_, let result) = app.inlinePreview.state,
+               let context = result.evidence?.context {
+                return result.visual == nil && result.evidence?.match == .literal
+                    && result.evidence?.highlight == "Target context anchor"
+                    && context.contains("Target context anchor paragraph")
+                    && context.contains("Intro paragraph") && context.contains("Trailing paragraph")
             }
             return false
         }

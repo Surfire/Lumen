@@ -678,7 +678,7 @@ final class Launcher: ObservableObject {
         }
         guard searchesText else { return }
         textDebounce = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(55))
+            try? await Task.sleep(for: .milliseconds(25))
             guard !Task.isCancelled, let self, self.revision == revision else { return }
             self.engine.search(fileQuery.engineQuery, mode: "text") { [weak self] response in
                 guard let self, self.revision == revision, !self.closed else { return }

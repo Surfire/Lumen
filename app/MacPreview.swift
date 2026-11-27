@@ -21,8 +21,12 @@ public struct MacPreviewRenderer: Sendable {
                 guard let evidence = item.evidence, !evidence.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     throw PreviewFailure.noExcerpt
                 }
-                // Text previews only reuse the selected result's existing index evidence.
-                return PreviewDocument(evidence: evidence)
+                let context = Self.plainTextContext(at: item.url, evidence: evidence)
+                return PreviewDocument(evidence: PreviewEvidence(text: evidence.text,
+                                                                 match: evidence.match,
+                                                                 page: evidence.page,
+                                                                 context: context,
+                                                                 highlight: evidence.highlight))
             case .image:
                 return PreviewDocument(visual: .image(try thumbnail(item.url)), evidence: item.evidence)
             case .pdf(let page):
@@ -93,6 +97,80 @@ public struct MacPreviewRenderer: Sendable {
         }
         try Task.checkCancellation()
         return Data(referencing: data)
+    }
+
+    private static let plainTextExtensions: Set<String> = [
+        "txt", "md", "markdown", "csv", "tsv", "json", "yaml", "yml", "xml",
+        "html", "htm", "log", "toml", "ini", "rs", "swift", "py", "js", "ts",
+        "tsx", "jsx", "c", "h", "cpp", "hpp", "m", "mm", "go", "rb", "java",
+        "kt", "sh", "zsh", "sql", "css", "scss",
+    ]
+    private static let maxPlainTextBytes = 512 * 1024
+
+    private static func plainTextContext(at url: URL, evidence: PreviewEvidence) -> String? {
+        guard plainTextExtensions.contains(url.pathExtension.lowercased()),
+              let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: maxPlainTextBytes + 1) else { return nil }
+        let truncatedAtCap = data.count > maxPlainTextBytes
+        let sample = truncatedAtCap ? data.prefix(maxPlainTextBytes) : data
+        guard let text = String(data: sample, encoding: .utf8) else { return nil }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let cleanSnippet = evidence.text.trimmingCharacters(in: CharacterSet(charactersIn: "….").union(.whitespacesAndNewlines))
+        let anchorRange = findAnchor(in: text, snippet: cleanSnippet, highlight: evidence.highlight)
+        // If a large plain-text file's match sits beyond the 512 KB read cap, defer to indexed document body.
+        if truncatedAtCap && anchorRange == nil { return nil }
+        return extractContextWindow(from: text, anchor: anchorRange, maxChars: 1600)
+    }
+
+    private static func findAnchor(in text: String, snippet: String, highlight: String?) -> Range<String.Index>? {
+        if !snippet.isEmpty {
+            if let range = text.range(of: snippet) { return range }
+            let prefix = String(snippet.prefix(48))
+            if prefix.count >= 6, let range = text.range(of: prefix) { return range }
+        }
+        if let highlight = highlight?.trimmingCharacters(in: .whitespacesAndNewlines), !highlight.isEmpty {
+            if let range = text.range(of: highlight, options: [.caseInsensitive, .diacriticInsensitive]) {
+                return range
+            }
+            if let first = highlight.split(whereSeparator: \.isWhitespace).first(where: { $0.count >= 2 }),
+               let range = text.range(of: String(first), options: [.caseInsensitive, .diacriticInsensitive]) {
+                return range
+            }
+        }
+        return nil
+    }
+
+    private static func extractContextWindow(from text: String, anchor: Range<String.Index>?, maxChars: Int) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.count <= maxChars { return trimmed }
+
+        let anchorStart = anchor?.lowerBound ?? text.startIndex
+        let beforeBudget = maxChars / 3
+        var start = text.index(anchorStart, offsetBy: -beforeBudget, limitedBy: text.startIndex) ?? text.startIndex
+        if start > text.startIndex {
+            let snapLimit = text.index(start, offsetBy: 160, limitedBy: anchorStart) ?? anchorStart
+            if let newline = text[start..<snapLimit].firstIndex(of: "\n") {
+                start = text.index(after: newline)
+            }
+        }
+        let charsBefore = text.distance(from: start, to: anchorStart)
+        let afterBudget = max(0, maxChars - charsBefore)
+        var end = text.index(anchorStart, offsetBy: afterBudget, limitedBy: text.endIndex) ?? text.endIndex
+        if end < text.endIndex {
+            let minAnchor = text.index(anchorStart, offsetBy: 64, limitedBy: end) ?? end
+            let snapFloor = text.index(end, offsetBy: -160, limitedBy: minAnchor) ?? minAnchor
+            if snapFloor < end, let newline = text[snapFloor..<end].lastIndex(of: "\n") {
+                end = newline
+            }
+        }
+        let slice = text[start..<end].trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !slice.isEmpty else { return nil }
+        let prefix = start > text.startIndex && !text[..<start].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "…\n" : ""
+        let suffix = end < text.endIndex && !text[end...].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "\n…" : ""
+        return prefix + slice + suffix
     }
 }
 #endif

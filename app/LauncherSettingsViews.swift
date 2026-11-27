@@ -194,7 +194,7 @@ struct LauncherSettings: View {
     @ObservedObject var session: SettingsSession
     let translation: TranslationPanelModel
     let volumes: ExternalVolumeCatalog
-    let images: LauncherImageSearch
+    @ObservedObject var images: LauncherImageSearch
     let clipboard: ClipboardManager
     @ObservedObject var windowManagement: WindowManagement
     @ObservedObject var scriptCatalog: LauncherScriptCatalog
@@ -482,6 +482,7 @@ struct LauncherSettings: View {
             GemmaAssetSettings(launcher: model, assets: GemmaAssetManager.shared) { _ in
                 model.verifyLocalModel()
                 images.adoptInstalledProjector()
+                model.refreshCoverageAfterImageBuild()
             }
             Divider().accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 10) {
@@ -626,6 +627,10 @@ struct LauncherSettings: View {
         indexStatus.gemmaCoverage?.pending == true && indexStatus.gemmaCoverage?.limited == false && model.canBuildEmbeddings
     }
 
+    private var imagePending: Bool {
+        indexStatus.imageCoverage?.pending == true && indexStatus.imageCoverage?.limited == false
+    }
+
     private var imageResumable: Bool {
         images.projector != nil && session.contentFilter.enable_images && !(indexStatus.savedScope?.contentFolders ?? []).isEmpty
             && !images.loading && model.canSearch && !indexStatus.scopePending && indexStatus.indexWork == nil
@@ -647,15 +652,24 @@ struct LauncherSettings: View {
             if contentActive || embeddingActive || images.building {
                 Button(model.t("暂停索引", "Pause Indexing")) {
                     model.setContentPaused(true)
-                    if embeddingActive { model.pauseEmbeddings(userInitiated: true) }
-                    if images.building { images.stop() }
+                    model.pauseEmbeddings(userInitiated: true)
+                    if images.building {
+                        images.stop()
+                        model.setEmbeddingIndexingPaused(true)
+                    }
                 }
                 .disabled(indexStatus.embeddingState == .pausing)
                 .accessibilityIdentifier("settings.content.pause")
-            } else if contentResumable || embeddingResumable {
+            } else if contentResumable || embeddingResumable || (imageResumable && imagePending) {
                 Button(model.t("继续索引", "Resume Indexing")) {
+                    model.setEmbeddingIndexingPaused(false)
                     if contentResumable { model.setContentPaused(false) }
-                    if embeddingResumable { model.buildEmbeddings() }
+                    if embeddingResumable {
+                        model.buildEmbeddings()
+                    } else if model.embeddingState != .running && imageResumable && imagePending {
+                        images.clearFailure()
+                        images.build()
+                    }
                 }
                 .accessibilityIdentifier("settings.content.resume")
             } else if imageResumable {

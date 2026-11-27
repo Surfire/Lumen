@@ -89,6 +89,20 @@ def exercise(work, keychain, password):
         manifest('bad-redirect', 'outside.zip', sha)
         tampered = (public / 'good.cms').read_bytes().replace(b'Synthetic release', b'Synthetic Release')
         (public / 'tampered.cms').write_bytes(tampered)
+        ad_hoc_only = json.dumps(
+            dict(version='0.5.0', build='21', url=f'{base}/upgrade.zip', sha256=sha, notes='Synthetic release')
+        ).encode()
+        ad_hoc_same = json.dumps(
+            dict(version='0.4.0', build='20', url=f'{base}/upgrade.zip', sha256=sha, notes='Synthetic release')
+        ).encode()
+        (public / 'ad-hoc-only.json').write_bytes(ad_hoc_only)
+        (public / 'ad-hoc-same.json').write_bytes(ad_hoc_same)
+        (public / 'tampered').write_bytes(ad_hoc_only)
+        (public / 'tampered.json').write_bytes(ad_hoc_only)
+        (public / 'tampered.json.cms').write_bytes(tampered)
+        (public / 'bad-feed-signer').write_bytes(ad_hoc_only)
+        (public / 'bad-feed-signer.json').write_bytes(ad_hoc_only)
+        (public / 'bad-feed-signer.json.cms').write_bytes((public / 'bad-feed-signer.cms').read_bytes())
 
         def run(app, name, *options, host=base):
             result = subprocess.run([app / 'Contents/MacOS/Lumen', '--updater-smoke', f'{host}/{name}.cms', *options],
@@ -125,6 +139,22 @@ def exercise(work, keychain, password):
             transaction('bad-version', 'signed app version does not match')
             transaction('bad-redirect', 'server did not return a download')
             transaction('good-rollback', 'previous app was restored. Simulated post-swap failure', 'fail-after-swap')
+            ad_hoc_app = work / 'ad-hoc-fallback/Applications/Lumen.app'
+            command('/usr/bin/ditto', baseline, ad_hoc_app)
+            inode = ad_hoc_app.stat().st_ino
+            result, output = run(ad_hoc_app, 'ad-hoc-only.json', 'ad-hoc-fallback')
+            expected = 'Ad-hoc release 0.5.0 (build 21); installableInPlace=false'
+            assert result == 0 and expected in output, ('ad-hoc-fallback', result, output)
+            assert ad_hoc_app.stat().st_ino == inode and info(ad_hoc_app) == info(baseline), output
+            assert not list(ad_hoc_app.parent.glob('.Lumen-backup-*'))
+            assert run(ad_hoc_app, 'ad-hoc-same.json', 'ad-hoc-fallback') == (0, 'No newer release\n')
+            for rejected in ('tampered.json', 'bad-feed-signer.json'):
+                bad_result, bad_output = run(ad_hoc_app, rejected, 'ad-hoc-fallback')
+                assert bad_result == 1 and "manifest's signature does not match" in bad_output, (
+                    rejected, bad_result, bad_output
+                )
+            fixtures.installer.verify_bundle(ad_hoc_app)
+            print(f'PASS: ad-hoc-fallback — {expected}')
         finally:
             server.shutdown()
             thread.join()

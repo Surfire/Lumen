@@ -3236,9 +3236,10 @@ esac
         )
         .unwrap();
         assert_eq!(explain(&file)["semantic"], "pending_gemma");
+        let dynamic_limit = lumen::gemma_coverage(&db).unwrap().chunk_limit;
         db.execute(
-            "INSERT INTO semantic_vector_count VALUES(?1,43690)",
-            [lumen::GEMMA_MODEL_ID],
+            "INSERT INTO semantic_vector_count VALUES(?1,?2)",
+            rusqlite::params![lumen::GEMMA_MODEL_ID, dynamic_limit],
         )
         .unwrap();
         assert_eq!(explain(&file)["semantic"], "gemma_limited");

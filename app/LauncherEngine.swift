@@ -17,6 +17,7 @@ struct SearchHit: Decodable, Equatable, Identifiable {
     var isCloudReference: Bool { availability == "placeholder" || availability == "provider_metadata_only" }
     var isImageMatch: Bool { matched_by == "image_embedding" }
     var isSemanticCandidate: Bool { matched_by == "semantic_candidate" }
+    var isRelatedHit: Bool { isSemanticCandidate || isImageMatch }
     var hasPreview: Bool { isResident && snippet != nil }
 
     func pathStamp() -> String? {
@@ -111,6 +112,7 @@ struct IndexReport: Decodable, Equatable {
     let documents: Int?
     let documents_not_read: Int?
     let gemma: GemmaCoverage?
+    let images: ImageCoverage?
     let scope: IndexScope?
     let content: ContentCoverage?
     let unverified: Int?
@@ -146,6 +148,16 @@ struct GemmaCoverage: Decodable, Equatable {
 
     var hasResults: Bool { documents_enabled && embedded_chunks > 0 }
     var complete: Bool { hasResults && !pending }
+}
+
+struct ImageCoverage: Decodable, Equatable {
+    let enabled: Bool
+    let vectors: Int
+    let pending: Bool
+    let limited: Bool
+    let vector_limit: Int
+
+    var hasResults: Bool { enabled && vectors > 0 }
 }
 
 struct IndexProgress: Decodable, Equatable {
@@ -596,6 +608,11 @@ final class LauncherEngine {
 
     func searchSemantic(_ query: String, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
         submit(query, mode: "semantic", limit: 12, to: \.semanticConnection,
+               command: ["semantic-serve"] + gemmaOptions, idleTimeout: .seconds(300), complete: complete)
+    }
+
+    func searchSemanticImages(_ query: String, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
+        submit(query, mode: "image", limit: 3, to: \.semanticConnection,
                command: ["semantic-serve"] + gemmaOptions, idleTimeout: .seconds(300), complete: complete)
     }
 

@@ -151,7 +151,7 @@ final class LauncherSmoke {
         let bundle = Bundle.main.bundleURL.resolvingSymlinksInPath()
         let temp = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().path
         guard (2...3).contains(args.count),
-              args.count == 2 || args[2] == "fail-after-swap" || args[2] == "relaunch-hook",
+              args.count == 2 || args[2] == "fail-after-swap" || args[2] == "relaunch-hook" || args[2] == "ad-hoc-fallback",
               bundle.path.hasPrefix(temp + "/"), bundle.lastPathComponent == "Lumen.app",
               bundle.deletingLastPathComponent().lastPathComponent == "Applications",
               let feed = URL(string: args[1]) else {
@@ -176,6 +176,18 @@ final class LauncherSmoke {
                     }
                     defer { defaults.removePersistentDomain(forName: suite) }
                     try await verifyUpdateSettingsFlow(updater: updater, defaults: defaults)
+                    exit(0)
+                }
+                if args.count == 3, args[2] == "ad-hoc-fallback" {
+                    let result = try await updater.checkForUpdates()
+                    guard !result.installableInPlace else {
+                        throw Failure("Ad-hoc fallback release unexpectedly allowed in-place install")
+                    }
+                    if let release = result.release {
+                        print("Ad-hoc release \(release.version) (build \(release.build)); installableInPlace=false")
+                    } else {
+                        print("No newer release")
+                    }
                     exit(0)
                 }
                 if let release = try await updater.check() {
@@ -4989,6 +5001,97 @@ final class LauncherSmoke {
             .split(separator: "\n").count
         try check(!streamImages.failed && streamImages.checked == 4 && imgLaunches == 1,
                   "streaming image-index failed or launched multiple processes (\(imgLaunches))")
+
+        // 5. Option A: single-Han visual recall (`mode: "image"`) & slot 6-7 placement.
+        try check(Launcher.qualifiesForImageRecall("鹿") &&
+                  Launcher.qualifiesForImageRecall("deer") &&
+                  !Launcher.qualifiesForImageRecall("a") &&
+                  !Launcher.qualifiesForImageRecall("lumen.png") &&
+                  !Launcher.qualifiesForImageRecall("ext:png 鹿"),
+                  "qualifiesForImageRecall trigger rules did not match single-Han Option A")
+
+        let optDir = directory.appendingPathComponent("phase3-option-a-image", isDirectory: true)
+        try FileManager.default.createDirectory(at: optDir, withIntermediateDirectories: true)
+        var deerPaths: [String] = []
+        for idx in 0..<8 {
+            let p = optDir.appendingPathComponent("deer-\(idx).txt")
+            try Data("deer".utf8).write(to: p)
+            deerPaths.append(p.path)
+        }
+        let optLogo = optDir.appendingPathComponent("Lumen-1024.png")
+        try Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).write(to: optLogo)
+        let optEngineFile = optDir.appendingPathComponent("engine")
+        let optDB = optDir.appendingPathComponent("index.sqlite")
+        try Data().write(to: optDB)
+        let optScript = #"""
+        #!/usr/bin/python3
+        import json, signal, sys
+        from pathlib import Path
+        root = Path(__file__).parent
+        command, *args = sys.argv[3:]
+        files = json.loads((root / 'files.json').read_text())
+        if command == 'status':
+            print(json.dumps(dict(
+                items=9, documents=0,
+                scope=dict(roots=[str(root)], allow=[], deny=[], documents=True, content_roots=[str(root)]),
+                content=dict(pending=0, checked=0, total=0),
+                gemma=dict(documents_enabled=True, embedded_chunks=0, skipped_chunks=0, pending=False, limited=False, chunk_limit=1000),
+                images=dict(enabled=True, vectors=1, pending=False, limited=False, vector_limit=1000)
+            )))
+        elif command == 'watch':
+            if '--help' in args:
+                print('--progress')
+            else:
+                print('{"event":"ready"}', flush=True)
+                signal.pause()
+        elif command == 'model-status':
+            print(json.dumps(dict(available=True, verified='--verify' in args)))
+        elif command == 'serve':
+            for line in sys.stdin:
+                req = json.loads(line)
+                hits = [dict(path=p, name=Path(p).name, kind='file', availability='local',
+                             matched_by='name', snippet=None, document_stamp=None, pdf_page=None)
+                        for p in files['direct']]
+                print(json.dumps(dict(id=req['id'], hits=hits)), flush=True)
+        elif command == 'semantic-serve':
+            for line in sys.stdin:
+                req = json.loads(line)
+                with (root / 'semantic-modes').open('a') as f:
+                    f.write((req.get('mode') or 'none') + '\n')
+                hits = [dict(path=files['logo'], name=Path(files['logo']).name, kind='file', availability='local',
+                             matched_by='image_embedding', snippet=None, document_stamp=None, pdf_page=None)]
+                print(json.dumps(dict(id=req['id'], hits=hits)), flush=True)
+        """#
+        try JSONSerialization.data(withJSONObject: ["direct": deerPaths, "logo": optLogo.path])
+            .write(to: optDir.appendingPathComponent("files.json"))
+        try Data(optScript.utf8).write(to: optEngineFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: optEngineFile.path)
+        let optDefaultsSuite = "lumen-phase3-option-a-\(UUID().uuidString)"
+        guard let optDefaults = UserDefaults(suiteName: optDefaultsSuite) else {
+            throw Failure("missing isolated Option A defaults")
+        }
+        defer { optDefaults.removePersistentDomain(forName: optDefaultsSuite) }
+        let optEngine = LauncherEngine(executable: optEngineFile, database: optDB, supportsStreamingBatches: true)
+        let optModel = Launcher(engine: optEngine, defaults: optDefaults, locale: "zh")
+        defer { optModel.close() }
+        optModel.start(automaticallyIndex: false)
+        try await until("Option A fixture did not become ready") {
+            optModel.canSearch && optModel.watchState == .running && optModel.localModelState == .available &&
+                optModel.imageCoverage?.hasResults == true
+        }
+        optModel.setSearchPresented(true)
+        optModel.setQuery("鹿")
+        try await until("single-Han query '鹿' did not attach image_embedding hit at slot 6") {
+            !optModel.semanticBusy && optModel.hits.count == 9 && optModel.hits[6].name == "Lumen-1024.png"
+        }
+        let modes = try String(contentsOf: optDir.appendingPathComponent("semantic-modes"), encoding: .utf8)
+            .split(separator: "\n").map(String.init)
+        try check(modes == ["image"] &&
+                  optModel.hits.prefix(6).map(\.name) == (0..<6).map { "deer-\($0).txt" } &&
+                  optModel.hits[6].isImageMatch &&
+                  optModel.selectedHit?.name == "deer-0.txt",
+                  "Option A image recall displaced direct rows, stole selection, or skipped mode=image: modes=\(modes), names=\(optModel.hits.map(\.name))")
+        optModel.close()
 
         try type("", into: app)
         print("Phase 3 regressions passed (IndexStatusState isolation, caches, dual-lane CoreSearchConnection, ContentBatch skip, streaming clients)")

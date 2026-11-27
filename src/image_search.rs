@@ -17,12 +17,16 @@ use std::{
 };
 
 pub const MODEL_ID: &str = "gemma2/image/imageio512-v1/q8_0/b11457/retrieval/768/l2/0531309472a6bc6f4b146c3736eee7795ec9db1903c25490d3c937490cef6dd8";
-const MAX_VECTORS: i64 = 4096;
+const MIN_IMAGE_VECTOR_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_IMAGE_VECTOR_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_BATCH: usize = 16;
 // A minimum cosine for this exact model, not an estimate of correctness.
 const MIN_COSINE: f32 = 0.65;
 const Z_THRESHOLD: f64 = 1.0;
 const LEGACY_VECTOR_BYTES: i64 = (DIMENSIONS * 4) as i64;
+const IMAGE_ITEM_WHERE: &str = "i.kind='file' AND i.availability IN ('local','provider_metadata_only') AND (substr(lower(i.path),-4) IN ('.png','.jpg') OR substr(lower(i.path),-5) IN ('.jpeg','.heic','.heif','.webp'))";
+#[cfg(test)]
+pub(crate) const CREATE_IMAGE_MTIME_INDEX: &str = "CREATE INDEX IF NOT EXISTS item_image_mtime ON item(mtime DESC, id DESC, path, kind, availability) WHERE kind='file' AND availability IN ('local','provider_metadata_only') AND (substr(lower(path),-4) IN ('.png','.jpg') OR substr(lower(path),-5) IN ('.jpeg','.heic','.heif','.webp'));";
 const IMAGE_LIVE: &str = "FROM image_embedding e JOIN item i USING(id)
     WHERE e.model=?1 AND i.path>=?2 AND i.path<?3 AND i.kind='file'
     AND i.availability IN ('local','provider_metadata_only')
@@ -31,12 +35,48 @@ pub(crate) const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS image_embedding(
         id INTEGER PRIMARY KEY, model TEXT NOT NULL, stamp TEXT NOT NULL, vector BLOB NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS image_skip(
+        id INTEGER PRIMARY KEY, model TEXT NOT NULL, stamp TEXT NOT NULL
+    );
     CREATE TRIGGER IF NOT EXISTS image_entry_deleted AFTER DELETE ON item
     BEGIN DELETE FROM image_embedding WHERE id=old.id; END;
     CREATE TRIGGER IF NOT EXISTS image_entry_moved AFTER UPDATE OF path, kind, availability ON item
     WHEN NEW.path != OLD.path OR NEW.kind != OLD.kind OR NEW.availability != OLD.availability
     BEGIN DELETE FROM image_embedding WHERE id=old.id; END;
+    CREATE TRIGGER IF NOT EXISTS image_skip_deleted AFTER DELETE ON item
+    BEGIN DELETE FROM image_skip WHERE id=old.id; END;
+    CREATE TRIGGER IF NOT EXISTS image_skip_moved AFTER UPDATE OF path, kind, availability, mtime ON item
+    WHEN NEW.path != OLD.path OR NEW.kind != OLD.kind OR NEW.availability != OLD.availability OR NEW.mtime != OLD.mtime
+    BEGIN DELETE FROM image_skip WHERE id=old.id; END;
+    CREATE INDEX IF NOT EXISTS item_image_mtime ON item(mtime DESC, id DESC, path, kind, availability) WHERE kind='file' AND availability IN ('local','provider_metadata_only') AND (substr(lower(path),-4) IN ('.png','.jpg') OR substr(lower(path),-5) IN ('.jpeg','.heic','.heif','.webp'));
 ";
+
+pub(crate) fn image_limit_for_memory(ram_bytes: u64) -> i64 {
+    let budget = (ram_bytes / 100).clamp(MIN_IMAGE_VECTOR_BYTES, MAX_IMAGE_VECTOR_BYTES);
+    (budget / ((DIMENSIONS as u64) * 2)) as i64
+}
+
+pub fn image_limit() -> i64 {
+    image_limit_for_memory(crate::platform::physical_memory_bytes())
+}
+
+fn has_mtime_index(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name='item_image_mtime')",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
+    if !has_table(conn, "image_embedding")?
+        || !has_table(conn, "image_skip")?
+        || !has_mtime_index(conn)?
+    {
+        conn.execute_batch(SCHEMA)?;
+    }
+    Ok(())
+}
 
 /// Image rules derived from the one saved content scope: `content_roots`
 /// gated by `content_filter.enable_images`. There is no separate image list.
@@ -281,6 +321,201 @@ fn count_images(conn: &Connection, rules: &Rules) -> Result<i64> {
 }
 
 #[derive(Serialize)]
+pub(crate) struct ImageCoverage {
+    pub enabled: bool,
+    pub vectors: i64,
+    pub pending: bool,
+    pub limited: bool,
+    pub vector_limit: i64,
+}
+
+fn read_has_vectors(conn: &Connection) -> Result<bool> {
+    let Some(rules) = Rules::read(conn)? else {
+        return Ok(false);
+    };
+    let mut stmt = conn.prepare_cached(&format!("SELECT i.path {IMAGE_LIVE}"))?;
+    for (lower, upper) in rules.bounds() {
+        let mut rows = stmt.query(params![MODEL_ID, lower, upper, LEGACY_VECTOR_BYTES])?;
+        while let Some(row) = rows.next()? {
+            if rules.allows(Path::new(row.get_ref(0)?.as_str()?)) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) fn has_vectors(conn: &Connection) -> Result<bool> {
+    if conn.is_autocommit() {
+        read_snapshot(conn, read_has_vectors)
+    } else {
+        read_has_vectors(conn)
+    }
+}
+
+fn bounds_clause(bounds: &[(String, String)], values: &mut Vec<rusqlite::types::Value>) -> String {
+    let mut clauses = Vec::with_capacity(bounds.len());
+    for (lower, upper) in bounds {
+        let lo = values.len() + 1;
+        let hi = lo + 1;
+        clauses.push(format!("(i.path>=?{lo} AND i.path<?{hi})"));
+        values.push(lower.clone().into());
+        values.push(upper.clone().into());
+    }
+    clauses.join(" OR ")
+}
+
+fn build_pending_query(
+    bounds: &[(String, String)],
+    use_mtime_index: bool,
+    has_embeddings: bool,
+    has_skip: bool,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let indexed_by = if use_mtime_index {
+        " INDEXED BY item_image_mtime"
+    } else {
+        ""
+    };
+    let mut values: Vec<rusqlite::types::Value> = Vec::new();
+    let mut extra_filters = String::new();
+    if has_embeddings || has_skip {
+        values.push(MODEL_ID.to_owned().into());
+    }
+    if has_embeddings {
+        values.push(LEGACY_VECTOR_BYTES.into());
+        extra_filters.push_str(
+            " AND NOT EXISTS(SELECT 1 FROM image_embedding e WHERE e.id=i.id AND e.model=?1 AND typeof(e.vector)='blob' AND length(e.vector) IN (?2/2,?2))",
+        );
+    }
+    if has_skip {
+        extra_filters
+            .push_str(" AND NOT EXISTS(SELECT 1 FROM image_skip s WHERE s.id=i.id AND s.model=?1)");
+    }
+    let bounds_sql = bounds_clause(bounds, &mut values);
+    let sql = format!(
+        "SELECT i.path FROM item i{indexed_by} WHERE {IMAGE_ITEM_WHERE} AND ({bounds_sql}){extra_filters}"
+    );
+    (sql, values)
+}
+
+fn has_pending_images(conn: &Connection, rules: &Rules, has_embeddings: bool) -> Result<bool> {
+    let bounds: Vec<(String, String)> = rules.bounds().collect();
+    if bounds.is_empty() {
+        return Ok(false);
+    }
+    let has_skip = has_table(conn, "image_skip")?;
+    let (sql, values) =
+        build_pending_query(&bounds, has_mtime_index(conn)?, has_embeddings, has_skip);
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(rusqlite::params_from_iter(values))?;
+    while let Some(row) = rows.next()? {
+        if rules.allows(Path::new(row.get_ref(0)?.as_str()?)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) fn coverage(conn: &Connection) -> Result<ImageCoverage> {
+    coverage_with_limit(conn, image_limit())
+}
+
+fn coverage_with_limit(conn: &Connection, vector_limit: i64) -> Result<ImageCoverage> {
+    let Some(rules) = saved_index_scope(conn)?.and_then(Rules::from_scope) else {
+        return Ok(ImageCoverage {
+            enabled: false,
+            vectors: 0,
+            pending: false,
+            limited: false,
+            vector_limit,
+        });
+    };
+    let has_embeddings = has_table(conn, "image_embedding")?;
+    let (vectors, total_stored) = if has_embeddings {
+        let vectors = count_images(conn, &rules)?;
+        let total: i64 =
+            conn.query_row("SELECT count(*) FROM image_embedding", [], |r| r.get(0))?;
+        (vectors, total)
+    } else {
+        (0, 0)
+    };
+    let pending = has_pending_images(conn, &rules, has_embeddings)?;
+    let limited = pending && total_stored >= vector_limit;
+    Ok(ImageCoverage {
+        enabled: true,
+        vectors,
+        pending,
+        limited,
+        vector_limit,
+    })
+}
+
+fn format_cursor(mtime: i64, id: i64) -> String {
+    format!("mtime:{mtime}:{id}")
+}
+
+fn parse_cursor(after: Option<&str>) -> Result<Option<(i64, i64)>> {
+    let Some(after) = after.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(rest) = after.strip_prefix("mtime:") else {
+        bail!("invalid image cursor");
+    };
+    let Some((mtime, id)) = rest.split_once(':') else {
+        bail!("invalid image cursor");
+    };
+    let mtime: i64 = mtime
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid image cursor"))?;
+    let id: i64 = id
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid image cursor"))?;
+    Ok(Some((mtime, id)))
+}
+
+fn build_batch_query(
+    bounds: &[(String, String)],
+    use_mtime_index: bool,
+    has_skip: bool,
+    cursor: Option<(i64, i64)>,
+    limit: usize,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let indexed_by = if use_mtime_index {
+        " INDEXED BY item_image_mtime"
+    } else {
+        ""
+    };
+    let mut values: Vec<rusqlite::types::Value> =
+        vec![MODEL_ID.to_owned().into(), LEGACY_VECTOR_BYTES.into()];
+    let bounds_sql = bounds_clause(bounds, &mut values);
+    let skip_sql = if has_skip {
+        " AND NOT EXISTS(SELECT 1 FROM image_skip s WHERE s.id=i.id AND s.model=?1)"
+    } else {
+        ""
+    };
+    let cursor_sql = if let Some((cursor_mtime, cursor_id)) = cursor {
+        let m = values.len() + 1;
+        let id = m + 1;
+        values.push(cursor_mtime.into());
+        values.push(cursor_id.into());
+        format!(" AND i.mtime<=?{m} AND (i.mtime<?{m} OR (i.mtime=?{m} AND i.id<?{id}))")
+    } else {
+        String::new()
+    };
+    let limit_idx = values.len() + 1;
+    values.push((limit as i64).into());
+    let sql = format!(
+        "SELECT i.id,i.path,i.mtime,CASE WHEN e.model=?1 AND typeof(e.vector)='blob'
+            AND length(e.vector) IN (?2/2,?2) THEN e.stamp END,e.id IS NOT NULL
+         FROM item i{indexed_by} LEFT JOIN image_embedding e ON i.id=e.id
+         WHERE {IMAGE_ITEM_WHERE}
+           AND ({bounds_sql}){skip_sql}{cursor_sql}
+         ORDER BY i.mtime DESC, i.id DESC LIMIT ?{limit_idx}"
+    );
+    (sql, values)
+}
+
+#[derive(Serialize)]
 pub struct ImageBatch {
     pub model_id: &'static str,
     pub processed: usize,
@@ -355,58 +590,35 @@ fn image_batch_step<E: ImageEncoder>(
         return Ok((None, true));
     }
     let rules = current_rules.context("choose a folder with image-scope first")?;
-    let after = after.unwrap_or("");
-    ensure!(
-        after.is_empty()
-            || rules
-                .bounds()
-                .any(|(lower, upper)| after >= lower.as_str() && after < upper.as_str()),
-        "image cursor is outside the selected folder"
-    );
-    let mut available = MAX_VECTORS
+    let cursor = parse_cursor(after)?;
+    let limit = image_limit();
+    let mut available = limit
         - snapshot.query_row("SELECT count(*) FROM image_embedding", [], |r| {
             r.get::<_, i64>(0)
         })?;
-    let mut rows = Vec::new();
-    {
-        let mut stmt = snapshot.prepare(
-            "SELECT i.id,i.path,CASE WHEN e.model=?4 AND typeof(e.vector)='blob'
-                AND length(e.vector) IN (?6/2,?6) THEN e.stamp END,e.id IS NOT NULL
-             FROM item i LEFT JOIN image_embedding e ON i.id=e.id
-             WHERE i.path>=?1 AND i.path<?2 AND i.path>?3
-               AND i.kind='file' AND i.availability IN ('local','provider_metadata_only')
-               AND (substr(lower(i.path),-4) IN ('.png','.jpg')
-                 OR substr(lower(i.path),-5) IN ('.jpeg','.heic','.heif','.webp'))
-             ORDER BY i.path LIMIT ?5",
-        )?;
-        // Ranges are disjoint and ascending, so the cursor orders all roots.
-        for (lower, upper) in rules.bounds() {
-            if rows.len() > max || after >= upper.as_str() {
-                continue;
-            }
-            rows.extend(
-                stmt.query_map(
-                    params![
-                        lower,
-                        upper,
-                        after,
-                        MODEL_ID,
-                        (max + 1 - rows.len()) as i64,
-                        LEGACY_VECTOR_BYTES
-                    ],
-                    |r| {
-                        Ok((
-                            r.get::<_, i64>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, Option<String>>(2)?,
-                            r.get::<_, bool>(3)?,
-                        ))
-                    },
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?,
-            );
-        }
-    }
+    let bounds: Vec<(String, String)> = rules.bounds().collect();
+    let rows = if bounds.is_empty() {
+        Vec::new()
+    } else {
+        let (sql, values) = build_batch_query(
+            &bounds,
+            has_mtime_index(&snapshot)?,
+            has_table(&snapshot, "image_skip")?,
+            cursor,
+            max + 1,
+        );
+        let mut stmt = snapshot.prepare(&sql)?;
+        stmt.query_map(rusqlite::params_from_iter(values), |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, bool>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
     drop(snapshot);
     let total_rows = rows.len();
     let planned = total_rows.min(max);
@@ -417,18 +629,19 @@ fn image_batch_step<E: ImageEncoder>(
         reused: 0,
         skipped: 0,
         limited: false,
-        next_after: (total_rows > max).then(|| rows[max - 1].1.clone()),
+        next_after: (total_rows > max).then(|| format_cursor(rows[max - 1].2, rows[max - 1].0)),
     };
     let mut encoded = Vec::new();
+    let mut skips = Vec::new();
     let mut stopped = false;
-    let mut last_path = None;
-    for (idx, (id, path, prior, occupied)) in rows.into_iter().take(max).enumerate() {
+    let mut last_cursor = None;
+    for (idx, (id, path, mtime, prior, occupied)) in rows.into_iter().take(max).enumerate() {
         if stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
             if idx == 0 {
                 return Ok((None, true));
             }
             batch.processed = idx;
-            batch.next_after = last_path.filter(|_| total_rows > idx);
+            batch.next_after = last_cursor.filter(|_| total_rows > idx);
             stopped = true;
             break;
         }
@@ -439,37 +652,41 @@ fn image_batch_step<E: ImageEncoder>(
             bail!("image or filename scope changed; retry the batch");
         }
         let source = Path::new(&path);
-        let stamp = rules
-            .allows(source)
-            .then(|| local_stamp(source, false))
-            .flatten();
-        let Some(stamp) = stamp else {
-            last_path = Some(path);
+        if !rules.allows(source) {
+            last_cursor = Some(format_cursor(mtime, id));
             batch.skipped += 1;
+            continue;
+        }
+        let Some(stamp) = local_stamp(source, false) else {
+            last_cursor = Some(format_cursor(mtime, id));
+            batch.skipped += 1;
+            skips.push((id, format!("unreadable:{mtime}")));
             continue;
         };
         if prior
             .as_deref()
             .is_some_and(|prior| crate::index::stamp_matches(prior, &stamp))
         {
-            last_path = Some(path);
+            last_cursor = Some(format_cursor(mtime, id));
             batch.reused += 1;
             continue;
         }
         if !occupied && available <= 0 {
-            last_path = Some(path);
+            last_cursor = Some(format_cursor(mtime, id));
             batch.limited = true;
             batch.skipped += 1;
             continue;
         }
         let Ok(bytes) = platform::read_local_checked(source, MAX_FILE_BYTES, Some(&stamp)) else {
-            last_path = Some(path);
+            last_cursor = Some(format_cursor(mtime, id));
             batch.skipped += 1;
+            skips.push((id, stamp));
             continue;
         };
         let Some(bytes) = thumbnail(&bytes) else {
-            last_path = Some(path);
+            last_cursor = Some(format_cursor(mtime, id));
             batch.skipped += 1;
+            skips.push((id, stamp));
             continue;
         };
         let worker = match worker {
@@ -478,10 +695,10 @@ fn image_batch_step<E: ImageEncoder>(
         };
         let vector = worker.encode_image_bytes(&bytes)?;
         available -= i64::from(!occupied);
-        last_path = Some(path.clone());
+        last_cursor = Some(format_cursor(mtime, id));
         encoded.push((id, path, stamp, pack(&vector)));
     }
-    if encoded.is_empty() {
+    if encoded.is_empty() && skips.is_empty() {
         return Ok((Some((batch, rules)), stopped));
     }
 
@@ -489,12 +706,20 @@ fn image_batch_step<E: ImageEncoder>(
         *writer = Some(open_write(database, false)?.0);
     }
     let conn = writer.as_mut().expect("opened writer connection");
+    ensure_schema(conn)?;
     let txn = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if Rules::read(&txn)?.as_ref() != Some(&rules) {
         if yield_on_scope_change {
             return Ok((None, true));
         }
         bail!("image or filename scope changed; retry the batch");
+    }
+    for (id, skip_stamp) in skips {
+        txn.execute(
+            "INSERT INTO image_skip VALUES (?1,?2,?3)
+             ON CONFLICT(id) DO UPDATE SET model=excluded.model,stamp=excluded.stamp",
+            params![id, MODEL_ID, skip_stamp],
+        )?;
     }
     let mut total: i64 = txn.query_row("SELECT count(*) FROM image_embedding", [], |r| r.get(0))?;
     for (id, path, stamp, packed) in encoded {
@@ -516,7 +741,7 @@ fn image_batch_step<E: ImageEncoder>(
             [id],
             |r| r.get(0),
         )?;
-        if !existing && total >= MAX_VECTORS {
+        if !existing && total >= limit {
             batch.skipped += 1;
             batch.limited = true;
             continue;
@@ -526,6 +751,7 @@ fn image_batch_step<E: ImageEncoder>(
              ON CONFLICT(id) DO UPDATE SET model=excluded.model,stamp=excluded.stamp,vector=excluded.vector",
             params![id, MODEL_ID, stamp, packed],
         )?;
+        txn.execute("DELETE FROM image_skip WHERE id=?1", [id])?;
         total += i64::from(!existing);
         batch.indexed += 1;
     }
@@ -1322,6 +1548,276 @@ mod tests {
         assert_eq!(adapted.content_roots, Some(vec![root.clone()]));
         assert_eq!(documents(&database), 1);
         drop(legacy);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn image_limit_scales_with_physical_memory_and_clamps_bounds() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const BYTES_PER_VEC: u64 = (DIMENSIONS as u64) * 2;
+        assert!(SCHEMA.contains(CREATE_IMAGE_MTIME_INDEX));
+        assert_eq!(
+            image_limit_for_memory(2 * GIB),
+            (MIN_IMAGE_VECTOR_BYTES / BYTES_PER_VEC) as i64
+        );
+        assert_eq!(
+            image_limit_for_memory(8 * GIB),
+            ((8 * GIB / 100) / BYTES_PER_VEC) as i64
+        );
+        assert_eq!(
+            image_limit_for_memory(16 * GIB),
+            ((16 * GIB / 100) / BYTES_PER_VEC) as i64
+        );
+        assert_eq!(
+            image_limit_for_memory(64 * GIB),
+            (MAX_IMAGE_VECTOR_BYTES / BYTES_PER_VEC) as i64
+        );
+        assert_eq!(
+            image_limit_for_memory(128 * GIB),
+            (MAX_IMAGE_VECTOR_BYTES / BYTES_PER_VEC) as i64
+        );
+        assert!(image_limit() >= (MIN_IMAGE_VECTOR_BYTES / BYTES_PER_VEC) as i64);
+
+        assert_eq!(parse_cursor(None).unwrap(), None);
+        assert_eq!(parse_cursor(Some("")).unwrap(), None);
+        assert_eq!(
+            parse_cursor(Some("mtime:1700000000:42")).unwrap(),
+            Some((1_700_000_000, 42))
+        );
+        assert_eq!(parse_cursor(Some("mtime:-5:1")).unwrap(), Some((-5, 1)));
+        for invalid in ["/tmp/a.png", "mtime:123", "mtime:1:2:3", "mtime:abc:1"] {
+            let err = parse_cursor(Some(invalid)).unwrap_err().to_string();
+            assert!(err.contains("invalid image cursor"), "{invalid}: {err}");
+        }
+    }
+
+    #[test]
+    fn mtime_index_covers_batch_and_pending_queries_and_indexes_recent_first_across_roots() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-image-mtime-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let root_a = root.join("aaa");
+        let root_z = root.join("zzz");
+        fs::create_dir_all(&root_a).unwrap();
+        fs::create_dir_all(&root_z).unwrap();
+        let png: &[u8] = &[
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, b'I', b'D', b'A', b'T', 0x08,
+            0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d,
+            0xb0, 0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+        ];
+        let old_img = root_a.join("old.png");
+        let new_img = root_z.join("new.png");
+        fs::write(&old_img, png).unwrap();
+        fs::write(&new_img, png).unwrap();
+        let set_mtime = |path: &Path, secs: i64| {
+            let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let times = [
+                libc::timeval {
+                    tv_sec: secs,
+                    tv_usec: 0,
+                },
+                libc::timeval {
+                    tv_sec: secs,
+                    tv_usec: 0,
+                },
+            ];
+            assert_eq!(unsafe { libc::utimes(cpath.as_ptr(), times.as_ptr()) }, 0);
+        };
+        set_mtime(&old_img, 1_700_000_000);
+        set_mtime(&new_img, 1_700_010_000);
+
+        let database = root.join("index.db");
+        crate::scan(
+            &database,
+            &Scope {
+                roots: vec![root.clone()],
+                content_roots: Some(vec![root_a.clone(), root_z.clone()]),
+                documents: true,
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        image_scope(&database, Some(&root_a)).unwrap();
+        image_scope(&database, Some(&root_z)).unwrap();
+
+        let reader = open_read(&database).unwrap();
+        assert!(has_mtime_index(&reader).unwrap());
+        let rules = Rules::read(&reader).unwrap().unwrap();
+        let bounds: Vec<(String, String)> = rules.bounds().collect();
+        assert_eq!(bounds.len(), 2);
+
+        let explain = |sql: &str, values: Vec<rusqlite::types::Value>| -> Vec<String> {
+            let mut stmt = reader
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            stmt.query_map(rusqlite::params_from_iter(values), |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        let (batch_sql, batch_vals) = build_batch_query(&bounds, true, true, None, 2);
+        let batch_plan = explain(&batch_sql, batch_vals).join(" | ");
+        assert!(
+            batch_plan.contains("COVERING INDEX item_image_mtime"),
+            "unexpected batch plan: {batch_plan}"
+        );
+        assert!(
+            !batch_plan.contains("TEMP B-TREE"),
+            "batch query should not sort with temp b-tree: {batch_plan}"
+        );
+        let (cursor_sql, cursor_vals) =
+            build_batch_query(&bounds, true, true, Some((1_700_010_000, 99)), 2);
+        let cursor_plan = explain(&cursor_sql, cursor_vals).join(" | ");
+        assert!(
+            cursor_plan.contains("COVERING INDEX item_image_mtime"),
+            "unexpected cursor batch plan: {cursor_plan}"
+        );
+        assert!(
+            !cursor_plan.contains("TEMP B-TREE"),
+            "cursor batch query should not sort with temp b-tree: {cursor_plan}"
+        );
+        let (pending_sql, pending_vals) = build_pending_query(&bounds, true, true, true);
+        let pending_plan = explain(&pending_sql, pending_vals).join(" | ");
+        assert!(
+            pending_plan.contains("COVERING INDEX item_image_mtime"),
+            "unexpected pending plan: {pending_plan}"
+        );
+
+        assert!(!has_vectors(&reader).unwrap());
+        let before = coverage(&reader).unwrap();
+        assert!(before.enabled);
+        assert_eq!(before.vectors, 0);
+        assert!(before.pending);
+        assert!(!before.limited);
+        assert_eq!(before.vector_limit, image_limit());
+
+        struct FixedEncoder;
+        impl ImageEncoder for FixedEncoder {
+            fn encode_image_bytes(&mut self, _: &[u8]) -> Result<Vec<f32>> {
+                Ok(query_vector())
+            }
+        }
+        let mut writer = None;
+        let mut worker = None;
+        let mut connect = Some(|| Ok(FixedEncoder));
+        let (step1, _) = image_batch_step(
+            &database,
+            &reader,
+            &mut writer,
+            &mut connect,
+            &mut worker,
+            None,
+            1,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let (batch1, _) = step1.unwrap();
+        assert_eq!((batch1.processed, batch1.indexed), (1, 1));
+        assert!(
+            batch1
+                .next_after
+                .as_deref()
+                .is_some_and(|cursor| cursor.starts_with("mtime:"))
+        );
+        let first_indexed_path: String = reader
+            .query_row(
+                "SELECT i.path FROM image_embedding e JOIN item i USING(id)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            first_indexed_path,
+            new_img.to_str().unwrap(),
+            "newer zzz/new.png must be indexed before older aaa/old.png"
+        );
+        assert!(has_vectors(&reader).unwrap());
+        let mid = coverage(&reader).unwrap();
+        assert!(mid.enabled && mid.vectors == 1 && mid.pending && !mid.limited);
+        let capped = coverage_with_limit(&reader, 1).unwrap();
+        assert!(capped.enabled && capped.vectors == 1 && capped.pending && capped.limited);
+
+        let (step2, _) = image_batch_step(
+            &database,
+            &reader,
+            &mut writer,
+            &mut connect,
+            &mut worker,
+            batch1.next_after.as_deref(),
+            1,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let (batch2, _) = step2.unwrap();
+        assert_eq!((batch2.processed, batch2.indexed), (1, 1));
+        assert_eq!(batch2.next_after, None);
+
+        let after = coverage(&reader).unwrap();
+        assert!(after.enabled);
+        assert_eq!(after.vectors, 2);
+        assert!(!after.pending);
+        assert!(!after.limited);
+        assert_eq!(after.vector_limit, image_limit());
+
+        let report = crate::status(&reader).unwrap();
+        assert_eq!(report["images"]["enabled"], true);
+        assert_eq!(report["images"]["vectors"], 2);
+        assert_eq!(report["images"]["pending"], false);
+        assert_eq!(report["images"]["limited"], false);
+        assert_eq!(report["images"]["vector_limit"], image_limit());
+
+        // An un-decodable / corrupt image is recorded in image_skip so coverage().pending settles to false
+        // until the item's mtime changes.
+        let bad_img = root_z.join("bad.png");
+        fs::write(&bad_img, b"not a valid png payload").unwrap();
+        set_mtime(&bad_img, 1_700_020_000);
+        crate::scan(
+            &database,
+            &Scope {
+                roots: vec![root.clone()],
+                content_roots: Some(vec![root_a.clone(), root_z.clone()]),
+                documents: true,
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        assert!(coverage(&reader).unwrap().pending);
+        let (skip_step, _) = image_batch_step(
+            &database,
+            &reader,
+            &mut writer,
+            &mut connect,
+            &mut worker,
+            None,
+            4,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(skip_step.unwrap().0.skipped, 1);
+        assert!(!coverage(&reader).unwrap().pending);
+
+        // Updating mtime on item clears image_skip via SQLite trigger so it becomes pending again.
+        let tx = writer.as_mut().unwrap();
+        tx.execute(
+            "UPDATE item SET mtime=?1 WHERE path=?2",
+            params![1_700_030_000_i64, bad_img.to_str().unwrap()],
+        )
+        .unwrap();
+        assert!(coverage(&reader).unwrap().pending);
+
+        drop(writer);
+        drop(reader);
         fs::remove_dir_all(root).unwrap();
     }
 }

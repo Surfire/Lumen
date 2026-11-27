@@ -394,6 +394,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 self.updatePresentation()
             }
         }.store(in: &cancellables)
+        model.isImageIndexingActive = { [weak self] in self?.imageSearch.building == true }
+        model.onCoverageAccepted = { [weak self] report in
+            guard let self else { return }
+            let roots = report.scope?.contentFolders ?? self.model.settingsScope.contentFolders
+            self.imageSearch.applyCoverage(report.images, contentRoots: roots)
+            self.scheduleAutomaticImageIndexingIfReady()
+        }
+        imageSearch.onBuildFinished = { [weak self] in
+            self?.model.refreshCoverageAfterImageBuild()
+        }
+        model.indexStatus.$localModelState.removeDuplicates().dropFirst().sink { [weak self] _ in
+            DispatchQueue.main.async { [weak self] in
+                self?.scheduleAutomaticImageIndexingIfReady()
+            }
+        }.store(in: &cancellables)
         scriptCatalog.$scripts.combineLatest(scriptCatalog.$shortcuts).dropFirst().sink { [weak self] scripts, shortcuts in
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
@@ -1788,6 +1803,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
         }
         if model.scopePending, imageSearch.building { imageSearch.stop() }
+    }
+
+    private func scheduleAutomaticImageIndexingIfReady() {
+        guard model.canSearch, !model.scopePending, model.indexWork == nil,
+              model.localModelState == .available || model.localModelState == .ready,
+              model.embeddingState != .running, model.embeddingState != .verifying, model.embeddingState != .pausing,
+              !model.isEmbeddingIndexingPaused,
+              model.imageCoverage?.pending == true, model.imageCoverage?.limited == false,
+              imageSearch.canAutoBuild else { return }
+        imageSearch.build()
     }
 
     private func updateSearchPresentation() {

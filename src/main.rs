@@ -357,6 +357,8 @@ struct Request {
     id: u64,
     query: String,
     limit: Option<usize>,
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -536,7 +538,7 @@ fn serve(
 fn serve_gemma(
     mut input: impl BufRead,
     mut output: impl Write,
-    mut search: impl FnMut(&str, usize) -> Result<Vec<lumen::Hit>>,
+    mut search: impl FnMut(&str, usize, Option<&str>) -> Result<Vec<lumen::Hit>>,
 ) -> Result<()> {
     let mut line = Vec::new();
     loop {
@@ -551,7 +553,7 @@ fn serve_gemma(
             "invalid semantic request frame"
         );
         match serde_json::from_slice::<Request>(&line) {
-            Ok(q) => match search(&q.query, q.limit.unwrap_or(20)) {
+            Ok(q) => match search(&q.query, q.limit.unwrap_or(20), q.mode.as_deref()) {
                 Ok(hits) => serde_json::to_writer(&mut output, &SearchReply { id: q.id, hits })?,
                 Err(error) => serde_json::to_writer(
                     &mut output,
@@ -800,7 +802,7 @@ fn main() -> Result<()> {
             serve_gemma(
                 io::stdin().lock(),
                 io::BufWriter::new(io::stdout().lock()),
-                |query, limit| {
+                |query, limit, _mode| {
                     search_checked(limit, check_access, 20, |limit| {
                         if check_access {
                             session.search_candidates(query, limit)
@@ -822,9 +824,11 @@ fn main() -> Result<()> {
             serve_gemma(
                 io::stdin().lock(),
                 io::BufWriter::new(io::stdout().lock()),
-                |query, limit| {
-                    search_checked(limit, check_access, 100, |limit| {
-                        session.search(query, limit)
+                |query, limit, mode| {
+                    let maximum = if mode == Some("image") { 20 } else { 100 };
+                    search_checked(limit, check_access, maximum, |limit| match mode {
+                        Some("image") => session.search_images(query, limit),
+                        _ => session.search(query, limit),
                     })
                 },
             )?;
@@ -925,23 +929,33 @@ mod tests {
         let mut input = prefix.to_vec();
         input.resize(limit - 1, b' ');
         input.push(b'\n');
-        input.extend_from_slice(b"invalid json\n{\"id\":2,\"query\":\"second\"}\n");
+        input.extend_from_slice(
+            b"invalid json\n{\"id\":2,\"query\":\"second\"}\n{\"id\":3,\"query\":\"photo\",\"mode\":\"image\",\"limit\":8}\n",
+        );
         let mut seen = Vec::new();
         let mut output = Vec::new();
-        serve_gemma(Cursor::new(input), &mut output, |query, limit| {
-            seen.push((query.to_owned(), limit));
+        serve_gemma(Cursor::new(input), &mut output, |query, limit, mode| {
+            seen.push((query.to_owned(), limit, mode.map(str::to_owned)));
             Ok(Vec::new())
         })
         .unwrap();
-        assert_eq!(seen, [("first".into(), 9), ("second".into(), 20)]);
+        assert_eq!(
+            seen,
+            [
+                ("first".into(), 9, None),
+                ("second".into(), 20, None),
+                ("photo".into(), 8, Some("image".into())),
+            ]
+        );
         let replies: Vec<serde_json::Value> = output
             .split_inclusive(|&byte| byte == b'\n')
             .map(|line| serde_json::from_slice(line).unwrap())
             .collect();
-        assert_eq!(replies.len(), 3);
+        assert_eq!(replies.len(), 4);
         assert_eq!(replies[0], json!({"id":1,"hits":[]}));
         assert!(replies[1]["error"].is_string());
         assert_eq!(replies[2], json!({"id":2,"hits":[]}));
+        assert_eq!(replies[3], json!({"id":3,"hits":[]}));
     }
 
     #[test]
@@ -950,7 +964,7 @@ mod tests {
         for (input, bytes_read) in [(vec![b' '; limit * 2], limit + 1), (b"{}".to_vec(), 2)] {
             let mut input = Cursor::new(input);
             let mut output = Vec::new();
-            let result = serve_gemma(&mut input, &mut output, |_, _| {
+            let result = serve_gemma(&mut input, &mut output, |_, _, _| {
                 panic!("invalid frame reached the worker")
             });
             assert!(

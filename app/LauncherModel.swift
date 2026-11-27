@@ -110,6 +110,7 @@ final class IndexStatusState: ObservableObject {
     @Published var contentFailed = false
     @Published var localModelState = LocalModelState.unchecked
     @Published var gemmaCoverage: GemmaCoverage?
+    @Published var imageCoverage: ImageCoverage?
     @Published var embeddingState = EmbeddingState.idle
     @Published var embeddingBatch: EmbeddingBatch?
     @Published var embeddingNotice: LauncherNotice?
@@ -186,6 +187,10 @@ final class Launcher: ObservableObject {
 
     var localModelState: LocalModelState { indexStatus.localModelState }
     var gemmaCoverage: GemmaCoverage? { indexStatus.gemmaCoverage }
+    var imageCoverage: ImageCoverage? { indexStatus.imageCoverage }
+    var onCoverageAccepted: ((IndexReport) -> Void)?
+    var isImageIndexingActive: (() -> Bool)?
+    var isEmbeddingIndexingPaused: Bool { defaults?.bool(forKey: "gemmaIndexingPaused") == true }
     var indexPhase: IndexPhase { indexStatus.indexPhase }
     var indexWork: IndexWork? { indexStatus.indexWork }
     var indexReport: IndexReport? { indexStatus.indexReport }
@@ -309,7 +314,7 @@ final class Launcher: ObservableObject {
         guard !commands.isEmpty else { return result + hits.map(LauncherResult.file) }
         let files: [(LauncherResult, Int)] = hits.map { hit in
             // Keep lexical order on ties. Regular use can move a direct file above a partial command match.
-            let direct = hit.matched_by != "path" && !hit.isSemanticCandidate
+            let direct = hit.matched_by != "path" && !hit.isRelatedHit
             let rank = direct ? 79 + frecency.boost(LauncherFrecency.fileID(hit.path)) : 78
             return (.file(hit), rank)
         }
@@ -648,7 +653,7 @@ final class Launcher: ObservableObject {
         var text: Result<[SearchHit], SearchFailure>?
         var related: [SearchHit] = []
         let oldRelated = presentedQuery == term && localModelState == .ready
-            ? hits.filter(\.isSemanticCandidate) : []
+            ? hits.filter(\.isRelatedHit) : []
         let fileQuery = LauncherFileQuery(term)
         // Short text falls back to a document scan. A one-character edit is a name lookup.
         let searchesText = fileQuery.kind != "folder" && fileQuery.words.count >= 2 &&
@@ -771,8 +776,20 @@ final class Launcher: ObservableObject {
 
     private func publishWithRelated(_ candidates: [SearchHit]) {
         var seen = Set(directHits.map(\.path))
-        let related = candidates.filter { seen.insert($0.path).inserted }.prefix(3)
-        publishHits(directHits + related)
+        let unique = candidates.filter { seen.insert($0.path).inserted }
+        let textRelated = Array(unique.filter(\.isSemanticCandidate).prefix(3))
+        let imageRelated = Array(unique.filter(\.isImageMatch).prefix(2))
+        if imageRelated.isEmpty || directHits.count <= 6 {
+            publishHits(directHits + textRelated + imageRelated)
+            return
+        }
+        let selectedDirectIdx = selectedID.flatMap { id in directHits.firstIndex(where: { $0.id == id }) } ?? 0
+        let insertAt = min(directHits.count, max(6, selectedDirectIdx + 1))
+        var merged = Array(directHits.prefix(insertAt))
+        merged.append(contentsOf: imageRelated)
+        merged.append(contentsOf: directHits.dropFirst(insertAt))
+        merged.append(contentsOf: textRelated)
+        publishHits(merged)
     }
 
     private func publishHits(_ hits: [SearchHit]) {
@@ -838,7 +855,7 @@ final class Launcher: ObservableObject {
 
     func resolve(_ hit: SearchHit, action: FileAction, complete: @escaping (URL) -> Void) {
         guard containsCurrentFile(hit) else { return }
-        guard !hit.isSemanticCandidate || localModelState == .ready else { return }
+        guard !hit.isRelatedHit || isImageSearch || localModelState == .ready else { return }
         if action == .preview && hit.kind != "file" { return }
         if action == .copyName || action == .copyPath {
             complete(URL(fileURLWithPath: hit.path))
@@ -864,7 +881,7 @@ final class Launcher: ObservableObject {
     private func removeMissingResult(_ hit: SearchHit) {
         actionValidating = false
         rejectedPaths.insert(hit.path)
-        if hit.isSemanticCandidate {
+        if hit.isRelatedHit && !isImageSearch {
             cancelRelatedExcerpts()
         } else {
             directHits.removeAll { $0.path == hit.path }
@@ -873,37 +890,65 @@ final class Launcher: ObservableObject {
         set(\.searchNotice, to: LauncherNotice(.stale))
     }
 
-    static func qualifiesForRelatedExcerpts(_ query: String, directCount: Int) -> Bool {
-        guard directCount < 8, !LauncherFileQuery(query).isFiltered else { return false }
+    private enum RelatedSearchKind { case semantic, imageOnly }
+
+    private static func semanticQueryShape(_ query: String) -> (han: Int, words: Int, length: Int)? {
+        guard !LauncherFileQuery(query).isFiltered else { return nil }
         let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard text.utf8.count <= 512, !text.contains("/"), !text.contains("\\"),
+        guard !text.isEmpty, text.utf8.count <= 512, !text.contains("/"), !text.contains("\\"),
               !text.split(whereSeparator: \.isWhitespace).contains(where: { word in
                   let token = String(word)
                   return Self.trailingExtensionRegex.firstMatch(in: token, range: NSRange(location: 0, length: token.utf16.count)) != nil
-              }) else { return false }
-        let words = text.split { !$0.isLetter && !$0.isNumber }
+              }) else { return nil }
+        let words = text.split { !$0.isLetter && !$0.isNumber }.count
         let han = text.unicodeScalars.filter { (0x3400...0x9fff).contains($0.value) }.count
-        return han >= 2 || (words.count >= 2 && text.count >= 6)
+        return (han, words, text.count)
+    }
+
+    static func qualifiesForRelatedExcerpts(_ query: String, directCount: Int) -> Bool {
+        guard directCount < 8, let shape = semanticQueryShape(query) else { return false }
+        return shape.han >= 2 || (shape.words >= 2 && shape.length >= 6)
+    }
+
+    static func qualifiesForImageRecall(_ query: String) -> Bool {
+        guard let shape = semanticQueryShape(query) else { return false }
+        return shape.han >= 1 || (shape.words >= 1 && shape.length >= 3)
+    }
+
+    private var hasInstalledImageProjector: Bool {
+        guard let home = engine.installedGemmaHome else { return true }
+        return GemmaAssetManager.installedProjector(home: home) != nil
+    }
+
+    private func relatedSearchKind(directCount: Int) -> RelatedSearchKind? {
+        guard !scopePending else { return nil }
+        if gemmaCoverage?.hasResults == true && Self.qualifiesForRelatedExcerpts(query, directCount: directCount) {
+            return .semantic
+        }
+        if imageCoverage?.hasResults == true && hasInstalledImageProjector && Self.qualifiesForImageRecall(query) {
+            return .imageOnly
+        }
+        return nil
     }
 
     private func shouldFindRelatedExcerpts(directCount: Int) -> Bool {
-        gemmaCoverage?.hasResults == true && !scopePending
-            && Self.qualifiesForRelatedExcerpts(query, directCount: directCount)
+        relatedSearchKind(directCount: directCount) != nil
     }
 
     private func queueRelatedExcerpts() {
         guard resultsRevision == revision, relatedRevision != revision,
-              shouldFindRelatedExcerpts(directCount: directHits.count) else { return }
+              let kind = relatedSearchKind(directCount: directHits.count) else { return }
         if case .unavailable = localModelState { return }
         if localModelState == .checking || localModelState == .unchecked { return }
         set(\.semanticBusy, to: true)
         let current = revision
         semanticDebounce?.cancel()
+        let delay: Duration = kind == .semantic ? .milliseconds(120) : .milliseconds(180)
         semanticDebounce = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(120))
+            try? await Task.sleep(for: delay)
             guard !Task.isCancelled, let self, !self.closed, self.revision == current else { return }
             if self.localModelState == .available || self.localModelState == .ready {
-                self.searchRelatedExcerpts(revision: current)
+                self.searchRelatedExcerpts(revision: current, kind: kind)
             } else if self.localModelState != .checking {
                 self.set(\.semanticBusy, to: false)
             }
@@ -918,15 +963,27 @@ final class Launcher: ObservableObject {
         relatedRevision = nil
     }
 
-    private func searchRelatedExcerpts(revision: UInt64) {
-        guard gemmaCoverage?.hasResults == true else {
-            set(\.semanticBusy, to: false)
-            return
-        }
-        relatedRevision = revision
-        set(\.semanticBusy, to: true)
-        engine.searchSemantic(query) { [weak self] reply in
+    private func searchRelatedExcerpts(revision: UInt64, kind: RelatedSearchKind) {
+        let complete: (Result<[SearchHit], SearchFailure>) -> Void = { [weak self] reply in
             self?.receiveRelated(reply, revision: revision)
+        }
+        switch kind {
+        case .semantic:
+            guard gemmaCoverage?.hasResults == true else {
+                set(\.semanticBusy, to: false)
+                return
+            }
+            relatedRevision = revision
+            set(\.semanticBusy, to: true)
+            engine.searchSemantic(query, complete: complete)
+        case .imageOnly:
+            guard imageCoverage?.hasResults == true else {
+                set(\.semanticBusy, to: false)
+                return
+            }
+            relatedRevision = revision
+            set(\.semanticBusy, to: true)
+            engine.searchSemanticImages(query, complete: complete)
         }
     }
 
@@ -935,7 +992,7 @@ final class Launcher: ObservableObject {
         switch reply {
         case .success(let hits):
             if localModelState != .ready { indexStatus.set(\.localModelState, to: .ready) }
-            validatePreviews(hits.filter(\.isSemanticCandidate), revision: revision) { [weak self] available in
+            validatePreviews(hits.filter(\.isRelatedHit), revision: revision) { [weak self] available in
                 guard let self, self.relatedRevision == revision else { return }
                 self.publishWithRelated(available)
                 self.set(\.semanticBusy, to: false)
@@ -980,7 +1037,7 @@ final class Launcher: ObservableObject {
                 let issue = LocalModelProblem.classify(status?.diagnostic ?? response.diagnostic) ?? .verification
                 self.indexStatus.set(\.localModelState, to: .unavailable(issue))
                 self.cancelRelatedExcerpts()
-                if self.hits.contains(where: \.isSemanticCandidate) { self.publishWithRelated([]) }
+                if !self.isImageSearch && self.hits.contains(where: \.isRelatedHit) { self.publishWithRelated([]) }
                 complete?(false)
             }
         }
@@ -1056,6 +1113,7 @@ final class Launcher: ObservableObject {
         clearFileDiagnosis()
         cancelCoverageRead()
         indexStatus.set(\.gemmaCoverage, to: nil)
+        indexStatus.set(\.imageCoverage, to: nil)
         invalidateSearch()
         engine.close()
         indexStatus.set(\.indexNotice, to: nil)
@@ -1176,10 +1234,18 @@ final class Launcher: ObservableObject {
         refreshCoverage(after: .milliseconds(100))
     }
 
+    func setEmbeddingIndexingPaused(_ paused: Bool) {
+        defaults?.set(paused, forKey: "gemmaIndexingPaused")
+    }
+
+    func refreshCoverageAfterImageBuild() {
+        refreshCoverage()
+    }
+
     func buildEmbeddings() {
         guard canBuildEmbeddings else { return }
         defaults?.set(true, forKey: "gemmaIndexingEnabled")
-        defaults?.set(false, forKey: "gemmaIndexingPaused")
+        setEmbeddingIndexingPaused(false)
         automaticBuildAttempted = true
         prepareEmbeddings()
     }
@@ -1201,7 +1267,7 @@ final class Launcher: ObservableObject {
     }
 
     func pauseEmbeddings(userInitiated: Bool = false) {
-        if userInitiated { defaults?.set(true, forKey: "gemmaIndexingPaused") }
+        if userInitiated { setEmbeddingIndexingPaused(true) }
         switch embeddingState {
         case .verifying:
             cancelModelCheck()
@@ -1330,10 +1396,29 @@ final class Launcher: ObservableObject {
         if previous != report.gemma {
             indexStatus.set(\.gemmaCoverage, to: report.gemma)
             if report.gemma?.hasResults != true, previous?.hasResults == true {
-                cancelRelatedExcerpts()
-                engine.closeSemantic()
-                if hits.contains(where: \.isSemanticCandidate) { publishWithRelated([]) }
+                if report.images?.hasResults != true {
+                    cancelRelatedExcerpts()
+                    engine.closeSemantic()
+                }
+                if !isImageSearch && hits.contains(where: \.isRelatedHit) {
+                    publishWithRelated(report.images?.hasResults == true ? hits.filter(\.isImageMatch) : [])
+                }
             } else if report.gemma?.hasResults == true, previous?.hasResults != true {
+                queueRelatedExcerpts()
+            }
+        }
+        let previousImages = imageCoverage
+        if previousImages != report.images {
+            indexStatus.set(\.imageCoverage, to: report.images)
+            if report.images?.hasResults != true, previousImages?.hasResults == true {
+                if gemmaCoverage?.hasResults != true {
+                    cancelRelatedExcerpts()
+                    engine.closeSemantic()
+                }
+                if !isImageSearch && hits.contains(where: \.isImageMatch) {
+                    publishWithRelated(gemmaCoverage?.hasResults == true ? hits.filter(\.isSemanticCandidate) : [])
+                }
+            } else if report.images?.hasResults == true, previousImages?.hasResults != true {
                 queueRelatedExcerpts()
             }
         }
@@ -1343,12 +1428,13 @@ final class Launcher: ObservableObject {
         }
         // The saved scope in the database decides whether documents are eligible.
         if !automaticBuildAttempted, embeddingState == .idle, canBuildEmbeddings,
-           defaults?.bool(forKey: "gemmaIndexingPaused") != true,
+           !isEmbeddingIndexingPaused, isImageIndexingActive?() != true,
            defaults?.bool(forKey: "gemmaIndexingEnabled") == true {
             automaticBuildAttempted = true
             prepareEmbeddings()
         }
         startContentIfReady()
+        onCoverageAccepted?(report)
     }
 
     private func refreshCoverage(after delay: Duration = .zero) {
@@ -1454,7 +1540,8 @@ final class Launcher: ObservableObject {
         indexStatus.set(\.watchProgress, to: nil)
         let setupIncomplete = indexReport == nil || savedScope == nil ||
             (contentCoverage?.pending ?? 0) > 0 ||
-            (gemmaCoverage?.documents_enabled == true && gemmaCoverage?.pending == true)
+            (gemmaCoverage?.documents_enabled == true && gemmaCoverage?.pending == true) ||
+            (imageCoverage?.enabled == true && imageCoverage?.pending == true && imageCoverage?.limited == false)
         if isSettingsPresented || setupIncomplete || notice.event == .ready {
             refreshCoverage(after: .milliseconds(400))
         }
@@ -1520,22 +1607,28 @@ final class Launcher: ObservableObject {
             var seen = Set<String>()
             let ranked = [strongNames, bodyHits, weakPaths].flatMap { self.frecency.rankFiles($0) }
             let lexical = Array(ranked.filter { seen.insert($0.path).inserted }.prefix(60))
-            let wantsRelated = self.localModelState == .ready && self.shouldFindRelatedExcerpts(directCount: lexical.count)
-            let existingRelated = wantsRelated ? self.hits.filter(\.isSemanticCandidate) : []
+            let relatedKind = self.localModelState == .ready ? self.relatedSearchKind(directCount: lexical.count) : nil
+            let existingRelated = relatedKind != nil ? self.hits.filter(\.isRelatedHit) : []
             self.presentedQuery = term
             self.directHits = lexical
             self.resultsRevision = currentRevision
             self.publishWithRelated(existingRelated)
-            if wantsRelated {
-                self.engine.searchSemantic(term) { [weak self] reply in
+            if let relatedKind {
+                let replyHandler: (Result<[SearchHit], SearchFailure>) -> Void = { [weak self] reply in
                     guard let self, !self.closed, self.silentRefreshGeneration == generation,
                           self.revision == currentRevision, self.isSearchPresented, self.query == term else { return }
                     guard case .success(let related) = reply else { return }
-                    self.filterExistingPreviews(related.filter(\.isSemanticCandidate)) { [weak self] available in
+                    self.filterExistingPreviews(related.filter(\.isRelatedHit)) { [weak self] available in
                         guard let self, !self.closed, self.silentRefreshGeneration == generation,
                               self.revision == currentRevision, self.isSearchPresented, self.query == term else { return }
                         self.publishWithRelated(available)
                     }
+                }
+                switch relatedKind {
+                case .semantic:
+                    self.engine.searchSemantic(term, complete: replyHandler)
+                case .imageOnly:
+                    self.engine.searchSemanticImages(term, complete: replyHandler)
                 }
             }
             if self.silentRefreshPending { self.scheduleSilentRefresh() }

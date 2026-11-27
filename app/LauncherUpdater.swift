@@ -13,9 +13,28 @@ struct LumenRelease: Decodable, Equatable {
     let notes: String
 }
 
+struct UpdateCheckResult: Equatable {
+    let release: LumenRelease?
+    let installableInPlace: Bool
+}
+
 private struct UpdateError: LocalizedError {
     let errorDescription: String?
     init(_ message: String) { errorDescription = message }
+}
+
+private enum DownloadError: LocalizedError {
+    case notFound
+    case message(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .notFound:
+            "The update server did not return a download."
+        case let .message(message):
+            message
+        }
+    }
 }
 
 final class LauncherUpdater: Sendable {
@@ -62,9 +81,34 @@ final class LauncherUpdater: Sendable {
         return try Self.parseAndCompareManifest(Self.signedContent(cms, certificate), transport: transport)
     }
 
-    func checkAdHoc() async throws -> LumenRelease? {
-        let payload = try await downloadBytes(Self.adHocFeed, limit: Self.manifestByteLimit, message: "Invalid release manifest size.")
+    func checkAdHoc(from url: URL? = nil) async throws -> LumenRelease? {
+        let payload = try await downloadBytes(url ?? Self.adHocFeed, limit: Self.manifestByteLimit, message: "Invalid release manifest size.")
         return try Self.parseAndCompareManifest(payload, transport: transport)
+    }
+
+    private var adHocFallbackFeed: URL? {
+        if feed == Self.feed {
+            return Self.adHocFeed
+        }
+        if feed.pathExtension == "cms" {
+            return feed.deletingPathExtension()
+        }
+        return nil
+    }
+
+    func checkForUpdates() async throws -> UpdateCheckResult {
+        if isReleaseSigned() {
+            do {
+                let found = try await check()
+                return UpdateCheckResult(release: found, installableInPlace: true)
+            } catch DownloadError.notFound {
+                guard let fallback = adHocFallbackFeed else {
+                    throw DownloadError.notFound
+                }
+                return UpdateCheckResult(release: try await checkAdHoc(from: fallback), installableInPlace: false)
+            }
+        }
+        return UpdateCheckResult(release: try await checkAdHoc(), installableInPlace: false)
     }
 
     nonisolated static func releasePageURL(for release: LumenRelease?) -> URL {
@@ -184,10 +228,17 @@ final class LauncherUpdater: Sendable {
     private func download(_ url: URL) async throws -> URL {
         guard transport.allows(url) else { throw UpdateError("Update URLs must use HTTPS.") }
         let (file, response) = try await session.download(from: url)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+        guard let http = response as? HTTPURLResponse,
               let finalURL = http.url, transport.allows(finalURL) else {
             try? FileManager.default.removeItem(at: file)
-            throw UpdateError("The update server did not return a download.")
+            throw DownloadError.message("The update server did not return a download.")
+        }
+        guard http.statusCode == 200 else {
+            try? FileManager.default.removeItem(at: file)
+            if http.statusCode == 404 {
+                throw DownloadError.notFound
+            }
+            throw DownloadError.message("The update server did not return a download.")
         }
         return file
     }
@@ -323,7 +374,7 @@ final class UpdateSettings: ObservableObject {
     @Published private(set) var checked = false
     @Published private(set) var error: String?
     @Published private(set) var backup: URL?
-    let canInstallInPlace: Bool
+    @Published private(set) var canInstallInPlace: Bool
 
     private let defaults: UserDefaults
     private let updater: LauncherUpdater
@@ -418,8 +469,9 @@ final class UpdateSettings: ObservableObject {
     private func performCheck() async throws {
         self.release = nil
         self.checked = false
-        let found = canInstallInPlace ? try await updater.check() : try await updater.checkAdHoc()
-        self.release = found
+        let result = try await updater.checkForUpdates()
+        self.release = result.release
+        self.canInstallInPlace = result.installableInPlace
         self.checked = true
         let now = Date()
         self.lastUpdateCheckAt = now

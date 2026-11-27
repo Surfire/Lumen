@@ -19,8 +19,8 @@ use std::{
 const CHUNK_CHARS: usize = 480;
 const EARLIEST_BREAK: usize = 300;
 const MAX_DOCUMENT_CHUNKS: usize = 128;
-const MAX_EMBEDDED_CHUNKS: i64 = 50_000;
-const MAX_VECTOR_BYTES: i64 = 128 * 1024 * 1024;
+const MIN_TEXT_VECTOR_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_TEXT_VECTOR_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_BATCH: usize = 1000;
 
 pub(super) const SCHEMA: &str = "
@@ -527,12 +527,31 @@ pub struct GemmaSearchSession {
 const IMAGE_BLEND_DIVISOR: usize = 4;
 
 /// Insert image hits among document hits by score, keeping the document
-/// order intact. Callers cap images so they never crowd out documents.
+/// order intact. Reserve slots for cross-modal image hits (capped to at most
+/// the image share) so higher-scoring text hits do not squeeze them out.
 fn blend_image_hits(hits: &mut Vec<Hit>, images: Vec<Hit>, limit: usize) {
+    let mut deduped = Vec::new();
     for image in images {
-        if hits.iter().any(|hit| hit.path == image.path) {
-            continue;
+        if !hits.iter().any(|hit| hit.path == image.path)
+            && !deduped.iter().any(|hit: &Hit| hit.path == image.path)
+        {
+            deduped.push(image);
         }
+    }
+    let existing_images = hits
+        .iter()
+        .filter(|hit| hit.matched_by == "image_embedding")
+        .count();
+    let max_images = if limit == 0 {
+        0
+    } else {
+        (limit / IMAGE_BLEND_DIVISOR).max(1).min(limit)
+    };
+    let reserved = deduped
+        .len()
+        .min(max_images.saturating_sub(existing_images));
+    hits.truncate(limit.saturating_sub(reserved));
+    for image in deduped {
         let score = image.score.unwrap_or(f64::MIN);
         let at = hits
             .iter()
@@ -546,21 +565,26 @@ fn blend_image_hits(hits: &mut Vec<Hit>, images: Vec<Hit>, limit: usize) {
 impl GemmaSearchSession {
     pub fn open(database: &Path, model: &crate::GemmaModel) -> Result<Self> {
         let conn = crate::open_read(database)?;
+        let has_projector = model.has_image_projector();
+        let can_search = |conn: &Connection| -> Result<bool> {
+            Ok(gemma_searchable(conn)?
+                || (has_projector && crate::image_search::has_vectors(conn)?))
+        };
         ensure!(
-            gemma_searchable(&conn)?,
-            "no current Gemma paragraph embeddings: run lumen embed --gemma first"
+            can_search(&conn)?,
+            "no current Gemma embeddings: run lumen embed --gemma or image-index first"
         );
         let mut worker = model.start()?;
         worker.probe()?;
         ensure!(
-            gemma_searchable(&conn)?,
-            "Gemma document coverage changed while starting the runtime"
+            can_search(&conn)?,
+            "Gemma document or image coverage changed while starting the runtime"
         );
         Ok(Self {
             conn,
             worker: GemmaQuery::Worker(worker),
             matrix: MatrixCache::default(),
-            images: model.has_image_projector().then(Default::default),
+            images: has_projector.then(Default::default),
         })
     }
 
@@ -588,6 +612,25 @@ impl GemmaSearchSession {
         let cap = (limit / IMAGE_BLEND_DIVISOR).max(1);
         let image_hits = crate::image_search::rank_with_query(&self.conn, images, &vector, cap)?;
         blend_image_hits(&mut hits, image_hits, limit);
+        hits.retain(|hit| !crate::external::is_external(Path::new(&hit.path)));
+        Ok(hits)
+    }
+
+    pub fn search_images(&mut self, query: &str, limit: usize) -> Result<Vec<Hit>> {
+        let query = query.trim();
+        if query.is_empty() || query.len() > 512 || !crate::query_allows_semantic(query) {
+            return Ok(Vec::new());
+        }
+        let Some(images) = &mut self.images else {
+            return Ok(Vec::new());
+        };
+        let vector = match self.worker.encode(query) {
+            Ok(vector) => vector,
+            Err(error) if error.is::<Unencodable>() => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut hits =
+            crate::image_search::rank_with_query(&self.conn, images, &vector, limit.clamp(1, 20))?;
         hits.retain(|hit| !crate::external::is_external(Path::new(&hit.path)));
         Ok(hits)
     }
@@ -644,9 +687,17 @@ impl State {
     }
 }
 
+pub(crate) fn vector_limit_for_memory(dimensions: i64, ram_bytes: u64) -> i64 {
+    if dimensions <= 0 {
+        return 0;
+    }
+    let budget = (ram_bytes / 40).clamp(MIN_TEXT_VECTOR_BYTES, MAX_TEXT_VECTOR_BYTES);
+    let bytes_per_vec = (dimensions as u64).saturating_mul(2).max(16);
+    (budget / bytes_per_vec) as i64
+}
+
 fn vector_limit(dimensions: i64) -> i64 {
-    // Bound the decoded matrix, including catalogs that still store binary32.
-    MAX_EMBEDDED_CHUNKS.min(MAX_VECTOR_BYTES / (dimensions * 4))
+    vector_limit_for_memory(dimensions, crate::platform::physical_memory_bytes())
 }
 
 pub(super) fn add_status(conn: &Connection, status: &mut serde_json::Value) -> Result<()> {
@@ -1311,6 +1362,118 @@ mod tests {
     }
 
     #[test]
+    fn blend_image_hits_preserves_cross_modal_images_when_higher_scoring_text_fills_limit() {
+        let hit = |path: &str, matched_by: &str, score: f64| Hit {
+            path: path.into(),
+            name: path.into(),
+            kind: "file".into(),
+            availability: "local".into(),
+            matched_by: matched_by.into(),
+            snippet: None,
+            document_stamp: None,
+            pdf_page: None,
+            score: Some(score),
+        };
+        let mut hits = vec![
+            hit("/d/1.md", "semantic", 0.85),
+            hit("/d/2.md", "semantic", 0.85),
+            hit("/d/3.md", "semantic", 0.85),
+            hit("/d/4.md", "semantic", 0.85),
+        ];
+        blend_image_hits(
+            &mut hits,
+            vec![hit("/p/photo.png", "image_embedding", 0.70)],
+            4,
+        );
+        let order: Vec<_> = hits.iter().map(|hit| hit.path.as_str()).collect();
+        assert_eq!(order, ["/d/1.md", "/d/2.md", "/d/3.md", "/p/photo.png"]);
+
+        let mut higher = vec![
+            hit("/d/1.md", "semantic", 0.85),
+            hit("/d/2.md", "semantic", 0.85),
+            hit("/d/3.md", "semantic", 0.85),
+            hit("/d/4.md", "semantic", 0.85),
+        ];
+        blend_image_hits(
+            &mut higher,
+            vec![hit("/p/top.png", "image_embedding", 0.95)],
+            4,
+        );
+        let order: Vec<_> = higher.iter().map(|hit| hit.path.as_str()).collect();
+        assert_eq!(order, ["/p/top.png", "/d/1.md", "/d/2.md", "/d/3.md"]);
+    }
+
+    #[test]
+    fn gemma_session_search_images_ranks_only_images_and_respects_projector_gate() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-gemma-search-images-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let folder = root.join("media");
+        fs::create_dir_all(&folder).unwrap();
+        let photo = folder.join("sunset.png");
+        fs::write(&photo, "image fixture").unwrap();
+        let database = root.join("index.sqlite");
+        crate::scan(
+            &database,
+            &Scope {
+                roots: vec![folder.clone()],
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        crate::image_scope(&database, Some(&folder)).unwrap();
+        let writer = Connection::open(&database).unwrap();
+        let query_vector = || {
+            let mut v = vec![0.0_f32; gemma::DIMENSIONS];
+            v[0] = 1.0;
+            v
+        };
+        let stamp = crate::diagnose::local_stamp(&photo, false).unwrap();
+        writer
+            .execute(
+                "INSERT INTO image_embedding SELECT id,?1,?2,?3 FROM item WHERE path=?4",
+                params![
+                    crate::IMAGE_MODEL_ID,
+                    stamp,
+                    pack(&query_vector()),
+                    photo.to_str().unwrap()
+                ],
+            )
+            .unwrap();
+        drop(writer);
+
+        let mut without_projector = GemmaSearchSession {
+            conn: crate::open_read(&database).unwrap(),
+            worker: GemmaQuery::Fixture(Box::new(query_vector)),
+            matrix: MatrixCache::default(),
+            images: None,
+        };
+        assert!(
+            without_projector
+                .search_images("sunset beach", 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut with_projector = GemmaSearchSession {
+            conn: crate::open_read(&database).unwrap(),
+            worker: GemmaQuery::Fixture(Box::new(query_vector)),
+            matrix: MatrixCache::default(),
+            images: Some(Default::default()),
+        };
+        let hits = with_projector.search_images("sunset beach", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, photo.to_str().unwrap());
+        assert_eq!(hits[0].matched_by, "image_embedding");
+        assert!(with_projector.search_images("   ", 10).unwrap().is_empty());
+
+        drop(without_projector);
+        drop(with_projector);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn gemma_eligibility_uses_current_model_visible_stamp_and_vector_shape() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE item(id INTEGER PRIMARY KEY,availability TEXT);
@@ -1609,8 +1772,42 @@ mod tests {
             spans.iter().map(|r| r.len()).sum::<usize>(),
             single_paragraph.len()
         );
-        assert_eq!(vector_limit(512), MAX_EMBEDDED_CHUNKS);
-        assert_eq!(vector_limit(4096), MAX_VECTOR_BYTES / (4096 * 4));
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(vector_limit_for_memory(0, 16 * GIB), 0);
+        assert_eq!(vector_limit_for_memory(-768, 16 * GIB), 0);
+        assert_eq!(
+            vector_limit_for_memory(512, 2 * GIB),
+            (MIN_TEXT_VECTOR_BYTES / (512 * 2)) as i64
+        );
+        assert_eq!(
+            vector_limit_for_memory(512, 8 * GIB),
+            ((8 * GIB / 40) / (512 * 2)) as i64
+        );
+        assert_eq!(
+            vector_limit_for_memory(768, 8 * GIB),
+            ((8 * GIB / 40) / (768 * 2)) as i64
+        );
+        assert_eq!(
+            vector_limit_for_memory(768, 16 * GIB),
+            ((16 * GIB / 40) / (768 * 2)) as i64
+        );
+        assert_eq!(
+            vector_limit_for_memory(4096, 16 * GIB),
+            ((16 * GIB / 40) / (4096 * 2)) as i64
+        );
+        assert_eq!(
+            vector_limit_for_memory(768, 64 * GIB),
+            (MAX_TEXT_VECTOR_BYTES / (768 * 2)) as i64
+        );
+        assert_eq!(
+            vector_limit_for_memory(4096, 128 * GIB),
+            (MAX_TEXT_VECTOR_BYTES / (4096 * 2)) as i64
+        );
+        assert_eq!(
+            vector_limit_for_memory(768, 64 * GIB),
+            vector_limit_for_memory(768, 128 * GIB)
+        );
+        assert!(vector_limit(768) >= (MIN_TEXT_VECTOR_BYTES / (768 * 2)) as i64);
     }
 
     #[test]

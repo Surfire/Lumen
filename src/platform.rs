@@ -88,6 +88,33 @@ fn dataless(_: &fs::Metadata) -> bool {
     false
 }
 
+const DEFAULT_PHYSICAL_MEMORY_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+#[cfg(target_os = "macos")]
+pub(crate) fn physical_memory_bytes() -> u64 {
+    let mut memsize: u64 = 0;
+    let mut size = std::mem::size_of::<u64>();
+    let ok = unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&raw mut memsize).cast(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok == 0 && size == std::mem::size_of::<u64>() && memsize > 0 {
+        memsize
+    } else {
+        DEFAULT_PHYSICAL_MEMORY_BYTES
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn physical_memory_bytes() -> u64 {
+    DEFAULT_PHYSICAL_MEMORY_BYTES
+}
+
 #[cfg(target_os = "macos")]
 pub struct NoMaterialization(i32);
 #[cfg(target_os = "macos")]
@@ -645,5 +672,10 @@ mod tests {
             .expect("bulk_children must emit VSYMLINK entries");
         assert!(link.1.is_none());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn physical_memory_bytes_reports_at_least_one_gib() {
+        assert!(physical_memory_bytes() >= 1024 * 1024 * 1024);
     }
 }

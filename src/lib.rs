@@ -564,6 +564,7 @@ fn open_write(path: &Path, exclusive_indexer: bool) -> Result<(Connection, Optio
         _ => bail!("not a supported Lumen index; no changes made"),
     }
     image_search::migrate_legacy_scope(&mut conn)?;
+    image_search::ensure_schema(&conn)?;
     Ok((conn, lease))
 }
 
@@ -1080,6 +1081,7 @@ pub fn status(conn: &Connection) -> Result<serde_json::Value> {
     data["content"]["image_ocr"] = saved_index_scope(conn)?
         .is_some_and(|scope| scope.image_ocr)
         .into();
+    data["images"] = serde_json::to_value(image_search::coverage(conn)?)?;
     semantic::add_status(conn, &mut data)?;
     data["unverified"] = unverified.into();
     Ok(data)

@@ -58,7 +58,7 @@ mod macos {
     use anyhow::Context;
     use rusqlite::Connection;
     use std::{
-        collections::{BTreeMap, BTreeSet},
+        collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
         fs,
         path::PathBuf,
         sync::{
@@ -81,6 +81,170 @@ mod macos {
     const BATCH_SIZE: usize = 512;
     const REPLAY_LIMIT: Duration = Duration::from_secs(4);
     const MAX_PERSISTED_RECONCILIATION_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+    const BURST_WINDOW: Duration = Duration::from_secs(1);
+    const BURST_THRESHOLD: usize = 64;
+    const BURST_QUIET: Duration = Duration::from_secs(3);
+    const BURST_MAX_HOLD: Duration = Duration::from_secs(10);
+    const MAX_BURST_PARENTS: usize = 256;
+
+    struct BurstWindow {
+        started: Instant,
+        last_event: Instant,
+        pending: BTreeMap<PathBuf, bool>,
+    }
+
+    impl BurstWindow {
+        fn deadline(&self) -> Instant {
+            (self.last_event + BURST_QUIET).min(self.started + BURST_MAX_HOLD)
+        }
+    }
+
+    struct ParentBurstState {
+        recent: VecDeque<Instant>,
+        last_seen_seq: u64,
+        burst: Option<BurstWindow>,
+    }
+
+    /// Coalesces FSEvents write storms per parent directory while leaving
+    /// non-bursting directories and `rearm` events completely unbuffered.
+    struct BurstCoalescer {
+        parents: HashMap<PathBuf, ParentBurstState>,
+        seq: u64,
+    }
+
+    impl BurstCoalescer {
+        fn new() -> Self {
+            Self {
+                parents: HashMap::new(),
+                seq: 0,
+            }
+        }
+
+        fn clear(&mut self) {
+            self.parents.clear();
+        }
+
+        fn has_pending(&self) -> bool {
+            self.parents
+                .values()
+                .any(|state| state.burst.as_ref().is_some_and(|b| !b.pending.is_empty()))
+        }
+
+        fn next_deadline(&self) -> Option<Instant> {
+            self.parents
+                .values()
+                .filter_map(|state| state.burst.as_ref().map(BurstWindow::deadline))
+                .min()
+        }
+
+        fn flush_due(&mut self, now: Instant, targets: &mut BTreeMap<PathBuf, bool>) {
+            for state in self.parents.values_mut() {
+                if state
+                    .burst
+                    .as_ref()
+                    .is_some_and(|burst| now >= burst.deadline())
+                    && let Some(burst) = state.burst.take()
+                {
+                    for (path, subtree) in burst.pending {
+                        merge_target(targets, path, subtree);
+                    }
+                }
+            }
+        }
+
+        fn ingest_batch(
+            &mut self,
+            batch: &mut Vec<Change>,
+            now: Instant,
+            targets: &mut BTreeMap<PathBuf, bool>,
+        ) {
+            for change in batch.iter() {
+                let parent = parent_key(&change.path);
+                self.observe_parent(parent, now, targets);
+            }
+            for change in batch.drain(..) {
+                let parent = parent_key(&change.path);
+                if let Some(burst) = self
+                    .parents
+                    .get_mut(parent)
+                    .and_then(|state| state.burst.as_mut())
+                {
+                    merge_target(&mut burst.pending, change.path, change.subtree);
+                } else {
+                    add_target(targets, change);
+                }
+            }
+        }
+
+        fn observe_parent(
+            &mut self,
+            parent: &Path,
+            now: Instant,
+            flushed: &mut BTreeMap<PathBuf, bool>,
+        ) {
+            self.seq = self.seq.wrapping_add(1);
+            let seq = self.seq;
+            if !self.parents.contains_key(parent) {
+                if self.parents.len() >= MAX_BURST_PARENTS
+                    && let Some(evict_key) = self
+                        .parents
+                        .iter()
+                        .min_by_key(|(_, state)| (state.burst.is_some(), state.last_seen_seq))
+                        .map(|(path, _)| path.clone())
+                    && let Some(evicted) = self.parents.remove(&evict_key)
+                    && let Some(burst) = evicted.burst
+                {
+                    for (path, subtree) in burst.pending {
+                        merge_target(flushed, path, subtree);
+                    }
+                }
+                self.parents.insert(
+                    parent.to_path_buf(),
+                    ParentBurstState {
+                        recent: VecDeque::new(),
+                        last_seen_seq: seq,
+                        burst: None,
+                    },
+                );
+            }
+            let state = self
+                .parents
+                .get_mut(parent)
+                .expect("parent state inserted above");
+            state.last_seen_seq = seq;
+            while state
+                .recent
+                .front()
+                .is_some_and(|&ts| now.saturating_duration_since(ts) >= BURST_WINDOW)
+            {
+                state.recent.pop_front();
+            }
+            state.recent.push_back(now);
+            if state.recent.len() > BURST_THRESHOLD + 1 {
+                state.recent.pop_front();
+            }
+            if let Some(burst) = &mut state.burst {
+                burst.last_event = now;
+            } else if state.recent.len() > BURST_THRESHOLD {
+                state.burst = Some(BurstWindow {
+                    started: now,
+                    last_event: now,
+                    pending: BTreeMap::new(),
+                });
+            }
+        }
+    }
+
+    fn parent_key(path: &Path) -> &Path {
+        path.parent().unwrap_or(path)
+    }
+
+    fn merge_target(targets: &mut BTreeMap<PathBuf, bool>, path: PathBuf, subtree: bool) {
+        targets
+            .entry(path)
+            .and_modify(|existing| *existing |= subtree)
+            .or_insert(subtree);
+    }
 
     pub(crate) fn checkpoint_before_scan<'a>(
         conn: &Connection,
@@ -367,15 +531,24 @@ mod macos {
             && resumed
             && crate::index::reconciliation_overdue(conn, MAX_PERSISTED_RECONCILIATION_AGE)?;
         let mut pending_update = false;
+        let mut coalescer = BurstCoalescer::new();
+        let mut batch = Vec::new();
+        let mut pending_cursor = sub.cursor;
         loop {
             let interval = if pending_recovery {
                 recovery_cooldown
             } else {
                 periodic
             };
-            let mut wait = interval.saturating_sub(last_reconciled.elapsed());
+            let now = Instant::now();
+            let mut wait = interval.saturating_sub(now.saturating_duration_since(last_reconciled));
             if pending_update {
-                wait = wait.min(MIN_UPDATE_INTERVAL.saturating_sub(last_emitted.elapsed()));
+                wait = wait.min(
+                    MIN_UPDATE_INTERVAL.saturating_sub(now.saturating_duration_since(last_emitted)),
+                );
+            }
+            if let Some(deadline) = coalescer.next_deadline() {
+                wait = wait.min(deadline.saturating_duration_since(now));
             }
             let first = match sub.receiver.recv_timeout(wait) {
                 Ok(event) => Some(event),
@@ -386,19 +559,28 @@ mod macos {
             };
             let mut targets = BTreeMap::new();
             let mut rearm = false;
-            let mut cursor = sub.cursor;
+            batch.clear();
             for event in first
                 .into_iter()
                 .chain(sub.receiver.try_iter().take(BATCH_SIZE - 1))
             {
                 match event {
                     Event::Change(change) => {
-                        rearm |= change.rearm;
-                        add_target(&mut targets, change);
+                        if change.rearm {
+                            rearm = true;
+                            add_target(&mut targets, change);
+                        } else {
+                            batch.push(change);
+                        }
                     }
-                    Event::Checkpoint { id, .. } => cursor = cursor.max(id),
+                    Event::Checkpoint { id, .. } => pending_cursor = pending_cursor.max(id),
                     Event::Lost => {}
                 }
+            }
+            let now = Instant::now();
+            coalescer.flush_due(now, &mut targets);
+            if !batch.is_empty() {
+                coalescer.ingest_batch(&mut batch, now, &mut targets);
             }
             if sub.sink.lost.swap(false, Ordering::AcqRel) {
                 if persistent {
@@ -415,6 +597,7 @@ mod macos {
                 || last_reconciled.elapsed() >= periodic
                 || pending_recovery && last_reconciled.elapsed() >= recovery_cooldown;
             if full {
+                coalescer.clear();
                 if persistent {
                     resume::invalidate(conn)?;
                 }
@@ -424,6 +607,7 @@ mod macos {
                 restrict_scope(conn, &coverage).context("apply refreshed watch scope")?;
                 (sub, _) = Subscription::start(conn, &coverage, persistent, false, &start)?;
                 reconcile_startup(conn, &coverage, &mut sub, None)?;
+                pending_cursor = sub.cursor;
                 last_reconciled = Instant::now();
                 pending_recovery = false;
                 pending_update = true;
@@ -435,11 +619,12 @@ mod macos {
                     pending_recovery |= stats.entries_unreadable != 0;
                     pending_update |= changed;
                 }
-                if cursor > sub.cursor
+                if !coalescer.has_pending()
+                    && pending_cursor > sub.cursor
                     && !pending_recovery
                     && !sub.sink.lost.load(Ordering::Acquire)
                 {
-                    sub.save(conn, cursor)?;
+                    sub.save(conn, pending_cursor)?;
                 }
             }
             if pending_update && last_emitted.elapsed() >= MIN_UPDATE_INTERVAL {
@@ -451,10 +636,7 @@ mod macos {
     }
 
     fn add_target(targets: &mut BTreeMap<PathBuf, bool>, change: Change) {
-        targets
-            .entry(change.path)
-            .and_modify(|subtree| *subtree |= change.subtree)
-            .or_insert(change.subtree);
+        merge_target(targets, change.path, change.subtree);
     }
 
     fn reconcile_startup<S>(
@@ -976,6 +1158,386 @@ mod macos {
                 "test complete"
             );
             assert_eq!(updates, 2);
+        }
+
+        fn make_change(path: PathBuf, subtree: bool) -> Change {
+            Change {
+                id: 0,
+                path,
+                subtree,
+                rearm: false,
+                uncertain: false,
+            }
+        }
+
+        #[test]
+        fn burst_coalescer_passes_normal_edits_and_holds_over_threshold() {
+            let mut coalescer = BurstCoalescer::new();
+            let t0 = Instant::now();
+
+            // Exactly 64 events in 1s must pass through without burst holdback.
+            let mut normal_batch: Vec<Change> = (0..BURST_THRESHOLD)
+                .map(|i| make_change(PathBuf::from(format!("/tmp/normal/f{i}.txt")), false))
+                .collect();
+            let mut targets = BTreeMap::new();
+            coalescer.ingest_batch(&mut normal_batch, t0, &mut targets);
+            assert_eq!(targets.len(), BURST_THRESHOLD);
+            assert!(!coalescer.has_pending());
+            assert!(coalescer.next_deadline().is_none());
+
+            // 65+ events under one parent trigger burst holdback while sibling passes immediately.
+            let mut storm_batch: Vec<Change> = (0..80)
+                .map(|i| {
+                    // Duplicate paths and mixed subtree flags should coalesce cleanly.
+                    let idx = i % 20;
+                    make_change(PathBuf::from(format!("/tmp/storm/f{idx}.txt")), i == 5)
+                })
+                .collect();
+            storm_batch.push(make_change(PathBuf::from("/tmp/sibling/ok.txt"), false));
+
+            let mut immediate = BTreeMap::new();
+            coalescer.ingest_batch(&mut storm_batch, t0, &mut immediate);
+            assert_eq!(
+                immediate.keys().collect::<Vec<_>>(),
+                vec![&PathBuf::from("/tmp/sibling/ok.txt")]
+            );
+            assert!(coalescer.has_pending());
+            assert_eq!(coalescer.next_deadline(), Some(t0 + BURST_QUIET));
+
+            // Still held just before quiet deadline.
+            let mut before_quiet = BTreeMap::new();
+            coalescer.flush_due(
+                t0 + BURST_QUIET - Duration::from_millis(1),
+                &mut before_quiet,
+            );
+            assert!(before_quiet.is_empty());
+            assert!(coalescer.has_pending());
+
+            // Flushes all 20 coalesced unique targets at quiet deadline, preserving subtree=true.
+            let mut flushed = BTreeMap::new();
+            coalescer.flush_due(t0 + BURST_QUIET, &mut flushed);
+            assert_eq!(flushed.len(), 20);
+            assert_eq!(flushed.get(Path::new("/tmp/storm/f5.txt")), Some(&true));
+            assert!(!coalescer.has_pending());
+            assert!(coalescer.next_deadline().is_none());
+        }
+
+        #[test]
+        fn burst_coalescer_flushes_at_max_hold_during_sustained_storm() {
+            let mut coalescer = BurstCoalescer::new();
+            let t0 = Instant::now();
+            let mut targets = BTreeMap::new();
+
+            // Initial burst (> 64 events) starts at t0.
+            let mut initial: Vec<Change> = (0..70)
+                .map(|i| make_change(PathBuf::from(format!("/tmp/build/obj_{i}.o")), false))
+                .collect();
+            coalescer.ingest_batch(&mut initial, t0, &mut targets);
+            assert!(targets.is_empty());
+            assert_eq!(coalescer.next_deadline(), Some(t0 + BURST_QUIET));
+
+            // Keep sending events every 2s up to 9s so quiet deadline keeps shifting past 10s,
+            // forcing BURST_MAX_HOLD (10s) to bound total holdback.
+            for sec in [2_u64, 4, 6, 8, 9] {
+                let now = t0 + Duration::from_secs(sec);
+                coalescer.flush_due(now, &mut targets);
+                assert!(targets.is_empty(), "flushed prematurely at {sec}s");
+                let mut tick = vec![make_change(
+                    PathBuf::from(format!("/tmp/build/tick_{sec}.o")),
+                    false,
+                )];
+                coalescer.ingest_batch(&mut tick, now, &mut targets);
+                assert!(targets.is_empty());
+            }
+            assert_eq!(coalescer.next_deadline(), Some(t0 + BURST_MAX_HOLD));
+
+            // Just before 10s: still held.
+            coalescer.flush_due(t0 + BURST_MAX_HOLD - Duration::from_millis(1), &mut targets);
+            assert!(targets.is_empty());
+
+            // At 10s: max-hold forces flush.
+            coalescer.flush_due(t0 + BURST_MAX_HOLD, &mut targets);
+            assert_eq!(targets.len(), 75);
+            assert!(!coalescer.has_pending());
+        }
+
+        #[test]
+        fn burst_coalescer_bounds_parents_and_evicts_oldest_without_losing_events() {
+            let mut coalescer = BurstCoalescer::new();
+            let t0 = Instant::now();
+            let mut targets = BTreeMap::new();
+
+            // One bursting parent plus 300 distinct non-bursting parents.
+            let mut burst: Vec<Change> = (0..70)
+                .map(|i| make_change(PathBuf::from(format!("/tmp/hot/item_{i}")), false))
+                .collect();
+            coalescer.ingest_batch(&mut burst, t0, &mut targets);
+            assert!(targets.is_empty());
+
+            for p in 0..300 {
+                let mut one = vec![make_change(PathBuf::from(format!("/tmp/dir_{p}/a")), false)];
+                coalescer.ingest_batch(&mut one, t0, &mut targets);
+            }
+            assert_eq!(targets.len(), 300);
+            assert!(coalescer.parents.len() <= MAX_BURST_PARENTS);
+            assert!(coalescer.has_pending());
+
+            // Now fill with 260 distinct bursting parents: map stays <= 256 and evicted
+            // bursting parents flush their pending paths instead of dropping them.
+            targets.clear();
+            for p in 0..260 {
+                let mut batch: Vec<Change> = (0..65)
+                    .map(|i| make_change(PathBuf::from(format!("/tmp/storm_{p}/f_{i}")), false))
+                    .collect();
+                coalescer.ingest_batch(&mut batch, t0, &mut targets);
+            }
+            assert_eq!(coalescer.parents.len(), MAX_BURST_PARENTS);
+            assert!(!targets.is_empty());
+            // Flush the remaining 256 bursting parents; total flushed paths across eviction + flush must be exact.
+            coalescer.flush_due(t0 + BURST_QUIET, &mut targets);
+            assert_eq!(targets.len(), 70 + 260 * 65);
+        }
+
+        #[test]
+        fn maintain_holds_burst_and_checkpoint_while_flushing_sibling_immediately() {
+            let dir = TestDirectory::new();
+            let root = dir.0.join("root");
+            let burst_dir = root.join("burst");
+            let sibling_dir = root.join("sibling");
+            fs::create_dir_all(&burst_dir).unwrap();
+            fs::create_dir_all(&sibling_dir).unwrap();
+
+            let db = absolute(&dir.0.join("index.sqlite")).unwrap();
+            let (mut conn, _lease) = open_write(&db, true).unwrap();
+            let coverage = Arc::new(
+                Coverage::new(
+                    db.clone(),
+                    &Scope {
+                        roots: vec![root],
+                        ..Scope::default()
+                    },
+                )
+                .unwrap(),
+            );
+            resume::install_invalidation(&conn).unwrap();
+
+            let saved_checkpoint = |conn: &Connection| -> Option<u64> {
+                use rusqlite::OptionalExtension;
+                let raw: Option<String> = conn
+                    .query_row(
+                        "SELECT value FROM info WHERE key='watch_checkpoint_v1'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .unwrap();
+                raw.and_then(|s| {
+                    serde_json::from_str::<(serde_json::Value, serde_json::Value, u64)>(&s)
+                        .ok()
+                        .map(|(_, _, id)| id)
+                })
+            };
+
+            let sink = RefCell::<Option<Arc<Sink>>>::new(None);
+            let mut updates = 0;
+            let mut initial_cursor = 0;
+            let mut ready_at = Instant::now();
+            let sibling_file = absolute(&sibling_dir.join("normal_edit.txt")).unwrap();
+            let burst_files: Vec<PathBuf> = (0..80)
+                .map(|i| absolute(&burst_dir.join(format!("storm_{i:03}.txt"))).unwrap())
+                .collect();
+
+            let result = maintain(
+                &mut conn,
+                coverage,
+                MaintenancePolicy {
+                    periodic: Duration::from_secs(60),
+                    recovery_cooldown: Duration::from_secs(30),
+                    persistent: true,
+                    guarded_cache: false,
+                },
+                None,
+                |s, replay| {
+                    *sink.borrow_mut() = Some(s.clone());
+                    if let Some((_, cursor)) = replay {
+                        s.send(Event::Checkpoint {
+                            id: cursor,
+                            history_done: true,
+                        });
+                    }
+                    Ok(())
+                },
+                |event| {
+                    match event {
+                        WatchEvent::Cached => unreachable!(),
+                        WatchEvent::Ready => {
+                            let reader = crate::open_read(&db)?;
+                            initial_cursor =
+                                saved_checkpoint(&reader).expect("initial watch checkpoint");
+                            fs::write(&sibling_file, "immediate edit")?;
+                            for path in &burst_files {
+                                fs::write(path, "storm")?;
+                            }
+                            let sink = sink.borrow();
+                            let sink = sink.as_ref().unwrap();
+                            sink.change(&sibling_file, initial_cursor + 1, false, false, false);
+                            for (i, path) in burst_files.iter().enumerate() {
+                                sink.change(
+                                    path,
+                                    initial_cursor + 2 + i as u64,
+                                    false,
+                                    false,
+                                    false,
+                                );
+                            }
+                            sink.checkpoint(initial_cursor + 100, false);
+                            ready_at = Instant::now();
+                        }
+                        WatchEvent::Updated => {
+                            updates += 1;
+                            let reader = crate::open_read(&db)?;
+                            if updates == 1 {
+                                assert!(
+                                    ready_at.elapsed() < BURST_QUIET,
+                                    "sibling edit was delayed by burst coalescer: {:?}",
+                                    ready_at.elapsed()
+                                );
+                                assert_eq!(
+                                    crate::search(
+                                        &reader,
+                                        "normal_edit",
+                                        crate::Mode::Name,
+                                        20,
+                                        None
+                                    )?
+                                    .len(),
+                                    1
+                                );
+                                assert!(
+                                    crate::search(&reader, "storm_", crate::Mode::Name, 100, None)?
+                                        .is_empty(),
+                                    "burst files flushed prematurely"
+                                );
+                                assert_eq!(
+                                    saved_checkpoint(&reader),
+                                    Some(initial_cursor),
+                                    "checkpoint advanced while BurstCoalescer held unflushed events"
+                                );
+                            } else {
+                                assert!(
+                                    ready_at.elapsed()
+                                        >= BURST_QUIET.saturating_sub(Duration::from_millis(100)),
+                                    "burst flushed before quiet deadline: {:?}",
+                                    ready_at.elapsed()
+                                );
+                                assert_eq!(
+                                    crate::search(&reader, "storm_", crate::Mode::Name, 100, None)?
+                                        .len(),
+                                    80
+                                );
+                                assert_eq!(
+                                    saved_checkpoint(&reader),
+                                    Some(initial_cursor + 100),
+                                    "checkpoint did not advance after burst flush"
+                                );
+                                anyhow::bail!("burst test complete");
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+            );
+            assert_eq!(
+                result.unwrap_err().root_cause().to_string(),
+                "burst test complete"
+            );
+            assert_eq!(updates, 2);
+        }
+
+        #[test]
+        fn rearm_bypasses_burst_and_clears_buffers_on_full_reconcile() {
+            let dir = TestDirectory::new();
+            let root = dir.0.join("root");
+            let burst_dir = root.join("burst");
+            fs::create_dir_all(&burst_dir).unwrap();
+
+            let db = absolute(&dir.0.join("index.sqlite")).unwrap();
+            let (mut conn, _lease) = open_write(&db, true).unwrap();
+            let coverage = Arc::new(
+                Coverage::new(
+                    db.clone(),
+                    &Scope {
+                        roots: vec![root.clone()],
+                        ..Scope::default()
+                    },
+                )
+                .unwrap(),
+            );
+            let sink = RefCell::<Option<Arc<Sink>>>::new(None);
+            let mut ready_at = Instant::now();
+            let burst_files: Vec<PathBuf> = (0..70)
+                .map(|i| absolute(&burst_dir.join(format!("storm_{i:03}.txt"))).unwrap())
+                .collect();
+            let rearm_file = absolute(&root.join("rearm_added.txt")).unwrap();
+
+            let result = maintain(
+                &mut conn,
+                coverage,
+                MaintenancePolicy {
+                    periodic: Duration::from_secs(60),
+                    recovery_cooldown: Duration::from_secs(30),
+                    persistent: false,
+                    guarded_cache: false,
+                },
+                None,
+                |s, _| {
+                    *sink.borrow_mut() = Some(s.clone());
+                    Ok(())
+                },
+                |event| {
+                    match event {
+                        WatchEvent::Cached => unreachable!(),
+                        WatchEvent::Ready => {
+                            for path in &burst_files {
+                                fs::write(path, "storm")?;
+                            }
+                            fs::write(&rearm_file, "rearm")?;
+                            let sink = sink.borrow();
+                            let sink = sink.as_ref().unwrap();
+                            for path in &burst_files {
+                                sink.change(path, 0, false, false, false);
+                            }
+                            // Rearm under the same parent must never be delayed by burst holdback.
+                            sink.change(&burst_dir, 0, true, true, false);
+                            ready_at = Instant::now();
+                        }
+                        WatchEvent::Updated => {
+                            assert!(
+                                ready_at.elapsed() < BURST_QUIET,
+                                "rearm was delayed by burst holdback: {:?}",
+                                ready_at.elapsed()
+                            );
+                            let reader = crate::open_read(&db)?;
+                            assert_eq!(
+                                crate::search(&reader, "rearm_added", crate::Mode::Name, 20, None)?
+                                    .len(),
+                                1
+                            );
+                            assert_eq!(
+                                crate::search(&reader, "storm_", crate::Mode::Name, 100, None)?
+                                    .len(),
+                                70
+                            );
+                            anyhow::bail!("rearm complete");
+                        }
+                    }
+                    Ok(())
+                },
+            );
+            assert_eq!(
+                result.unwrap_err().root_cause().to_string(),
+                "rearm complete"
+            );
         }
     }
 }

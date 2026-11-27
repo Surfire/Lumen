@@ -44,22 +44,22 @@ pub(super) fn pack(values: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-fn unpack_into(bytes: &[u8], dims: usize, values: &mut Vec<f32>) -> bool {
-    if bytes.len() == dims * 2 {
+fn unpack_into(bytes: &[u8], dims: usize, values: &mut Vec<u16>) -> bool {
+    if Some(bytes.len()) == dims.checked_mul(2) {
         values.extend(
             bytes
                 .as_chunks::<2>()
                 .0
                 .iter()
-                .map(|b| from_half(u16::from_le_bytes(*b))),
+                .map(|b| u16::from_le_bytes(*b)),
         );
-    } else if bytes.len() == dims * 4 {
+    } else if Some(bytes.len()) == dims.checked_mul(4) {
         values.extend(
             bytes
                 .as_chunks::<4>()
                 .0
                 .iter()
-                .map(|b| f32::from_le_bytes(*b)),
+                .map(|b| to_half(f32::from_le_bytes(*b))),
         );
     } else {
         return false;
@@ -67,9 +67,100 @@ fn unpack_into(bytes: &[u8], dims: usize, values: &mut Vec<f32>) -> bool {
     true
 }
 
+#[cfg(any(not(target_arch = "aarch64"), test))]
+#[inline]
+fn dot_f16_f32_scalar(row: &[u16], query: &[f32]) -> f32 {
+    assert_eq!(row.len(), query.len());
+    row.iter()
+        .zip(query)
+        .map(|(&bits, &q)| from_half(bits) * q)
+        .sum()
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn f16x8_to_f32x4x2(
+    src: std::arch::aarch64::uint16x8_t,
+) -> (
+    std::arch::aarch64::float32x4_t,
+    std::arch::aarch64::float32x4_t,
+) {
+    use std::arch::aarch64::float32x4_t;
+    let lo: float32x4_t;
+    let hi: float32x4_t;
+    // SAFETY: `fcvtl` and `fcvtl2` are ARMv8 baseline NEON instructions that
+    // operate purely on vector registers with no memory access or side effects.
+    // `lo` uses `out` so it cannot alias `src` before `fcvtl2` reads `src.8h`.
+    unsafe {
+        core::arch::asm!(
+            "fcvtl {lo:v}.4s, {src:v}.4h",
+            "fcvtl2 {hi:v}.4s, {src:v}.8h",
+            src = in(vreg) src,
+            lo = out(vreg) lo,
+            hi = lateout(vreg) hi,
+            options(pure, nomem, nostack),
+        );
+    }
+    (lo, hi)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn dot_f16_f32(row: &[u16], query: &[f32]) -> f32 {
+    use std::arch::aarch64::{vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32, vld1q_u16};
+
+    assert_eq!(row.len(), query.len());
+    let (row_chunks, row_tail) = row.as_chunks::<16>();
+    let (query_chunks, query_tail) = query.as_chunks::<16>();
+
+    // SAFETY: `as_chunks::<16>` ensures each chunk contains 16 valid elements,
+    // keeping all 8-u16 and 4-f32 NEON loads within slice bounds.
+    let mut sum = unsafe {
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
+
+        for (r, q) in row_chunks.iter().zip(query_chunks) {
+            let rp = r.as_ptr();
+            let qp = q.as_ptr();
+
+            let h0 = vld1q_u16(rp);
+            let h1 = vld1q_u16(rp.add(8));
+            let (a0, a1) = f16x8_to_f32x4x2(h0);
+            let (a2, a3) = f16x8_to_f32x4x2(h1);
+
+            let q0 = vld1q_f32(qp);
+            let q1 = vld1q_f32(qp.add(4));
+            let q2 = vld1q_f32(qp.add(8));
+            let q3 = vld1q_f32(qp.add(12));
+
+            acc0 = vfmaq_f32(acc0, a0, q0);
+            acc1 = vfmaq_f32(acc1, a1, q1);
+            acc2 = vfmaq_f32(acc2, a2, q2);
+            acc3 = vfmaq_f32(acc3, a3, q3);
+        }
+
+        let acc01 = vaddq_f32(acc0, acc1);
+        let acc23 = vaddq_f32(acc2, acc3);
+        vaddvq_f32(vaddq_f32(acc01, acc23))
+    };
+
+    for (&bits, &q) in row_tail.iter().zip(query_tail) {
+        sum += from_half(bits) * q;
+    }
+    sum
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn dot_f16_f32(row: &[u16], query: &[f32]) -> f32 {
+    dot_f16_f32_scalar(row, query)
+}
+
 pub(super) struct Matrix<T> {
     dims: usize,
-    values: Vec<f32>,
+    values: Vec<u16>,
     pub rows: Vec<T>,
 }
 
@@ -90,11 +181,45 @@ impl<T> Matrix<T> {
         true
     }
 
-    pub fn scores<'a>(&'a self, query: &'a [f32]) -> impl Iterator<Item = f32> + 'a {
+    pub fn scores(&self, query: &[f32]) -> std::vec::IntoIter<f32> {
+        const PARALLEL_THRESHOLD: usize = 4096;
         assert_eq!(query.len(), self.dims);
-        self.values
-            .chunks_exact(self.dims)
-            .map(move |row| row.iter().zip(query).map(|(a, b)| a * b).sum())
+        let n_rows = self.rows.len();
+        if self.dims == 0 || n_rows == 0 {
+            return vec![0.0_f32; n_rows].into_iter();
+        }
+        let mut out = vec![0.0_f32; n_rows];
+        if n_rows < PARALLEL_THRESHOLD {
+            for (row, dst) in self.values.chunks_exact(self.dims).zip(&mut out) {
+                *dst = dot_f16_f32(row, query);
+            }
+        } else {
+            let dims = self.dims;
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(2, 8);
+            let rows_per_chunk = n_rows.div_ceil(threads);
+            let vals_per_chunk = rows_per_chunk * dims;
+            std::thread::scope(|s| {
+                let mut val_chunks = self.values.chunks(vals_per_chunk);
+                let mut out_chunks = out.chunks_mut(rows_per_chunk);
+                let first = val_chunks.next().zip(out_chunks.next());
+                for (val_chunk, out_chunk) in val_chunks.zip(out_chunks) {
+                    s.spawn(move || {
+                        for (row, dst) in val_chunk.chunks_exact(dims).zip(out_chunk) {
+                            *dst = dot_f16_f32(row, query);
+                        }
+                    });
+                }
+                if let Some((val_chunk, out_chunk)) = first {
+                    for (row, dst) in val_chunk.chunks_exact(dims).zip(out_chunk) {
+                        *dst = dot_f16_f32(row, query);
+                    }
+                }
+            });
+        }
+        out.into_iter()
     }
 }
 
@@ -308,5 +433,161 @@ mod tests {
 
         drop((legacy_reader, legacy_writer, reader, writer));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn packed_u16_storage_and_legacy_f32_push() {
+        let mut matrix = Matrix::new(4);
+        let row0 = [1.0_f32, -2.5, 0.25, 2_f32.powi(-20)];
+        let row1 = [-0.5_f32, 3.0, 0.0, -2_f32.powi(-18)];
+
+        // Packed binary16 push copies 2 bytes per dimension directly.
+        assert!(matrix.push(0_usize, &pack(&row0)));
+        assert_eq!(matrix.values.len(), 4);
+        assert_eq!(std::mem::size_of_val(matrix.values.as_slice()), 8);
+
+        // Legacy 4-byte f32 blob push converts via to_half into u16 storage.
+        let legacy_bytes: Vec<u8> = row1.iter().flat_map(|f| f.to_le_bytes()).collect();
+        assert!(matrix.push(1_usize, &legacy_bytes));
+        assert_eq!(matrix.rows, [0, 1]);
+        assert_eq!(matrix.values.len(), 8);
+        assert_eq!(
+            &matrix.values[4..8],
+            &row1.map(to_half),
+            "legacy f32 blob should convert via to_half"
+        );
+
+        // Mismatched byte lengths must be rejected without mutating rows or values.
+        assert!(!matrix.push(2_usize, &[0_u8; 6]));
+        assert!(!matrix.push(2_usize, &[0_u8; 12]));
+        assert_eq!(matrix.rows, [0, 1]);
+        assert_eq!(matrix.values.len(), 8);
+
+        let query = [0.5_f32, -1.0, 4.0, 1024.0];
+        let got: Vec<f32> = matrix.scores(&query).collect();
+        let expected: Vec<f32> = matrix
+            .values
+            .chunks_exact(4)
+            .map(|row| dot_f16_f32_scalar(row, &query))
+            .collect();
+        for (g, e) in got.iter().zip(&expected) {
+            assert!((g - e).abs() < 1e-4, "got={g} expected={e}");
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_fcvtl_matches_from_half_for_all_u16() {
+        use std::arch::aarch64::vld1q_u16;
+
+        let all_bits: Vec<u16> = (0..=u16::MAX).collect();
+        for chunk in all_bits.as_chunks::<8>().0 {
+            let v = unsafe { vld1q_u16(chunk.as_ptr()) };
+            let (lo, hi) = f16x8_to_f32x4x2(v);
+            let converted: [f32; 8] = unsafe {
+                let lo_arr: [f32; 4] = std::mem::transmute(lo);
+                let hi_arr: [f32; 4] = std::mem::transmute(hi);
+                [
+                    lo_arr[0], lo_arr[1], lo_arr[2], lo_arr[3], hi_arr[0], hi_arr[1], hi_arr[2],
+                    hi_arr[3],
+                ]
+            };
+            for (&bits, &got) in chunk.iter().zip(&converted) {
+                let expected = from_half(bits);
+                if expected.is_nan() {
+                    assert!(got.is_nan(), "expected NaN for {bits:#06x}");
+                } else {
+                    assert_eq!(
+                        got.to_bits(),
+                        expected.to_bits(),
+                        "mismatch for half {bits:#06x}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dot_parity_across_dims_with_negatives_and_subnormals() {
+        let special = [
+            -0.0_f32,
+            2_f32.powi(-24),           // smallest positive binary16 subnormal
+            -1023.0 * 2_f32.powi(-24), // largest negative binary16 subnormal
+            0.333_251_95,
+            -1.75,
+            12.5,
+            -0.0625,
+            2_f32.powi(-14), // smallest normal
+        ];
+        for dims in [1_usize, 7, 15, 16, 17, 768] {
+            let mut matrix = Matrix::new(dims);
+            // Push multiple rows so odd dimensions exercise unaligned 2-byte row starts.
+            for row_idx in 0..5 {
+                let raw: Vec<f32> = (0..dims)
+                    .map(|j| {
+                        let base = special[(j + row_idx) % special.len()];
+                        if j % 5 == 0 {
+                            base
+                        } else {
+                            let sign = if (j + row_idx) % 2 == 0 { 1.0 } else { -1.0 };
+                            sign * (((j * 13 + row_idx * 7) % 100) as f32 / 257.0)
+                        }
+                    })
+                    .collect();
+                assert!(matrix.push(row_idx, &pack(&raw)));
+            }
+            let query: Vec<f32> = (0..dims)
+                .map(|j| {
+                    let sign = if j % 3 == 0 { -1.0 } else { 1.0 };
+                    sign * (((j * 17 + 3) % 89) as f32 / 113.0 + 0.05)
+                })
+                .collect();
+
+            let actual: Vec<f32> = matrix.scores(&query).collect();
+            assert_eq!(actual.len(), 5);
+            for (row_idx, &got) in actual.iter().enumerate() {
+                let row = &matrix.values[row_idx * dims..(row_idx + 1) * dims];
+                let expected = dot_f16_f32_scalar(row, &query);
+                assert!(
+                    (got - expected).abs() < 1e-4,
+                    "dims={dims} row={row_idx}: got={got} expected={expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_scores_parity_above_threshold() {
+        const ROWS: usize = 5000;
+        const DIMS: usize = 35; // Exercises multi-16 NEON loop + tail + unaligned row offsets.
+        let mut matrix = Matrix::new(DIMS);
+        for row_idx in 0..ROWS {
+            let raw: Vec<f32> = (0..DIMS)
+                .map(|j| {
+                    let sign = if (row_idx + j) % 2 == 0 { 1.0 } else { -1.0 };
+                    let mag = ((row_idx * 31 + j * 17) % 120) as f32 / 300.0;
+                    if j == 0 && row_idx % 9 == 0 {
+                        sign * 2_f32.powi(-21)
+                    } else {
+                        sign * mag
+                    }
+                })
+                .collect();
+            assert!(matrix.push(row_idx, &pack(&raw)));
+        }
+        let query: Vec<f32> = (0..DIMS)
+            .map(|j| ((j as f32) * 0.13 - 1.5) * 0.25)
+            .collect();
+
+        let scores: Vec<f32> = matrix.scores(&query).collect();
+        assert_eq!(scores.len(), ROWS);
+        for (row_idx, &got) in scores.iter().enumerate() {
+            let row = &matrix.values[row_idx * DIMS..(row_idx + 1) * DIMS];
+            let expected = dot_f16_f32_scalar(row, &query);
+            assert!(
+                (got - expected).abs() < 1e-4,
+                "row={row_idx}: got={got} expected={expected}"
+            );
+        }
     }
 }

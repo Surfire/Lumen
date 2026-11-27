@@ -42,6 +42,7 @@ final class LauncherImageSearch: ObservableObject {
     private var generation = 0
     private var indexedInCurrentBuild = 0
     private(set) var noProgressExhausted = false
+    private(set) var lastBuildWasBounded = false
     var onBuildFinished: (() -> Void)?
 
     init(engine: LauncherEngine, defaults: UserDefaults?) {
@@ -159,6 +160,7 @@ final class LauncherImageSearch: ObservableObject {
     }
 
     private func finishBuild(succeeded: Bool, bounded: Bool = false) {
+        lastBuildWasBounded = bounded
         if succeeded, indexedInCurrentBuild == 0, !limited {
             noProgressExhausted = true
         } else if bounded {

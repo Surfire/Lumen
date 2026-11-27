@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Read, Write},
     os::unix::{
@@ -13,6 +14,10 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -35,6 +40,7 @@ const PARALLEL_SLOTS: usize = 4;
 const SLOT_CONTEXT: usize = 2048;
 pub(crate) const IMAGE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const IMAGE_TIMEOUT: Duration = Duration::from_secs(12);
+const IMAGE_CONCURRENCY: usize = 2;
 
 #[derive(Deserialize)]
 struct Asset {
@@ -170,44 +176,17 @@ server=$!
 trap 'kill -KILL "$server" 2>/dev/null; wait "$server" 2>/dev/null; /bin/rm -f "$folder/worker.sock"; /bin/rmdir "$folder" 2>/dev/null' EXIT
 IFS= read -r owner || :
 "#;
+        let cpus = thread::available_parallelism().map_or(4, |n| n.get());
+        let model = self.home.join(MODEL_FILE);
+        let args = server_args(&model, projector.as_deref(), &worker.socket, cpus);
         let mut command = Command::new("/bin/sh");
-        command
+        let child = command
             .arg("-c")
             .arg(supervise)
             .arg("lumen-gemma-owner")
             .arg(&worker.private)
             .arg(self.home.join("runtime/llama-server"))
-            .arg("--model")
-            .arg(self.home.join(MODEL_FILE));
-        if let Some(projector) = &projector {
-            command.arg("--mmproj").arg(projector);
-        }
-        let cpus = thread::available_parallelism().map_or(4, |n| n.get());
-        let child = command
-            .arg("--host")
-            .arg(&worker.socket)
-            .args([
-                "--offline",
-                "--embedding",
-                "--embd-normalize",
-                "2",
-                "--no-ui",
-                "--batch-size",
-                "4096",
-                "--ubatch-size",
-                "2048",
-                "--gpu-layers",
-                "99",
-            ])
-            // llama-server splits the context across slots; keep 2048 tokens per slot.
-            .arg("--parallel")
-            .arg(PARALLEL_SLOTS.to_string())
-            .arg("--ctx-size")
-            .arg((PARALLEL_SLOTS * SLOT_CONTEXT).to_string())
-            .arg("--threads")
-            .arg((cpus / 2).clamp(2, 6).to_string())
-            .arg("--threads-batch")
-            .arg(cpus.clamp(4, 8).to_string())
+            .args(args)
             // Give the supervisor and runtime a group entirely owned by this worker.
             .process_group(0)
             .current_dir(&worker.private)
@@ -229,6 +208,48 @@ IFS= read -r owner || :
         }
         bail!("verified Gemma runtime did not become healthy before the startup deadline")
     }
+}
+
+fn server_args(
+    model: &Path,
+    projector: Option<&Path>,
+    socket: &Path,
+    cpus: usize,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["--model".into(), model.as_os_str().to_owned()];
+    if let Some(projector) = projector {
+        args.push("--mmproj".into());
+        args.push(projector.as_os_str().to_owned());
+    }
+    args.extend([
+        "--host".into(),
+        socket.as_os_str().to_owned(),
+        "--offline".into(),
+        "--embedding".into(),
+        "--embd-normalize".into(),
+        "2".into(),
+        "--no-ui".into(),
+        "--cache-ram".into(),
+        "0".into(),
+        "--poll".into(),
+        "0".into(),
+        "--batch-size".into(),
+        "4096".into(),
+        "--ubatch-size".into(),
+        "2048".into(),
+        "--gpu-layers".into(),
+        "99".into(),
+        // llama-server splits the context across slots; keep 2048 tokens per slot.
+        "--parallel".into(),
+        PARALLEL_SLOTS.to_string().into(),
+        "--ctx-size".into(),
+        (PARALLEL_SLOTS * SLOT_CONTEXT).to_string().into(),
+        "--threads".into(),
+        (cpus / 4).clamp(2, 4).to_string().into(),
+        "--threads-batch".into(),
+        (cpus / 2).clamp(2, 6).to_string().into(),
+    ]);
+    args
 }
 
 fn check_directory(path: &Path) -> Result<fs::Metadata> {
@@ -517,15 +538,82 @@ impl GemmaWorker {
     }
 
     pub(crate) fn encode_image(&mut self, bytes: &[u8]) -> Result<Vec<f32>> {
+        self.encode_image_ref(bytes)
+    }
+
+    fn encode_image_ref(&self, bytes: &[u8]) -> Result<Vec<f32>> {
         ensure!(
             bytes.len() as u64 <= IMAGE_MAX_BYTES,
             "image exceeds the input size limit"
         );
-        let url = format!("data:image/png;base64,{}", image_base64(bytes));
+        let mime = if bytes.starts_with(b"\xff\xd8\xff") {
+            "image/jpeg"
+        } else {
+            "image/png"
+        };
+        let url = format!("data:{mime};base64,{}", image_base64(bytes));
         self.encode_input(
             serde_json::json!({"content":[{"type":"image_url","image_url":{"url":url}}]}),
             IMAGE_TIMEOUT,
         )
+    }
+
+    /// Encodes up to `IMAGE_CONCURRENCY` images concurrently while preserving input order.
+    pub(crate) fn encode_images(
+        &self,
+        images: &[&[u8]],
+        stop: Option<&AtomicBool>,
+    ) -> Result<Vec<Option<Vec<f32>>>> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        if stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Ok(vec![None; images.len()]);
+        }
+        let next = AtomicUsize::new(0);
+        let first_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+        let results: Mutex<Vec<Option<Vec<f32>>>> = Mutex::new(vec![None; images.len()]);
+        let workers = images.len().min(IMAGE_CONCURRENCY);
+        thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    loop {
+                        if stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                            break;
+                        }
+                        if first_error
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_some()
+                        {
+                            break;
+                        }
+                        let idx = next.fetch_add(1, Ordering::AcqRel);
+                        if idx >= images.len() {
+                            break;
+                        }
+                        match self.encode_image_ref(images[idx]) {
+                            Ok(vector) => {
+                                results.lock().unwrap_or_else(|e| e.into_inner())[idx] =
+                                    Some(vector);
+                            }
+                            Err(error) => {
+                                let mut latch =
+                                    first_error.lock().unwrap_or_else(|e| e.into_inner());
+                                if latch.is_none() {
+                                    *latch = Some(error);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(error) = first_error.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            return Err(error);
+        }
+        Ok(results.into_inner().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Encodes passages in batched requests. `None` marks an unencodable
@@ -951,6 +1039,39 @@ mod tests {
 
     type Reply = fn(&[String]) -> (u16, String);
 
+    fn read_http_input(stream: &mut UnixStream) -> Vec<serde_json::Value> {
+        let mut request = Vec::new();
+        let mut buffer = [0; 8192];
+        let body = loop {
+            let count = stream.read(&mut buffer).unwrap();
+            request.extend_from_slice(&buffer[..count]);
+            let Some(end) = request.windows(4).position(|b| b == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = std::str::from_utf8(&request[..end]).unwrap();
+            let length: usize = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length: "))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            if request.len() >= end + 4 + length {
+                break request[end + 4..end + 4 + length].to_vec();
+            }
+        };
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        serde_json::from_value(json["input"].clone()).unwrap()
+    }
+
+    fn write_http_reply(stream: &mut UnixStream, status: u16, reply: &str) {
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\r\n{reply}",
+            reply.len()
+        );
+    }
+
     // Serves llama.cpp-shaped `/v1/embeddings` replies on a private Unix socket
     // and records the number of inputs in every request.
     fn stub_worker(name: &str, reply: Reply) -> (GemmaWorker, std::sync::mpsc::Receiver<usize>) {
@@ -967,35 +1088,14 @@ mod tests {
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { return };
-                let mut request = Vec::new();
-                let mut buffer = [0; 8192];
-                let body = loop {
-                    let count = stream.read(&mut buffer).unwrap();
-                    request.extend_from_slice(&buffer[..count]);
-                    let Some(end) = request.windows(4).position(|b| b == b"\r\n\r\n") else {
-                        continue;
-                    };
-                    let headers = std::str::from_utf8(&request[..end]).unwrap();
-                    let length: usize = headers
-                        .lines()
-                        .find_map(|line| line.strip_prefix("Content-Length: "))
-                        .unwrap()
-                        .trim()
-                        .parse()
-                        .unwrap();
-                    if request.len() >= end + 4 + length {
-                        break request[end + 4..end + 4 + length].to_vec();
-                    }
-                };
-                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                let inputs: Vec<String> = serde_json::from_value(json["input"].clone()).unwrap();
+                let values = read_http_input(&mut stream);
+                let inputs: Vec<String> = values
+                    .into_iter()
+                    .map(|value| serde_json::from_value(value).unwrap())
+                    .collect();
                 let _ = sizes.send(inputs.len());
                 let (status, reply) = reply(&inputs);
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\r\n{reply}",
-                    reply.len()
-                );
+                write_http_reply(&mut stream, status, &reply);
             }
         });
         let worker = GemmaWorker {
@@ -1005,6 +1105,39 @@ mod tests {
             key: "test".into(),
         };
         (worker, received)
+    }
+
+    fn stub_image_server<F>(name: &str, reply: F) -> GemmaWorker
+    where
+        F: Fn(&[serde_json::Value]) -> (u16, String) + Send + Sync + 'static,
+    {
+        use std::os::unix::net::UnixListener;
+        let private = PathBuf::from(format!(
+            "/private/tmp/lumen-gemma-stub-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&private);
+        DirBuilder::new().mode(0o700).create(&private).unwrap();
+        let socket = private.join("worker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let reply = std::sync::Arc::new(reply);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let reply = reply.clone();
+                thread::spawn(move || {
+                    let inputs = read_http_input(&mut stream);
+                    let (status, body) = reply(&inputs);
+                    write_http_reply(&mut stream, status, &body);
+                });
+            }
+        });
+        GemmaWorker {
+            owner: None,
+            private,
+            socket,
+            key: "test".into(),
+        }
     }
 
     // Input `t<k> ...` embeds as the unit vector on axis k.
@@ -1091,5 +1224,186 @@ mod tests {
         let (mut worker, _) = stub_worker("failure", |_| (500, "{}".into()));
         let error = worker.encode_passages(&["t1", "t2"]).unwrap_err();
         assert!(!error.is::<Unencodable>());
+    }
+
+    fn axis_reply(axis: usize) -> String {
+        let mut vector = vec![0.0_f32; DIMENSIONS];
+        vector[axis] = 1.0;
+        serde_json::json!({"data":[{"index":0,"embedding":vector}]}).to_string()
+    }
+
+    #[test]
+    fn server_args_sets_lean_runtime_flags_and_clamps_threads() {
+        let flag = |args: &[OsString], name: &str| -> String {
+            let pos = args.iter().position(|a| a == name).unwrap();
+            args[pos + 1].to_string_lossy().into_owned()
+        };
+        let text = server_args(
+            Path::new("/tmp/model.gguf"),
+            None,
+            Path::new("/tmp/w.sock"),
+            10,
+        );
+        assert!(!text.iter().any(|a| a == "--mmproj"));
+        assert_eq!(flag(&text, "--model"), "/tmp/model.gguf");
+        assert_eq!(flag(&text, "--host"), "/tmp/w.sock");
+        assert!(text.iter().any(|a| a == "--offline"));
+        assert!(text.iter().any(|a| a == "--embedding"));
+        assert_eq!(flag(&text, "--embd-normalize"), "2");
+        assert!(text.iter().any(|a| a == "--no-ui"));
+        assert_eq!(flag(&text, "--cache-ram"), "0");
+        assert_eq!(flag(&text, "--poll"), "0");
+        assert_eq!(flag(&text, "--batch-size"), "4096");
+        assert_eq!(flag(&text, "--ubatch-size"), "2048");
+        assert_eq!(flag(&text, "--gpu-layers"), "99");
+        assert_eq!(flag(&text, "--parallel"), "4");
+        assert_eq!(flag(&text, "--ctx-size"), "8192");
+        assert_eq!(flag(&text, "--threads"), "2");
+        assert_eq!(flag(&text, "--threads-batch"), "5");
+
+        let vision_high = server_args(
+            Path::new("/tmp/model.gguf"),
+            Some(Path::new("/tmp/mmproj.gguf")),
+            Path::new("/tmp/w.sock"),
+            24,
+        );
+        assert_eq!(flag(&vision_high, "--mmproj"), "/tmp/mmproj.gguf");
+        assert_eq!(flag(&vision_high, "--threads"), "4");
+        assert_eq!(flag(&vision_high, "--threads-batch"), "6");
+
+        let low_cpu = server_args(
+            Path::new("/tmp/model.gguf"),
+            None,
+            Path::new("/tmp/w.sock"),
+            2,
+        );
+        assert_eq!(flag(&low_cpu, "--threads"), "2");
+        assert_eq!(flag(&low_cpu, "--threads-batch"), "2");
+    }
+
+    #[test]
+    fn encode_image_sniffs_jpeg_and_png_data_uris() {
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let seen_server = seen.clone();
+        let mut worker = stub_image_server("img-sniff", move |inputs| {
+            let url = inputs[0]["content"][0]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            seen_server.lock().unwrap().push(url);
+            (200, axis_reply(3))
+        });
+        let jpeg = b"\xff\xd8\xff\xe0hello-jpeg";
+        let png = b"\x89PNG\r\n\x1a\nhello-png";
+        assert_eq!(worker.encode_image(jpeg).unwrap()[3], 1.0);
+        assert_eq!(worker.encode_image(png).unwrap()[3], 1.0);
+        let urls = seen.lock().unwrap();
+        assert_eq!(
+            urls[0],
+            format!("data:image/jpeg;base64,{}", image_base64(jpeg))
+        );
+        assert_eq!(
+            urls[1],
+            format!("data:image/png;base64,{}", image_base64(png))
+        );
+    }
+
+    #[test]
+    fn encode_images_preserves_order_and_honors_mid_batch_stop_and_errors() {
+        let payloads: Vec<Vec<u8>> = (0..5)
+            .map(|i| {
+                let mut bytes = if i % 2 == 0 {
+                    b"\xff\xd8\xff\xe0".to_vec()
+                } else {
+                    b"\x89PNG\r\n\x1a\n".to_vec()
+                };
+                bytes.push(i as u8);
+                bytes
+            })
+            .collect();
+        let expected_urls: Vec<String> = payloads
+            .iter()
+            .map(|bytes| {
+                let mime = if bytes.starts_with(b"\xff\xd8\xff") {
+                    "image/jpeg"
+                } else {
+                    "image/png"
+                };
+                format!("data:{mime};base64,{}", image_base64(bytes))
+            })
+            .collect();
+        let expected_map = expected_urls.clone();
+        let worker = stub_image_server("img-order", move |inputs| {
+            let url = inputs[0]["content"][0]["image_url"]["url"]
+                .as_str()
+                .unwrap();
+            let axis = expected_map.iter().position(|u| u == url).unwrap();
+            if axis % 2 == 0 {
+                // Force out-of-order completion between the two worker slots.
+                thread::sleep(Duration::from_millis(15));
+            }
+            (200, axis_reply(axis))
+        });
+        assert!(worker.encode_images(&[], None).unwrap().is_empty());
+        let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        let vectors = worker.encode_images(&refs, None).unwrap();
+        assert_eq!(vectors.len(), 5);
+        for (i, vec_opt) in vectors.into_iter().enumerate() {
+            assert_eq!(vec_opt.unwrap()[i], 1.0, "slot {i} must keep index order");
+        }
+
+        // Pre-set stop skips all work without hitting the socket.
+        let already_stopped = AtomicBool::new(true);
+        let skipped = worker
+            .encode_images(&refs[..3], Some(&already_stopped))
+            .unwrap();
+        assert!(skipped.iter().all(Option::is_none));
+
+        // Mid-batch stop leaves unstarted trailing slots None.
+        let six: Vec<Vec<u8>> = (0..6).map(|i| vec![0xff, 0xd8, 0xff, i as u8]).collect();
+        let six_urls: Vec<String> = six
+            .iter()
+            .map(|b| format!("data:image/jpeg;base64,{}", image_base64(b)))
+            .collect();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_server = stop.clone();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let calls_server = calls.clone();
+        let stop_worker = stub_image_server("img-stop", move |inputs| {
+            let url = inputs[0]["content"][0]["image_url"]["url"]
+                .as_str()
+                .unwrap();
+            let axis = six_urls.iter().position(|u| u == url).unwrap();
+            if calls_server.fetch_add(1, Ordering::AcqRel) == 0 {
+                stop_server.store(true, Ordering::Release);
+            }
+            thread::sleep(Duration::from_millis(10));
+            (200, axis_reply(axis))
+        });
+        let six_refs: Vec<&[u8]> = six.iter().map(Vec::as_slice).collect();
+        let stopped = stop_worker.encode_images(&six_refs, Some(&stop)).unwrap();
+        let completed = stopped.iter().take_while(|v| v.is_some()).count();
+        assert!((1..=IMAGE_CONCURRENCY).contains(&completed));
+        for (i, slot) in stopped.iter().enumerate() {
+            if i < completed {
+                assert_eq!(slot.as_ref().unwrap()[i], 1.0);
+            } else {
+                assert!(slot.is_none(), "unstarted slot {i} must remain None");
+            }
+        }
+
+        // Server error propagates cleanly out of worker threads.
+        let fail_url = format!("data:image/jpeg;base64,{}", image_base64(&six[2]));
+        let err_worker = stub_image_server("img-err", move |inputs| {
+            let url = inputs[0]["content"][0]["image_url"]["url"]
+                .as_str()
+                .unwrap();
+            if url == fail_url {
+                (500, "{}".into())
+            } else {
+                (200, axis_reply(0))
+            }
+        });
+        assert!(err_worker.encode_images(&six_refs[..4], None).is_err());
     }
 }

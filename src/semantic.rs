@@ -14,6 +14,7 @@ use std::{
     ops::Range,
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
+    time::Instant,
 };
 
 const CHUNK_CHARS: usize = 480;
@@ -220,7 +221,114 @@ const GEMMA_QUEUE: &str = "FROM semantic_chunk c JOIN item i ON i.id=c.document_
     JOIN document_state ds ON ds.id=c.document_id WHERE i.availability IN ('local','provider_metadata_only') AND NOT EXISTS
        (SELECT 1 FROM semantic_vector v INDEXED BY semantic_vector_chunk WHERE v.model=?1 AND v.chunk_id=c.id)";
 
+const GEMMA_QUEUE_FAST: &str = "FROM gemma_pending_chunk CROSS JOIN semantic_chunk c ON c.id=gemma_pending_chunk.chunk_id CROSS JOIN item i ON i.id=c.document_id CROSS JOIN document_state ds ON ds.id=c.document_id WHERE i.availability IN ('local','provider_metadata_only')";
+
+fn has_gemma_pending_queue(conn: &Connection) -> Result<bool> {
+    let tables: bool = conn
+        .prepare_cached(
+            "SELECT count(*)=2 FROM sqlite_schema
+             WHERE type='table' AND name IN ('gemma_pending_chunk','semantic_vector')",
+        )?
+        .query_row([], |row| row.get(0))?;
+    if !tables {
+        return Ok(false);
+    }
+    let model: Option<String> = conn
+        .prepare_cached("SELECT value FROM info WHERE key='gemma_pending_model'")?
+        .query_row([], |row| row.get(0))
+        .optional()?;
+    Ok(model.as_deref() == Some(gemma::ID))
+}
+
+pub(crate) fn ensure_gemma_queue(conn: &Connection) -> Result<()> {
+    if has_gemma_pending_queue(conn)? || !has_gemma_store(conn)? {
+        return Ok(());
+    }
+    let model_sql = gemma::ID.replace('\'', "''");
+    let ddl = format!(
+        "CREATE TABLE IF NOT EXISTS gemma_pending_chunk(chunk_id INTEGER PRIMARY KEY);
+         DROP TRIGGER IF EXISTS gemma_pending_chunk_inserted;
+         CREATE TRIGGER gemma_pending_chunk_inserted AFTER INSERT ON semantic_chunk
+         BEGIN
+             INSERT OR IGNORE INTO gemma_pending_chunk(chunk_id)
+             SELECT new.id WHERE NOT EXISTS(
+                 SELECT 1 FROM semantic_vector WHERE model='{model_sql}' AND chunk_id=new.id
+             );
+         END;
+         DROP TRIGGER IF EXISTS gemma_pending_chunk_deleted;
+         CREATE TRIGGER gemma_pending_chunk_deleted AFTER DELETE ON semantic_chunk
+         BEGIN
+             DELETE FROM gemma_pending_chunk WHERE chunk_id=old.id;
+         END;
+         DROP TRIGGER IF EXISTS gemma_pending_vector_inserted;
+         CREATE TRIGGER gemma_pending_vector_inserted AFTER INSERT ON semantic_vector
+             WHEN new.model='{model_sql}'
+         BEGIN
+             DELETE FROM gemma_pending_chunk WHERE chunk_id=new.chunk_id;
+         END;
+         DROP TRIGGER IF EXISTS gemma_pending_vector_deleted;
+         CREATE TRIGGER gemma_pending_vector_deleted AFTER DELETE ON semantic_vector
+             WHEN old.model='{model_sql}'
+         BEGIN
+             INSERT OR IGNORE INTO gemma_pending_chunk(chunk_id)
+             SELECT old.chunk_id WHERE EXISTS(
+                 SELECT 1 FROM semantic_chunk WHERE id=old.chunk_id
+             );
+         END;"
+    );
+    let tx = conn
+        .is_autocommit()
+        .then(|| conn.unchecked_transaction())
+        .transpose()?;
+    let db = tx.as_deref().unwrap_or(conn);
+    db.execute_batch(&ddl)?;
+    db.execute("DELETE FROM gemma_pending_chunk", [])?;
+    db.execute(
+        "INSERT OR IGNORE INTO gemma_pending_chunk(chunk_id)
+         SELECT c.id FROM semantic_chunk c
+         WHERE NOT EXISTS (
+             SELECT 1 FROM semantic_vector v INDEXED BY semantic_vector_chunk
+             WHERE v.model=?1 AND v.chunk_id=c.id
+         )",
+        [gemma::ID],
+    )?;
+    db.execute(
+        "INSERT OR REPLACE INTO info(key,value) VALUES('gemma_pending_model',?1)",
+        [gemma::ID],
+    )?;
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+fn gemma_queue_fetch_sql(fast: bool) -> String {
+    if fast {
+        format!(
+            "WITH next AS (SELECT c.id,c.document_id,c.start_byte,c.end_byte,i.mtime {GEMMA_QUEUE_FAST} AND gemma_pending_chunk.chunk_id>?1 ORDER BY i.mtime DESC,c.id LIMIT ?2)
+             SELECT n.id, CAST(substr(CAST(d.body AS BLOB),n.start_byte+1,n.end_byte-n.start_byte) AS TEXT)
+             FROM next n JOIN document d ON d.id=n.document_id ORDER BY n.mtime DESC,n.id"
+        )
+    } else {
+        format!(
+            "WITH next AS (SELECT c.id,c.document_id,c.start_byte,c.end_byte,i.mtime {GEMMA_QUEUE} AND c.id>?2 ORDER BY i.mtime DESC,c.id LIMIT ?3)
+             SELECT n.id, CAST(substr(CAST(d.body AS BLOB),n.start_byte+1,n.end_byte-n.start_byte) AS TEXT)
+             FROM next n JOIN document d ON d.id=n.document_id ORDER BY n.mtime DESC,n.id"
+        )
+    }
+}
+
 fn gemma_pending(conn: &Connection) -> Result<bool> {
+    if has_gemma_pending_queue(conn)? {
+        return Ok(conn
+            .prepare_cached(&format!(
+                "SELECT EXISTS(SELECT 1 {GEMMA_QUEUE_FAST}) OR EXISTS(
+                SELECT 1 FROM semantic_document p JOIN item i ON i.id=p.document_id
+                JOIN document_state ds ON ds.id=p.document_id
+                WHERE p.prepared=0 AND i.availability IN ('local','provider_metadata_only'))"
+            ))?
+            .query_row([], |row| row.get(0))?);
+    }
     Ok(conn
         .prepare_cached(&format!(
             "SELECT EXISTS(SELECT 1 {GEMMA_QUEUE}) OR EXISTS(
@@ -332,6 +440,8 @@ fn embed_gemma_batch(
     let mut prepared = 0;
     let mut after = 0_i64;
     let extra_budget = max.max(32);
+    let fast_queue = has_gemma_pending_queue(conn)?;
+    let fetch_sql = gemma_queue_fetch_sql(fast_queue);
     while items.len() < max {
         if stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
             return Ok((EmbedBatch::default(), true));
@@ -342,14 +452,13 @@ fn embed_gemma_batch(
             return Ok((EmbedBatch::default(), true));
         }
         let remaining = (max - items.len()) as i64;
-        let mut stmt = conn.prepare_cached(&format!(
-            "WITH next AS (SELECT c.id,c.document_id,c.start_byte,c.end_byte,i.mtime {GEMMA_QUEUE} AND c.id>?2 ORDER BY i.mtime DESC,c.id LIMIT ?3)
-             SELECT c.id, CAST(substr(CAST(d.body AS BLOB),c.start_byte+1,c.end_byte-c.start_byte) AS TEXT)
-             FROM next c JOIN document d ON d.id=c.document_id ORDER BY c.mtime DESC,c.id"
-        ))?;
-        let rows = stmt.query_map(params![gemma::ID, after, remaining], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-        })?;
+        let mut stmt = conn.prepare_cached(&fetch_sql)?;
+        let map_row = |r: &rusqlite::Row<'_>| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?));
+        let rows = if fast_queue {
+            stmt.query_map(params![after, remaining], map_row)?
+        } else {
+            stmt.query_map(params![gemma::ID, after, remaining], map_row)?
+        };
         // A short fetch drains the queue, so later chunks come from newly
         // prepared documents whose AUTOINCREMENT ids exceed every fetched id.
         let mut fetched = 0;
@@ -453,6 +562,7 @@ fn embed_gemma(conn: &mut Connection, model: &crate::GemmaModel, max: usize) -> 
         documents_enabled(conn)?,
         "Gemma requires explicit document indexing scope"
     );
+    ensure_gemma_queue(conn)?;
     if gemma_count(conn)? >= gemma_limit() || !gemma_pending(conn)? {
         return Ok(EmbedBatch::default());
     }
@@ -469,6 +579,7 @@ fn stream_gemma_with<E: PassageEncoder>(
 ) -> Result<()> {
     let (initial_scope, enabled) = scope_state(conn)?;
     ensure!(enabled, "Gemma requires explicit document indexing scope");
+    ensure_gemma_queue(conn)?;
     if gemma_count(conn)? >= gemma_limit() || !gemma_pending(conn)? {
         emit(&EmbedBatch::default())?;
         return Ok(());
@@ -478,6 +589,7 @@ fn stream_gemma_with<E: PassageEncoder>(
         if stop.load(Ordering::Acquire) {
             break;
         }
+        let started = Instant::now();
         let (batch, yielded) = embed_gemma_batch(
             conn,
             &mut encoder,
@@ -494,6 +606,7 @@ fn stream_gemma_with<E: PassageEncoder>(
         if done {
             break;
         }
+        crate::platform::pace_stream_batch(started.elapsed(), stop);
     }
     Ok(())
 }
@@ -2137,6 +2250,316 @@ mod tests {
 
         drop(session);
         drop(writer);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gemma_pending_chunk_maintains_exact_parity_across_lifecycle() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-gemma-queue-parity-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let docs = root.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        for i in 0..4 {
+            fs::write(
+                docs.join(format!("doc-{i}.txt")),
+                format!("Paragraph {i} with enough content for semantic chunking."),
+            )
+            .unwrap();
+        }
+        let database = root.join("index.sqlite");
+        crate::scan(
+            &database,
+            &Scope {
+                roots: vec![docs],
+                documents: true,
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+
+        let (mut conn, _lease) = open_write(&database, false).unwrap();
+        assert!(has_gemma_pending_queue(&conn).unwrap());
+
+        let assert_parity = |conn: &Connection| {
+            let queued: Vec<i64> = conn
+                .prepare("SELECT chunk_id FROM gemma_pending_chunk ORDER BY chunk_id")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let expected: Vec<i64> = conn
+                .prepare(
+                    "SELECT c.id FROM semantic_chunk c
+                     WHERE NOT EXISTS(
+                         SELECT 1 FROM semantic_vector v WHERE v.model=?1 AND v.chunk_id=c.id
+                     )
+                     ORDER BY c.id",
+                )
+                .unwrap()
+                .query_map([gemma::ID], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                queued, expected,
+                "gemma_pending_chunk diverged from ground truth"
+            );
+            queued
+        };
+
+        // Preparing documents populates gemma_pending_chunk via trigger.
+        while prepare_next_document(&mut conn, true).unwrap() {}
+        let initial = assert_parity(&conn);
+        assert_eq!(initial.len(), 4);
+        assert!(gemma_pending(&conn).unwrap());
+
+        // Vectors for another model must not clear Gemma's pending queue.
+        conn.execute(
+            "INSERT INTO semantic_vector(model,chunk_id,vector) VALUES('other-model',?1,zeroblob(3072))",
+            [initial[0]],
+        )
+        .unwrap();
+        assert_eq!(assert_parity(&conn), initial);
+
+        // Embedding a partial batch (1 valid + 1 skipped/NULL) removes both from the queue.
+        struct PartialEncoder {
+            seen: usize,
+        }
+        impl PassageEncoder for PartialEncoder {
+            fn encode_passage(&mut self, _: &str) -> Result<Vec<f32>> {
+                self.seen += 1;
+                if self.seen == 2 {
+                    return Err(Unencodable.into());
+                }
+                Ok(query_vector())
+            }
+        }
+        let mut encoder = PartialEncoder { seen: 0 };
+        let (batch, yielded) = embed_gemma_batch(&mut conn, &mut encoder, 2, None, None).unwrap();
+        assert!(!yielded);
+        assert_eq!((batch.new_embeddings, batch.skipped_chunks), (1, 1));
+        assert_eq!(assert_parity(&conn).len(), 2);
+
+        // Drain the rest of the queue.
+        let (batch2, yielded2) = embed_gemma_batch(&mut conn, &mut encoder, 8, None, None).unwrap();
+        assert!(!yielded2);
+        assert_eq!(batch2.new_embeddings, 2);
+        assert!(assert_parity(&conn).is_empty());
+        assert!(!gemma_pending(&conn).unwrap());
+
+        // Deleting a vector for gemma::ID re-queues that exact chunk.
+        conn.execute(
+            "DELETE FROM semantic_vector WHERE model=?1 AND chunk_id=?2",
+            params![gemma::ID, initial[0]],
+        )
+        .unwrap();
+        assert_eq!(assert_parity(&conn), vec![initial[0]]);
+        assert!(gemma_pending(&conn).unwrap());
+
+        // Deleting an embedded chunk directly must NOT re-insert an orphan via vector-delete cascade.
+        conn.execute("DELETE FROM semantic_chunk WHERE id=?1", [initial[1]])
+            .unwrap();
+        assert_eq!(assert_parity(&conn), vec![initial[0]]);
+
+        // Deleting a document with an embedded chunk cascades cleanly with zero orphans.
+        let doc_of_third: i64 = conn
+            .query_row(
+                "SELECT document_id FROM semantic_chunk WHERE id=?1",
+                [initial[2]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute("DELETE FROM document WHERE id=?1", [doc_of_third])
+            .unwrap();
+        assert_eq!(assert_parity(&conn), vec![initial[0]]);
+
+        // Deleting the pending chunk clears the queue completely.
+        conn.execute("DELETE FROM semantic_chunk WHERE id=?1", [initial[0]])
+            .unwrap();
+        assert!(assert_parity(&conn).is_empty());
+        assert!(!gemma_pending(&conn).unwrap());
+
+        // Stale model marker + stale queue rows are cleanly rebuilt by ensure_gemma_queue.
+        conn.execute(
+            "UPDATE info SET value='stale-model' WHERE key='gemma_pending_model'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gemma_pending_chunk(chunk_id) VALUES(999999)",
+            [],
+        )
+        .unwrap();
+        assert!(!has_gemma_pending_queue(&conn).unwrap());
+        ensure_gemma_queue(&conn).unwrap();
+        assert!(has_gemma_pending_queue(&conn).unwrap());
+        assert!(assert_parity(&conn).is_empty());
+
+        drop(conn);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gemma_queue_fast_query_plan_uses_pending_table_without_scanning_all_chunks() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-gemma-queue-plan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let docs = root.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        for i in 0..3 {
+            fs::write(docs.join(format!("plan-{i}.txt")), format!("Body text {i}")).unwrap();
+        }
+        let database = root.join("index.sqlite");
+        crate::scan(
+            &database,
+            &Scope {
+                roots: vec![docs],
+                documents: true,
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+
+        let (mut conn, _lease) = open_write(&database, false).unwrap();
+        assert!(has_gemma_pending_queue(&conn).unwrap());
+        while prepare_next_document(&mut conn, true).unwrap() {}
+
+        let explain = |sql: &str, use_params: bool| -> Vec<String> {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let extract = |r: &rusqlite::Row<'_>| r.get::<_, String>(3);
+            if use_params {
+                stmt.query_map(params![0_i64, 16_i64], extract)
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap()
+            } else {
+                stmt.query_map([], extract)
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap()
+            }
+        };
+
+        let fetch_plan = explain(&gemma_queue_fetch_sql(true), true);
+        let fetch_joined = fetch_plan.join("\n");
+        let pending_idx = fetch_plan
+            .iter()
+            .position(|line| line.contains("gemma_pending_chunk"))
+            .unwrap_or_else(|| {
+                panic!("expected fetch plan to drive from gemma_pending_chunk:\n{fetch_joined}")
+            });
+        let chunk_idx = fetch_plan
+            .iter()
+            .position(|line| line.contains("SEARCH c USING INTEGER PRIMARY KEY (rowid=?)"))
+            .unwrap_or_else(|| {
+                panic!("expected point lookup on semantic_chunk c:\n{fetch_joined}")
+            });
+        assert!(
+            pending_idx < chunk_idx,
+            "gemma_pending_chunk must drive before semantic_chunk:\n{fetch_joined}"
+        );
+        assert!(
+            !fetch_joined.contains("SCAN c")
+                && !fetch_joined.contains("SCAN semantic_chunk")
+                && !fetch_joined.contains("SEARCH c USING INTEGER PRIMARY KEY (rowid>?)"),
+            "fetch plan must not scan all of semantic_chunk:\n{fetch_joined}"
+        );
+
+        let pending_plan = explain(
+            &format!("SELECT EXISTS(SELECT 1 {GEMMA_QUEUE_FAST})"),
+            false,
+        );
+        let pending_joined = pending_plan.join("\n");
+        let exists_pending_idx = pending_plan
+            .iter()
+            .position(|line| line.contains("gemma_pending_chunk"))
+            .unwrap_or_else(|| {
+                panic!("expected pending plan to drive from gemma_pending_chunk:\n{pending_joined}")
+            });
+        let exists_chunk_idx = pending_plan
+            .iter()
+            .position(|line| line.contains("SEARCH c USING INTEGER PRIMARY KEY (rowid=?)"))
+            .unwrap_or_else(|| {
+                panic!("expected point lookup on semantic_chunk c:\n{pending_joined}")
+            });
+        assert!(
+            exists_pending_idx < exists_chunk_idx,
+            "gemma_pending_chunk must drive before semantic_chunk:\n{pending_joined}"
+        );
+        assert!(
+            !pending_joined.contains("SCAN c") && !pending_joined.contains("SCAN semantic_chunk"),
+            "pending plan must not scan all of semantic_chunk:\n{pending_joined}"
+        );
+
+        drop(conn);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gemma_queue_falls_back_cleanly_when_pending_table_absent() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-gemma-queue-fallback-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let docs = root.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        for i in 0..2 {
+            fs::write(
+                docs.join(format!("fb-{i}.txt")),
+                format!("Fallback content {i}"),
+            )
+            .unwrap();
+        }
+        let database = root.join("index.sqlite");
+        crate::scan(
+            &database,
+            &Scope {
+                roots: vec![docs],
+                documents: true,
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+
+        let (mut conn, _lease) = open_write(&database, false).unwrap();
+        while prepare_next_document(&mut conn, true).unwrap() {}
+        // Simulate a legacy DB lacking gemma_pending_chunk.
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS gemma_pending_chunk_inserted;
+             DROP TRIGGER IF EXISTS gemma_pending_chunk_deleted;
+             DROP TRIGGER IF EXISTS gemma_pending_vector_inserted;
+             DROP TRIGGER IF EXISTS gemma_pending_vector_deleted;
+             DROP TABLE gemma_pending_chunk;
+             DELETE FROM info WHERE key='gemma_pending_model';",
+        )
+        .unwrap();
+        assert!(!has_gemma_pending_queue(&conn).unwrap());
+
+        // Read-only connection sees pending=true without needing write access.
+        let ro = crate::open_read(&database).unwrap();
+        assert!(gemma_pending(&ro).unwrap());
+        assert!(gemma_coverage(&ro).unwrap().pending);
+        drop(ro);
+
+        // Legacy fallback in embed_gemma_batch still drains and embeds all chunks cleanly.
+        struct SimpleEncoder;
+        impl PassageEncoder for SimpleEncoder {
+            fn encode_passage(&mut self, _: &str) -> Result<Vec<f32>> {
+                Ok(query_vector())
+            }
+        }
+        let mut encoder = SimpleEncoder;
+        let (batch, yielded) = embed_gemma_batch(&mut conn, &mut encoder, 8, None, None).unwrap();
+        assert!(!yielded);
+        assert_eq!(batch.new_embeddings, 2);
+        assert!(!batch.has_more);
+        assert!(!gemma_pending(&conn).unwrap());
+
+        drop(conn);
         fs::remove_dir_all(root).unwrap();
     }
 }

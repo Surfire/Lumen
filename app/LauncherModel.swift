@@ -191,6 +191,9 @@ final class Launcher: ObservableObject {
     var onCoverageAccepted: ((IndexReport) -> Void)?
     var isImageIndexingActive: (() -> Bool)?
     var canBootstrapImages: (() -> Bool)?
+    var shouldDeferEmbeddingsToImages: (() -> Bool)?
+    var maxEmbeddingBatchesPerTurn: (() -> Int?)?
+    var onEmbeddingsTurnCompleted: (() -> Void)?
     var isEmbeddingIndexingPaused: Bool { defaults?.bool(forKey: "gemmaIndexingPaused") == true }
     var indexPhase: IndexPhase { indexStatus.indexPhase }
     var indexWork: IndexWork? { indexStatus.indexWork }
@@ -1291,11 +1294,12 @@ final class Launcher: ObservableObject {
         embedNextBatch()
     }
 
-    private func embedNextBatch() {
+    private func embedNextBatch(batchesSeen: Int = 0, maxBatches: Int? = nil) {
         if engine.supportsStreamingBatches {
             streamEmbeddings()
             return
         }
+        let maxBatches = batchesSeen == 0 ? (maxBatches ?? maxEmbeddingBatchesPerTurn?()) : maxBatches
         let arguments = ["embed", "--gemma", "--max", "32"] + engine.gemmaOptions
         writer = engine.run(arguments, priority: .background) { [weak self] response in
             guard let self, !self.closed else { return }
@@ -1306,6 +1310,7 @@ final class Launcher: ObservableObject {
                 self.finishEmbeddings(.idle)
                 return
             }
+            let batchesSeen = batchesSeen + 1
             self.indexStatus.set(\.embeddingBatch, to: batch)
             if !batch.has_more {
                 self.finishEmbeddings(.finished)
@@ -1318,6 +1323,12 @@ final class Launcher: ObservableObject {
                     self.automaticBuildAttempted = false
                     self.finishEmbeddings(.idle)
                     self.startContentIfReady()
+                } else if let maxBatches, batchesSeen >= maxBatches, batch.has_more {
+                    self.embeddingStreamGeneration &+= 1
+                    self.writer = nil
+                    self.automaticBuildAttempted = false
+                    self.finishEmbeddings(.idle)
+                    self.onEmbeddingsTurnCompleted?()
                 } else {
                     let needsSettingsRefresh = self.isSettingsPresented &&
                         (self.lastSettingsCoverageRefresh.map { $0.duration(to: .now) >= .seconds(2) } ?? true)
@@ -1325,7 +1336,7 @@ final class Launcher: ObservableObject {
                         if self.isSettingsPresented { self.lastSettingsCoverageRefresh = .now }
                         self.refreshCoverage()
                     }
-                    self.embedNextBatch()
+                    self.embedNextBatch(batchesSeen: batchesSeen, maxBatches: maxBatches)
                 }
             } else {
                 self.finishEmbeddings(.paused)
@@ -1338,13 +1349,16 @@ final class Launcher: ObservableObject {
     private func streamEmbeddings() {
         embeddingStreamGeneration &+= 1
         let generation = embeddingStreamGeneration
+        let maxBatches = maxEmbeddingBatchesPerTurn?()
         let arguments = ["embed", "--gemma", "--stream", "--max", "32"] + engine.gemmaOptions
         var lastBatch: EmbeddingBatch?
+        var batchesSeen = 0
         var noProgress = false
         writer = engine.run(arguments, onLine: { [weak self] line in
             guard let self, !self.closed, self.embeddingStreamGeneration == generation,
                   let batch = try? JSONDecoder().decode(EmbeddingBatch.self, from: line) else { return }
             lastBatch = batch
+            batchesSeen += 1
             self.indexStatus.set(\.embeddingBatch, to: batch)
             if !batch.has_more { return }
             if batch.new_embeddings == 0 && batch.skipped_chunks == 0 {
@@ -1354,6 +1368,15 @@ final class Launcher: ObservableObject {
                 return
             }
             if self.embeddingState == .running {
+                if let maxBatches, batchesSeen >= maxBatches, batch.has_more {
+                    self.embeddingStreamGeneration &+= 1
+                    self.writer?.terminate()
+                    self.writer = nil
+                    self.automaticBuildAttempted = false
+                    self.finishEmbeddings(.idle)
+                    self.onEmbeddingsTurnCompleted?()
+                    return
+                }
                 let needsSettingsRefresh = self.isSettingsPresented &&
                     (self.lastSettingsCoverageRefresh.map { $0.duration(to: .now) >= .seconds(2) } ?? true)
                 if self.gemmaCoverage?.hasResults != true || needsSettingsRefresh {
@@ -1428,11 +1451,12 @@ final class Launcher: ObservableObject {
             automaticBuildAttempted = false
         }
         // The saved scope in the database decides whether documents are eligible.
-        let needsImageBootstrap = report.images?.enabled == true
+        let needsImageBootstrap = (report.images?.enabled == true
             && report.images?.vectors == 0
             && report.images?.pending == true
             && report.images?.limited == false
-            && canBootstrapImages?() == true
+            && canBootstrapImages?() == true)
+            || shouldDeferEmbeddingsToImages?() == true
         if !needsImageBootstrap,
            !automaticBuildAttempted, embeddingState == .idle, canBuildEmbeddings,
            !isEmbeddingIndexingPaused, isImageIndexingActive?() != true,

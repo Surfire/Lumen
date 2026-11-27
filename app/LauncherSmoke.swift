@@ -4989,6 +4989,31 @@ final class LauncherSmoke {
         }
         pauseModel.close()
 
+        try? FileManager.default.removeItem(at: streamDir.appendingPathComponent("embed-first-sent"))
+        try? FileManager.default.removeItem(at: streamDir.appendingPathComponent("embed-sigterm"))
+        let turnDefaultsSuite = "lumen-phase3-turn-\(UUID().uuidString)"
+        guard let turnDefaults = UserDefaults(suiteName: turnDefaultsSuite) else {
+            throw Failure("missing isolated phase3 turn defaults")
+        }
+        defer { turnDefaults.removePersistentDomain(forName: turnDefaultsSuite) }
+        let turnModel = Launcher(engine: streamEngine, defaults: turnDefaults, locale: "en")
+        defer { turnModel.close() }
+        var turnCompletedCount = 0
+        turnModel.maxEmbeddingBatchesPerTurn = { 1 }
+        turnModel.onEmbeddingsTurnCompleted = { turnCompletedCount += 1 }
+        turnModel.start(automaticallyIndex: false)
+        try await until("phase3 turn fixture did not become ready") {
+            turnModel.canSearch && turnModel.watchState == .running && turnModel.canBuildEmbeddings
+        }
+        turnModel.buildEmbeddings()
+        try await until("bounded streaming embed turn did not yield to idle after 1 batch") {
+            turnCompletedCount == 1 && turnModel.embeddingState == .idle && turnModel.indexWork == nil &&
+                FileManager.default.fileExists(atPath: streamDir.appendingPathComponent("embed-sigterm").path)
+        }
+        try check(turnModel.embeddingNotice == nil && turnModel.embeddingBatch?.new_embeddings == 1,
+                  "bounded streaming embed turn set unexpected notice or missed first batch")
+        turnModel.close()
+
         let streamImages = LauncherImageSearch(engine: streamEngine, defaults: streamDefaults)
         streamImages.setProjector(streamDir.appendingPathComponent("projector"))
         streamImages.ensureStatus()
@@ -4999,17 +5024,23 @@ final class LauncherSmoke {
         }
         let imgLaunches = try String(contentsOf: streamDir.appendingPathComponent("img-launches"), encoding: .utf8)
             .split(separator: "\n").count
-        try check(!streamImages.failed && streamImages.checked == 4 && imgLaunches == 1,
-                  "streaming image-index failed or launched multiple processes (\(imgLaunches))")
+        try check(!streamImages.failed && !streamImages.lastBuildWasBounded && streamImages.checked == 4 && imgLaunches == 1,
+                  "streaming image-index failed, reported bounded, or launched multiple processes (\(imgLaunches))")
 
+        var observedBoundedInCallback = false
+        streamImages.onBuildFinished = { [weak streamImages] in
+            observedBoundedInCallback = streamImages?.lastBuildWasBounded == true
+        }
         streamImages.build(maxBatches: 1)
         try await until("bounded streaming image-index bootstrap did not settle after batch 1") {
             !streamImages.building && !streamImages.loading
         }
         let boundedLaunches = try String(contentsOf: streamDir.appendingPathComponent("img-launches"), encoding: .utf8)
             .split(separator: "\n").count
-        try check(!streamImages.failed && !streamImages.noProgressExhausted && streamImages.checked == 3 && boundedLaunches == 2,
-                  "bounded image bootstrap failed: failed=\(streamImages.failed) exhausted=\(streamImages.noProgressExhausted) checked=\(streamImages.checked) launches=\(boundedLaunches)")
+        try check(!streamImages.failed && !streamImages.noProgressExhausted &&
+                  streamImages.lastBuildWasBounded && observedBoundedInCallback &&
+                  streamImages.checked == 3 && boundedLaunches == 2,
+                  "bounded image bootstrap failed: failed=\(streamImages.failed) exhausted=\(streamImages.noProgressExhausted) bounded=\(streamImages.lastBuildWasBounded) callback=\(observedBoundedInCallback) checked=\(streamImages.checked) launches=\(boundedLaunches)")
 
         // 5. Option A: single-Han visual recall (`mode: "image"`) & slot 6-7 placement.
         try check(Launcher.qualifiesForImageRecall("鹿") &&

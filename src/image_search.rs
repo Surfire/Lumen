@@ -13,13 +13,19 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use std::{
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 pub const MODEL_ID: &str = "gemma2/image/imageio512-v1/q8_0/b11457/retrieval/768/l2/0531309472a6bc6f4b146c3736eee7795ec9db1903c25490d3c937490cef6dd8";
 const MIN_IMAGE_VECTOR_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_IMAGE_VECTOR_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_BATCH: usize = 16;
+const DECODE_CONCURRENCY: usize = 4;
 // A minimum cosine for this exact model, not an estimate of correctness.
 const MIN_COSINE: f32 = 0.65;
 const Z_THRESHOLD: f64 = 1.0;
@@ -528,11 +534,35 @@ pub struct ImageBatch {
 
 trait ImageEncoder {
     fn encode_image_bytes(&mut self, bytes: &[u8]) -> Result<Vec<f32>>;
+
+    fn encode_image_batch(
+        &mut self,
+        images: &[&[u8]],
+        stop: Option<&AtomicBool>,
+    ) -> Result<Vec<Option<Vec<f32>>>> {
+        let mut vectors = Vec::with_capacity(images.len());
+        for bytes in images {
+            if stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                vectors.resize_with(images.len(), || None);
+                break;
+            }
+            vectors.push(Some(self.encode_image_bytes(bytes)?));
+        }
+        Ok(vectors)
+    }
 }
 
 impl ImageEncoder for crate::gemma::GemmaWorker {
     fn encode_image_bytes(&mut self, bytes: &[u8]) -> Result<Vec<f32>> {
         self.encode_image(bytes)
+    }
+
+    fn encode_image_batch(
+        &mut self,
+        images: &[&[u8]],
+        stop: Option<&AtomicBool>,
+    ) -> Result<Vec<Option<Vec<f32>>>> {
+        self.encode_images(images, stop)
     }
 }
 
@@ -592,7 +622,7 @@ fn image_batch_step<E: ImageEncoder>(
     let rules = current_rules.context("choose a folder with image-scope first")?;
     let cursor = parse_cursor(after)?;
     let limit = image_limit();
-    let mut available = limit
+    let available = limit
         - snapshot.query_row("SELECT count(*) FROM image_embedding", [], |r| {
             r.get::<_, i64>(0)
         })?;
@@ -621,27 +651,43 @@ fn image_batch_step<E: ImageEncoder>(
     };
     drop(snapshot);
     let total_rows = rows.len();
-    let planned = total_rows.min(max);
-    let mut batch = ImageBatch {
-        model_id: MODEL_ID,
-        processed: planned,
-        indexed: 0,
-        reused: 0,
-        skipped: 0,
-        limited: false,
-        next_after: (total_rows > max).then(|| format_cursor(rows[max - 1].2, rows[max - 1].0)),
-    };
-    let mut encoded = Vec::new();
-    let mut skips = Vec::new();
+
+    enum DecodeState {
+        Pending,
+        Failed,
+        Thumbnail(Vec<u8>),
+    }
+
+    enum RowOutcome {
+        Reused,
+        Skipped {
+            skip_stamp: Option<String>,
+            limited: bool,
+        },
+        Ready {
+            path: String,
+            stamp: String,
+            decode: DecodeState,
+            packed: Option<Vec<u8>>,
+        },
+    }
+
+    struct PreflightRow {
+        id: i64,
+        mtime: i64,
+        outcome: RowOutcome,
+    }
+
+    // Phase 1: sequential DB/rule preflight over up to `max` rows.
+    let mut outcomes = Vec::with_capacity(total_rows.min(max));
+    let mut ready_indices = Vec::new();
+    let mut planned_new: i64 = 0;
     let mut stopped = false;
-    let mut last_cursor = None;
     for (idx, (id, path, mtime, prior, occupied)) in rows.into_iter().take(max).enumerate() {
         if stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
             if idx == 0 {
                 return Ok((None, true));
             }
-            batch.processed = idx;
-            batch.next_after = last_cursor.filter(|_| total_rows > idx);
             stopped = true;
             break;
         }
@@ -653,50 +699,242 @@ fn image_batch_step<E: ImageEncoder>(
         }
         let source = Path::new(&path);
         if !rules.allows(source) {
-            last_cursor = Some(format_cursor(mtime, id));
-            batch.skipped += 1;
+            outcomes.push(PreflightRow {
+                id,
+                mtime,
+                outcome: RowOutcome::Skipped {
+                    skip_stamp: None,
+                    limited: false,
+                },
+            });
             continue;
         }
         let Some(stamp) = local_stamp(source, false) else {
-            last_cursor = Some(format_cursor(mtime, id));
-            batch.skipped += 1;
-            skips.push((id, format!("unreadable:{mtime}")));
+            outcomes.push(PreflightRow {
+                id,
+                mtime,
+                outcome: RowOutcome::Skipped {
+                    skip_stamp: Some(format!("unreadable:{mtime}")),
+                    limited: false,
+                },
+            });
             continue;
         };
         if prior
             .as_deref()
             .is_some_and(|prior| crate::index::stamp_matches(prior, &stamp))
         {
-            last_cursor = Some(format_cursor(mtime, id));
-            batch.reused += 1;
+            outcomes.push(PreflightRow {
+                id,
+                mtime,
+                outcome: RowOutcome::Reused,
+            });
             continue;
         }
-        if !occupied && available <= 0 {
-            last_cursor = Some(format_cursor(mtime, id));
-            batch.limited = true;
-            batch.skipped += 1;
+        if !occupied && planned_new >= available {
+            outcomes.push(PreflightRow {
+                id,
+                mtime,
+                outcome: RowOutcome::Skipped {
+                    skip_stamp: None,
+                    limited: true,
+                },
+            });
             continue;
         }
-        let Ok(bytes) = platform::read_local_checked(source, MAX_FILE_BYTES, Some(&stamp)) else {
-            last_cursor = Some(format_cursor(mtime, id));
-            batch.skipped += 1;
-            skips.push((id, stamp));
-            continue;
+        planned_new += i64::from(!occupied);
+        ready_indices.push(outcomes.len());
+        outcomes.push(PreflightRow {
+            id,
+            mtime,
+            outcome: RowOutcome::Ready {
+                path,
+                stamp,
+                decode: DecodeState::Pending,
+                packed: None,
+            },
+        });
+    }
+
+    // Phase 2: parallel checked local read + ImageIO thumbnail decode (up to 4 threads).
+    let decoded_states =
+        if !ready_indices.is_empty() && !stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            let decode_targets: Vec<(&str, &str)> = ready_indices
+                .iter()
+                .map(|&row_idx| match &outcomes[row_idx].outcome {
+                    RowOutcome::Ready { path, stamp, .. } => (path.as_str(), stamp.as_str()),
+                    _ => unreachable!("ready_indices only references Ready rows"),
+                })
+                .collect();
+            let next = AtomicUsize::new(0);
+            let decoded: Mutex<Vec<Option<DecodeState>>> =
+                Mutex::new((0..decode_targets.len()).map(|_| None).collect());
+            let workers = decode_targets.len().min(DECODE_CONCURRENCY);
+            thread::scope(|scope| {
+                for _ in 0..workers {
+                    scope.spawn(|| {
+                        loop {
+                            if stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                                break;
+                            }
+                            let idx = next.fetch_add(1, Ordering::AcqRel);
+                            if idx >= decode_targets.len() {
+                                break;
+                            }
+                            let (path, stamp) = decode_targets[idx];
+                            let state = match platform::read_local_checked(
+                                Path::new(path),
+                                MAX_FILE_BYTES,
+                                Some(stamp),
+                            )
+                            .ok()
+                            .and_then(|bytes| thumbnail(&bytes))
+                            {
+                                Some(thumb) => DecodeState::Thumbnail(thumb),
+                                None => DecodeState::Failed,
+                            };
+                            decoded.lock().unwrap_or_else(|e| e.into_inner())[idx] = Some(state);
+                        }
+                    });
+                }
+            });
+            Some(decoded.into_inner().unwrap_or_else(|e| e.into_inner()))
+        } else {
+            None
         };
-        let Some(bytes) = thumbnail(&bytes) else {
-            last_cursor = Some(format_cursor(mtime, id));
-            batch.skipped += 1;
-            skips.push((id, stamp));
-            continue;
-        };
-        let worker = match worker {
-            Some(worker) => worker,
-            None => worker.insert(connect.take().expect("image worker connects once")()?),
-        };
-        let vector = worker.encode_image_bytes(&bytes)?;
-        available -= i64::from(!occupied);
-        last_cursor = Some(format_cursor(mtime, id));
-        encoded.push((id, path, stamp, pack(&vector)));
+    if let Some(states) = decoded_states {
+        for (&row_idx, state) in ready_indices.iter().zip(states) {
+            if let Some(state) = state
+                && let RowOutcome::Ready { decode, .. } = &mut outcomes[row_idx].outcome
+            {
+                *decode = state;
+            }
+        }
+    }
+
+    // Phase 3: concurrent encode over decoded thumbnails, honoring stop and scope revocations.
+    let mut stop_at: Option<usize> = None;
+    let mut to_encode: Vec<usize> = Vec::new();
+    for &row_idx in &ready_indices {
+        match &outcomes[row_idx].outcome {
+            RowOutcome::Ready {
+                decode: DecodeState::Thumbnail(_),
+                ..
+            } => to_encode.push(row_idx),
+            RowOutcome::Ready {
+                decode: DecodeState::Failed,
+                ..
+            } => {}
+            RowOutcome::Ready {
+                decode: DecodeState::Pending,
+                ..
+            } => {
+                stop_at = Some(row_idx);
+                stopped = true;
+                break;
+            }
+            _ => unreachable!("ready_indices only references Ready rows"),
+        }
+    }
+    if !to_encode.is_empty() {
+        if stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            stop_at = Some(to_encode[0]);
+            stopped = true;
+        } else {
+            if Rules::read(reader)?.as_ref() != Some(&rules) {
+                if yield_on_scope_change {
+                    return Ok((None, true));
+                }
+                bail!("image or filename scope changed; retry the batch");
+            }
+            let worker = match worker {
+                Some(worker) => worker,
+                None => worker.insert(connect.take().expect("image worker connects once")()?),
+            };
+            let encoded_vecs = {
+                let slices: Vec<&[u8]> = to_encode
+                    .iter()
+                    .map(|&row_idx| match &outcomes[row_idx].outcome {
+                        RowOutcome::Ready {
+                            decode: DecodeState::Thumbnail(bytes),
+                            ..
+                        } => bytes.as_slice(),
+                        _ => unreachable!("to_encode only references decoded thumbnails"),
+                    })
+                    .collect();
+                worker.encode_image_batch(&slices, stop)?
+            };
+            ensure!(
+                encoded_vecs.len() == to_encode.len(),
+                "image encoder returned a mismatched batch length"
+            );
+            if Rules::read(reader)?.as_ref() != Some(&rules) {
+                if yield_on_scope_change {
+                    return Ok((None, true));
+                }
+                bail!("image or filename scope changed; retry the batch");
+            }
+            for (row_idx, vec_opt) in to_encode.into_iter().zip(encoded_vecs) {
+                if let Some(vector) = vec_opt {
+                    if let RowOutcome::Ready { packed, .. } = &mut outcomes[row_idx].outcome {
+                        *packed = Some(pack(&vector));
+                    }
+                } else {
+                    stop_at.get_or_insert(row_idx);
+                    stopped = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    let completed_len = stop_at.unwrap_or(outcomes.len());
+    if stopped && completed_len == 0 {
+        return Ok((None, true));
+    }
+    let mut batch = ImageBatch {
+        model_id: MODEL_ID,
+        processed: completed_len,
+        indexed: 0,
+        reused: 0,
+        skipped: 0,
+        limited: false,
+        next_after: if completed_len > 0 && total_rows > completed_len {
+            let last = &outcomes[completed_len - 1];
+            Some(format_cursor(last.mtime, last.id))
+        } else {
+            None
+        },
+    };
+    let mut encoded = Vec::new();
+    let mut skips = Vec::new();
+    for row in outcomes.into_iter().take(completed_len) {
+        match row.outcome {
+            RowOutcome::Reused => batch.reused += 1,
+            RowOutcome::Skipped {
+                skip_stamp,
+                limited,
+            } => {
+                batch.skipped += 1;
+                batch.limited |= limited;
+                if let Some(stamp) = skip_stamp {
+                    skips.push((row.id, stamp));
+                }
+            }
+            RowOutcome::Ready {
+                path,
+                stamp,
+                decode,
+                packed,
+            } => match (decode, packed) {
+                (_, Some(packed)) => encoded.push((row.id, path, stamp, packed)),
+                (DecodeState::Failed, None) => {
+                    batch.skipped += 1;
+                    skips.push((row.id, stamp));
+                }
+                _ => unreachable!("completed ready rows either encoded or failed decode"),
+            },
+        }
     }
     if encoded.is_empty() && skips.is_empty() {
         return Ok((Some((batch, rules)), stopped));
@@ -766,6 +1004,7 @@ fn image_stream_with<E: ImageEncoder>(
     max: usize,
     stop: &AtomicBool,
     mut emit: impl FnMut(&ImageBatch) -> Result<()>,
+    pace: &mut impl FnMut(Duration, &AtomicBool),
 ) -> Result<()> {
     ensure!(
         (1..=MAX_BATCH).contains(&max),
@@ -782,6 +1021,7 @@ fn image_stream_with<E: ImageEncoder>(
         if stop.load(Ordering::Acquire) {
             break;
         }
+        let started = Instant::now();
         let (step, stopped) = image_batch_step(
             &database,
             &reader,
@@ -794,6 +1034,7 @@ fn image_stream_with<E: ImageEncoder>(
             Some(stop),
             true,
         )?;
+        let elapsed = started.elapsed();
         let Some((batch, rules)) = step else {
             break;
         };
@@ -808,6 +1049,7 @@ fn image_stream_with<E: ImageEncoder>(
         if done {
             break;
         }
+        pace(elapsed, stop);
         cursor = batch.next_after;
     }
     Ok(())
@@ -862,6 +1104,7 @@ impl<'a> ImageSearchSession<'a> {
             max,
             stop,
             emit,
+            &mut crate::platform::pace_stream_batch,
         )
     }
 
@@ -1338,6 +1581,7 @@ mod tests {
                 ));
                 Ok(())
             },
+            &mut |_, _| {},
         )
         .unwrap();
         assert_eq!(connect_count, 1);
@@ -1370,6 +1614,7 @@ mod tests {
                 ));
                 Ok(())
             },
+            &mut |_, _| {},
         )
         .unwrap();
         assert_eq!(cached_connects, 0);
@@ -1402,6 +1647,7 @@ mod tests {
                 stopped_batches.push((batch.processed, batch.indexed, batch.next_after.is_some()));
                 Ok(())
             },
+            &mut |_, _| {},
         )
         .unwrap();
         assert_eq!(stopped_batches, [(1, 1, true)]);
@@ -1818,6 +2064,426 @@ mod tests {
 
         drop(writer);
         drop(reader);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    const TINY_PNG: &[u8] = &[
+        0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D',
+        b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, b'I', b'D', b'A', b'T', 0x08, 0xd7, 0x63, 0xf8,
+        0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d, 0xb0, 0x00, 0x00, 0x00,
+        0x00, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    fn axis_vec(axis: usize) -> Vec<f32> {
+        let mut v = vec![0.0_f32; DIMENSIONS];
+        v[axis] = 1.0;
+        v
+    }
+
+    #[test]
+    fn batch_encode_preserves_order_across_mixed_valid_unreadable_and_reused_rows() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-image-mixed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let images = root.join("images");
+        fs::create_dir_all(&images).unwrap();
+
+        let set_mtime = |path: &Path, secs: u64| {
+            let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+            file.set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs)),
+            )
+            .unwrap();
+        };
+
+        let a_reused = images.join("a_reused.png");
+        let b_valid = images.join("b_valid.png");
+        let c_corrupt = images.join("c_corrupt.png");
+        let d_missing = images.join("d_missing.png");
+        let e_valid = images.join("e_valid.png");
+
+        fs::write(&a_reused, TINY_PNG).unwrap();
+        fs::write(&b_valid, TINY_PNG).unwrap();
+        fs::write(&c_corrupt, b"corrupt image bytes").unwrap();
+        fs::write(&d_missing, TINY_PNG).unwrap();
+        fs::write(&e_valid, TINY_PNG).unwrap();
+
+        set_mtime(&a_reused, 1_700_000_500);
+        set_mtime(&b_valid, 1_700_000_400);
+        set_mtime(&c_corrupt, 1_700_000_300);
+        set_mtime(&d_missing, 1_700_000_200);
+        set_mtime(&e_valid, 1_700_000_100);
+
+        let database = root.join("index.db");
+        crate::index::scan(
+            &database,
+            &Scope {
+                roots: vec![images.clone()],
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        image_scope(&database, Some(&images)).unwrap();
+
+        // Remove d_missing after scan so Phase 1 marks it unreadable.
+        fs::remove_file(&d_missing).unwrap();
+
+        // Pre-populate a_reused with axis 1 so Phase 1 reuses it.
+        let writer_conn = open_write(&database, false).unwrap().0;
+        ensure_schema(&writer_conn).unwrap();
+        writer_conn
+            .execute(
+                "INSERT INTO image_embedding VALUES ((SELECT id FROM item WHERE path=?1), ?2, ?3, ?4)",
+                params![
+                    a_reused.to_str().unwrap(),
+                    MODEL_ID,
+                    local_stamp(&a_reused, false).unwrap(),
+                    pack(&axis_vec(1))
+                ],
+            )
+            .unwrap();
+        drop(writer_conn);
+
+        struct BatchOrderEncoder {
+            calls: std::sync::Arc<Mutex<Vec<usize>>>,
+        }
+        impl ImageEncoder for BatchOrderEncoder {
+            fn encode_image_bytes(&mut self, _: &[u8]) -> Result<Vec<f32>> {
+                unreachable!("batch step must call encode_image_batch")
+            }
+            fn encode_image_batch(
+                &mut self,
+                images: &[&[u8]],
+                _: Option<&AtomicBool>,
+            ) -> Result<Vec<Option<Vec<f32>>>> {
+                self.calls.lock().unwrap().push(images.len());
+                Ok((0..images.len()).map(|i| Some(axis_vec(10 + i))).collect())
+            }
+        }
+
+        let reader = open_read(&database).unwrap();
+        let calls = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let mut writer = None;
+        let mut worker = None;
+        let mut connect = Some(|| {
+            Ok(BatchOrderEncoder {
+                calls: calls.clone(),
+            })
+        });
+        let (step, stopped) = image_batch_step(
+            &database,
+            &reader,
+            &mut writer,
+            &mut connect,
+            &mut worker,
+            None,
+            8,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(!stopped);
+        let (batch, _) = step.unwrap();
+        assert_eq!(
+            (batch.processed, batch.indexed, batch.reused, batch.skipped),
+            (5, 2, 1, 2)
+        );
+        assert!(batch.next_after.is_none());
+        assert_eq!(*calls.lock().unwrap(), vec![2]);
+
+        let unpack_axis = |path: &Path| -> usize {
+            let blob: Vec<u8> = reader
+                .query_row(
+                    "SELECT e.vector FROM image_embedding e JOIN item i USING(id) WHERE i.path=?1",
+                    [path.to_str().unwrap()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(blob.len(), DIMENSIONS * 2);
+            (0..DIMENSIONS)
+                .max_by(|&a, &b| {
+                    let fa = half_to_f32(&blob[a * 2..a * 2 + 2]);
+                    let fb = half_to_f32(&blob[b * 2..b * 2 + 2]);
+                    fa.total_cmp(&fb)
+                })
+                .unwrap()
+        };
+        assert_eq!(unpack_axis(&a_reused), 1);
+        assert_eq!(unpack_axis(&b_valid), 10);
+        assert_eq!(unpack_axis(&e_valid), 11);
+        let skipped_count: i64 = reader
+            .query_row("SELECT count(*) FROM image_skip", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(skipped_count, 2);
+
+        drop(writer);
+        drop(reader);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn half_to_f32(bytes: &[u8]) -> f32 {
+        let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let sign = ((bits & 0x8000) as u32) << 16;
+        let exp = (bits >> 10) & 0x1f;
+        let frac = (bits & 0x03ff) as u32;
+        if exp == 0 {
+            f32::from_bits(sign)
+        } else {
+            f32::from_bits(sign | (((exp as u32) + 112) << 23) | (frac << 13))
+        }
+    }
+
+    #[test]
+    fn mid_batch_stop_pins_cursor_to_last_completed_row_without_skipping_unencoded_rows() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-image-midstop-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let images = root.join("images");
+        fs::create_dir_all(&images).unwrap();
+
+        let set_mtime = |path: &Path, secs: u64| {
+            let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+            file.set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs)),
+            )
+            .unwrap();
+        };
+
+        let r0 = images.join("r0_reused.png");
+        let r1 = images.join("r1_corrupt.png");
+        let r2 = images.join("r2_valid.png");
+        let r3 = images.join("r3_valid.png");
+        let r4 = images.join("r4_reused.png");
+        fs::write(&r0, TINY_PNG).unwrap();
+        fs::write(&r1, b"bad").unwrap();
+        fs::write(&r2, TINY_PNG).unwrap();
+        fs::write(&r3, TINY_PNG).unwrap();
+        fs::write(&r4, TINY_PNG).unwrap();
+        for (p, m) in [
+            (&r0, 1_700_000_500),
+            (&r1, 1_700_000_400),
+            (&r2, 1_700_000_300),
+            (&r3, 1_700_000_200),
+            (&r4, 1_700_000_100),
+        ] {
+            set_mtime(p, m);
+        }
+
+        let database = root.join("index.db");
+        crate::index::scan(
+            &database,
+            &Scope {
+                roots: vec![images.clone()],
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        image_scope(&database, Some(&images)).unwrap();
+
+        let writer = open_write(&database, false).unwrap().0;
+        ensure_schema(&writer).unwrap();
+        for p in [&r0, &r4] {
+            writer
+                .execute(
+                    "INSERT INTO image_embedding VALUES ((SELECT id FROM item WHERE path=?1), ?2, ?3, ?4)",
+                    params![
+                        p.to_str().unwrap(),
+                        MODEL_ID,
+                        local_stamp(p, false).unwrap(),
+                        pack(&query_vector())
+                    ],
+                )
+                .unwrap();
+        }
+        drop(writer);
+
+        struct StopAfterFirstEncoder {
+            stop_on_encode: bool,
+        }
+        impl ImageEncoder for StopAfterFirstEncoder {
+            fn encode_image_bytes(&mut self, _: &[u8]) -> Result<Vec<f32>> {
+                Ok(query_vector())
+            }
+            fn encode_image_batch(
+                &mut self,
+                images: &[&[u8]],
+                stop: Option<&AtomicBool>,
+            ) -> Result<Vec<Option<Vec<f32>>>> {
+                let mut out = Vec::with_capacity(images.len());
+                for (idx, _) in images.iter().enumerate() {
+                    if stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                        out.push(None);
+                    } else {
+                        out.push(Some(query_vector()));
+                        if self.stop_on_encode
+                            && idx == 0
+                            && let Some(flag) = stop
+                        {
+                            flag.store(true, Ordering::Release);
+                        }
+                    }
+                }
+                Ok(out)
+            }
+        }
+
+        let stop = AtomicBool::new(false);
+        let mut first_batches = Vec::new();
+        let mut cursor = None;
+        image_stream_with(
+            &database,
+            || {
+                Ok(StopAfterFirstEncoder {
+                    stop_on_encode: true,
+                })
+            },
+            None,
+            5,
+            &stop,
+            |batch| {
+                first_batches.push((
+                    batch.processed,
+                    batch.indexed,
+                    batch.reused,
+                    batch.skipped,
+                    batch.next_after.is_some(),
+                ));
+                cursor = batch.next_after.clone();
+                Ok(())
+            },
+            &mut |_, _| {},
+        )
+        .unwrap();
+        // Rows completed before r3 (where encode returned None): r0 (reused), r1 (skip), r2 (indexed).
+        // r4 (reused) comes after r3 and MUST NOT be counted before r3 is visited.
+        assert_eq!(first_batches, [(3, 1, 1, 1, true)]);
+        assert_eq!(image_status(&database).unwrap().vectors, 3);
+
+        // Resuming from next_after visits r3 (indexed) and r4 (reused).
+        let stop2 = AtomicBool::new(false);
+        let mut resumed_batches = Vec::new();
+        image_stream_with(
+            &database,
+            || {
+                Ok(StopAfterFirstEncoder {
+                    stop_on_encode: false,
+                })
+            },
+            cursor.as_deref(),
+            5,
+            &stop2,
+            |batch| {
+                resumed_batches.push((
+                    batch.processed,
+                    batch.indexed,
+                    batch.reused,
+                    batch.skipped,
+                    batch.next_after.is_some(),
+                ));
+                Ok(())
+            },
+            &mut |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(resumed_batches, [(2, 1, 1, 0, false)]);
+        assert_eq!(image_status(&database).unwrap().vectors, 4);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn image_stream_invokes_pace_between_batches_only() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-image-pace-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let images = root.join("images");
+        fs::create_dir_all(&images).unwrap();
+        for i in 0..5 {
+            fs::write(images.join(format!("p-{i}.png")), TINY_PNG).unwrap();
+        }
+        let database = root.join("index.db");
+        crate::index::scan(
+            &database,
+            &Scope {
+                roots: vec![images.clone()],
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        image_scope(&database, Some(&images)).unwrap();
+
+        struct SimpleEncoder;
+        impl ImageEncoder for SimpleEncoder {
+            fn encode_image_bytes(&mut self, _: &[u8]) -> Result<Vec<f32>> {
+                Ok(query_vector())
+            }
+        }
+
+        let stop = AtomicBool::new(false);
+        let events = std::cell::RefCell::new(Vec::new());
+        image_stream_with(
+            &database,
+            || Ok(SimpleEncoder),
+            None,
+            2,
+            &stop,
+            |_| {
+                events.borrow_mut().push("emit");
+                Ok(())
+            },
+            &mut |elapsed, flag| {
+                assert!(!flag.load(Ordering::Acquire));
+                let _ = elapsed;
+                events.borrow_mut().push("pace");
+            },
+        )
+        .unwrap();
+        assert_eq!(*events.borrow(), ["emit", "pace", "emit", "pace", "emit"]);
+
+        // Stopping on the first batch must never invoke pace.
+        let writer = open_write(&database, false).unwrap().0;
+        writer.execute("DELETE FROM image_embedding", []).unwrap();
+        drop(writer);
+        struct StopOnFirst;
+        impl ImageEncoder for StopOnFirst {
+            fn encode_image_bytes(&mut self, _: &[u8]) -> Result<Vec<f32>> {
+                Ok(query_vector())
+            }
+            fn encode_image_batch(
+                &mut self,
+                images: &[&[u8]],
+                stop: Option<&AtomicBool>,
+            ) -> Result<Vec<Option<Vec<f32>>>> {
+                if let Some(flag) = stop {
+                    flag.store(true, Ordering::Release);
+                }
+                Ok(vec![Some(query_vector()), None][..images.len()].to_vec())
+            }
+        }
+        let stop2 = AtomicBool::new(false);
+        let stop_events = std::cell::RefCell::new(Vec::new());
+        image_stream_with(
+            &database,
+            || Ok(StopOnFirst),
+            None,
+            2,
+            &stop2,
+            |_| {
+                stop_events.borrow_mut().push("emit");
+                Ok(())
+            },
+            &mut |_, _| stop_events.borrow_mut().push("pace"),
+        )
+        .unwrap();
+        assert_eq!(*stop_events.borrow(), ["emit"]);
+
         fs::remove_dir_all(root).unwrap();
     }
 }

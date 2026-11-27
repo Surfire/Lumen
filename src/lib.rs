@@ -565,6 +565,7 @@ fn open_write(path: &Path, exclusive_indexer: bool) -> Result<(Connection, Optio
     }
     image_search::migrate_legacy_scope(&mut conn)?;
     image_search::ensure_schema(&conn)?;
+    semantic::ensure_gemma_queue(&conn)?;
     Ok((conn, lease))
 }
 

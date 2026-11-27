@@ -2,6 +2,8 @@ use anyhow::{Context, Result, bail};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 pub fn availability(path: &Path, meta: &fs::Metadata) -> &'static str {
     classify(path, dataless(meta))
@@ -113,6 +115,181 @@ pub(crate) fn physical_memory_bytes() -> u64 {
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn physical_memory_bytes() -> u64 {
     DEFAULT_PHYSICAL_MEMORY_BYTES
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ThermalPressure {
+    Nominal,
+    Fair,
+    Serious,
+    Critical,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn thermal_pressure() -> ThermalPressure {
+    use std::ffi::c_char;
+    unsafe extern "C" {
+        fn notify_register_check(name: *const c_char, out_token: *mut i32) -> u32;
+        fn notify_get_state(token: i32, state64: *mut u64) -> u32;
+        fn notify_cancel(token: i32) -> u32;
+    }
+    let mut token = 0_i32;
+    let mut level = 0_u64;
+    let reg = unsafe {
+        notify_register_check(
+            c"com.apple.system.thermalpressurelevel".as_ptr(),
+            &raw mut token,
+        )
+    };
+    if reg != 0 {
+        return ThermalPressure::Nominal;
+    }
+    let status = unsafe { notify_get_state(token, &raw mut level) };
+    unsafe {
+        notify_cancel(token);
+    }
+    if status != 0 {
+        return ThermalPressure::Nominal;
+    }
+    match level {
+        0 => ThermalPressure::Nominal,
+        1 => ThermalPressure::Fair,
+        2 => ThermalPressure::Serious,
+        _ => ThermalPressure::Critical,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn thermal_pressure() -> ThermalPressure {
+    ThermalPressure::Nominal
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn on_battery_power() -> bool {
+    use std::ffi::c_void;
+    type Cf = *const c_void;
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IOPSCopyPowerSourcesInfo() -> Cf;
+        fn IOPSGetProvidingPowerSourceType(snapshot: Cf) -> Cf;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringGetCString(
+            the_string: Cf,
+            buffer: *mut u8,
+            buffer_size: isize,
+            encoding: u32,
+        ) -> u8;
+        fn CFRelease(cf: Cf);
+    }
+    let info = unsafe { IOPSCopyPowerSourcesInfo() };
+    if info.is_null() {
+        return false;
+    }
+    let ptype = unsafe { IOPSGetProvidingPowerSourceType(info) };
+    let mut buf = [0_u8; 64];
+    let ok = !ptype.is_null()
+        && unsafe {
+            CFStringGetCString(ptype, buf.as_mut_ptr(), buf.len() as isize, 0x0800_0100) != 0
+        };
+    // `ptype` is borrowed from `info`; only release `info`.
+    unsafe { CFRelease(info) };
+    if !ok {
+        return false;
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    &buf[..len] == b"Battery Power"
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn on_battery_power() -> bool {
+    false
+}
+
+const PACE_SLICE: Duration = Duration::from_millis(50);
+const PACE_SERIOUS_POLL: Duration = Duration::from_secs(1);
+const PACE_SERIOUS_CAP: Duration = Duration::from_secs(30);
+const PACE_RECOVERY_MIN_REST: Duration = Duration::from_millis(500);
+
+pub(crate) fn stream_rest_duration(
+    work: Duration,
+    thermal: ThermalPressure,
+    on_battery: bool,
+) -> Duration {
+    if thermal >= ThermalPressure::Serious {
+        return Duration::from_secs(1);
+    }
+    if work < Duration::from_millis(50) {
+        return Duration::ZERO;
+    }
+    let bounded = work.min(Duration::from_secs(60));
+    match (thermal, on_battery) {
+        (ThermalPressure::Nominal, false) => bounded
+            .mul_f64(1.2)
+            .clamp(Duration::from_millis(150), Duration::from_secs(4)),
+        (ThermalPressure::Fair, false) | (ThermalPressure::Nominal, true) => bounded
+            .mul_f64(3.5)
+            .clamp(Duration::from_millis(300), Duration::from_secs(8)),
+        (ThermalPressure::Fair, true) => bounded
+            .mul_f64(7.0)
+            .clamp(Duration::from_millis(500), Duration::from_secs(12)),
+        (ThermalPressure::Serious | ThermalPressure::Critical, _) => Duration::from_secs(1),
+    }
+}
+
+pub(crate) fn pace_stream_batch_with(
+    work: Duration,
+    stop: &AtomicBool,
+    sample: impl Fn() -> (ThermalPressure, bool),
+    mut sleep_step: impl FnMut(Duration),
+) {
+    let mut sleep_sliced = |mut remaining: Duration| -> Duration {
+        let mut slept = Duration::ZERO;
+        while !remaining.is_zero() && !stop.load(Ordering::Acquire) {
+            let step = remaining.min(PACE_SLICE);
+            sleep_step(step);
+            remaining = remaining.saturating_sub(step);
+            slept += step;
+        }
+        slept
+    };
+
+    let mut cooled = Duration::ZERO;
+    while !stop.load(Ordering::Acquire) {
+        let (thermal, on_battery) = sample();
+        if thermal >= ThermalPressure::Serious {
+            let remaining_cap = PACE_SERIOUS_CAP.saturating_sub(cooled);
+            if remaining_cap.is_zero() {
+                break;
+            }
+            cooled += sleep_sliced(PACE_SERIOUS_POLL.min(remaining_cap));
+            if cooled >= PACE_SERIOUS_CAP {
+                break;
+            }
+            continue;
+        }
+        let rest = stream_rest_duration(work, thermal, on_battery);
+        if !cooled.is_zero() {
+            let target = rest.max(PACE_RECOVERY_MIN_REST);
+            sleep_sliced(target.saturating_sub(cooled));
+        } else {
+            sleep_sliced(rest);
+        }
+        break;
+    }
+}
+
+pub(crate) fn pace_stream_batch(work: Duration, stop: &AtomicBool) {
+    if work < Duration::from_millis(50) {
+        return;
+    }
+    pace_stream_batch_with(
+        work,
+        stop,
+        || (thermal_pressure(), on_battery_power()),
+        std::thread::sleep,
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -677,5 +854,183 @@ mod tests {
     #[test]
     fn physical_memory_bytes_reports_at_least_one_gib() {
         assert!(physical_memory_bytes() >= 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn stream_rest_duration_covers_all_thermal_and_battery_states() {
+        use ThermalPressure::{Critical, Fair, Nominal, Serious};
+        let ms = Duration::from_millis;
+        let secs = Duration::from_secs;
+
+        // Fast batches stay zero-wait below Serious so stub/unit tests never stall.
+        for (thermal, battery) in [
+            (Nominal, false),
+            (Nominal, true),
+            (Fair, false),
+            (Fair, true),
+        ] {
+            assert_eq!(
+                stream_rest_duration(ms(0), thermal, battery),
+                Duration::ZERO
+            );
+            assert_eq!(
+                stream_rest_duration(ms(49), thermal, battery),
+                Duration::ZERO
+            );
+        }
+        for (thermal, battery) in [
+            (Serious, false),
+            (Serious, true),
+            (Critical, false),
+            (Critical, true),
+        ] {
+            assert_eq!(stream_rest_duration(ms(10), thermal, battery), secs(1));
+            assert_eq!(stream_rest_duration(secs(2), thermal, battery), secs(1));
+        }
+
+        // Nominal on AC: 1.2x clamped to [150ms, 4s].
+        assert_eq!(stream_rest_duration(ms(50), Nominal, false), ms(150));
+        assert_eq!(stream_rest_duration(ms(1000), Nominal, false), ms(1200));
+        assert_eq!(stream_rest_duration(secs(5), Nominal, false), secs(4));
+
+        // Fair on AC or Nominal on battery: 3.5x clamped to [300ms, 8s].
+        for (thermal, battery) in [(Fair, false), (Nominal, true)] {
+            assert_eq!(stream_rest_duration(ms(50), thermal, battery), ms(300));
+            assert_eq!(stream_rest_duration(ms(1000), thermal, battery), ms(3500));
+            assert_eq!(stream_rest_duration(secs(3), thermal, battery), secs(8));
+        }
+
+        // Fair on battery: 7.0x clamped to [500ms, 12s].
+        assert_eq!(stream_rest_duration(ms(50), Fair, true), ms(500));
+        assert_eq!(stream_rest_duration(ms(1000), Fair, true), secs(7));
+        assert_eq!(stream_rest_duration(secs(2), Fair, true), secs(12));
+    }
+
+    #[test]
+    fn pace_stream_batch_with_wakes_immediately_on_stop_and_recovers_from_serious() {
+        use ThermalPressure::{Critical, Fair, Nominal, Serious};
+        use std::cell::Cell;
+        let ms = Duration::from_millis;
+        let secs = Duration::from_secs;
+
+        // Pre-set stop exits before sampling or sleeping.
+        let preset_stop = AtomicBool::new(true);
+        let sampled = Cell::new(0usize);
+        let mut sleeps = Vec::new();
+        pace_stream_batch_with(
+            secs(1),
+            &preset_stop,
+            || {
+                sampled.set(sampled.get() + 1);
+                (Nominal, false)
+            },
+            |d| sleeps.push(d),
+        );
+        assert_eq!(sampled.get(), 0);
+        assert!(sleeps.is_empty());
+
+        // Immediate wakeup on stop during normal rest (1.2s -> stops after 3x50ms = 150ms).
+        let stop = AtomicBool::new(false);
+        let mut normal_sleeps = Vec::new();
+        pace_stream_batch_with(
+            secs(1),
+            &stop,
+            || (Nominal, false),
+            |d| {
+                normal_sleeps.push(d);
+                if normal_sleeps.len() == 3 {
+                    stop.store(true, Ordering::Release);
+                }
+            },
+        );
+        assert_eq!(normal_sleeps, vec![ms(50), ms(50), ms(50)]);
+
+        // Immediate wakeup on stop during Serious thermal wait.
+        let hot_stop = AtomicBool::new(false);
+        let mut hot_sleeps = Vec::new();
+        pace_stream_batch_with(
+            ms(200),
+            &hot_stop,
+            || (Serious, false),
+            |d| {
+                hot_sleeps.push(d);
+                if hot_sleeps.len() == 4 {
+                    hot_stop.store(true, Ordering::Release);
+                }
+            },
+        );
+        assert_eq!(hot_sleeps, vec![ms(50); 4]);
+
+        // Serious -> Nominal recovery cools in 1s chunks then breaks once below Serious (>=500ms).
+        let stop = AtomicBool::new(false);
+        let calls = Cell::new(0usize);
+        let mut recovery_total = Duration::ZERO;
+        pace_stream_batch_with(
+            ms(200),
+            &stop,
+            || {
+                let n = calls.get();
+                calls.set(n + 1);
+                if n < 2 {
+                    (Serious, false)
+                } else {
+                    (Nominal, false)
+                }
+            },
+            |d| {
+                assert!(d <= ms(50));
+                recovery_total += d;
+            },
+        );
+        assert_eq!(calls.get(), 3);
+        assert_eq!(recovery_total, secs(2));
+
+        // Serious -> Fair on battery honors full Fair+battery rest target rather than under-resting.
+        let calls = Cell::new(0usize);
+        let mut fair_recovery = Duration::ZERO;
+        pace_stream_batch_with(
+            secs(1),
+            &stop,
+            || {
+                let n = calls.get();
+                calls.set(n + 1);
+                if n == 0 {
+                    (Critical, true)
+                } else {
+                    (Fair, true)
+                }
+            },
+            |d| {
+                assert!(d <= ms(50));
+                fair_recovery += d;
+            },
+        );
+        assert_eq!(calls.get(), 2);
+        assert_eq!(fair_recovery, secs(7));
+
+        // Stuck Serious yields cleanly at the 30s cap.
+        let mut cap_total = Duration::ZERO;
+        pace_stream_batch_with(
+            ms(200),
+            &stop,
+            || (Serious, false),
+            |d| {
+                assert!(d <= ms(50));
+                cap_total += d;
+            },
+        );
+        assert_eq!(cap_total, secs(30));
+    }
+
+    #[test]
+    fn thermal_pressure_and_battery_power_live_smoke() {
+        let pressure = thermal_pressure();
+        assert!(pressure <= ThermalPressure::Critical);
+        let _on_battery: bool = on_battery_power();
+        // Fast (<50ms) stub batches must never stall even if the host is thermally hot.
+        let stop = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        pace_stream_batch(Duration::from_millis(10), &stop);
+        assert!(started.elapsed() < Duration::from_millis(50));
     }
 }

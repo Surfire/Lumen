@@ -86,6 +86,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var configuredKey: HotKey?
     private var actionInFlight = false
     private var activeDisplayIsPortrait = false
+    private enum BackgroundIndexTurn { case text, images }
+    private var backgroundIndexTurn: BackgroundIndexTurn = .images
     private(set) var localPreview: LocalPreviewPanel?
     private(set) var searchPresented = false
     private var searchPresentationGeneration: UInt64 = 0
@@ -400,6 +402,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             if case .unavailable = self.model.localModelState { return false }
             return self.imageSearch.canAutoBuild
         }
+        model.shouldDeferEmbeddingsToImages = { [weak self] in
+            guard let self else { return false }
+            return self.bothSemanticQueuesPending && self.backgroundIndexTurn == .images
+        }
+        model.maxEmbeddingBatchesPerTurn = { [weak self] in
+            guard let self else { return nil }
+            return self.bothSemanticQueuesPending ? 100 : nil
+        }
+        model.onEmbeddingsTurnCompleted = { [weak self] in
+            guard let self else { return }
+            self.backgroundIndexTurn = .images
+            self.scheduleAutomaticImageIndexingIfReady()
+        }
         model.onCoverageAccepted = { [weak self] report in
             guard let self else { return }
             let roots = report.scope?.contentFolders ?? self.model.settingsScope.contentFolders
@@ -407,7 +422,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             self.scheduleAutomaticImageIndexingIfReady()
         }
         imageSearch.onBuildFinished = { [weak self] in
-            self?.model.refreshCoverageAfterImageBuild()
+            guard let self else { return }
+            if self.imageSearch.lastBuildWasBounded {
+                self.backgroundIndexTurn = .text
+            }
+            self.model.refreshCoverageAfterImageBuild()
         }
         model.indexStatus.$localModelState.removeDuplicates().dropFirst().sink { [weak self] _ in
             DispatchQueue.main.async { [weak self] in
@@ -1810,6 +1829,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if model.scopePending, imageSearch.building { imageSearch.stop() }
     }
 
+    private var bothSemanticQueuesPending: Bool {
+        model.gemmaCoverage?.pending == true && model.gemmaCoverage?.limited == false &&
+            model.imageCoverage?.pending == true && model.imageCoverage?.limited == false &&
+            imageSearch.canAutoBuild
+    }
+
     private func scheduleAutomaticImageIndexingIfReady() {
         guard model.canSearch, !model.scopePending, model.indexWork == nil,
               model.localModelState == .available || model.localModelState == .ready,
@@ -1817,10 +1842,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
               !model.isEmbeddingIndexingPaused,
               model.imageCoverage?.pending == true, model.imageCoverage?.limited == false,
               imageSearch.canAutoBuild else { return }
+        if bothSemanticQueuesPending, backgroundIndexTurn == .text, (model.imageCoverage?.vectors ?? 0) > 0 {
+            return
+        }
         if model.imageCoverage?.vectors == 0,
            model.gemmaCoverage?.pending == true,
            model.gemmaCoverage?.limited == false {
             imageSearch.build(maxBatches: 4)
+        } else if bothSemanticQueuesPending {
+            imageSearch.build(maxBatches: 16)
         } else {
             imageSearch.build()
         }

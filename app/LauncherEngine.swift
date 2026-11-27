@@ -236,6 +236,7 @@ struct ContentScopePreview: Decodable, Equatable {
         let name: String
         let count: Int
         let suggested_noise: Bool
+        let noise_reason: String?
 
         var id: String { path }
 
@@ -245,9 +246,10 @@ struct ContentScopePreview: Decodable, Equatable {
             name = try values.decodeIfPresent(String.self, forKey: .name) ?? (path as NSString).lastPathComponent
             count = try values.decodeIfPresent(Int.self, forKey: .count) ?? 0
             suggested_noise = try values.decodeIfPresent(Bool.self, forKey: .suggested_noise) ?? false
+            noise_reason = try values.decodeIfPresent(String.self, forKey: .noise_reason)
         }
 
-        private enum CodingKeys: String, CodingKey { case path, name, count, suggested_noise }
+        private enum CodingKeys: String, CodingKey { case path, name, count, suggested_noise, noise_reason }
     }
 
     let total_files: Int
@@ -258,6 +260,8 @@ struct ContentScopePreview: Decodable, Equatable {
         ["preview-content-scope"] + roots.flatMap { ["--content-root", $0] } + (filter?.arguments ?? [])
     }
 }
+
+typealias ContentPreview = ContentScopePreview
 
 struct IndexScope: Decodable, Equatable {
     var roots: [String] = []

@@ -319,7 +319,7 @@ final class Launcher: ObservableObject {
         let files: [(LauncherResult, Int)] = hits.map { hit in
             // Keep lexical order on ties. Regular use can move a direct file above a partial command match.
             let direct = hit.matched_by != "path" && !hit.isRelatedHit
-            let rank = direct ? 79 + frecency.boost(LauncherFrecency.fileID(hit.path)) : 78
+            let rank = direct ? 79 + frecency.boost(LauncherFrecency.fileID(hit.path), query: query) : 78
             return (.file(hit), rank)
         }
         return result + (commands + files).sorted { $0.1 > $1.1 }.map(\.0)
@@ -383,7 +383,7 @@ final class Launcher: ObservableObject {
         }
         applicationOpens = LaunchDispatcher.didOpenApplication.sink { [weak self] action in
             guard let self, !self.closed, self.appActions.contains(action) else { return }
-            self.frecency.noteOpened(action.id)
+            self.frecency.noteOpened(action.id, query: self.query)
             self.updateLaunchMatches()
             self.rebuildVisibleResults()
             self.reconcileSelection()
@@ -579,7 +579,7 @@ final class Launcher: ObservableObject {
         guard !isImageSearch else { return }
         let now = Date.now
         let current = LauncherFileQuery(query).isFiltered ? [] :
-            LaunchCatalog.matches(query, actions: builtInActions + appActions) { frecency.boost($0, now: now) }
+            LaunchCatalog.matches(query, actions: builtInActions + appActions) { frecency.boost($0, query: query, now: now) }
         set(\.launchMatches, to: current)
     }
 
@@ -677,7 +677,7 @@ final class Launcher: ObservableObject {
             // Keep provisional path filler below body hits and out of the first result update.
             let weakPaths = complete ? nameHits.filter { $0.matched_by == "path" } : []
             var seen = Set<String>()
-            let ranked = [strongNames, bodyHits, weakPaths].flatMap { self.frecency.rankFiles($0) }
+            let ranked = [strongNames, bodyHits, weakPaths].flatMap { self.frecency.rankFiles($0, query: term) }
             let lexical = Array(ranked.filter { seen.insert($0.path).inserted }.prefix(60))
             guard complete || !lexical.isEmpty else { return }
             self.presentedQuery = term
@@ -835,14 +835,14 @@ final class Launcher: ObservableObject {
 
     func noteActionPerformed(_ action: LaunchAction) {
         if case .application = action.destination { return } // App launches are recorded by the dispatcher.
-        frecency.noteOpened(action.id)
+        frecency.noteOpened(action.id, query: query)
         updateLaunchMatches()
         rebuildVisibleResults()
         reconcileSelection()
     }
 
     func noteFileOpened(_ hit: SearchHit) {
-        frecency.noteOpened(LauncherFrecency.fileID(hit.path))
+        frecency.noteOpened(LauncherFrecency.fileID(hit.path), query: query)
         rebuildVisibleResults()
         reconcileSelection()
     }
@@ -1636,7 +1636,7 @@ final class Launcher: ObservableObject {
             let bodyHits = (try? text?.get()) ?? []
             let weakPaths = nameHits.filter { $0.matched_by == "path" }
             var seen = Set<String>()
-            let ranked = [strongNames, bodyHits, weakPaths].flatMap { self.frecency.rankFiles($0) }
+            let ranked = [strongNames, bodyHits, weakPaths].flatMap { self.frecency.rankFiles($0, query: term) }
             let lexical = Array(ranked.filter { seen.insert($0.path).inserted }.prefix(60))
             let relatedKind = self.localModelState == .ready ? self.relatedSearchKind(directCount: lexical.count) : nil
             let existingRelated = relatedKind != nil ? self.hits.filter(\.isRelatedHit) : []

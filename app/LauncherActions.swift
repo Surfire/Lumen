@@ -26,7 +26,12 @@ struct LaunchAction: Equatable, Identifiable {
         self.aliases = aliases
         let names = [english, chinese].map(LaunchCatalog.normalized)
         self.normalizedNames = names
-        self.normalizedSearchable = names + aliases.map(LaunchCatalog.normalized)
+        let derived = [english, chinese].flatMap(LaunchCatalog.initialsAliases)
+            + names.flatMap(LaunchCatalog.curatedAppAliases)
+        var seen = Set<String>()
+        self.normalizedSearchable = (names + aliases.map(LaunchCatalog.normalized) + derived).filter {
+            !$0.isEmpty && seen.insert($0).inserted
+        }
     }
 
     func title(chinese useChinese: Bool) -> String { useChinese ? chinese : english }
@@ -275,6 +280,55 @@ enum LaunchCatalog {
         "com.apple.iwork.numbers": "Numbers 表格", "com.apple.iwork.keynote": "Keynote 讲演",
     ]
 
+    static let commonAppAliases: [String: [String]] = [
+        "photoshop": ["ps"],
+        "illustrator": ["ai"],
+        "premiere": ["pr"],
+        "premierepro": ["pr"],
+        "aftereffects": ["ae"],
+        "wechat": ["wx"],
+        "visualstudiocode": ["code", "vscode"],
+        "terminal": ["term"],
+        "systemsettings": ["pref", "sys"],
+        "activitymonitor": ["top", "monitor"],
+    ]
+
+    static func curatedAppAliases(_ normalizedName: String) -> [String] {
+        var keys = [normalizedName]
+        var trimmed = normalizedName
+        while let last = trimmed.last, last.isNumber { trimmed.removeLast() }
+        if !trimmed.isEmpty, trimmed != normalizedName { keys.append(trimmed) }
+        if trimmed.hasPrefix("adobe"), trimmed.count > 5 {
+            keys.append(String(trimmed.dropFirst(5)))
+        }
+        return keys.flatMap { commonAppAliases[$0] ?? [] }
+    }
+
+    static func initialsAliases(_ value: String) -> [String] {
+        let words = value.split { !$0.isASCII || (!$0.isLetter && !$0.isNumber) }
+        var result: [String] = []
+        if words.count >= 2 {
+            let wordInitials = String(words.compactMap(\.first)).lowercased()
+            if wordInitials.count >= 2 { result.append(wordInitials) }
+        }
+        var camel = ""
+        for word in words {
+            guard let first = word.first else { continue }
+            camel.append(contentsOf: first.lowercased())
+            var prev = first
+            for char in word.dropFirst() {
+                if prev.isLowercase && char.isUppercase {
+                    camel.append(contentsOf: char.lowercased())
+                }
+                prev = char
+            }
+        }
+        if camel.count >= 2, !result.contains(camel) {
+            result.append(camel)
+        }
+        return result
+    }
+
     private static let commonAliases = [
         "com.apple.calculator": ["calc"], "com.apple.safari": ["safari", "苹果浏览器"],
         "com.google.chrome": ["chrome", "谷歌浏览器"], "org.mozilla.firefox": ["firefox", "火狐"],
@@ -321,9 +375,8 @@ enum LaunchCatalog {
             let english = bundle.infoDictionary?["CFBundleDisplayName"] as? String ?? filename
             let normalizedID = identifier.lowercased()
             let chinese = chineseNames[normalizedID] ?? localized
-            let initials = filename.split { !$0.isLetter && !$0.isNumber }.compactMap(\.first)
             let aliases = [filename, localized, bundle.infoDictionary?["CFBundleName"] as? String ?? filename]
-                + (commonAliases[normalizedID] ?? []) + (initials.count > 1 ? [String(initials)] : [])
+                + (commonAliases[normalizedID] ?? []) + initialsAliases(filename)
                 + pinyinAliases(chinese) + (localized == chinese ? [] : pinyinAliases(localized))
             actions.append(LaunchAction(id: "app:" + identifier, english: english, chinese: chinese,
                                         symbol: "app", destination: .application(target, stamp: SearchHit.filesystemStamp(attributes)),

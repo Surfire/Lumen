@@ -59,12 +59,15 @@ final class LauncherFrecency {
 
     private let defaults: UserDefaults?
     private let key = "launcher.frecency.v1"
+    private let queryKey = "launcher.frecency.query.v1"
     private let capacity = 512
     private var entries: [String: Entry]
+    private var queryEntries: [String: Entry]
 
     init(defaults: UserDefaults?) {
         self.defaults = defaults
         entries = defaults?.data(forKey: key).flatMap { try? JSONDecoder().decode([String: Entry].self, from: $0) } ?? [:]
+        queryEntries = defaults?.data(forKey: queryKey).flatMap { try? JSONDecoder().decode([String: Entry].self, from: $0) } ?? [:]
     }
 
     private struct FileIDCache: Sendable {
@@ -99,7 +102,14 @@ final class LauncherFrecency {
         return id
     }
 
-    func noteOpened(_ id: String, now: Date = .now) {
+    nonisolated static func queryEntryKey(query: String, targetID: String) -> String? {
+        let normalized = LaunchCatalog.normalized(query)
+        guard !normalized.isEmpty else { return nil }
+        let payload = normalized + "\0" + targetID
+        return "q:" + Data(SHA256.hash(data: Data(payload.utf8))).base64EncodedString()
+    }
+
+    func noteOpened(_ id: String, query: String = "", now: Date = .now) {
         let prior = entries[id].map { $0.count * decay($0.lastOpened, now: now, days: 14) } ?? 0
         entries[id] = Entry(count: min(prior + 1, 64), lastOpened: now)
         if entries.count > capacity {
@@ -107,23 +117,46 @@ final class LauncherFrecency {
             entries = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
         }
         if let data = try? JSONEncoder().encode(entries) { defaults?.set(data, forKey: key) }
+
+        if let qKey = Self.queryEntryKey(query: query, targetID: id) {
+            let qPrior = queryEntries[qKey].map { $0.count * decay($0.lastOpened, now: now, days: 14) } ?? 0
+            queryEntries[qKey] = Entry(count: min(qPrior + 1, 64), lastOpened: now)
+            if queryEntries.count > capacity {
+                let keep = queryEntries.sorted { $0.value.lastOpened > $1.value.lastOpened }.prefix(capacity)
+                queryEntries = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
+            }
+            if let data = try? JSONEncoder().encode(queryEntries) { defaults?.set(data, forKey: queryKey) }
+        }
     }
 
-    func boost(_ id: String, now: Date = .now) -> Int {
-        guard let entry = entries[id] else { return 0 }
-        let frequency = entry.count * decay(entry.lastOpened, now: now, days: 14)
-        let recency = decay(entry.lastOpened, now: now, days: 3)
-        return min(12, Int(3 * log2(1 + frequency) + 4 * recency))
+    func boost(_ id: String, query: String = "", now: Date = .now) -> Int {
+        let globalBoost: Int
+        if let entry = entries[id] {
+            let frequency = entry.count * decay(entry.lastOpened, now: now, days: 14)
+            let recency = decay(entry.lastOpened, now: now, days: 3)
+            globalBoost = min(12, Int(3 * log2(1 + frequency) + 4 * recency))
+        } else {
+            globalBoost = 0
+        }
+        let queryBoost: Int
+        if let qKey = Self.queryEntryKey(query: query, targetID: id), let qEntry = queryEntries[qKey] {
+            let frequency = qEntry.count * decay(qEntry.lastOpened, now: now, days: 14)
+            let recency = decay(qEntry.lastOpened, now: now, days: 3)
+            queryBoost = min(14, Int(4 * log2(1 + frequency) + 6 * recency))
+        } else {
+            queryBoost = 0
+        }
+        return globalBoost + queryBoost
     }
 
     private func decay(_ lastOpened: Date, now: Date, days: Double) -> Double {
         exp2(-max(0, now.timeIntervalSince(lastOpened)) / (86_400 * days))
     }
 
-    func rankFiles(_ hits: [SearchHit]) -> [SearchHit] {
-        guard hits.count > 1, !entries.isEmpty else { return hits }
+    func rankFiles(_ hits: [SearchHit], query: String = "") -> [SearchHit] {
+        guard hits.count > 1, !entries.isEmpty || !queryEntries.isEmpty else { return hits }
         let now = Date.now
-        return hits.enumerated().map { (index: $0.offset, hit: $0.element, rank: $0.offset - boost(Self.fileID($0.element.path), now: now)) }
+        return hits.enumerated().map { (index: $0.offset, hit: $0.element, rank: $0.offset - boost(Self.fileID($0.element.path), query: query, now: now)) }
             .sorted { ($0.rank, $0.index) < ($1.rank, $1.index) }.map(\.hit)
     }
 }

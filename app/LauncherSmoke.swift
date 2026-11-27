@@ -1162,6 +1162,7 @@ final class LauncherSmoke {
         try await verifyPhase3Regressions(app)
         try await verifyBuild33Phase1Regressions(app)
         try await verifyBuild33Phase2Regressions(app)
+        try await verifyV060SwiftUXRegressions(app)
         try check(model.indexPhase == .needsIndex && !model.canSearch, "action smoke unexpectedly had a file index")
         func chosen() -> LaunchAction? {
             if case .action(let action)? = model.selectedResult { return action }
@@ -4756,8 +4757,9 @@ final class LauncherSmoke {
                                        symbol: "app", destination: .application(URL(fileURLWithPath: "/Applications/Demo.app"), stamp: "0"),
                                        aliases: ["vscode", "代码"])
         try check(precomputed.normalizedNames == ["visualstudiocode", "vscode中文"] &&
-                  precomputed.normalizedSearchable == ["visualstudiocode", "vscode中文", "vscode", "代码"] &&
-                  LaunchCatalog.matches("vscode", actions: [precomputed]).first?.action.id == precomputed.id,
+                  precomputed.normalizedSearchable == ["visualstudiocode", "vscode中文", "vscode", "代码", "vsc", "vc", "code"] &&
+                  LaunchCatalog.matches("vscode", actions: [precomputed]).first?.action.id == precomputed.id &&
+                  LaunchCatalog.matches("vsc", actions: [precomputed]).first?.action.id == precomputed.id,
                   "LaunchAction did not precompute normalized names/searchable cleanly")
 
         let highlight = LauncherHighlight("cdyh")
@@ -6051,6 +6053,155 @@ final class LauncherSmoke {
         session.discard()
         try check(session.hasChanges == hadChanges && !session.contentFilter.enable_code, "SettingsSession.discard did not restore contentFilter")
         print("Build 33 Phase 2 regressions passed (network f_fstypename, GemmaAssetManager, ContentFilter, preview-content-scope, ExternalVolume, SettingsSession)")
+    }
+
+    private func verifyV060SwiftUXRegressions(_ app: AppDelegate) async throws {
+        // 1. Query-conditioned hashed frecency: query-specific boost outranks globally opened targets, zero plaintext in UserDefaults.
+        let suiteName = "io.github.surfire.lumen.smoke.v060.frecency.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            throw Failure("failed to create isolated UserDefaults suite for v060 frecency smoke")
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let frecency = LauncherFrecency(defaults: defaults)
+        let globalHit = SearchHit(path: "/private/tmp/v060-secret-dir/PlaintextGlobalAlpha.pdf",
+                                  name: "PlaintextGlobalAlpha.pdf", kind: "file", availability: "local",
+                                  matched_by: "name", snippet: nil, document_stamp: nil, pdf_page: nil)
+        let queryHit = SearchHit(path: "/private/tmp/v060-secret-dir/PlaintextQueryBeta.pdf",
+                                 name: "PlaintextQueryBeta.pdf", kind: "file", availability: "local",
+                                 matched_by: "name", snippet: nil, document_stamp: nil, pdf_page: nil)
+        let globalID = LauncherFrecency.fileID(globalHit.path)
+        let queryID = LauncherFrecency.fileID(queryHit.path)
+        let now = Date.now
+
+        for step in 0..<8 {
+            frecency.noteOpened(globalID, query: "UnrelatedPlaintextQuery", now: now.addingTimeInterval(Double(step)))
+        }
+        frecency.noteOpened(queryID, query: "  Quarterly   Report  ", now: now.addingTimeInterval(10))
+
+        let globalBoostForQuery = frecency.boost(globalID, query: "quarterly report", now: now.addingTimeInterval(11))
+        let specificBoostForQuery = frecency.boost(queryID, query: "QUARTERLY REPORT", now: now.addingTimeInterval(11))
+        try check(specificBoostForQuery > globalBoostForQuery && specificBoostForQuery >= 15,
+                  "query-conditioned frecency did not boost query-specific target (\(specificBoostForQuery)) above global target (\(globalBoostForQuery))")
+        try check(frecency.rankFiles([globalHit, queryHit], query: "  quarterly report ").first == queryHit,
+                  "rankFiles(query:) did not promote query-conditioned file hit over globally opened file hit")
+        try check(frecency.rankFiles([globalHit, queryHit]).first == globalHit,
+                  "rankFiles() without query did not preserve global frecency ranking")
+
+        let reloadedFrecency = LauncherFrecency(defaults: defaults)
+        try check(reloadedFrecency.rankFiles([globalHit, queryHit], query: "quarterly report").first == queryHit,
+                  "reloaded LauncherFrecency did not persist query-conditioned ranking")
+
+        guard let rawGlobalData = defaults.data(forKey: "launcher.frecency.v1"),
+              let rawQueryData = defaults.data(forKey: "launcher.frecency.query.v1"),
+              let rawGlobalText = String(data: rawGlobalData, encoding: .utf8),
+              let rawQueryText = String(data: rawQueryData, encoding: .utf8) else {
+            throw Failure("frecency UserDefaults data missing for launcher.frecency.v1 or launcher.frecency.query.v1")
+        }
+        for forbidden in ["Quarterly", "quarterly", "Report", "report", "UnrelatedPlaintextQuery", "unrelatedplaintextquery",
+                          "v060-secret-dir", "PlaintextGlobalAlpha", "PlaintextQueryBeta", ".pdf"] {
+            try check(!rawGlobalText.contains(forbidden) && !rawQueryText.contains(forbidden),
+                      "plaintext token '\(forbidden)' leaked into UserDefaults frecency payload")
+        }
+        let decodedQueryMap = try JSONDecoder().decode([String: [String: Double]].self, from: rawQueryData)
+        try check(!decodedQueryMap.isEmpty && decodedQueryMap.keys.allSatisfy { $0.hasPrefix("q:") },
+                  "launcher.frecency.query.v1 keys did not use 'q:' SHA-256 format: \(decodedQueryMap.keys)")
+
+        // 2. App word/camelCase initials (vsc, wc, am, st, it) & curated aliases (ps, wx, ai, pr, ae, term, pref, top).
+        let dummyURL = URL(fileURLWithPath: "/Applications/Dummy.app", isDirectory: true)
+        try check(LaunchCatalog.initialsAliases("Visual Studio Code") == ["vsc"] &&
+                  LaunchCatalog.initialsAliases("Activity Monitor") == ["am"] &&
+                  LaunchCatalog.initialsAliases("WeChat") == ["wc"] &&
+                  LaunchCatalog.initialsAliases("SublimeText") == ["st"] &&
+                  LaunchCatalog.initialsAliases("iTerm") == ["it"],
+                  "LaunchCatalog.initialsAliases did not produce expected word/camelCase initials")
+
+        let vscApp = LaunchAction(id: "app:v060.vsc", english: "Visual Studio Code", chinese: "Visual Studio Code",
+                                  symbol: "app", destination: .application(dummyURL, stamp: "0"), aliases: [])
+        let wechatApp = LaunchAction(id: "app:v060.wechat", english: "WeChat", chinese: "微信",
+                                     symbol: "app", destination: .application(dummyURL, stamp: "0"), aliases: [])
+        let activityApp = LaunchAction(id: "app:v060.am", english: "Activity Monitor", chinese: "活动监视器",
+                                       symbol: "app", destination: .application(dummyURL, stamp: "0"), aliases: [])
+        let sublimeApp = LaunchAction(id: "app:v060.st", english: "SublimeText", chinese: "SublimeText",
+                                      symbol: "app", destination: .application(dummyURL, stamp: "0"), aliases: [])
+        let itermApp = LaunchAction(id: "app:v060.it", english: "iTerm", chinese: "iTerm",
+                                    symbol: "app", destination: .application(dummyURL, stamp: "0"), aliases: [])
+        let psApp = LaunchAction(id: "app:v060.ps", english: "Adobe Photoshop 2026", chinese: "Photoshop",
+                                 symbol: "app", destination: .application(dummyURL, stamp: "0"), aliases: [])
+        let distractorPS = LaunchAction(id: "app:v060.psviewer", english: "PSViewer", chinese: "PSViewer",
+                                        symbol: "app", destination: .application(dummyURL, stamp: "0"), aliases: [])
+        let distractorVSC = LaunchAction(id: "app:v060.vscatalog", english: "VSCatalog", chinese: "VSCatalog",
+                                         symbol: "app", destination: .application(dummyURL, stamp: "0"), aliases: [])
+        let catalog = [distractorPS, distractorVSC, vscApp, wechatApp, activityApp, sublimeApp, itermApp, psApp]
+
+        for action in catalog {
+            try check(Set(action.normalizedSearchable).count == action.normalizedSearchable.count,
+                      "LaunchAction.normalizedSearchable contained duplicate entries: \(action.normalizedSearchable)")
+        }
+        for (query, expected) in [
+            ("vsc", vscApp), ("vscode", vscApp), ("code", vscApp),
+            ("wc", wechatApp), ("wx", wechatApp),
+            ("am", activityApp), ("top", activityApp),
+            ("st", sublimeApp), ("it", itermApp), ("ps", psApp),
+        ] {
+            let match = LaunchCatalog.matches(query, actions: catalog).first
+            try check(match?.action == expected && (match?.score ?? 0) >= 96,
+                      "LaunchCatalog.matches('\(query)') matched \(String(describing: match?.action.id)) (score \(String(describing: match?.score))), expected \(expected.id)")
+        }
+
+        // Also verify query-conditioned action frecency in LaunchCatalog.matches.
+        for step in 0..<6 {
+            frecency.noteOpened(sublimeApp.id, query: "unrelated", now: now.addingTimeInterval(Double(step)))
+        }
+        frecency.noteOpened(vscApp.id, query: "editor", now: now.addingTimeInterval(10))
+        try check(frecency.boost(vscApp.id, query: "editor", now: now.addingTimeInterval(11)) >
+                  frecency.boost(sublimeApp.id, query: "editor", now: now.addingTimeInterval(11)),
+                  "query-conditioned action frecency did not outrank globally opened action")
+
+        // 3. ContentPreview.Subfolder decoding both with and without noise_reason + localized noise reason labels.
+        let withReasonJSON = Data(#"{"path":"/tmp/ComfyUI/output","name":"output","count":1200,"suggested_noise":true,"noise_reason":"ai_runtime"}"#.utf8)
+        let withoutReasonJSON = Data(#"{"path":"/tmp/docs","name":"docs","count":12,"suggested_noise":false}"#.utf8)
+        let decodedWithReason = try JSONDecoder().decode(ContentPreview.Subfolder.self, from: withReasonJSON)
+        let decodedWithoutReason = try JSONDecoder().decode(ContentPreview.Subfolder.self, from: withoutReasonJSON)
+        try check(decodedWithReason.noise_reason == "ai_runtime" && decodedWithReason.suggested_noise && decodedWithReason.count == 1200,
+                  "ContentPreview.Subfolder failed to decode noise_reason")
+        try check(decodedWithoutReason.noise_reason == nil && !decodedWithoutReason.suggested_noise,
+                  "ContentPreview.Subfolder failed backward-compatible decoding without noise_reason")
+        try check(LauncherSettings.noiseReasonLabel("ai_runtime", zh: true) == "AI 运行时" &&
+                  LauncherSettings.noiseReasonLabel("ai_runtime", zh: false) == "AI Runtime" &&
+                  LauncherSettings.noiseReasonLabel("image_dump", zh: true) == "高图占比" &&
+                  LauncherSettings.noiseReasonLabel("sequential_frames", zh: true) == "序列帧" &&
+                  LauncherSettings.noiseReasonLabel("high_volume", zh: false) == "High Volume" &&
+                  LauncherSettings.noiseReasonLabel("noise_dir", zh: false) == "Noise" &&
+                  LauncherSettings.noiseReasonLabel(nil, zh: true) == nil,
+                  "LauncherSettings.noiseReasonLabel localized mapping mismatch")
+
+        // 4. LumenApp.linkedMediaURL(forSubtitlePath:) sibling matching.
+        let mediaDir = URL(fileURLWithPath: IndexScope.folderPath(directory), isDirectory: true)
+            .appendingPathComponent("v060-linked-media-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: mediaDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: mediaDir) }
+
+        let lectureSrt = mediaDir.appendingPathComponent("lecture.srt")
+        let lectureMp4 = mediaDir.appendingPathComponent("lecture.mp4")
+        let podcastVtt = mediaDir.appendingPathComponent("podcast.vtt")
+        let podcastM4a = mediaDir.appendingPathComponent("podcast.m4a")
+        let orphanSrt = mediaDir.appendingPathComponent("orphan.srt")
+        let notesTxt = mediaDir.appendingPathComponent("notes.txt")
+        let notesMp4 = mediaDir.appendingPathComponent("notes.mp4")
+
+        for file in [lectureSrt, lectureMp4, podcastVtt, podcastM4a, orphanSrt, notesTxt, notesMp4] {
+            try Data("fixture".utf8).write(to: file)
+        }
+        try check(LumenApp.linkedMediaURL(forSubtitlePath: lectureSrt.path)?.resolvingSymlinksInPath() == lectureMp4.resolvingSymlinksInPath(),
+                  "linkedMediaURL did not resolve sibling .mp4 for .srt")
+        try check(LumenApp.linkedMediaURL(forSubtitlePath: podcastVtt.path)?.resolvingSymlinksInPath() == podcastM4a.resolvingSymlinksInPath(),
+                  "linkedMediaURL did not resolve sibling .m4a for .vtt")
+        try check(LumenApp.linkedMediaURL(forSubtitlePath: orphanSrt.path) == nil,
+                  "linkedMediaURL did not return nil when no sibling media exists")
+        try check(LumenApp.linkedMediaURL(forSubtitlePath: notesTxt.path) == nil,
+                  "linkedMediaURL matched non-subtitle .txt file")
+        print("v0.6.0 Swift UX regressions passed (query-conditioned hashed frecency, app initials/aliases, noise_reason decoding, linkedMediaURL)")
     }
 
     private struct Failure: Error, CustomStringConvertible {

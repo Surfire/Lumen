@@ -548,7 +548,11 @@ struct LauncherSettings: View {
                             Button {
                                 session.excludeNoise(folder)
                             } label: {
-                                Label("\(folder.name) · \(folder.count.formatted())", systemImage: "minus.circle")
+                                if let reason = Self.noiseReasonLabel(folder.noise_reason, zh: model.zh) {
+                                    Label("\(folder.name) · \(reason) · \(folder.count.formatted())", systemImage: "minus.circle")
+                                } else {
+                                    Label("\(folder.name) · \(folder.count.formatted())", systemImage: "minus.circle")
+                                }
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
@@ -562,12 +566,23 @@ struct LauncherSettings: View {
         }
     }
 
+    static func noiseReasonLabel(_ reason: String?, zh: Bool) -> String? {
+        switch reason {
+        case "ai_runtime": return zh ? "AI 运行时" : "AI Runtime"
+        case "image_dump": return zh ? "高图占比" : "Image Dump"
+        case "sequential_frames": return zh ? "序列帧" : "Frame Dump"
+        case "high_volume": return zh ? "高频" : "High Volume"
+        case "noise_dir": return zh ? "噪声" : "Noise"
+        default: return nil
+        }
+    }
+
     @ViewBuilder private var advancedContentFilters: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 14) {
                 filterToggle("PDF", \.enable_pdf)
                 filterToggle("Office", \.enable_docx)
-                    .help("DOCX / XLSX / PPTX")
+                    .help("DOCX / XLSX / PPTX / DOC / XLS / PPT / RTF")
                 filterToggle(model.t("文本", "Text"), \.enable_text)
                 filterToggle(model.t("图片", "Images"), \.enable_images)
             }

@@ -6,6 +6,10 @@ import SwiftUI
 
 @main
 struct LumenApp {
+    nonisolated static func linkedMediaURL(forSubtitlePath path: String) -> URL? {
+        AppDelegate.linkedMediaURL(forSubtitlePath: path)
+    }
+
     @MainActor static func main() {
         #if LUMEN_SMOKE
         LauncherSmoke.runUpdaterIfRequested()
@@ -1018,6 +1022,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
     }
 
+    nonisolated private static let linkedMediaExtensions = ["mp4", "mov", "m4v", "mkv", "m4a", "mp3", "wav", "flac"]
+
+    nonisolated static func linkedMediaURL(forSubtitlePath path: String) -> URL? {
+        let url = URL(fileURLWithPath: path)
+        let ext = url.pathExtension.lowercased()
+        guard ext == "srt" || ext == "vtt" else { return nil }
+        let stem = url.deletingPathExtension()
+        guard !stem.lastPathComponent.isEmpty else { return nil }
+        return withNoDatalessMaterialization { () -> URL? in
+            for mediaExt in linkedMediaExtensions {
+                let candidate = stem.appendingPathExtension(mediaExt)
+                if SearchHit.existsOnDisk(at: candidate.path, kind: "file", permitsDatalessLeaf: true) {
+                    return candidate
+                }
+            }
+            return nil
+        }
+    }
+
     private func showSearchContextActions() {
         guard let selected = model.selectedResult else { return }
         var items: [ContextActions.Item] = []
@@ -1037,6 +1060,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         case .file(let hit):
             item("reveal", "在 Finder 中显示", "Show in Finder", "folder") { [weak self] in self?.revealInFinder(hit) }
             if hit.kind == "file" {
+                if let mediaURL = Self.linkedMediaURL(forSubtitlePath: hit.path) {
+                    let ext = mediaURL.pathExtension.lowercased()
+                    item("open-linked-media", "打开关联媒体 (.\(ext))", "Open Linked Media (.\(ext))", "play.rectangle") { [weak self] in
+                        self?.openLinkedMedia(mediaURL, for: hit)
+                    }
+                }
                 if LauncherInlinePreview.kind(hit) != nil {
                     item("preview", "内嵌预览", "Inline Preview", "eye") { [weak self] in
                         self?.previewFile(hit, allowCloudDownload: true)
@@ -1257,6 +1286,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
             #endif
             LaunchDispatcher.perform(action, chinese: model.zh) { finished($0, nil) }
+        }
+    }
+
+    private func openLinkedMedia(_ url: URL, for hit: SearchHit) {
+        guard model.containsCurrentFile(hit),
+              SearchHit.existsOnDisk(at: url.path, kind: "file", permitsDatalessLeaf: true) else {
+            model.openingFailed()
+            return
+        }
+        let config = NSWorkspace.OpenConfiguration()
+        #if LUMEN_SMOKE
+        if let smoke, smoke.simulatesFileOpen(url) {
+            smoke.opened = url
+            dismissSearch()
+            return
+        }
+        let isSmoke = smoke != nil
+        if isSmoke && url.pathExtension.lowercased() != "app"
+            && NSWorkspace.shared.urlForApplication(toOpen: url) == nil
+        {
+            model.openingFailed()
+            return
+        }
+        config.activates = !isSmoke
+        config.promptsUserIfNeeded = !isSmoke
+        #else
+        config.activates = true
+        config.promptsUserIfNeeded = true
+        #endif
+        NSWorkspace.shared.open(url, configuration: config) { [weak self] app, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if app != nil && error == nil {
+                    self.model.noteFileOpened(hit)
+                    self.dismissSearch()
+                } else {
+                    self.model.openingFailed()
+                }
+            }
         }
     }
 

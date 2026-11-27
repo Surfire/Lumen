@@ -284,6 +284,7 @@ final class ClipboardManager: ObservableObject {
     @discardableResult func copy(id: Int64) -> Bool {
         guard let entry = items.first(where: { $0.id == id }) else { return false }
         do {
+            let store = self.store
             let wrote: Bool
             if let text = entry.text {
                 wrote = Self.writeInternalString(text, to: pasteboard)
@@ -298,7 +299,6 @@ final class ClipboardManager: ObservableObject {
             } else { return false }
             guard wrote else { failed = true; return false }
             moveItemToFront(id: id)
-            let store = self.store
             let expectedGeneration = self.clearGeneration
             performStoreWork({ try store.noteUsed(id: id) }) { manager, result in
                 guard manager.clearGeneration == expectedGeneration else { return }

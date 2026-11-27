@@ -279,7 +279,7 @@ mod tests {
         let mut heif = heic_bytes.clone();
         let end = u32::from_be_bytes(heif[..4].try_into().unwrap()) as usize;
         heif[8..12].copy_from_slice(b"mif1");
-        for brand in heif[16..end].chunks_exact_mut(4) {
+        for brand in heif[16..end].as_chunks_mut::<4>().0 {
             if matches!(&*brand, b"heic" | b"heix") {
                 brand.copy_from_slice(b"mif1");
             }

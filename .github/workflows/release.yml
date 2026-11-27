@@ -130,10 +130,7 @@ jobs:
           TAG: ${{ steps.meta.outputs.tag }}
           SIGNED: ${{ steps.meta.outputs.signed }}
         run: |
-          cat > /tmp/release-body.md <<'BODY'
-          ### Lumen Release (${TAG})
-          - **Requirements**: Apple Silicon Mac (`arm64`), macOS 14+
-          BODY
+          printf '### Lumen Release (%s)\n- **Requirements**: Apple Silicon Mac (`arm64`), macOS 14+\n' "$TAG" > /tmp/release-body.md
           if [ "$SIGNED" != "true" ]; then
             cat >> /tmp/release-body.md <<'BODY'
 

@@ -189,7 +189,8 @@ private struct ClipboardItemPreview: View {
                     loadingThumbnail = false
                     // Upgrade the 240 px thumbnail to a crisp preview sized for this pane.
                     if let full = await Self.loadFullImage(store: clipboard.store, id: item.id) {
-                        thumbnail = full.image
+                        thumbnail = NSImage(cgImage: full.cgImage,
+                                            size: NSSize(width: full.cgImage.width, height: full.cgImage.height))
                         imageCaption = full.caption
                     }
                 }
@@ -271,8 +272,8 @@ private struct ClipboardItemPreview: View {
         }
     }
 
-    nonisolated private static func loadFullImage(store: ClipboardStore, id: Int64) async -> (image: NSImage, caption: String)? {
-        await Task.detached(priority: .utility) { () -> (image: NSImage, caption: String)? in
+    nonisolated private static func loadFullImage(store: ClipboardStore, id: Int64) async -> (cgImage: CGImage, caption: String)? {
+        await Task.detached(priority: .utility) { () -> (cgImage: CGImage, caption: String)? in
             guard !Task.isCancelled, let data = try? store.image(id: id), let source = ClipboardStore.imageSource(data),
                   let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
                       kCGImageSourceCreateThumbnailFromImageAlways: true,
@@ -285,7 +286,7 @@ private struct ClipboardItemPreview: View {
                let w = props[kCGImagePropertyPixelWidth] as? Int, let h = props[kCGImagePropertyPixelHeight] as? Int {
                 caption = "\(w) × \(h) · PNG"
             }
-            return (NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height)), caption)
+            return (image, caption)
         }.value
     }
 

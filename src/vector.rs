@@ -48,14 +48,18 @@ fn unpack_into(bytes: &[u8], dims: usize, values: &mut Vec<f32>) -> bool {
     if bytes.len() == dims * 2 {
         values.extend(
             bytes
-                .chunks_exact(2)
-                .map(|b| from_half(u16::from_le_bytes([b[0], b[1]]))),
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| from_half(u16::from_le_bytes(*b))),
         );
     } else if bytes.len() == dims * 4 {
         values.extend(
             bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b)),
         );
     } else {
         return false;

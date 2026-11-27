@@ -3959,7 +3959,21 @@ final class LauncherSmoke {
                 model.activityTitle == model.t("文件监听已停止", "File watching stopped") &&
                 model.launcherActivityTitle == nil
         }
-        print("Settings smoke passed (shared window, shortcut, draft, exact-scope rebuild, Apply, and file diagnostics)")
+        let leaseTitle = model.title(
+            for: LauncherNotice(.watch, "cannot acquire index writer lease; another index or watch may be running")
+        )
+        try check(leaseTitle.contains("写锁") || leaseTitle.contains("index lock"),
+                  "writer lease notice title fell back to permissions wording: \(leaseTitle)")
+        try check(!leaseTitle.contains("访问权限") && !leaseTitle.contains("verify access"),
+                  "writer lease notice falsely reported permissions issue: \(leaseTitle)")
+
+        try? FileManager.default.removeItem(at: directory.appendingPathComponent("fail-watch"))
+        try signal("lease-once")
+        model.restartWatcher()
+        try await until("watcher auto-retried transient writer lease contention and recovered") {
+            model.watchState == .running && model.watchNotice == nil
+        }
+        print("Settings smoke passed (shared window, shortcut, draft, exact-scope rebuild, Apply, file diagnostics, and watcher lease recovery)")
     }
 
     private func captureSettings(_ window: NSPanel, session: SettingsSession) async throws {

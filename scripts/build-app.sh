@@ -63,8 +63,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
  <key>CFBundleName</key><string>Lumen</string>
  <key>CFBundleIconFile</key><string>Lumen.icns</string>
  <key>CFBundlePackageType</key><string>APPL</string>
- <key>CFBundleShortVersionString</key><string>0.6.1</string>
- <key>CFBundleVersion</key><string>39</string>
+ <key>CFBundleShortVersionString</key><string>0.6.2</string>
+ <key>CFBundleVersion</key><string>40</string>
  <key>LSMinimumSystemVersion</key><string>14.0</string>
  <key>LSUIElement</key><true/>
  <key>NSAppleEventsUsageDescription</key><string>Lumen uses macOS automation only when you run a system action such as Empty Trash or Toggle Dark Mode.</string>

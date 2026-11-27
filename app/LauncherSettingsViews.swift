@@ -1142,6 +1142,16 @@ struct LauncherSettings: View {
                 NoticeView(model: model, notice: notice)
             }
 
+            if indexStatus.watchState == .failed, !model.scopePending, model.indexWork == nil {
+                HStack {
+                    Button(model.t("重新启动监听", "Restart Watching")) {
+                        model.restartWatcher()
+                    }
+                    .buttonStyle(LumenSecondaryButtonStyle())
+                    Spacer(minLength: 0)
+                }
+            }
+
             if let report = indexStatus.indexReport {
                 let columns = [
                     GridItem(.flexible(), spacing: 10),

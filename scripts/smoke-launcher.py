@@ -229,6 +229,10 @@ if action == "watch":
     assert args == ["--bundled-pdf-helper", "--progress"], "watch must use the saved scope and current app helper"
     with (work / "watch-launches").open("a") as handle:
         handle.write("start\\n")
+    lease_once = work / "lease-once"
+    if lease_once.exists():
+        lease_once.unlink()
+        sys.exit("open watch index /tmp/test.sqlite: cannot acquire index writer lease; another index or watch may be running")
     print(json.dumps({"event": "ready"}), flush=True)
     while True:
         if (work / "fail-watch").exists():

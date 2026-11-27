@@ -42,6 +42,59 @@ fn write_json_line<T: Serialize + ?Sized>(value: &T) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn spawn_stdout_eof_watchdog() {
+    use std::mem::MaybeUninit;
+    unsafe {
+        let mut st = MaybeUninit::<libc::stat>::uninit();
+        if libc::fstat(libc::STDOUT_FILENO, st.as_mut_ptr()) != 0 {
+            return;
+        }
+        if (st.assume_init().st_mode & libc::S_IFMT) != libc::S_IFIFO {
+            return;
+        }
+    }
+    let _ = std::thread::Builder::new()
+        .name("lumen-watch-stdout-eof".into())
+        .spawn(|| unsafe {
+            let kq = libc::kqueue();
+            if kq < 0 {
+                return;
+            }
+            let change = libc::kevent {
+                ident: libc::STDOUT_FILENO as libc::uintptr_t,
+                filter: libc::EVFILT_WRITE,
+                flags: libc::EV_ADD | libc::EV_CLEAR,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            if libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) < 0 {
+                libc::close(kq);
+                return;
+            }
+            let mut event = std::mem::zeroed::<libc::kevent>();
+            loop {
+                let n = libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, std::ptr::null());
+                if n < 0 {
+                    let err = std::io::Error::last_os_error().raw_os_error();
+                    if err == Some(libc::EINTR) {
+                        continue;
+                    }
+                    break;
+                }
+                if n > 0 && (event.flags & (libc::EV_EOF | libc::EV_ERROR)) != 0 {
+                    libc::close(kq);
+                    std::process::exit(0);
+                }
+            }
+            libc::close(kq);
+        });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_stdout_eof_watchdog() {}
+
 #[derive(Parser)]
 #[command(version, about = "Lumen — local search / 本地搜索")]
 struct Cli {
@@ -666,6 +719,7 @@ fn main() -> Result<()> {
         } => {
             let progress = scan_progress(scope.progress)?;
             let scope = scope.into_scope(&db);
+            spawn_stdout_eof_watchdog();
             lumen::watch_with_launch_progress(
                 &db,
                 &scope,

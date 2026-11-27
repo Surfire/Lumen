@@ -253,6 +253,11 @@ final class Launcher: ObservableObject {
     // An existing index may contain paths hidden by permission changes while Lumen was closed.
     private var scopeTrustedForLookup = false { didSet { syncCanSearch() } }
     private var watchGeneration: UInt64 = 0
+    private var watchRetryTask: Task<Void, Never>?
+    private var watchLeaseRetryCount = 0
+    private static let watchLeaseRetryDelays: [Duration] = [
+        .milliseconds(400), .milliseconds(800), .seconds(1), .seconds(2), .seconds(3),
+    ]
     private var watcher: Process?
     private var afterWatcherStops: (() -> Void)?
     private var stoppingWatcher = false
@@ -461,6 +466,7 @@ final class Launcher: ObservableObject {
         closed = true
         embeddingStreamGeneration &+= 1
         cancelSilentRefresh()
+        cancelWatchRetry()
         textDebounce?.cancel()
         semanticDebounce?.cancel()
         cancelCoverageRead()
@@ -468,9 +474,20 @@ final class Launcher: ObservableObject {
         clearFileDiagnosis()
         if modelInspection?.isRunning == true { modelInspection?.terminate() }
         engine.close()
-        for process in [watcher, writer, contentWriter].compactMap({ $0 }) where process.isRunning {
+        let active = [watcher, writer, contentWriter].compactMap({ $0 }).filter(\.isRunning)
+        for process in active {
             process.terminate()
         }
+        // Give terminating watch/writers a short window to release their SQLite/flock leases before app relaunch.
+        let deadline = ContinuousClock.now + .milliseconds(400)
+        while ContinuousClock.now < deadline && active.contains(where: \.isRunning) {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+    }
+
+    private func cancelWatchRetry() {
+        watchRetryTask?.cancel()
+        watchRetryTask = nil
     }
 
     func t(_ chinese: String, _ english: String) -> String { zh ? chinese : english }
@@ -490,9 +507,14 @@ final class Launcher: ObservableObject {
         case .opening: return t("macOS 无法打开这个项目。", "macOS could not open this item.")
         case .scope: return t("索引范围中的路径必须以 / 开头。", "Index scope paths must start with /.")
         case .scopeState: return t("无法保存索引范围更新状态。请检查索引目录权限后重试。", "Could not save the scope update state. Check index directory permissions and try again.")
-        case .watch: return canSearch
-            ? t("文件监听已停止，仍可搜索已验证的索引。", "File watching stopped. You can still search the verified index.")
-            : t("未能核对现有索引的访问权限。", "Lumen could not verify access to the saved index.")
+        case .watch:
+            if notice.detail.contains("index writer lease") {
+                return t("另一个索引或文件监听进程正在占用写锁，暂无法启动监听。",
+                         "Another index or file watcher is holding the index lock.")
+            }
+            return canSearch
+                ? t("文件监听已停止，仍可搜索已验证的索引。", "File watching stopped. You can still search the verified index.")
+                : t("未能核对现有索引的访问权限。", "Lumen could not verify access to the saved index.")
         case .online: return t("此项目仅索引名称和路径，可使用「在 Finder 中显示」。", "Only the name and path were indexed. Use Show in Finder to locate this item.")
         case .stale: return t("此结果已变化或无法访问。请重新搜索。", "This result changed or became unavailable. Search again.")
         }
@@ -1615,9 +1637,17 @@ final class Launcher: ObservableObject {
         scheduleSearch()
     }
 
+    func restartWatcher() {
+        guard !closed, watchSupported == true, !scopePending, indexWork == nil, watcher == nil else { return }
+        cancelWatchRetry()
+        watchLeaseRetryCount = 0
+        startWatcherIfReady()
+    }
+
     private func startWatcherIfReady() {
         guard watchSupported == true, indexPhase == .ready, !scopePending,
               watcher == nil, !closed else { return }
+        cancelWatchRetry()
         indexStatus.set(\.watchState, to: .starting)
         indexStatus.set(\.watchNotice, to: nil)
         watchGeneration &+= 1
@@ -1644,6 +1674,20 @@ final class Launcher: ObservableObject {
             } else if response.diagnostic.contains("predates saved scope settings") ||
                         response.diagnostic.contains("no saved scope;") {
                 self.indexStatus.set(\.watchState, to: .needsSetup)
+            } else if response.diagnostic.contains("index writer lease"),
+                      self.watchLeaseRetryCount < Self.watchLeaseRetryDelays.count {
+                let delay = Self.watchLeaseRetryDelays[self.watchLeaseRetryCount]
+                self.watchLeaseRetryCount += 1
+                let retryGeneration = self.watchGeneration
+                self.indexStatus.set(\.watchState, to: .starting)
+                self.indexStatus.set(\.watchNotice, to: nil)
+                self.watchRetryTask = Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: delay)
+                    guard !Task.isCancelled, let self, !self.closed,
+                          self.watchGeneration == retryGeneration else { return }
+                    self.watchRetryTask = nil
+                    self.startWatcherIfReady()
+                }
             } else {
                 self.indexStatus.set(\.watchState, to: .failed)
                 self.indexStatus.set(\.watchNotice, to: LauncherNotice(.watch, response.diagnostic))
@@ -1656,6 +1700,7 @@ final class Launcher: ObservableObject {
               let notice = try? JSONDecoder().decode(WatchEvent.self, from: line) else { return }
         if notice.event == .cached {
             guard watchSupportsCachedStart else { return }
+            watchLeaseRetryCount = 0
             engine.setCachedHitAccess(true)
             scopeTrustedForLookup = true
             indexStatus.set(\.indexPhase, to: .ready)
@@ -1666,6 +1711,7 @@ final class Launcher: ObservableObject {
         let accessPhaseChanged = notice.event == .ready && engine.checksCachedHitAccess
         let becameReady = notice.event == .ready && !canSearch
         if notice.event == .ready {
+            watchLeaseRetryCount = 0
             engine.setCachedHitAccess(false)
             scopeTrustedForLookup = true
             indexStatus.set(\.indexPhase, to: .ready)
@@ -1795,6 +1841,8 @@ final class Launcher: ObservableObject {
     }
 
     private func withWatcherStopped(_ next: @escaping () -> Void) {
+        cancelWatchRetry()
+        watchLeaseRetryCount = 0
         if watchSupported == true { indexStatus.set(\.watchState, to: .paused) }
         indexStatus.set(\.watchProgress, to: nil)
         engine.setCachedHitAccess(false)

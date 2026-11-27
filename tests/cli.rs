@@ -2224,6 +2224,56 @@ printf 'second batch text'
     }
 
     #[test]
+    fn watch_exits_and_releases_writer_lease_when_stdout_pipe_closes() {
+        let f = Fixture::new();
+        let root = f.0.join("watched-orphan-check");
+        let r = root.to_str().unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("note.txt"), "hello").unwrap();
+
+        let mut first = f
+            .cli()
+            .arg("watch")
+            .args(["--root", r])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = first.stdout.take().unwrap();
+        let mut reader = BufReader::new(stdout);
+        let mut ready = String::new();
+        reader.read_line(&mut ready).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&ready).unwrap(),
+            serde_json::json!({"event": "ready"})
+        );
+
+        let duplicate = f.cli().args(["watch", "--root", r]).output().unwrap();
+        assert!(!duplicate.status.success());
+        assert!(String::from_utf8_lossy(&duplicate.stderr).contains("index writer lease"));
+
+        drop(reader);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            if let Some(status) = first.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        let Some(status) = status else {
+            let _ = first.kill();
+            let _ = first.wait();
+            panic!("watch did not exit after stdout pipe closed");
+        };
+        assert!(status.success(), "unexpected exit status: {status}");
+
+        let _second = watch(&f, &["--root", r]);
+    }
+
+    #[test]
     fn legacy_settings_require_explicit_scope_and_preserve_the_database() {
         let f = Fixture::new();
         let root = f.0.join("scope");

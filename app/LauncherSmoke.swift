@@ -5,6 +5,7 @@ import Combine
 import Darwin
 import Foundation
 import ImageIO
+import PDFKit
 import SQLite3
 import SwiftUI
 import zlib
@@ -3157,8 +3158,47 @@ final class LauncherSmoke {
         }
         if exists("capture-preview") {
             try capture("lumen-inline-pdf.png", appearance: .aqua, window: app.panel)
+            try capture("lumen-inline-pdf-dark.png", appearance: .darkAqua, window: app.panel)
             app.panel.appearance = nil
         }
+        // Verify matched PDF page selection + content-proportional preview panel sizing.
+        let pdfURL = URL(fileURLWithPath: pdfPath)
+        if let pdfDoc = PDFDocument(url: pdfURL), let page2 = pdfDoc.page(at: 1) {
+            let pageSelections = MacPreviewRenderer.pdfPageSelections(in: pdfDoc, on: page2, highlight: "zircon calibration", snippet: model.selectedHit?.snippet)
+            try check(!pageSelections.isEmpty, "matched PDF page highlight produced no PDF selections")
+            let pdfSized = LocalPreviewPanel.preferredContentSize(for: pdfURL, page: 2, maxSize: NSSize(width: 1000, height: 760), backingScale: 2)
+            try check(pdfSized.height >= 450 && pdfSized.height <= 760 && pdfSized.width >= 400,
+                      "PDF adaptive preview sizing out of expected range: \(pdfSized)")
+        }
+        let sizeDir = directory.appendingPathComponent("adaptive-sizes", isDirectory: true)
+        try FileManager.default.createDirectory(at: sizeDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sizeDir) }
+        func writePNG(name: String, width: Int, height: Int) throws -> URL {
+            let fileURL = sizeDir.appendingPathComponent(name)
+            guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
+                                             bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                             colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+                  let data = rep.representation(using: .png, properties: [:]) else {
+                throw Failure("could not allocate synthetic PNG fixture \(name)")
+            }
+            try data.write(to: fileURL)
+            return fileURL
+        }
+        let wideImg = try writePNG(name: "wide.png", width: 1600, height: 800)
+        let tallImg = try writePNG(name: "tall.png", width: 800, height: 1600)
+        let hugeImg = try writePNG(name: "huge.png", width: 4800, height: 3200)
+        let cap = NSSize(width: 900, height: 720)
+        let wideSize = LocalPreviewPanel.preferredContentSize(for: wideImg, page: nil, maxSize: cap, backingScale: 2)
+        let tallSize = LocalPreviewPanel.preferredContentSize(for: tallImg, page: nil, maxSize: cap, backingScale: 2)
+        let hugeSize = LocalPreviewPanel.preferredContentSize(for: hugeImg, page: nil, maxSize: cap, backingScale: 2)
+        let docSize = LocalPreviewPanel.preferredContentSize(for: sizeDir.appendingPathComponent("note.md"), page: nil, maxSize: cap, backingScale: 2)
+        try check(wideSize.width > wideSize.height && abs((wideSize.width / wideSize.height) - 2.0) < 0.05,
+                  "landscape image preview did not preserve 2:1 aspect ratio: \(wideSize)")
+        try check(tallSize.height > tallSize.width && abs((tallSize.width / tallSize.height) - 0.5) < 0.1,
+                  "portrait image preview did not preserve portrait orientation: \(tallSize)")
+        try check(hugeSize.width <= cap.width && hugeSize.height <= cap.height && abs((hugeSize.width / hugeSize.height) - 1.5) < 0.05,
+                  "oversized image did not fit within max bounds while preserving 3:2 ratio: \(hugeSize)")
+        try check(docSize.height > 600 && docSize.width == 760, "markdown preview did not adopt document reading proportions: \(docSize)")
         guard let pdfImage = app.inlinePreview.image else { throw Failure("PDF bitmap was not decoded for the view") }
         app.panel.contentView?.layoutSubtreeIfNeeded()
         try check(app.inlinePreview.image === pdfImage, "layout discarded the cached PDF bitmap")
@@ -3663,6 +3703,13 @@ final class LauncherSmoke {
     }
 
     private func captureSettings(_ window: NSPanel, session: SettingsSession) async throws {
+        let app = NSApp.delegate as? AppDelegate
+        let restoredHotKey = app?.model.hotKey == nil
+        if let app, restoredHotKey,
+           let sampleKey = try? event(kVK_ANSI_Z, "Z", in: app, flags: [.command, .control, .shift]) {
+            app.recordShortcut(sampleKey)
+        }
+        defer { if restoredHotKey { app?.disableShortcut() } }
         for page in SettingsPage.allCases {
             session.page = page
             try await Task.sleep(for: .milliseconds(100))
@@ -3869,10 +3916,11 @@ final class LauncherSmoke {
         try type("health examination", into: app)
         try await until("stored Gemma vectors remained searchable at the storage cap") {
             model.hits.contains { $0.isSemanticCandidate && $0.name == "notes.md" } &&
-                self.exists("capped-gemma-query-started")
+                self.exists("capped-gemma-query-started") && !model.semanticBusy &&
+                app.panel.frame.size == enrichedSize
         }
         try check(lineCount("semantic-serve-launches") == 1 && app.panel.frame == frame,
-                  "capped search restarted the worker or resized the panel")
+                  "capped search restarted the worker or resized the panel (launches=\(lineCount("semantic-serve-launches")), got=\(app.panel.frame), expected=\(frame))")
 
     }
 
@@ -4235,7 +4283,8 @@ final class LauncherSmoke {
         try check(PanelGeometry.size(for: PanelState(mode: .search, overlay: .none), rows: [.file(plainHit), .file(snippetHit)], showsResults: true)
                   == CGSize(width: 680, height: shell + 44 + 60), "mixed row heights did not sum accurately")
         try check(PanelGeometry.size(for: PanelState(mode: .search, overlay: .inlinePreview(plainHit)), rows: [.file(plainHit)], showsResults: true)
-                  == CGSize(width: 860, height: shell + 176), "inline preview did not widen to 860pt with 176pt floor")
+                  == CGSize(width: 860, height: shell + PanelGeometry.inlinePreviewMinimumHeight),
+                  "inline preview did not widen to 860pt with \(Int(PanelGeometry.inlinePreviewMinimumHeight))pt floor")
         try check(PanelGeometry.size(for: PanelState(mode: .search, overlay: .contextMenu(count: 3)), rows: [.file(plainHit)], showsResults: true)
                   == CGSize(width: 680, height: shell + 132), "search context menu geometry mismatch")
         try check(PanelGeometry.size(for: PanelState(mode: .clipboard, overlay: .none), rows: [], showsResults: false)

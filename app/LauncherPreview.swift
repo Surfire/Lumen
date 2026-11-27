@@ -1,8 +1,10 @@
 import AppKit
 import Carbon.HIToolbox
 import Darwin
+import ImageIO
 import PDFKit
 import Quartz
+import UniformTypeIdentifiers
 
 enum FileAction: Equatable {
     case open, reveal, preview, copyName, copyPath
@@ -89,17 +91,115 @@ final class LocalPreviewPanel: NSPanel {
     private let url: URL
     private var closed = false
 
-    init?(url: URL, title: String, page: Int? = nil) {
-        let frame = NSRect(x: 0, y: 0, width: 680, height: 520)
+    private static let spreadsheetOrDeckExtensions: Set<String> = [
+        "xlsx", "xls", "csv", "tsv", "numbers", "pptx", "ppt", "key",
+    ]
+    private static let documentOrCodeExtensions: Set<String> = [
+        "docx", "doc", "rtf", "rtfd", "pages", "odt", "md", "markdown", "txt",
+        "json", "yaml", "yml", "xml", "html", "htm", "toml", "ini", "log",
+        "swift", "rs", "py", "ts", "tsx", "js", "jsx", "c", "cpp", "h", "hpp",
+        "m", "mm", "go", "rb", "java", "kt", "sh", "zsh", "sql", "css", "scss",
+    ]
+    private static let videoExtensions: Set<String> = ["mp4", "mov", "m4v", "webm", "mkv"]
+    private static let audioExtensions: Set<String> = ["mp3", "m4a", "wav", "flac", "aac", "ogg"]
+
+    static func preferredContentSize(
+        for url: URL,
+        page: Int?,
+        maxSize: NSSize,
+        backingScale: CGFloat = 2
+    ) -> NSSize {
+        let minW: CGFloat = 400
+        let minH: CGFloat = 300
+        let maxW = max(minW, maxSize.width)
+        let maxH = max(minH, maxSize.height)
+
+        func fit(width: CGFloat, height: CGFloat, scaleHint: CGFloat = 1, maxUpscale: CGFloat = 1) -> NSSize {
+            guard width > 0, height > 0 else {
+                return NSSize(width: min(680, maxW), height: min(520, maxH))
+            }
+            let targetW = width * scaleHint
+            let targetH = height * scaleHint
+            let ratioScale = min(maxW / targetW, maxH / targetH)
+            let boundedScale = ratioScale < 1 ? ratioScale : min(ratioScale, maxUpscale)
+            var fittedW = round(targetW * boundedScale)
+            var fittedH = round(targetH * boundedScale)
+            if fittedW < minW || fittedH < minH {
+                let up = min(maxW / max(fittedW, 1), maxH / max(fittedH, 1), max(minW / max(fittedW, 1), minH / max(fittedH, 1)))
+                fittedW = min(maxW, round(fittedW * up))
+                fittedH = min(maxH, round(fittedH * up))
+            }
+            return NSSize(width: max(minW, min(maxW, fittedW)), height: max(minH, min(maxH, fittedH)))
+        }
+
+        let ext = url.pathExtension.lowercased()
+        if page != nil || ext == "pdf",
+           let document = PDFDocument(url: url), !document.isLocked,
+           document.pageCount > 0 {
+            let index = min(max((page ?? 1) - 1, 0), document.pageCount - 1)
+            if let pdfPage = document.page(at: index) {
+                let bounds = pdfPage.bounds(for: .cropBox)
+                let rotated = abs(pdfPage.rotation) % 180 == 90
+                let w = rotated ? bounds.height : bounds.width
+                let h = rotated ? bounds.width : bounds.height
+                return fit(width: w, height: h, scaleHint: 1.2, maxUpscale: 1.35)
+            }
+        }
+        if UTType(filenameExtension: ext)?.conforms(to: .image) == true,
+           let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+           let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any],
+           let rawW = props[kCGImagePropertyPixelWidth as String] as? CGFloat,
+           let rawH = props[kCGImagePropertyPixelHeight as String] as? CGFloat,
+           rawW > 0, rawH > 0 {
+            let orientation = (props[kCGImagePropertyOrientation as String] as? Int) ?? 1
+            let swapped = (5...8).contains(orientation)
+            let pxW = swapped ? rawH : rawW
+            let pxH = swapped ? rawW : rawH
+            let scale = max(backingScale, 1)
+            return fit(width: pxW / scale, height: pxH / scale, scaleHint: 1, maxUpscale: 1.5)
+        }
+        if Self.spreadsheetOrDeckExtensions.contains(ext) {
+            return NSSize(width: min(920, maxW), height: min(620, maxH))
+        }
+        if Self.documentOrCodeExtensions.contains(ext) {
+            return NSSize(width: min(760, maxW), height: min(680, maxH))
+        }
+        if Self.videoExtensions.contains(ext) {
+            return NSSize(width: min(880, maxW), height: min(520, maxH))
+        }
+        if Self.audioExtensions.contains(ext) {
+            return NSSize(width: min(480, maxW), height: min(300, maxH))
+        }
+        return NSSize(width: min(680, maxW), height: min(520, maxH))
+    }
+
+    init?(
+        url: URL,
+        title: String,
+        page: Int? = nil,
+        highlight: String? = nil,
+        snippet: String? = nil,
+        maxSize: NSSize? = nil,
+        backingScale: CGFloat? = nil
+    ) {
+        let cap = maxSize ?? NSSize(width: 960, height: 760)
+        let size = Self.preferredContentSize(for: url, page: page, maxSize: cap, backingScale: backingScale ?? 2)
+        let frame = NSRect(origin: .zero, size: size)
         let view: NSView
         var destination: PDFPage?
+        var firstHighlight: PDFSelection?
         if let page {
             let display = PDFView(frame: frame)
             guard page > 0, let document = PDFDocument(url: url), !document.isLocked,
                   page <= document.pageCount, let target = document.page(at: page - 1) else { return nil }
-            display.displayMode = .singlePage
+            display.displayMode = .singlePageContinuous
             display.autoScales = true
             display.document = document
+            let matches = MacPreviewRenderer.pdfPageSelections(in: document, on: target, highlight: highlight, snippet: snippet)
+            if !matches.isEmpty {
+                display.highlightedSelections = matches
+                firstHighlight = matches.first
+            }
             preview = nil
             pdf = display
             destination = target
@@ -123,7 +223,16 @@ final class LocalPreviewPanel: NSPanel {
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         minSize = NSSize(width: 400, height: 300)
         contentView = view
-        if let destination { pdf?.go(to: destination) }
+        if let destination {
+            pdf?.layoutDocumentView()
+            pdf?.go(to: destination)
+            if let firstHighlight, pdf?.currentPage == destination {
+                pdf?.go(to: firstHighlight)
+                if pdf?.currentPage != destination {
+                    pdf?.go(to: destination)
+                }
+            }
+        }
     }
 
     override var canBecomeKey: Bool { true }

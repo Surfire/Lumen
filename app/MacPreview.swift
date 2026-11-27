@@ -79,10 +79,70 @@ public struct MacPreviewRenderer: Sendable {
         guard let ref = page.pageRef else { throw PreviewFailure.invalidContent }
         ctx.concatenate(ref.getDrawingTransform(.cropBox, rect: outRect, rotate: 0, preserveAspectRatio: true))
         ctx.drawPDFPage(ref)
+        if matchPage != nil {
+            let selections = Self.pdfPageSelections(in: document, on: page, highlight: evidence?.highlight, snippet: evidence?.text)
+            if !selections.isEmpty {
+                ctx.saveGState()
+                ctx.setFillColor(CGColor(red: 1.0, green: 0.82, blue: 0.18, alpha: 0.34))
+                for selection in selections {
+                    for line in selection.selectionsByLine() where line.pages.contains(page) {
+                        let lineRect = line.bounds(for: page)
+                        if !lineRect.isEmpty {
+                            ctx.fill(lineRect.insetBy(dx: -2, dy: -1))
+                        }
+                    }
+                }
+                ctx.restoreGState()
+            }
+        }
         guard let bitmap = ctx.makeImage() else { throw PreviewFailure.invalidContent }
         let validEvidence = evidence.flatMap { $0.page == nil || $0.page == number ? $0 : nil }
         return PreviewDocument(visual: .pdf(try png(bitmap), displayedPage: number, isMatchPage: matchPage != nil),
                                evidence: validEvidence)
+    }
+
+    static func pdfPageSelections(
+        in document: PDFDocument,
+        on page: PDFPage,
+        highlight: String?,
+        snippet: String?
+    ) -> [PDFSelection] {
+        var candidates: [String] = []
+        if let snippet {
+            let clean = snippet.trimmingCharacters(in: CharacterSet(charactersIn: "….").union(.whitespacesAndNewlines))
+            if clean.count >= 4 {
+                candidates.append(clean)
+                if clean.count > 48 { candidates.append(String(clean.prefix(48))) }
+                for clause in clean.split(whereSeparator: { $0 == "\n" || $0 == "。" || $0 == "." || $0 == "；" || $0 == ";" }) {
+                    let piece = String(clause).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if piece.count >= 4 { candidates.append(piece) }
+                }
+            }
+        }
+        if let highlight {
+            let trimmed = highlight.trimmingCharacters(in: .whitespacesAndNewlines)
+            let tokens = trimmed.split(whereSeparator: \.isWhitespace).map(String.init).filter { token in
+                let lower = token.lowercased()
+                return !lower.isEmpty && !lower.hasPrefix("kind:") && !lower.hasPrefix("path:")
+                    && !lower.hasPrefix("ext:") && !token.hasPrefix("/") && !token.hasPrefix("~/")
+            }
+            let phrase = tokens.joined(separator: " ")
+            if phrase.count >= 2 { candidates.append(phrase) }
+            for token in tokens where token.count >= 2 { candidates.append(token) }
+        }
+        var seen = Set<String>()
+        let needles = candidates.filter { seen.insert($0.lowercased()).inserted }
+        var matches: [PDFSelection] = []
+        for needle in needles {
+            for selection in document.findString(needle, withOptions: [.caseInsensitive, .diacriticInsensitive]) {
+                if selection.pages.contains(page) {
+                    matches.append(selection)
+                    if matches.count >= 24 { return matches }
+                }
+            }
+            if !matches.isEmpty && needle.count >= 12 { break }
+        }
+        return matches
     }
 
     private func png(_ image: CGImage) throws -> Data {

@@ -201,7 +201,8 @@ struct LauncherSettings: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(nsColor: .windowBackgroundColor))
         }
-        .frame(minWidth: 700, minHeight: 488)
+        .frame(minWidth: 700, minHeight: 540)
+        .toggleStyle(.switch)
         .labeledContentStyle(SettingsValueStyle())
     }
 
@@ -213,46 +214,77 @@ struct LauncherSettings: View {
     }
 
     private var sidebar: some View {
-        ScrollView {
-            VStack(spacing: 4) {
-                ForEach(SettingsPage.allCases) { item in
-                    let selected = item == page
-                    Button {
-                        session.page = item
-                    } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: item.symbol)
-                                .foregroundStyle(selected ? .primary : .secondary)
-                                .frame(width: 20)
-                            Text(item.title(model))
-                                .font(.system(size: 13, weight: selected ? .semibold : .medium))
-                                .lineLimit(2)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        .foregroundStyle(.primary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 8)
-                        .background {
-                            if selected { RoundedRectangle(cornerRadius: 7).fill(Color.primary.opacity(0.085)) }
-                        }
-                        .overlay {
-                            if sidebarFocus == item {
-                                RoundedRectangle(cornerRadius: 7)
-                                    .strokeBorder(Color.accentColor.opacity(0.6), lineWidth: 1.5)
-                            }
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .focused($sidebarFocus, equals: item)
-                    .accessibilityAddTraits(selected ? .isSelected : [])
-                    .accessibilityIdentifier("settings.page.\(item.rawValue)")
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Image(nsImage: NSApp.applicationIconImage)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 30, height: 30)
+                    .shadow(color: .black.opacity(0.16), radius: 2, y: 1)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Lumen")
+                        .font(.system(size: 13.5, weight: .semibold))
+                    Text("v\(version)")
+                        .font(.system(size: 10.5).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
+                Spacer(minLength: 0)
             }
-            .padding(.horizontal, 11)
-            .padding(.top, 18)
-            .onMoveCommand(perform: navigateSidebar)
+            .padding(.horizontal, 14)
+            .padding(.top, 14)
+            .padding(.bottom, 10)
+            Divider().padding(.horizontal, 12).accessibilityHidden(true)
+            ScrollView {
+                VStack(spacing: 3) {
+                    ForEach(SettingsPage.allCases) { item in
+                        let selected = item == page
+                        Button {
+                            session.page = item
+                        } label: {
+                            HStack(spacing: 9) {
+                                Image(systemName: item.symbol)
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(selected ? Color.accentColor : .secondary)
+                                    .frame(width: 22, height: 22)
+                                    .background(
+                                        selected ? Color.accentColor.opacity(0.16) : Color.primary.opacity(0.055),
+                                        in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    )
+                                Text(item.title(model))
+                                    .font(.system(size: 13, weight: selected ? .semibold : .medium))
+                                    .lineLimit(2)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .foregroundStyle(.primary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 6)
+                            .background {
+                                if selected {
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .fill(Color.primary.opacity(0.08))
+                                }
+                            }
+                            .overlay {
+                                if sidebarFocus == item {
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .strokeBorder(Color.accentColor.opacity(0.6), lineWidth: 1.5)
+                                }
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .focused($sidebarFocus, equals: item)
+                        .accessibilityAddTraits(selected ? .isSelected : [])
+                        .accessibilityIdentifier("settings.page.\(item.rawValue)")
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.top, 10)
+                .padding(.bottom, 14)
+                .onMoveCommand(perform: navigateSidebar)
+            }
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(model.t("设置页面", "Settings Pages"))
@@ -353,10 +385,19 @@ struct LauncherSettings: View {
         group(model.t("打开搜索", "Open Search")) {
             LabeledContent(model.t("全局快捷键", "Global Shortcut")) {
                 HStack(spacing: 9) {
-                    Text(model.hotKey?.label ?? model.t("未设置", "Off")).monospaced()
-                        .accessibilityIdentifier("settings.shortcut.value")
+                    if let hotKey = model.hotKey {
+                        ShortcutKeycaps(label: hotKey.label)
+                            .fixedSize()
+                            .accessibilityIdentifier("settings.shortcut.value")
+                    } else {
+                        Text(model.t("未设置", "Off"))
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .accessibilityIdentifier("settings.shortcut.value")
+                    }
                     ShortcutControl(model: model, record: recordShortcut).fixedSize()
                     Button(model.t("停用", "Disable"), action: disableShortcut)
+                        .fixedSize()
                         .disabled(model.hotKey == nil && model.hotKeyIssue == nil)
                 }
             }
@@ -476,7 +517,8 @@ struct LauncherSettings: View {
             if session.hasChanges {
                 note(model.t("有未应用的更改", "Unapplied changes"))
                 Button(model.t("还原", "Revert")) { session.discard() }
-                    .buttonStyle(.borderless)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
             } else if model.isIndexing {
                 note(model.activityTitle)
             } else if !session.canEditScope && indexStatus.indexPhase == .ready {
@@ -495,7 +537,13 @@ struct LauncherSettings: View {
 
     @ViewBuilder private var background: some View {
         group(model.t("文件变化与扫描", "File Changes and Scans")) {
-            Text(watchLabel)
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(watchStatusColor)
+                    .frame(width: 8, height: 8)
+                    .accessibilityHidden(true)
+                Text(watchLabel)
+            }
             if let metrics = model.activityMetrics {
                 if let progress = model.activeProgress, let fraction = progress.fraction {
                     ProgressView(metrics, value: fraction)
@@ -520,9 +568,35 @@ struct LauncherSettings: View {
 
     @ViewBuilder private var about: some View {
         group("Lumen") {
-            LabeledContent(model.t("版本", "Version"), value: version)
-            LabeledContent(model.t("当前状态", "Current Status"), value: model.activityTitle)
-            if let updates { LauncherUpdateControls(updates: updates, model: model) }
+            HStack(spacing: 14) {
+                Image(nsImage: NSApp.applicationIconImage)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 56, height: 56)
+                    .shadow(color: .black.opacity(0.18), radius: 3, y: 1.5)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(model.t("Lumen · 鹿鸣", "Lumen"))
+                        .font(.system(size: 16, weight: .semibold))
+                    Text(model.t("版本 \(version)", "Version \(version)"))
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(aboutStatusColor)
+                            .frame(width: 7, height: 7)
+                            .accessibilityHidden(true)
+                        Text(model.activityTitle)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, 2)
+            if let updates {
+                Divider().accessibilityHidden(true)
+                LauncherUpdateControls(updates: updates, model: model)
+            }
         }
         group(model.t("索引统计", "Index Counts")) {
             if let report = indexStatus.indexReport {
@@ -628,14 +702,18 @@ struct LauncherSettings: View {
     }
 
     private func group<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Text(title).font(.system(size: 13, weight: .semibold)).accessibilityAddTraits(.isHeader)
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.system(size: 12.5, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .accessibilityAddTraits(.isHeader)
             VStack(alignment: .leading, spacing: 10, content: content)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(13)
-                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+                .padding(14)
+                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
                 .overlay {
-                    RoundedRectangle(cornerRadius: 10).strokeBorder(Color(nsColor: .separatorColor).opacity(0.55))
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .strokeBorder(Color(nsColor: .separatorColor).opacity(0.45))
                         .allowsHitTesting(false)
                 }
         }
@@ -643,6 +721,20 @@ struct LauncherSettings: View {
 
     private func note(_ text: String) -> some View {
         Text(text).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var watchStatusColor: Color {
+        switch indexStatus.watchState {
+        case .running: return Color(nsColor: .systemGreen)
+        case .paused, .failed: return Color(nsColor: .systemOrange)
+        case .checking, .starting, .needsSetup, .unavailable: return .secondary
+        }
+    }
+
+    private var aboutStatusColor: Color {
+        if indexStatus.watchState == .failed { return Color(nsColor: .systemOrange) }
+        if indexStatus.watchState == .running || model.canSearch { return Color(nsColor: .systemGreen) }
+        return .secondary
     }
 
     @ViewBuilder private var embeddingControls: some View {
@@ -681,10 +773,15 @@ struct LauncherSettings: View {
         case .checking:
             ProgressView(model.t("正在校验本机 Gemma 资源…", "Verifying local Gemma resources…")).controlSize(.small)
         case .ready:
-            Label(model.t("本机 Gemma 模型已就绪", "Local Gemma model ready"), systemImage: "checkmark.circle")
+            HStack(spacing: 7) {
+                Circle().fill(Color(nsColor: .systemGreen)).frame(width: 8, height: 8).accessibilityHidden(true)
+                Text(model.t("本机 Gemma 模型已就绪", "Local Gemma model ready"))
+            }
         case .unavailable(let issue):
-            Label(model.modelDiagnostic(issue), systemImage: "info.circle")
-                .foregroundStyle(.secondary)
+            HStack(spacing: 7) {
+                Circle().fill(Color(nsColor: .systemOrange)).frame(width: 8, height: 8).accessibilityHidden(true)
+                Text(model.modelDiagnostic(issue)).foregroundStyle(.secondary)
+            }
             if !model.canBuildEmbeddings && indexStatus.indexWork != .embeddings {
                 Button(model.t("重新检查本机模型", "Recheck Local Model")) { model.verifyLocalModel() }
             }
@@ -761,6 +858,45 @@ private struct LauncherUpdateControls: View {
                 Text(model.t("当前已是最新版本。", "Lumen is up to date."))
             }
         }
+    }
+}
+
+private struct ShortcutKeycaps: View {
+    let label: String
+
+    private var tokens: [String] {
+        let modifiers: Set<Character> = ["⌃", "⌥", "⇧", "⌘"]
+        var parts: [String] = []
+        var remainder = Substring(label)
+        while let first = remainder.first, modifiers.contains(first) {
+            parts.append(String(first))
+            remainder = remainder.dropFirst()
+        }
+        if !remainder.isEmpty {
+            let key = String(remainder)
+            parts.append(key == "␣" ? "Space" : key)
+        }
+        return parts.isEmpty ? [label] : parts
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(Array(tokens.enumerated()), id: \.offset) { _, token in
+                Text(token)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(.primary)
+                    .padding(.horizontal, 6.5)
+                    .frame(minWidth: 23, minHeight: 22)
+                    .background(Color(nsColor: .controlColor), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(Color(nsColor: .separatorColor).opacity(0.6), lineWidth: 0.75)
+                    }
+                    .shadow(color: .black.opacity(0.08), radius: 0.5, y: 1)
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(label)
     }
 }
 

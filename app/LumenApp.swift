@@ -1304,8 +1304,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func showLocalPreview(_ hit: SearchHit, at url: URL) throws {
+        let activeScreen = panel.screen
+            ?? NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) })
+            ?? NSScreen.main
+        let visible = activeScreen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1200, height: 800)
+        let maxSize = NSSize(width: min(visible.width * 0.78, 1100), height: min(visible.height * 0.80, 860))
+        let scale = activeScreen?.backingScaleFactor ?? 2
+        let highlight = hit.isSemanticCandidate ? hit.snippet : model.query
         guard let preview = try inlinePreview.withResidentFile(url, expectedStamp: nil, {
-            LocalPreviewPanel(url: url, title: hit.name, page: hit.pdf_page)
+            LocalPreviewPanel(url: url, title: hit.name, page: hit.pdf_page,
+                              highlight: highlight, snippet: hit.snippet,
+                              maxSize: maxSize, backingScale: scale)
         }) else { throw PreviewFailure.invalidContent }
         localPreview?.close()
         localPreview = preview
@@ -1313,13 +1322,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         preview.delegate = self
         #if LUMEN_SMOKE
         if smoke == nil {
-            preview.center()
+            preview.setFrameOrigin(NSPoint(x: visible.midX - preview.frame.width / 2,
+                                           y: visible.midY - preview.frame.height / 2))
             makeLocalPreviewKey()
         } else {
             preview.setFrameOrigin(NSPoint(x: -12_000, y: -12_000))
         }
         #else
-        preview.center()
+        preview.setFrameOrigin(NSPoint(x: visible.midX - preview.frame.width / 2,
+                                       y: visible.midY - preview.frame.height / 2))
         makeLocalPreviewKey()
         #endif
     }
@@ -1400,11 +1411,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         NSApp.activate()
         #endif
         if settings == nil {
-            let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 770, height: 568),
+            let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 800, height: 640),
                                  styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
             window.hidesOnDeactivate = false
-            window.contentMinSize = NSSize(width: 700, height: 488)
+            window.contentMinSize = NSSize(width: 700, height: 540)
             window.delegate = self
             #if LUMEN_SMOKE
             let updates: UpdateSettings? = smoke == nil ? updateSettings : nil

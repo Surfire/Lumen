@@ -672,12 +672,14 @@ final class CoreSearchWorker: @unchecked Sendable {
     let queue: DispatchQueue
     private let database: URL
     private let root: URL?
+    private let withNameIndex: Bool
     private var handle: OpaquePointer?
 
-    init(label: String, database: URL, root: URL?) {
+    init(label: String, database: URL, root: URL?, withNameIndex: Bool = true) {
         self.queue = DispatchQueue(label: label, qos: .userInitiated)
         self.database = database
         self.root = root
+        self.withNameIndex = withNameIndex
     }
 
     deinit {
@@ -688,8 +690,8 @@ final class CoreSearchWorker: @unchecked Sendable {
     func open() -> OpaquePointer? {
         if let handle { return handle }
         handle = database.path.withCString { db in
-            if let root { return root.path.withCString { lumen_session_open(db, $0) } }
-            return lumen_session_open(db, nil)
+            if let root { return root.path.withCString { lumen_session_open_lane(db, $0, withNameIndex) } }
+            return lumen_session_open_lane(db, nil, withNameIndex)
         }
         return handle
     }
@@ -797,8 +799,8 @@ final class CoreSearchLane {
     private var queued: [Pending] = []
     var isBusy: Bool { active != nil }
 
-    init(label: String, database: URL, root: URL?) {
-        worker = CoreSearchWorker(label: label, database: database, root: root)
+    init(label: String, database: URL, root: URL?, withNameIndex: Bool = true) {
+        worker = CoreSearchWorker(label: label, database: database, root: root, withNameIndex: withNameIndex)
     }
 
     func warm() { worker.queue.async { [worker] in _ = worker.open() } }
@@ -922,8 +924,8 @@ final class CoreSearchConnection {
     var isBusy: Bool { nameLane.isBusy || textLane.isBusy }
 
     init(database: URL, root: URL?) {
-        nameLane = CoreSearchLane(label: "lumen.core.name", database: database, root: root)
-        textLane = CoreSearchLane(label: "lumen.core.text", database: database, root: root)
+        nameLane = CoreSearchLane(label: "lumen.core.name", database: database, root: root, withNameIndex: true)
+        textLane = CoreSearchLane(label: "lumen.core.text", database: database, root: root, withNameIndex: false)
     }
 
     func warm() { nameLane.warm() }

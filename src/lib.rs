@@ -613,14 +613,18 @@ pub fn search_with_backend(
 /// A persistent reader for the native launcher's request stream.
 pub struct SearchSession {
     conn: Connection,
-    names: name_fast::NameFast,
+    names: Option<name_fast::NameFast>,
 }
 
 impl SearchSession {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_names(path, true)
+    }
+
+    pub fn open_with_names(path: &Path, enable_name_index: bool) -> Result<Self> {
         let path = absolute(path)?;
         let conn = open_read(&path)?;
-        let names = name_fast::NameFast::new(&path, &conn);
+        let names = enable_name_index.then(|| name_fast::NameFast::new(&path, &conn));
         Ok(Self { conn, names })
     }
 
@@ -682,7 +686,7 @@ impl SearchSession {
 
     pub fn search(&mut self, query: &str, mode: Mode, limit: usize) -> Result<Vec<Hit>> {
         let mut hits =
-            search_with_names(&self.conn, query, mode, limit, None, Some(&mut self.names))?;
+            search_with_names(&self.conn, query, mode, limit, None, self.names.as_mut())?;
         if let Some(database) = self.conn.path().filter(|path| !path.is_empty()) {
             external::append_hits(
                 Path::new(database),

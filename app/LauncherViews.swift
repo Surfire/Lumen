@@ -263,8 +263,12 @@ struct SearchWindow: View {
     private func keyHint(_ key: String, _ action: String) -> some View {
         HStack(spacing: 4) {
             Text(key).font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .padding(.horizontal, 4).padding(.vertical, 1)
-                .background(.primary.opacity(0.075), in: RoundedRectangle(cornerRadius: 3))
+                .padding(.horizontal, 4.5).padding(.vertical, 1.5)
+                .background(.primary.opacity(0.065), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .strokeBorder(.primary.opacity(0.11), lineWidth: 0.75)
+                }
             Text(action)
         }
         .fixedSize()
@@ -291,7 +295,7 @@ struct SearchWindow: View {
                         }
                     }
                 }
-                .padding(.horizontal, 8)
+                .padding(.horizontal, 10)
             }
             .onChange(of: selection) { _, value in
                 if let value { proxy.scrollTo(value) }
@@ -522,18 +526,19 @@ private struct ResultCategory: View {
 
 private struct ResultRowChrome: ViewModifier {
     let selected: Bool
+    @Environment(\.colorScheme) private var colorScheme
     @State private var hovered = false
 
     func body(content: Content) -> some View {
         content
             .background {
-                let shape = RoundedRectangle(cornerRadius: 8)
+                let shape = RoundedRectangle(cornerRadius: 9, style: .continuous)
                 ZStack {
                     if selected {
-                        shape.fill(Color.accentColor.opacity(0.14))
-                        shape.strokeBorder(Color.accentColor.opacity(0.29), lineWidth: 1)
+                        shape.fill(Color.accentColor.opacity(colorScheme == .dark ? 0.17 : 0.13))
+                        shape.strokeBorder(Color.accentColor.opacity(colorScheme == .dark ? 0.30 : 0.18), lineWidth: 1)
                     } else if hovered {
-                        shape.fill(.primary.opacity(0.065))
+                        shape.fill(.primary.opacity(0.06))
                     }
                 }
                 .padding(.vertical, 1)

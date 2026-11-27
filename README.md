@@ -1,83 +1,126 @@
-<img src="assets/readme/lumen-hero.svg" width="100%" alt="Lumen，本地 Mac 搜索。插画示意同一个输入框如何查找文件。">
+<p align="center">
+  <img src="assets/readme/lumen-hero-zh.png" width="100%" alt="Lumen · 鹿鸣：macOS 原生极速检索、PDF 匹配页高亮直达与本地语义搜索">
+</p>
 
-# Lumen · 鹿鸣
+<p align="center">
+  <img src="assets/readme/lumen-logo.png" width="68" alt="Lumen 鹿鸣 Logo">
+</p>
 
-**一个快捷键，找到 Mac 上的文件、打开应用、直达系统设置。** 同一个输入框支持文件名、路径、拼音和已索引的正文，也可输入命令翻译、问模型或查找图片。
+<h1 align="center">Lumen · 鹿鸣</h1>
 
-[快速上手](#快速上手) · [功能与边界](#功能与边界) · [开发与验证](#开发与验证) · [English](README.en.md)
+<p align="center">
+  <strong>一个快捷键，秒找全盘文件、打开应用、直达系统设置与文档答案。</strong><br>
+  Rust 零倒排 SoA + AArch64 NEON 原生检索引擎，搭配 SwiftUI / AppKit 极简交互。<br>
+  支持全盘文件名与拼音毫秒查找、PDF 匹配页视觉直达、EmbeddingGemma 本地语义搜索，以及不唤醒云端占位文件的安全边界。
+</p>
 
-**v0.5** · **Apple Silicon** · **macOS 14+** · **Rust + 原生 macOS 界面**
+<p align="center">
+  <a href="#界面预览">界面预览</a> ·
+  <a href="#为什么选择-lumen">核心能力</a> ·
+  <a href="#同类工具对比">竞品对比</a> ·
+  <a href="#实测性能与内存表现">性能实测</a> ·
+  <a href="#快速上手与安装">快速上手</a> ·
+  <a href="README.en.md">English</a>
+</p>
 
-| 试着输入 | 会发生什么 |
+<p align="center">
+  <code>v0.5.1</code> · <code>Apple Silicon</code> · <code>macOS 14+</code> · <code>Rust + AppKit / SwiftUI</code> · <a href="LICENSE"><code>MIT License</code></a>
+</p>
+
+---
+
+| 试着输入 | 你会看到什么 |
 | :--- | :--- |
-| `年报 复盘 pdf` | 匹配两个关键词，按实际 PDF 扩展名过滤。可用双引号匹配连续短语。 |
-| `luming` / `lm` | 用全拼或首字母查找文件名「鹿鸣」。 |
-| `蓝牙` / `25 km in mi` | 直达系统设置，或在本机换算。无需先建文件索引。 |
+| `年报 复盘 pdf` | 同框多词匹配并按真实扩展名过滤；支持双引号精确短语搜索 |
+| `luming` / `lm` | 全拼或首字母直接定位中文文件名「鹿鸣」 |
+| `蓝牙` / `25 km in mi` | 无需等待文件索引，直接跳转系统设置或本地实时计算/单位换算 |
+| `tr:en 会议改期了` | 同一输入框流式翻译，回车一键复制结果（支持本机 oMLX 与 OpenAI 兼容服务） |
+| `qa 如何整理周报结构` | 本机提问大模型，按 `Esc` 立即取消，不联网抓取、不附带本地文件 |
+| `img 帆船` | 基于本地视觉模型按画面语义搜图，全过程零数据上传 |
 
-## 快速上手
+---
 
-在仓库根目录构建。需要 Apple Silicon Mac、macOS 14+、Xcode 命令行工具和 Rust。
+## 界面预览
 
-```sh
-scripts/build-app.sh
-open target/Lumen.app
-```
+### 搜索列表与「视觉优先」文档预览（深浅色自适应）
 
-这是使用临时签名（ad hoc）的开发构建。日用安装请用已有的命名签名身份，并在同一位置原位升级。首次从临时签名迁移时，macOS 可能再次询问文件访问权限。[本机签名、安装和回滚](docs/UPGRADING.md)
+> 选中 PDF 命中项按 **`空格`** 或 **`⌘Y`** 预览：内联窗格先展示已定位页码与半透明琥珀色高亮的页面视图，再在其下方列出原文上下文；呼出独立 Quick Look 悬浮窗则会按 PDF CropBox/旋转角或图片像素/EXIF 比例自适应缩放窗口尺寸。
 
-用菜单栏打开 Lumen，或按默认快捷键 **⌃⇧Space**。可在「设置 → 通用与快捷键」录制或停用热键。应用和系统设置可立即搜索。首次符合条件时，会在后台自动建立文件名索引。可在「索引与隐私」调整范围，也可从菜单栏手动开始扫描、查看阶段、扫描数量和耗时。
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/readme/search-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/readme/search-light.png">
+    <img src="assets/readme/search-light.png" width="90%" alt="Lumen 搜索与内联 PDF 匹配页高亮预览界面">
+  </picture>
+</p>
 
-重新打开 Lumen 时，符合条件的已保存索引可先用于查找。监听器在后台补查关闭期间的变动。
+### 原生 macOS 设置与触感快捷键体验
 
-### 签名发布与 Homebrew
+> 使用原生 AppKit/SwiftUI 开关组件、实体按键帽热键录制、独立目录与排除优先级规则，以及离线模型状态灯与单文件无唤醒诊断。
 
-对于安装在可写「应用程序」文件夹且使用发布签名的副本，请打开「设置 → 高级与诊断 → 检查更新」。检查只在手动触发时进行。Lumen 会验证 GitHub 发布清单的签名、ZIP 校验值和应用签名，再原位替换应用。安装后请退出并重新打开 Lumen；界面会显示旧版本的备份路径。临时签名构建不支持应用内更新。若发布证书更换，请手动安装首个使用新证书的版本。
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/readme/settings-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/readme/settings-light.png">
+    <img src="assets/readme/settings-light.png" width="90%" alt="Lumen 原生 macOS 设置界面">
+  </picture>
+</p>
 
-通过 Homebrew tap 安装时，请用 `brew upgrade --cask lumen` 升级。普通卸载保留数据；`--zap` 还会移除偏好和 Application Support，包括脚本和剪贴板历史。
+---
 
-### 在同一个搜索框里操作
+## 为什么选择 Lumen
 
-| 输入或按键 | 动作 |
-| :--- | :--- |
-| `?` | 查看命令，方向键选择，回车填入搜索框。 |
-| `tr` | 输入 `tr:en 会议改期了`，回车提交翻译。也可输入 `tr 文本` 或「翻译」。 |
-| `qa` | 输入 `qa 如何制定阅读计划？`，回车把问题发给所选模型。问答不会搜索网页、附加文件或读取剪贴板。 |
-| `g` | 输入 `g macOS 快捷键`，回车用默认浏览器打开 Google 搜索。可在「设置 → 快捷链接」启用 `gh`（GitHub）、`wiki`（中文维基百科）、`map`（Google 地图），也可添加自定义 HTTPS 查询别名。 |
-| `img` | 输入 `img 红色帆船`，按描述搜索已建立图像索引的本机图片。 |
-| ↩ / ⌘↩ / ⌘K | 打开选中项、在 Finder 显示文件、打开当前结果的操作菜单。 |
-| 空格 / ⌘Y / Esc | 浏览结果时，空格可快速查看所选本地文件；输入时空格仍用于打字。⌘Y 切换预览，Esc 先关闭预览。PDF 有已定位的命中页时可跳到该页。 |
-| ⇧⌘C / ⌥⌘C | 复制文件名或路径。 |
-| ⌘, | 打开设置。 |
+- **全盘文件名约 1 ms 极速响应，百万级常驻仅 ~145 MiB**
+  在单一轻量核心中采用紧凑结构体数组（SoA）与 **AArch64 NEON SIMD** 并行扫描架构，放弃冗重的内存倒排表，且文本检索通道不再重复持有名称索引。实测在 **166.7 万条真实磁盘文件** 下，全盘名称、拼音与路径热查询稳定在 **0.79–1.75 ms**，常驻内存约 **144.7 MiB**。
+- **语义与全文命中直达页内，不再只看几行冷冰冰的摘录**
+  对 TXT、Markdown、DOCX（正文与表格）及原生 PDF 文本层建立按需本地索引；PDF 命中结果时直接跳转到对应的页码并在原页面上用琥珀色高亮匹配位置。内联预览默认 **先看画面、再看上下文**，不打断当前搜索会话焦点。
+- **自适应比例的原生 Quick Look 悬浮窗**
+  浏览结果时按 **`空格`**（打字时空格保持正常输入）或按 **`⌘Y`** 打开独立预览窗：自动识别 PDF CropBox 与页面旋转角度、图片真实像素与 EXIF 方向、文档/视频/音频等扩展类型比例，避免所有文件千篇一律挤进固定方块。
+- **严格克制的本地 EmbeddingGemma 语义 & 搜图**
+  选配本机 EmbeddingGemma 模型后，可在完全离线环境下按自然语言找文档与图片（`img ...`，支持 PNG/JPEG 及离线图像检索流水线）。语义排序经过相关性校准：无关噪音词返回 0 条虚假相似项，高相关文档再附带原页跳转；纯文件名检索完全不依赖模型。
+- **默认零误触发云端下载的网盘保护边界**
+  底层检索、预览和诊断统一强制启用 `IOPOL_VFS_MATERIALIZE_DATALESS_FILES_OFF`、`SF_DATALESS` 检查与 `O_NOFOLLOW_ANY`。已识别的 iCloud Drive、OneDrive 与 File Provider 目录仅记录系统可见元数据，**绝不因为扫描或预览偷偷下载只存在云端的文件**。
+- **一把称手的日常 macOS 效率中枢**
+  同一个窗口整合：应用与系统设置模糊启动、常用项目固定（空查询即可见）、数学计算与单位换算、快捷链接（`g` 默认开启；`gh`/`wiki`/`map` 及自定义 HTTPS 别名按需开启）、需主动开启的私密剪贴板历史、本地脚本与 Apple 快捷指令、基于 macOS 辅助功能的窗口排版，以及 `tr` / `qa` 流式问答与翻译。
 
-问答和翻译共享「设置 → 翻译」选中的提供商和模型。支持本机 oMLX 或其他 OpenAI 兼容端点。结果通过 SSE 逐段显示，也兼容返回普通 JSON 的服务。按 Esc 或编辑查询可取消请求；完成后再按回车复制结果。只有主动提交的文字才送达界面显示的服务。[提供商配置](docs/TRANSLATION.md)
+---
 
-**启用图像内容搜索。** 在「设置 → 索引与隐私 → 图像内容」选一个已纳入名称索引的本机目录和匹配的本机投影器，然后点「建立或刷新图像索引」。目前支持 PNG 和 JPEG，使用本机 EmbeddingGemma 2 模型及单独准备的视觉投影器。[模型、投影器和大小限制](docs/offline-image-search.md)
+## 同类工具对比
 
-## 功能与边界
+| 维度 | **Lumen · 鹿鸣** | **macOS Spotlight** | **Raycast / Alfred** | **Oil Find** | **DigUp** |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **定位** | 全盘秒搜 + 文档/语义直达 + 全能启动器 | 系统内建搜索 | 扩展生态驱动的启动器 | 高性能专用文件查找器 | 本地多模态内容检索引擎 |
+| **文件名搜索引擎** | 自研 Rust 零倒排 SoA + NEON 并行扫描 | 系统 `mds` / `mdimporter` | 依赖 macOS Spotlight（`mdfind`） | 自研 C + NEON 扫描与筛选 | 侧重内容切片向量检索，非全盘文件名启动器 |
+| **百万级常驻内存** | **~145 MiB**（实测 166.7 万真实文件） | 系统分布式后台常驻（不可控） | 启动器进程轻量，但依赖系统索引驻留 | 极低内存文件名常驻 | 随本地模型与向量索引规模动态变化 |
+| **文档正文与本地语义** | 本地 FTS + **EmbeddingGemma** 离线检索（免费开源） | 仅关键词/元数据，无本地大模型语义召回 | 依赖 Spotlight 或插件/云端 AI | 基础版搜文件名/外置盘；文档/图像搜索需付费 Pro | 免费开源 **EmbeddingGemma 2** 多模态深搜 |
+| **PDF 命中页定位与高亮** | 内联与独立预览窗 **直达命中页 + 页内高亮** | Quick Look 仅打开文件或基础查找 | 按扩展/Quick Look 方式预览 | 侧重定位文件路径与基础预览 | 展示匹配片段与定位信息 |
+| **拼音 / 首字母检索** | 原生内建全拼与首字母缩写（`luming`/`lm`） | 有限支持，偶发失效 | 需额外插件或自定义脚本 | 原生支持拼音/多模式匹配 | — |
+| **启动器扩展工作流** | 应用、设置、计算、剪贴板、窗口、脚本/快捷指令、`tr`/`qa` | 应用、计算与系统网页建议 | **强项**：丰富扩展生态与热键命令 | 无应用启动、剪贴板或窗口管理 | 专注文档与媒体检索，非启动器 |
+| **网盘零误下载保证** | 线程级 `IOPOL` + `SF_DATALESS` 零唤醒隔离 | 视云盘 File Provider 与系统规则而定 | 依赖系统索引或插件实现 | 检查占位标识，尊重系统云文件状态 | 面向本机已选媒体目录 |
+| **开源与授权** | **MIT 开源免费** | 闭源系统组件 | 核心免费（部分高级功能订阅制） | 文件名/外置盘 MIT 开源；Pro 功能闭源付费 | **开源免费** |
 
-- **名称、正文与图像范围各自设置。** 名称索引默认覆盖启动盘可访问范围，跳过系统、隐私、缓存和隐藏位置。可选定目录或添加排除，排除优先。目录与正文变更在「应用」后生效。外置卷的名称索引在「索引与隐私」按需添加，断开后不显示其结果。
-- **正文和语义按需启用。** 在指定目录读取本地 TXT、Markdown、DOCX 主文档的段落及表格、PDF 原生文本层。无 OCR 或 DOCX 页码。加密、超限或不支持的文档仍可按名称搜索。选配本机模型后，语义搜索可补充相关原文片段。名称搜索不需要模型。[离线语义](docs/offline-gemma.md)
-- **网盘只记录可见元数据。** 已识别的 iCloud、OneDrive 和 File Provider 范围记录系统可见的名称与路径。索引和预览不会主动下载云端占位文件。搜索索引和离线推理留在本机，应用不捆绑或自动下载权重。
-- **进度和缺失原因可以检查。** 「高级与诊断」分别显示文件监听和语义索引状态。使用「文件诊断 → 选取文件」检查名称、正文和语义覆盖，诊断不会读取原文或唤醒云端项目。
-- **常用项目可以固定。** 空搜索可显示手动固定的项目，也可为应用、项目目录和网页创建快捷链接或别名。
+---
 
-## v0.5 新特性
+## 实测性能与内存表现
 
-- 优化视觉层次和命中高亮，新增需主动启用的本地私密剪贴板历史。
-- 使用 macOS 辅助功能管理窗口，支持本地脚本命令和 Apple 快捷指令。
-- 热查询使用进程内静态核心，较重的提取器仍单独运行。
-- 支持签名应用内更新和 Homebrew Cask。
+### 1. 166.7 万真实磁盘项目实测（Apple Silicon，热态 `lumen serve`）
 
-## v0.4 更新要点
+在包含 **1,667,692 条真实本机文件/目录**、**2,370 份正文档** 与 **43,690 条 Gemma 向量** 的真实工作库上验证（单名称索引驻留 + 双通道隔离）：
 
-- **M1：搜索与索引可靠性。** 搜索面板跟随指针所在屏幕，不抢占其他应用，尊重输入法组字。应用支持模糊匹配，排序会参考成功打开的记录；名称索引默认跳过常见开发缓存，且不深入应用包。
-- **M2：Spotlight 式操作与统一检索。** 可拖出本地文件、用 `kind:` / `ext:` 或路径前缀筛选，并在浏览时按空格快速查看。支持登录时启动，以及锁屏、睡眠、静音等系统操作。常驻的 `lumen serve` 同时处理名称、正文查询及批量结果验证，不为每次查询或每条结果另起进程。
-- **M3：流式结果与简化设置。** `tr` / `qa` 逐段显示结果；可选网页命令默认关闭。主应用移除「扩展」设置页和辅助程序。
-- **M3：整合版的独立语义与多模态工作。** T13 为新建或重建的向量采用 f16 存储，仍可读取 f32；T14 涵盖 HEIC/HEIF、WebP 图像检索，以及为本地图像和截图按需启用 Apple Vision OCR。这两项不属于启动器清理工作，不会为索引而下载仅云端文件。
+| 查询场景 | 实测耗时 / 占用 | 说明 |
+| :--- | ---: | :--- |
+| 拼音首字母名称查询（`lm`） | **0.79 ms** | `mode=name` 热态返回 Top 60 |
+| 中文双字名称查询（`临床` / `项目` / `工作` / `报告`） | **0.85–0.93 ms** | 并行 NEON 零倒排扫描 |
+| 英文名称查询（`readme`） | **1.10 ms** | `mode=name` 热态 |
+| 高频词 / 单字回退（`方案` / `方`） | **1.54–1.61 ms** | 166.7 万条全盘扫描无索引退化 |
+| 不存在关键词名称排空（`哈基米`） | **1.75 ms** | 快速排空，不再卡顿 1–2 秒 |
+| 常驻检索服务进程内存（`lumen serve` RSS） | **144.7 MiB** | 仅 `nameLane` 持有单一 `NameFast` 实例 |
+| 正文全文热查询（`方案` / 不存在 FTS 词 `哈基米`） | **46.61 ms** / **0.16 ms** | `mode=text` + FTS5 前缀索引 |
+| 本地 EmbeddingGemma 语义召回（14 组对照） | **~18–25 ms** | 7/7 相关查询稳定返回 11–12 条；7/7 无关词返回 **0 条噪音** |
 
-### 百万文件名称索引基准
+### 2. 一百万合成文件微基准（Apple M5 Max）
 
-在 Apple M5 Max 上，紧凑的 SoA（结构数组）名称索引首次扫描 1,000,000 个合成文件耗时 **45,503.66 ms**。预热后的 `lumen serve` 占用 **140,880 KiB（137.58 MiB）**，更新可见性检查后为 **146,960 KiB（143.52 MiB）**。4,000 次热查询均在前 20 位返回预期路径。
+在 Apple M5 Max 上首次扫描 1,000,000 个合成文件耗时 **45,503.66 ms**，预热后 `lumen serve` 内存为 **140,880 KiB（137.58 MiB）**（更新可见性检查后为 **146,960 KiB / 143.52 MiB**），4,000 次热查询均在前 20 位命中：
 
 | 热查询类别 | p50（ms） | p95（ms） | p99（ms） |
 | :--- | ---: | ---: | ---: |
@@ -86,31 +129,79 @@ open target/Lumen.app
 | 拼音 | 0.477 | 0.961 | 1.079 |
 | 多词 | 0.264 | 0.342 | 0.402 |
 
-这里测量的是高选择性的预热名称查询，含常驻 CLI 的 JSONL 往返；不代表启动、界面、正文或与 Spotlight 对比的耗时。十万文件数据、并发重扫和测量方法见 [v0.4 基线](benchmarks/v0.4-baseline.md)。
+> 注：以上均测量核心引擎 / 常驻 CLI 的热态检索与驻留内存；图形界面整条链路延迟另受 SwiftUI 列表渲染与防抖调度影响，详细信息与十万级并发数据见 [v0.4 基线](benchmarks/v0.4-baseline.md) 与 [基准协议](docs/BENCHMARK.md)。
 
-## 开发与验证
+---
 
-Rust 负责扫描、索引和检索，AppKit 与 SwiftUI 提供原生界面。
+## 常用按键与命令速查
 
-[版本变更](CHANGELOG.md) · [架构](docs/ARCHITECTURE.md) · [兼容范围](docs/COMPATIBILITY.md) · [基准协议](docs/BENCHMARK.md) · [第三方依赖](THIRD_PARTY.md)
+| 输入或按键 | 动作 |
+| :--- | :--- |
+| **`⌃⇧Space`**（可自定义） | 从任何应用上方无焦点抢占呼出 / 隐藏 Lumen |
+| **`?`** | 浏览全部内置命令，方向键选择，回车填入搜索框 |
+| **`tr` / `qa` / `img`** | 同输入框翻译、本机提问大模型、以文搜图 |
+| **`g`** / `gh` / `wiki` / `map` | 网页快捷搜索（可在「设置 → 快捷链接」按需开启或添加） |
+| **`↩` / `⌘↩` / `⌘K`** | 打开选中项、在 Finder 中显示、呼出当前项操作菜单 |
+| **`空格` / `⌘Y` / `Esc`** | 浏览结果时 `空格` 快速预览，打字时正常输入；`⌘Y` 切换预览；`Esc` 优先关闭预览再收起窗口 |
+| **`⇧⌘C` / `⌥⌘C`** | 复制文件名或完整路径 |
+| **`⌘,`** | 打开原生设置 |
+
+- 翻译 / 问答模型配置详见：[提供商配置](docs/TRANSLATION.md)
+- 离线语义与视觉模型配置详见：[离线语义](docs/offline-gemma.md) · [模型、投影器和大小限制](docs/offline-image-search.md)
+
+---
+
+## 快速上手与安装
+
+### 从源码构建
+
+需要 **Apple Silicon Mac**、**macOS 14+**、Xcode 命令行工具与 Rust 工具链：
+
+```sh
+scripts/build-app.sh
+open target/Lumen.app
+```
+
+上述命令生成临时签名（ad-hoc）开发版；日常安装推荐使用命名本地签名身份以保留磁盘权限，并在升级时使用 `install-app.py` 原子替换：
+
+```sh
+LUMEN_SIGN_IDENTITY="Lumen Local Code Signing" scripts/build-app.sh
+python3 scripts/install-app.py install target/Lumen.app
+open -a "$HOME/Applications/Lumen.app"
+```
+
+更多细节、回滚与证书迁移见：[本机签名、安装和回滚](docs/UPGRADING.md)。
+
+### 签名发布与 Homebrew
+
+- **应用内签名更新**：对于使用正式发布证书签名并安装在可写「应用程序」目录中的副本，可在 **「设置 → 高级与诊断 → 检查更新」** 手动触发更新；Lumen 会校验清单签名、ZIP 校验和与应用代码签名后再原位替换并备份旧版。
+- **Homebrew**：通过 Homebrew tap 安装的用户可直接执行 `brew upgrade --cask lumen`。普通卸载保留索引与配置；`--zap` 会一并清理偏好设置、脚本与剪贴板历史。
+
+---
+
+## 开发、架构与完整回归
+
+[架构文档](docs/ARCHITECTURE.md) · [兼容范围](docs/COMPATIBILITY.md) · [版本变更](CHANGELOG.md) · [第三方依赖](THIRD_PARTY.md)
 
 <details>
-<summary>构建与回归命令</summary>
+<summary>构建、代码检查与全套自动化验收命令</summary>
 
 ```sh
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 scripts/build-app.sh
-python3 scripts/smoke-updater.py
+LUMEN_SMOKE=1 scripts/build-app.sh
 python3 scripts/smoke-app.py
 python3 scripts/smoke-launcher.py
 python3 scripts/smoke-relaunch.py target/Lumen.app
 python3 scripts/smoke-translation.py
+python3 scripts/smoke-install-app.py
+python3 scripts/smoke-updater.py
 ```
 
-使用合成资料验证。AppKit 和 FSEvents 测试依赖 macOS 原生服务，模拟与跳过的用例不能代替实体外接盘或真实第三方服务的验收。
+验收默认采用可复现合成资料；AppKit 焦点与 FSEvents 测试依赖 macOS 桌面会话环境。
 
 </details>
 
-原创源码采用 [MIT](LICENSE)。独立实现参考了 Tinycast、Oil Find、DigUp 和 Luminator Index 的产品思路。
+源码采用 [MIT License](LICENSE)。产品与工程设计在独立实现中吸取并致敬了 Tinycast、Oil Find、DigUp 与 Luminator Index 的优秀理念。

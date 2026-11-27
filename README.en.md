@@ -1,118 +1,207 @@
-<img src="assets/readme/lumen-hero.svg" width="100%" alt="Lumen, local search for Mac. An illustration shows one search box finding files.">
+<p align="center">
+  <img src="assets/readme/lumen-hero-en.png" width="100%" alt="Lumen for macOS: Instant local search, matched-page PDF preview highlighting, and on-device semantic retrieval">
+</p>
 
-# Lumen
+<p align="center">
+  <img src="assets/readme/lumen-logo.png" width="68" alt="Lumen Origami Stag Logo">
+</p>
 
-**Find files, open apps, and jump to System Settings from one keyboard shortcut.** The same search box matches names, paths, pinyin, and indexed document text. It also accepts commands for translation, model questions, and image search.
+<h1 align="center">Lumen</h1>
 
-[Quick start](#quick-start) · [Features and limits](#features-and-limits) · [Development](#development) · [简体中文](README.md)
+<p align="center">
+  <strong>Find files, launch apps, jump to System Settings, and preview exact answers inside documents from one shortcut.</strong><br>
+  Powered by a compact zero-posting SoA + AArch64 NEON Rust engine and a native AppKit / SwiftUI interface.<br>
+  Combines millisecond disk-wide filename &amp; pinyin search, matched-page PDF highlighting, offline EmbeddingGemma retrieval, and strict zero-download cloud boundaries.
+</p>
 
-**v0.5** · **Apple Silicon** · **macOS 14+** · **Rust + native macOS UI**
+<p align="center">
+  <a href="#interface-gallery">Interface</a> ·
+  <a href="#why-lumen">Why Lumen</a> ·
+  <a href="#comparison-with-alternatives">Comparison</a> ·
+  <a href="#verified-benchmarks">Benchmarks</a> ·
+  <a href="#quick-start--installation">Quick Start</a> ·
+  <a href="README.md">简体中文</a>
+</p>
+
+<p align="center">
+  <code>v0.5.1</code> · <code>Apple Silicon</code> · <code>macOS 14+</code> · <code>Rust + AppKit / SwiftUI</code> · <a href="LICENSE"><code>MIT License</code></a>
+</p>
+
+---
 
 | Try typing | What happens |
 | :--- | :--- |
-| `Q4 plan pdf` | Find PDFs matching both terms. Quote an exact phrase. |
-| `luming` / `lm` | Finds a file named 鹿鸣 using full pinyin or initials. |
-| `Bluetooth` | Find the macOS settings page without a file index. |
+| `Q4 plan pdf` | Matches multiple keywords and filters by real PDF extension; quote for exact phrases |
+| `luming` / `lm` | Finds files named 鹿鸣 via full pinyin or initials |
+| `Bluetooth` / `25 km in mi` | Jump straight to System Settings or convert units locally—no file index required |
+| `tr:zh Meeting postponed` | Streams translation inside the launcher (`Return` copies output; supports local oMLX or OpenAI-compatible endpoints) |
+| `qa How to structure a review?` | Sends only your explicit prompt to the selected model; `Esc` cancels cleanly with no web or file leakage |
+| `img sailboat` | Searches indexed local photos semantically using on-device vision embeddings |
 
-## Quick start
+---
 
-Build from the repository root on an Apple Silicon Mac with macOS 14 or later, the Xcode command-line tools, and Rust.
+## Interface Gallery
 
-```sh
-scripts/build-app.sh
-open target/Lumen.app
-```
+### Search & Visual-First Matched-Page Preview (Light & Dark)
 
-This creates an ad hoc signed development build. For daily use, build with an existing named signing identity and update the installed app in place. macOS may request folder access again when you migrate from an ad hoc build. [Local signing, installation, and rollback](docs/UPGRADING.md)
+> Press **`Space`** (while browsing) or **`⌘Y`** on a PDF hit: inline preview puts the rendered matched page with translucent amber passage highlights **above** the extracted text context, while the standalone Quick Look window scales automatically to match the true aspect ratio and rotation of PDFs, images, docs, or media.
 
-Open Lumen from the menu bar or press **Control–Shift–Space**. Record or disable the shortcut in **Settings → General & Shortcuts**. Apps and System Settings are searchable immediately. The first eligible name scan starts quietly in the background. Adjust the folder scope in **Index & Privacy**, or start a scan from the menu bar, which shows the current phase, scanned item count, and elapsed time.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/readme/search-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/readme/search-light.png">
+    <img src="assets/readme/search-light.png" width="90%" alt="Lumen search results with visual-first inline PDF match-page preview">
+  </picture>
+</p>
 
-When you reopen Lumen, eligible results from the saved index can appear while the watcher catches up with changes made since you closed it.
+### Native macOS Settings & Tactile Shortcuts
 
-### Signed releases and Homebrew
+> Native `.switch` toggles, keycap shortcut capture, isolated include/exclude indexing rules, and offline diagnostics without waking cloud placeholders.
 
-For a release-signed copy in a writable Applications folder, open **Settings → Advanced & Diagnostics → Check for Updates**. Checks are manual. Lumen verifies the signed GitHub release manifest, ZIP checksum, and app signature before replacing the app. Quit and reopen after installation; Lumen shows where it saved the previous app. Ad hoc builds cannot use the updater. If the release signing certificate changes, install the first build with the new certificate manually.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/readme/settings-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/readme/settings-light.png">
+    <img src="assets/readme/settings-light.png" width="90%" alt="Lumen native macOS settings window">
+  </picture>
+</p>
 
-If you installed from a Homebrew tap, use `brew upgrade --cask lumen` instead. Normal uninstall keeps your data; `--zap` also removes Lumen’s preferences and Application Support, including scripts and clipboard history.
+---
 
-### Use the same launcher field
+## Why Lumen
 
-| Type or press | Action |
-| :--- | :--- |
-| `?` | Browse commands. Use the arrow keys to select one and Return to fill it in. |
-| `tr` | Type `tr:zh Meeting postponed` and press Return to translate. You can also enter `tr text` or `translate`. |
-| `qa` | Type `qa How do I plan a reading list?` and press Return to ask the selected model. Q&A has no web search, file attachments, or clipboard access. |
-| `g` | Type `g macOS shortcuts` and press Return to open Google Search in your default browser. Under **Settings → Quicklinks**, enable the optional `gh` (GitHub), `wiki` (Chinese Wikipedia), and `map` (Google Maps) commands, or add custom HTTPS query aliases. |
-| `img` | Type `img red sailboat` to find indexed local images by what they show. |
-| Return / ⌘Return / ⌘K | Open the selected item, reveal the file in Finder, or open the result actions. |
-| Space / ⌘Y / Esc | Space opens Quick Look on the selected local file while browsing; it still inserts a space while typing. ⌘Y toggles preview, and Esc dismisses it first. A PDF preview can jump to a known match page. |
-| ⇧⌘C / ⌥⌘C | Copy the file name or path. |
-| ⌘, | Open Settings. |
+- **~1 ms Disk-Wide Filename Search in ~145 MiB Resident RAM**
+  Instead of duplicating large inverted posting tables across search lanes, Lumen runs one compact structure-of-arrays (SoA) table scanned in parallel with **AArch64 NEON SIMD**. On a real Apple Silicon index of **1,667,692 disk items**, warm name, pinyin, and path queries finish in **0.79–1.75 ms** inside a **144.7 MiB** resident worker.
+- **Visual-First Document Preview That Jumps to the Matched Page**
+  Lumen extracts local TXT, Markdown, DOCX paragraphs/tables, and native PDF text layers on demand. For PDF hits, both inline preview and the Quick Look window jump directly to the matched page (`Match on page N`) and highlight matching terms in translucent amber—keeping visuals first without stealing search focus.
+- **Content-Proportional Quick Look Windows**
+  `LocalPreviewPanel` adapts its geometry to the inspected item: PDF CropBox & page rotation, image pixel dimensions & EXIF orientation, wide spreadsheets/decks, upright documents/code, video, or audio—instead of forcing every file into a rigid box.
+- **Calibrated Local EmbeddingGemma Semantic & Image Search**
+  With optional locally staged weights, EmbeddingGemma finds related documents cleanly while strict relevance calibration suppresses unrelated noise to **0 false hits**. Local visual search (`img ...`) covers PNG and JPEG (plus HEIC/WebP and opt-in on-device Apple Vision OCR pipelines). Name search needs zero AI models.
+- **Cloud-Safe Zero-Download Guarantee**
+  Every scan, preview, and diagnostic call runs under thread-scoped `IOPOL_VFS_MATERIALIZE_DATALESS_FILES_OFF`, `SF_DATALESS` checks, and `O_NOFOLLOW_ANY`. Recognized iCloud Drive, OneDrive, and File Provider placeholders index visible filenames safely without ever downloading online-only files.
+- **Unified Native macOS Workflow**
+  Pin favorites for empty-query recall, convert units/math, trigger `g` / `gh` / `wiki` / `map` or custom HTTPS quicklinks, browse opt-in private clipboard history, run local scripts & Apple Shortcuts, manage windows via macOS Accessibility, and stream `tr` / `qa` responses.
 
-Q&A and translation share the provider and model selected under **Settings → Translation**. Use a local oMLX instance or another OpenAI-compatible endpoint. Results appear incrementally over Server-Sent Events (SSE); a provider that responds with ordinary JSON still works. Esc or editing the query cancels the request. Press Return again after completion to copy. Only text you submit is sent to the provider shown in the launcher. [Provider setup](docs/TRANSLATION.md)
+---
 
-**Enable image content search.** Under **Settings → Index & Privacy → Image Content**, choose one local folder already covered by the name index and a matching local projector. Then select **Build or Refresh Image Index**. PNG and JPEG search uses the local EmbeddingGemma 2 model and a separately staged vision projector. [Model, projector, and file limits](docs/offline-image-search.md)
+## Comparison with Alternatives
 
-## Features and limits
+| Capability | **Lumen** | **macOS Spotlight** | **Raycast / Alfred** | **Oil Find** | **DigUp** |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Focus** | Whole-disk fast search + page-level doc preview + native launcher | System search | Extensible workflow launcher | Dedicated fast file finder | Multimodal local content retrieval |
+| **Filename Engine** | Custom Rust zero-posting SoA + parallel NEON | macOS `mds` / `mdimporter` | Delegates file lookup to Spotlight (`mdfind`) | Custom C + NEON scan & filter | Chunk-level semantic index rather than full-disk filename launcher |
+| **Million-File Footprint** | **~145 MiB** (measured on 1.67M real items) | Managed by background OS daemons | Lightweight UI + relies on OS Spotlight | Very low-memory filename residency | Scales with local model & content vector store |
+| **Doc FTS & Local Semantic** | Built-in FTS + local **EmbeddingGemma** (free, open-source) | Keyword/metadata only; no local Gemma retrieval | Extensions / Spotlight / optional Pro AI | Free filename & external drive; Pro paid for text/image content | Free open-source **EmbeddingGemma 2** multimodal search |
+| **Matched PDF Page + Highlight** | Jumps to matched page & highlights inline + Quick Look | Standard Quick Look preview | Standard Quick Look / extensions | Focused on fast file paths & basic preview | Passage excerpt & match locations |
+| **Chinese Pinyin & Initials** | Built-in full pinyin & initials (`luming` / `lm`) | Partial OS support | Requires community workflows | Built-in pinyin & multi-mode matching | — |
+| **Launcher Workflows** | Apps, System Settings, calc/units, clipboard, Accessibility windows, scripts/Shortcuts, `tr`/`qa` | Apps, calc, web suggestions | **Strength**: huge extension marketplace | File finding only (no apps/clipboard/window tiling) | Focused on media & doc search |
+| **Zero Cloud Materialization** | Thread-level `IOPOL` + `SF_DATALESS` isolation | Depends on importer & provider | Relies on Spotlight or workflow scripts | Checks cloud flags on placeholder files | Operates on chosen local folders |
+| **License** | **MIT Open Source (Free)** | Proprietary macOS component | Free core (optional paid Pro tiers) | MIT for filenames/external drives; paid Pro for content search | **Free Open Source** |
 
-- **Separate scopes for names, documents, and images.** Name indexing defaults to accessible locations on the startup disk, skipping system, private, cache, and hidden locations. Choose folders or add exclusions, which take priority. Scope and document changes take effect on **Apply**. Add an external volume's name index under **Index & Privacy**. Its results are hidden when disconnected.
-- **Opt-in document and semantic search.** In selected folders, Lumen reads local TXT and Markdown, paragraphs and tables in the main DOCX document, and the native PDF text layer. OCR and DOCX page numbers are outside the current scope. Encrypted, oversized, or unsupported documents remain searchable by name. An optional local model can surface related excerpts. Name search requires no model. [Offline semantic search](docs/offline-gemma.md)
-- **Cloud files are indexed by visible metadata.** For recognized iCloud, OneDrive, and other File Provider locations, Lumen records names and paths the system exposes. Indexing and previewing do not download cloud placeholders. Search indexes and offline inference stay on the Mac. Model weights are provisioned separately.
-- **Check progress and diagnose missing files.** **Advanced & Diagnostics** shows file watching and semantic indexing separately. Use **File Diagnostics → Choose File** to check name, document, and semantic coverage for a file. This check neither reads document content nor downloads a placeholder.
-- **Pin frequently used items.** Pinned items appear with an empty query. Save apps, project folders, or web pages as quicklinks or aliases.
+---
 
-## What’s new in v0.5
+## Verified Benchmarks
 
-- Sharper visual hierarchy and match highlighting, plus opt-in private local clipboard history.
-- Native Accessibility window management, opt-in local script commands, and Apple Shortcuts.
-- A static, in-process core for hot search, with heavy extractors still isolated.
-- Signed in-app updates and a Homebrew Cask.
+### 1. Real 1,667,692-Item Apple Silicon Disk Index (Warm `lumen serve`)
 
-## What’s new in v0.4
+Measured directly against a real disk database holding **1,667,692 items**, **2,370 documents**, and **43,690 EmbeddingGemma vectors** (single `NameFast` instance on `nameLane`, zero duplicate copy on `textLane`):
 
-- **M1 — Reliability.** The search panel stays out of the way of other apps, follows the pointer’s display, and respects IME composition. App lookup adds fuzzy matching; ranking learns from successful opens. Indexing skips common development caches and treats app bundles as packages by default.
-- **M2 — Spotlight-style interactions and one search process.** Drag local files from results, filter with `kind:`, `ext:`, and path prefixes, and use Space for Quick Look while browsing. Settings offers Launch at Login; the launcher supports actions such as Lock Screen, Sleep, and Mute. A persistent `lumen serve` session handles name search, full-text search, and batch result validation without launching a process for each query or hit.
-- **M3 — Streaming and simpler settings.** `tr` and `qa` stream in the launcher, and the optional web commands are off by default. The main app no longer ships an Extensions settings page or helper.
-- **M3 — Separate semantic and multimodal work for the integrated release.** T13 covers compact f16 vector storage for new/rebuilt embeddings while retaining f32 reads. T14 covers HEIC/HEIF and WebP image search and opt-in, on-device Apple Vision OCR for local images and screenshots. These are not part of the launcher cleanup worktree; cloud-only placeholders must not be downloaded for indexing.
+| Query Type | Measured Latency / RSS | Notes |
+| :--- | ---: | :--- |
+| Pinyin initials (`lm`) | **0.79 ms** | `mode=name`, warm Top 60 |
+| Chinese 2-character (`临床` / `项目` / `工作` / `报告`) | **0.85–0.93 ms** | Parallel AArch64 NEON zero-posting scan |
+| Latin name (`readme`) | **1.10 ms** | `mode=name`, warm |
+| High-frequency / single-Han (`方案` / `方`) | **1.54–1.61 ms** | Full 1.67M scan without timeout or degradation |
+| Negative miss (`哈基米`) | **1.75 ms** | Fast miss without stalling UI |
+| `lumen serve` resident memory (RSS) | **144.7 MiB** | Single resident `NameFast` + SQLite handle |
+| Document full-text (`方案` / FTS miss `哈基米`) | **46.61 ms** / **0.16 ms** | `mode=text` + FTS5 |
+| Local EmbeddingGemma semantic queries (14-query sweep) | **~18–25 ms** | 7/7 in-domain queries hit cleanly; 7/7 noise queries return **0 hits** |
 
-### Million-file name-index benchmark
+### 2. 1,000,000-File Synthetic Baseline (Apple M5 Max)
 
-On an Apple M5 Max, the compact structure-of-arrays (SoA) index scanned 1,000,000 synthetic files in **45,503.66 ms** and the warm `lumen serve` process used **140,880 KiB (137.58 MiB)**. After checking update visibility it used **146,960 KiB (143.52 MiB)**. All 4,000 hot queries returned the expected path in the top 20.
+Scanning 1,000,000 synthetic files took **45,503.66 ms**, warm `lumen serve` used **140,880 KiB (137.58 MiB)** (**146,960 KiB / 143.52 MiB** after visibility check hardening), and all 4,000 warm queries returned the expected path in the top 20:
 
-| Hot query class | p50 (ms) | p95 (ms) | p99 (ms) |
+| Hot Query Class | p50 (ms) | p95 (ms) | p99 (ms) |
 | :--- | ---: | ---: | ---: |
 | Latin name | 0.253 | 0.328 | 0.357 |
 | Chinese name | 0.495 | 1.195 | 1.368 |
 | Pinyin | 0.477 | 0.961 | 1.079 |
 | Multiword | 0.264 | 0.342 | 0.402 |
 
-These are selective, warm name queries over persistent CLI transport, including JSONL round-trip time—not launch, UI, full-text, or Spotlight comparison timings. See the [v0.4 baseline](benchmarks/v0.4-baseline.md) for the 100k run, concurrent rescan results, and methodology.
+> Note: Timings measure core engine / persistent CLI round-trip execution and resident RSS; end-to-end GUI latency also includes debounce and SwiftUI presentation. See [benchmarks/v0.4-baseline.md](benchmarks/v0.4-baseline.md) and [docs/BENCHMARK.md](docs/BENCHMARK.md) for methodology.
 
-## Development
+---
 
-Rust handles scanning, indexing, and retrieval. AppKit and SwiftUI provide the native interface.
+## Keyboard Shortcuts & Commands
 
-[Changelog](CHANGELOG.md) · [Architecture](docs/ARCHITECTURE.md) · [Compatibility](docs/COMPATIBILITY.md) · [Benchmark protocol](docs/BENCHMARK.md) · [Third-party dependencies](THIRD_PARTY.md)
+| Input or Shortcut | Action |
+| :--- | :--- |
+| **`⌃⇧Space`** (configurable) | Toggle Lumen non-activating search panel from anywhere |
+| **`?`** | Browse built-in commands with arrow keys and `Return` |
+| **`tr` / `qa` / `img`** | Streaming translation, on-prompt model Q&A, semantic image search |
+| **`g`** / `gh` / `wiki` / `map` | Web search shortcuts (configure aliases under **Settings → Quicklinks**) |
+| **`Return` / `⌘Return` / `⌘K`** | Open item, reveal in Finder, or open Context Actions menu |
+| **`Space` / `⌘Y` / `Esc`** | `Space` previews while browsing (types space normally while editing); `⌘Y` toggles preview; `Esc` closes preview first |
+| **`⇧⌘C` / `⌥⌘C`** | Copy file name or full path |
+| **`⌘,`** | Open native Settings |
+
+- Provider configuration: [docs/TRANSLATION.md](docs/TRANSLATION.md)
+- Offline models & vision setup: [docs/offline-gemma.md](docs/offline-gemma.md) · [docs/offline-image-search.md](docs/offline-image-search.md)
+
+---
+
+## Quick Start & Installation
+
+### Build from Source
+
+Requires an **Apple Silicon Mac**, **macOS 14+**, Xcode Command Line Tools, and Rust:
+
+```sh
+scripts/build-app.sh
+open target/Lumen.app
+```
+
+For daily use without repeated permission prompts, build with a persistent Keychain signing identity and install atomically in place:
+
+```sh
+LUMEN_SIGN_IDENTITY="Lumen Local Code Signing" scripts/build-app.sh
+python3 scripts/install-app.py install target/Lumen.app
+open -a "$HOME/Applications/Lumen.app"
+```
+
+See [docs/UPGRADING.md](docs/UPGRADING.md) for local signing, installation, and rollback details.
+
+### Signed Releases & Homebrew
+
+- **In-app updates**: Release-signed builds installed in a writable Applications folder support manual checks under **Settings → Advanced & Diagnostics → Check for Updates**, verifying release manifest signature, ZIP SHA-256, and app signature before replacing in place with backup rollback.
+- **Homebrew**: Upgrade via `brew upgrade --cask lumen`. Normal uninstall keeps user data; `--zap` removes preferences, scripts, and clipboard history.
+
+---
+
+## Development & Verification
+
+[Architecture](docs/ARCHITECTURE.md) · [Compatibility](docs/COMPATIBILITY.md) · [Changelog](CHANGELOG.md) · [Third-Party Dependencies](THIRD_PARTY.md)
 
 <details>
-<summary>Build and regression checks</summary>
+<summary>Build, lint, unit, and smoke verification gates</summary>
 
 ```sh
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 scripts/build-app.sh
-python3 scripts/smoke-updater.py
+LUMEN_SMOKE=1 scripts/build-app.sh
 python3 scripts/smoke-app.py
 python3 scripts/smoke-launcher.py
 python3 scripts/smoke-relaunch.py target/Lumen.app
 python3 scripts/smoke-translation.py
+python3 scripts/smoke-install-app.py
+python3 scripts/smoke-updater.py
 ```
 
-Use synthetic fixtures. Tests for AppKit and FSEvents depend on native macOS services. Simulated or skipped tests do not establish coverage on physical external drives or live third-party services.
+Synthetic fixtures are used across tests; AppKit and FSEvents verification requires an unlocked interactive macOS desktop session.
 
 </details>
 
-**Packaging a release:** Set `LUMEN_SIGN_IDENTITY` to the named Keychain identity and `LUMEN_MANIFEST_KEY` to a protected PEM of the same private key, kept outside the repository. Set `LUMEN_NOTARY_PROFILE` to a `notarytool` profile for public Developer ID releases. Run `scripts/package-release.sh OUTPUT_DIR RELEASE_NOTES.txt` and upload the ZIP and `lumen-update.json.cms` to the GitHub release tagged `v<version>`. Increment the bundle build number for every release. Use `version` and `sha256` from the emitted `lumen-update.json` to fill the [Cask template](packaging/homebrew/Casks/lumen.rb) before publishing it in a tap.
-
-Original source is released under the [MIT License](LICENSE). Lumen is independently implemented, with product inspiration from Tinycast, Oil Find, DigUp, and Luminator Index.
+Released under the [MIT License](LICENSE). Independently implemented with product inspiration from Tinycast, Oil Find, DigUp, and Luminator Index.

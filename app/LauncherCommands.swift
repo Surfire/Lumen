@@ -82,7 +82,7 @@ enum PanelGeometry {
     static let standardRowHeight: CGFloat = 44
     static let previewRowHeight: CGFloat = 60
     static let emptyResultsHeight: CGFloat = 56
-    static let inlinePreviewMinimumHeight: CGFloat = 176
+    static let inlinePreviewMinimumHeight: CGFloat = 360
 
     static func rowHeight(for result: LauncherResult) -> CGFloat {
         if case .file(let hit) = result, hit.hasPreview { return previewRowHeight }
@@ -529,13 +529,14 @@ struct LauncherCommandCard: View {
                 }
             }
         }
-        .padding(.horizontal, 16).padding(.vertical, 10)
+        .padding(.horizontal, 16)
+        .padding(.vertical, commands.resolution == .discovery ? 8 : 10)
     }
 
     private var discovery: some View {
         ScrollViewReader { scroll in
             ScrollView {
-                VStack(alignment: .leading, spacing: 3) {
+                VStack(alignment: .leading, spacing: 2) {
                     ForEach(Array(commands.entries.enumerated()), id: \.element.commandID) { index, item in
                         Button {
                             commands.choose(index)
@@ -549,7 +550,7 @@ struct LauncherCommandCard: View {
                                 Spacer()
                                 if let host = item.destinationHost { Text(host).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
                             }
-                            .padding(.horizontal, 8).frame(height: 29)
+                            .padding(.horizontal, 8).frame(height: 27)
                             .background(commands.selection == index ? Color.accentColor.opacity(0.17) : .clear,
                                         in: RoundedRectangle(cornerRadius: 6))
                         }

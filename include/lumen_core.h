@@ -5,12 +5,16 @@
 extern "C" {
 #endif
 
+#include <stdbool.h>
+
 typedef struct LumenSessionHandle LumenSessionHandle;
 
 /* Open a read-only catalog. Paths must be nonempty NUL-terminated UTF-8. root_path may
  * be NULL; the saved catalog scope is authoritative, as with lumen serve.
  * Returns NULL on failure. Serialize all calls on each handle, including close. */
 LumenSessionHandle *lumen_session_open(const char *database_path, const char *root_path);
+LumenSessionHandle *lumen_session_open_lane(const char *database_path, const char *root_path,
+                                            bool with_name_index);
 
 /* One NUL-terminated UTF-8 JSON request (no line framing). Use the lumen serve
  * name/text search, cached-hit validation, status, or excerpt fields; op may be omitted,

@@ -57,49 +57,54 @@ public struct MacInlinePreviewView: View {
                     .foregroundStyle(.secondary)
             case .ready(_, let content):
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 8) {
-                        if let evidence = content.evidence {
-                            let body = evidence.context ?? evidence.text
-                            Text(evidence.context != nil
-                                ? (evidence.match == .related
-                                    ? label("相关段落上下文", "Related excerpt context")
-                                    : label("文字匹配上下文", "Text match context"))
-                                : (evidence.match == .related
-                                    ? label("相关片段", "Related excerpt")
-                                    : label("文字匹配片段", "Text match excerpt")))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Text(highlighted(body, evidence: evidence))
-                                .font(.callout)
-                                .lineSpacing(3)
-                                .textSelection(.enabled)
-                        }
+                    VStack(alignment: .leading, spacing: 10) {
                         if let visual = content.visual {
                             switch visual {
                             case .image:
-                                bitmap(caption: label("图片预览", "Image preview"))
+                                bitmap(caption: label("图片预览", "Image preview"), hasEvidence: content.evidence != nil)
                             case .pdf(_, let displayedPage, let isMatchPage):
                                 bitmap(caption: isMatchPage
                                     ? label("命中第 \(displayedPage) 页", "Match on page \(displayedPage)")
-                                    : label("预览第 \(displayedPage) 页（未定位命中页）", "Page \(displayedPage) preview (match page unknown)"))
+                                    : label("预览第 \(displayedPage) 页（未定位命中页）", "Page \(displayedPage) preview (match page unknown)"),
+                                       hasEvidence: content.evidence != nil)
+                            }
+                        }
+                        if let evidence = content.evidence {
+                            let body = evidence.context ?? evidence.text
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(evidence.context != nil
+                                    ? (evidence.match == .related
+                                        ? label("相关段落上下文", "Related excerpt context")
+                                        : label("文字匹配上下文", "Text match context"))
+                                    : (evidence.match == .related
+                                        ? label("相关片段", "Related excerpt")
+                                        : label("文字匹配片段", "Text match excerpt")))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(highlighted(body, evidence: evidence))
+                                    .font(.callout)
+                                    .lineSpacing(3)
+                                    .textSelection(.enabled)
                             }
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxHeight: 360)
+                .frame(maxHeight: 380)
             }
         }
         .accessibilityIdentifier("lumen-inline-preview")
     }
 
-    @ViewBuilder private func bitmap(caption: String) -> some View {
+    @ViewBuilder private func bitmap(caption: String, hasEvidence: Bool) -> some View {
         if let image {
             Text(caption).font(.caption).foregroundStyle(.secondary)
             Image(nsImage: image)
                 .resizable()
                 .scaledToFit()
-                .frame(maxHeight: 285)
+                .frame(maxHeight: hasEvidence ? 192 : 224)
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5))
                 .accessibilityLabel(Text(caption))
         } else {
             Text(label("预览无法解码", "Preview could not be decoded")).foregroundStyle(.secondary)

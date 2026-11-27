@@ -65,13 +65,22 @@ pub unsafe extern "C" fn lumen_session_open(
     db: *const c_char,
     root: *const c_char,
 ) -> *mut LumenSessionHandle {
+    unsafe { lumen_session_open_lane(db, root, true) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lumen_session_open_lane(
+    db: *const c_char,
+    root: *const c_char,
+    with_name_index: bool,
+) -> *mut LumenSessionHandle {
     catch_unwind(|| -> Result<_> {
         let db = unsafe { input(db)? };
         ensure!(
             !db.is_empty() && (root.is_null() || !unsafe { input(root)? }.is_empty()),
             "empty path"
         );
-        let session = SearchSession::open(Path::new(db))?;
+        let session = SearchSession::open_with_names(Path::new(db), with_name_index)?;
         Ok(Box::into_raw(Box::new(LumenSessionHandle(session))))
     })
     .ok()
@@ -435,6 +444,36 @@ mod tests {
                 );
                 lumen_session_close(handle);
             }
+        }
+        unsafe {
+            let text_handle = lumen_session_open_lane(c_db.as_ptr(), c_root.as_ptr(), false);
+            assert!(!text_handle.is_null());
+            assert_eq!(
+                reply(lumen_session_search_json(text_handle, text_query.as_ptr())),
+                json!({"id":2,"hits":text})
+            );
+            assert_eq!(
+                reply(lumen_session_validate_json(
+                    text_handle,
+                    validation.as_ptr()
+                )),
+                json!({"id":4,"valid":[false,true]})
+            );
+            assert_eq!(
+                reply(lumen_session_status_json(
+                    text_handle,
+                    cr#"{"id":20}"#.as_ptr()
+                )),
+                json!({"id":20,"status":expected_status})
+            );
+            assert_eq!(
+                reply(lumen_session_excerpt_json(
+                    text_handle,
+                    excerpt_hit.as_ptr()
+                )),
+                json!({"id":13,"context":"the fixture needle"})
+            );
+            lumen_session_close(text_handle);
         }
     }
 }

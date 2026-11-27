@@ -134,6 +134,13 @@ impl Diagnosis {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SemanticTarget<'a> {
+    Gemma,
+    Model(&'a str, usize),
+    PendingOnly,
+}
+
 pub fn diagnose(database: &Path, path: &Path) -> Diagnosis {
     if !path.components().any(|c| c == Component::ParentDir)
         && let Ok(path) = absolute(path)
@@ -145,7 +152,71 @@ pub fn diagnose(database: &Path, path: &Path) -> Diagnosis {
     diagnose_catalog(database, path)
 }
 
+pub fn diagnose_with_model(database: &Path, path: &Path, model_id: &str, dims: usize) -> Diagnosis {
+    if !path.components().any(|c| c == Component::ParentDir)
+        && let Ok(path) = absolute(path)
+        && crate::external::is_external(&path)
+    {
+        return crate::external::diagnose(database, &path)
+            .unwrap_or_else(|| Diagnosis::blocked(Reason::IndexUnavailable));
+    }
+    diagnose_catalog_with_target(database, path, SemanticTarget::Model(model_id, dims))
+}
+
+pub fn diagnose_local_openai(
+    database: &Path,
+    path: &Path,
+    config: &crate::LocalOpenAiConfig,
+) -> anyhow::Result<Diagnosis> {
+    // Validate loopback boundary and model name before touching the catalog.
+    let worker = crate::local_openai::LocalOpenAiWorker::new(config)?;
+    anyhow::ensure!(
+        !worker.model().is_empty(),
+        "local OpenAI embedding model must not be empty"
+    );
+    if !path.components().any(|c| c == Component::ParentDir)
+        && let Ok(abs_path) = absolute(path)
+        && crate::external::is_external(&abs_path)
+    {
+        return Ok(crate::external::diagnose(database, &abs_path)
+            .unwrap_or_else(|| Diagnosis::blocked(Reason::IndexUnavailable)));
+    }
+    #[cfg(target_os = "macos")]
+    let Ok(_io) = crate::platform::NoMaterialization::enter() else {
+        return Ok(Diagnosis::blocked(Reason::Unknown));
+    };
+    if path.as_os_str().is_empty() || path.components().any(|c| c == Component::ParentDir) {
+        return Ok(Diagnosis::blocked(Reason::Unknown));
+    }
+    let Ok(path) = absolute(path) else {
+        return Ok(Diagnosis::blocked(Reason::Unknown));
+    };
+    let Ok(database) = absolute(database) else {
+        return Ok(Diagnosis::blocked(Reason::IndexUnavailable));
+    };
+    let Ok(conn) = open_read(&database) else {
+        return Ok(Diagnosis::blocked(Reason::IndexUnavailable));
+    };
+    let Ok(snapshot) = conn.unchecked_transaction() else {
+        return Ok(Diagnosis::blocked(Reason::IndexUnavailable));
+    };
+    let resolved = semantic::resolve_local_openai_target(&snapshot, config)?;
+    let target = match resolved.as_ref() {
+        Some((model_id, dims)) => SemanticTarget::Model(model_id, *dims),
+        None => SemanticTarget::PendingOnly,
+    };
+    Ok(inspect_with_target(&snapshot, &database, &path, target))
+}
+
 pub(super) fn diagnose_catalog(database: &Path, path: &Path) -> Diagnosis {
+    diagnose_catalog_with_target(database, path, SemanticTarget::Gemma)
+}
+
+fn diagnose_catalog_with_target(
+    database: &Path,
+    path: &Path,
+    target: SemanticTarget<'_>,
+) -> Diagnosis {
     #[cfg(target_os = "macos")]
     let Ok(_io) = crate::platform::NoMaterialization::enter() else {
         return Diagnosis::blocked(Reason::Unknown);
@@ -167,7 +238,7 @@ pub(super) fn diagnose_catalog(database: &Path, path: &Path) -> Diagnosis {
     let Ok(snapshot) = conn.unchecked_transaction() else {
         return Diagnosis::blocked(Reason::IndexUnavailable);
     };
-    inspect(&snapshot, &database, &path)
+    inspect_with_target(&snapshot, &database, &path, target)
 }
 
 /// Check one previously presented hit against the committed catalog and the
@@ -470,7 +541,12 @@ impl<'a> CatalogValidator<'a> {
     }
 }
 
-fn inspect(conn: &Connection, database: &Path, path: &Path) -> Diagnosis {
+fn inspect_with_target(
+    conn: &Connection,
+    database: &Path,
+    path: &Path,
+    target: SemanticTarget<'_>,
+) -> Diagnosis {
     let Ok(Some(scope)) = saved_index_scope(conn) else {
         return Diagnosis::blocked(Reason::ScopeUnknown);
     };
@@ -505,10 +581,20 @@ fn inspect(conn: &Connection, database: &Path, path: &Path) -> Diagnosis {
     }) {
         return Diagnosis::blocked(Reason::Excluded);
     }
-    inspect_file(conn, &scope, &file)
+    inspect_file_with_target(conn, &scope, &file, target)
 }
 
+#[cfg(test)]
 fn inspect_file(conn: &Connection, scope: &Scope, file: &Selected) -> Diagnosis {
+    inspect_file_with_target(conn, scope, file, SemanticTarget::Gemma)
+}
+
+fn inspect_file_with_target(
+    conn: &Connection,
+    scope: &Scope,
+    file: &Selected,
+    target: SemanticTarget<'_>,
+) -> Diagnosis {
     let Some(path) = file.path.to_str() else {
         return Diagnosis::blocked(Reason::Unsupported);
     };
@@ -540,9 +626,13 @@ fn inspect_file(conn: &Connection, scope: &Scope, file: &Selected) -> Diagnosis 
     let id = item.map(|row| row.0);
     let text = text_state(conn, scope, file, name, id);
     let semantic = match (text, id) {
-        (Reason::Indexed, Some(id)) => {
-            semantic::diagnose_gemma(conn, id).unwrap_or(Reason::Unknown)
-        }
+        (Reason::Indexed, Some(id)) => match target {
+            SemanticTarget::Gemma => semantic::diagnose_gemma(conn, id).unwrap_or(Reason::Unknown),
+            SemanticTarget::Model(model_id, dims) => {
+                semantic::diagnose_model(conn, id, model_id, dims).unwrap_or(Reason::Unknown)
+            }
+            SemanticTarget::PendingOnly => Reason::PendingGemma,
+        },
         _ => text,
     };
     Diagnosis {

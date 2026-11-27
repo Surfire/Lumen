@@ -9,6 +9,7 @@ mod image_decode;
 mod image_search;
 mod index;
 mod legacy_office;
+pub mod local_openai;
 mod model;
 mod name_fast;
 mod pinyin;
@@ -24,20 +25,27 @@ pub use content::{
     apply_content_scope_with_image_ocr, index_content, preview_content_scope,
 };
 pub use diagnose::verify_cached_access;
-pub use diagnose::{Diagnosis, Reason as DiagnoseReason, diagnose, validate_hit};
+pub use diagnose::{
+    Diagnosis, Reason as DiagnoseReason, diagnose, diagnose_local_openai, diagnose_with_model,
+    validate_hit,
+};
 pub use external::{VolumeStatus, forget_volume, index_volume, volumes};
 pub use gemma::{GemmaModel, ID as GEMMA_MODEL_ID};
 pub use image_search::{
     ImageSearchSession, MODEL_ID as IMAGE_MODEL_ID, image_batch, image_scope, image_status,
 };
 pub use index::{scan, scan_with_progress};
+pub use local_openai::{
+    LocalOpenAiConfig, LocalOpenAiWorker, ValidatedEndpoint, validate_loopback_url,
+};
 pub use model::{Model, ModelBackend};
 pub(crate) use name_fast::bucket_generation;
 pub use progress::{ScanPhase, ScanProgress, ScanProgressReporter};
 pub use query::allows_semantic as query_allows_semantic;
 pub use semantic::{
-    EmbedBatch, GemmaCoverage, GemmaSearchSession, embed, embed_batch, embed_with_backend,
-    gemma_coverage,
+    EmbedBatch, GemmaCoverage, GemmaSearchSession, SemanticSearchSession, embed, embed_batch,
+    embed_local_openai, embed_local_openai_batch, embed_with_backend, gemma_coverage,
+    local_openai_coverage, stream_local_openai,
 };
 pub use watch::{WatchEvent, watch, watch_with_launch_progress, watch_with_progress};
 
@@ -631,7 +639,7 @@ fn open_write(path: &Path, exclusive_indexer: bool) -> Result<(Connection, Optio
     }
     image_search::migrate_legacy_scope(&mut conn)?;
     image_search::ensure_schema(&conn)?;
-    semantic::ensure_gemma_queue(&conn)?;
+    semantic::ensure_active_pending_queue(&conn)?;
     Ok((conn, lease))
 }
 
@@ -1177,6 +1185,22 @@ pub fn status_with_scope(conn: &Connection, include_scope: bool) -> Result<serde
             "content_filter": scope.content_filter,
         });
     }
+    Ok(report)
+}
+
+pub fn status_with_local_openai(
+    conn: &Connection,
+    config: &LocalOpenAiConfig,
+) -> Result<serde_json::Value> {
+    let (model_id, dimensions, coverage) = semantic::local_openai_status_coverage(conn, config)?;
+    let mut report = status(conn)?;
+    let coverage_json = serde_json::to_value(&coverage)?;
+    report["gemma"] = coverage_json.clone();
+    report["local_openai"] = serde_json::json!({
+        "model_id": model_id,
+        "dimensions": dimensions,
+        "coverage": coverage_json,
+    });
     Ok(report)
 }
 

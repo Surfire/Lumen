@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use lumen::{ContentFilter, GemmaModel, Mode, Model, ModelBackend, PdfHelperPolicy, Scope};
+use lumen::{
+    ContentFilter, GemmaModel, LocalOpenAiConfig, Mode, Model, ModelBackend, PdfHelperPolicy, Scope,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -143,29 +145,60 @@ impl From<ScopeArgs> for Scope {
     }
 }
 
+#[derive(Args, Clone, Debug, Default)]
+struct OpenAiArgs {
+    /// Loopback OpenAI-compatible embedding endpoint URL (http://127.0.0.1..., localhost, [::1], or unix://).
+    #[arg(long, value_name = "URL", requires = "openai_model")]
+    openai_url: Option<String>,
+    /// Embedding model name served by the local OpenAI-compatible endpoint.
+    #[arg(long, value_name = "MODEL", requires = "openai_url")]
+    openai_model: Option<String>,
+}
+
+impl OpenAiArgs {
+    fn config(self) -> Option<LocalOpenAiConfig> {
+        self.openai_url
+            .zip(self.openai_model)
+            .map(|(url, model)| LocalOpenAiConfig { url, model })
+    }
+}
+
 #[derive(Args)]
 struct SemanticArgs {
     /// Select EmbeddingGemma 2 explicitly, including a partially built index for a diagnostic query.
-    #[arg(long, conflicts_with_all = ["helper", "language"])]
+    #[arg(long, conflicts_with_all = ["helper", "language", "openai_url", "openai_model"])]
     gemma: bool,
     /// Override the isolated EmbeddingGemma 2 resource directory.
     #[arg(long, conflicts_with_all = ["helper", "language"], value_name = "DIR")]
     gemma_home: Option<PathBuf>,
     /// Existing local model executable.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["openai_url", "openai_model"])]
     helper: Option<PathBuf>,
     /// Language profile (defaults to en for a helper).
     #[arg(long, requires = "helper")]
     language: Option<String>,
+    /// Loopback OpenAI-compatible embedding endpoint URL (http://127.0.0.1..., localhost, [::1], or unix://).
+    #[arg(long, value_name = "URL", requires = "openai_model", conflicts_with_all = ["gemma", "helper", "language"])]
+    openai_url: Option<String>,
+    /// Embedding model name served by the local OpenAI-compatible endpoint.
+    #[arg(long, value_name = "MODEL", requires = "openai_url", conflicts_with_all = ["gemma", "helper", "language"])]
+    openai_model: Option<String>,
 }
 
 enum ConfiguredModel {
     Helper(Model),
     Gemma(GemmaModel),
+    LocalOpenAi(LocalOpenAiConfig),
 }
 
 impl SemanticArgs {
     fn configure(self) -> Result<Option<ConfiguredModel>> {
+        if let Some((url, model)) = self.openai_url.zip(self.openai_model) {
+            return Ok(Some(ConfiguredModel::LocalOpenAi(LocalOpenAiConfig {
+                url,
+                model,
+            })));
+        }
         if self.gemma {
             return Ok(Some(ConfiguredModel::Gemma(GemmaModel::installed(
                 self.gemma_home.as_deref(),
@@ -185,6 +218,7 @@ impl ConfiguredModel {
         match self {
             Self::Helper(model) => ModelBackend::Helper(model),
             Self::Gemma(model) => ModelBackend::Gemma(model),
+            Self::LocalOpenAi(config) => ModelBackend::LocalOpenAi(config),
         }
     }
 }
@@ -301,7 +335,11 @@ enum Action {
     /// Remove an external volume catalog and its authorization.
     ForgetVolume { uuid: String },
     /// Explain one explicitly selected path using only metadata and the saved index.
-    Diagnose { path: PathBuf },
+    Diagnose {
+        #[command(flatten)]
+        openai: OpenAiArgs,
+        path: PathBuf,
+    },
     /// Embed the next batch of document chunks locally (defaults to Gemma).
     Embed {
         #[command(flatten)]
@@ -315,15 +353,22 @@ enum Action {
     },
     /// Check installed local semantic resources without modifying the index.
     ModelStatus {
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["openai_url", "openai_model"])]
         gemma: bool,
         #[arg(long, value_name = "DIR")]
         gemma_home: Option<PathBuf>,
         #[arg(long, default_value = "zh")]
         language: String,
+        #[command(flatten)]
+        openai: OpenAiArgs,
         /// Launch the worker and check pinned hashes, runtime and model format.
         #[arg(long)]
         verify: bool,
+    },
+    /// List models advertised by a strict loopback OpenAI-compatible local server.
+    OpenaiModels {
+        #[arg(long, value_name = "URL")]
+        url: String,
     },
     /// Check whether Gemma has indexed the opted-in document scope and is ready for the launcher.
     GemmaStatus {
@@ -337,6 +382,8 @@ enum Action {
     SemanticServe {
         #[arg(long, value_name = "DIR")]
         gemma_home: Option<PathBuf>,
+        #[command(flatten)]
+        openai: OpenAiArgs,
         #[arg(long)]
         check_access: bool,
     },
@@ -345,6 +392,8 @@ enum Action {
         /// Include the saved absolute directory rules and document setting.
         #[arg(long)]
         include_scope: bool,
+        #[command(flatten)]
+        openai: OpenAiArgs,
     },
     /// Persistent newline-delimited JSON query transport on stdio for the desktop launcher.
     Serve {
@@ -452,6 +501,39 @@ fn gemma_status(
         "coverage": coverage,
         "diagnostic": inspection.err().map(|error| format!("{error:#}")),
     })
+}
+
+fn local_openai_status(config: &LocalOpenAiConfig, verify: bool) -> serde_json::Value {
+    let result: Result<(Option<String>, Option<usize>)> = (|| {
+        let worker = lumen::LocalOpenAiWorker::new(config)?;
+        if verify {
+            let (signature, dims) = worker.probe()?;
+            Ok((Some(signature), Some(dims)))
+        } else {
+            worker.check_reachable()?;
+            Ok((None, None))
+        }
+    })();
+    match result {
+        Ok((signature, dimensions)) => json!({
+            "backend": "local_openai",
+            "model_id": signature,
+            "signature": signature,
+            "dimensions": dimensions,
+            "available": true,
+            "verified": verify,
+            "diagnostic": serde_json::Value::Null,
+        }),
+        Err(error) => json!({
+            "backend": "local_openai",
+            "model_id": serde_json::Value::Null,
+            "signature": serde_json::Value::Null,
+            "dimensions": serde_json::Value::Null,
+            "available": false,
+            "verified": false,
+            "diagnostic": format!("{error:#}"),
+        }),
+    }
 }
 
 const REQUEST_LINE_LIMIT: u64 = 16 * 1024;
@@ -705,8 +787,12 @@ fn main() -> Result<()> {
         Action::ForgetVolume { uuid } => {
             println!("{}", json!({"removed":lumen::forget_volume(&db, &uuid)?}));
         }
-        Action::Diagnose { path } => {
-            println!("{}", serde_json::to_string(&lumen::diagnose(&db, &path))?);
+        Action::Diagnose { openai, path } => {
+            let diagnosis = match openai.config() {
+                Some(config) => lumen::diagnose_local_openai(&db, &path, &config)?,
+                None => lumen::diagnose(&db, &path),
+            };
+            println!("{}", serde_json::to_string(&diagnosis)?);
         }
         Action::Embed {
             semantic,
@@ -738,11 +824,23 @@ fn main() -> Result<()> {
             gemma: _,
             gemma_home,
             language: _,
+            openai,
             verify,
         } => {
-            let inspection = GemmaModel::installed(gemma_home.as_deref())
-                .and_then(|model| model.inspect(verify));
-            println!("{}", gemma_status(inspection, verify, None));
+            if let Some(config) = openai.config() {
+                println!("{}", local_openai_status(&config, verify));
+            } else {
+                let inspection = GemmaModel::installed(gemma_home.as_deref())
+                    .and_then(|model| model.inspect(verify));
+                println!("{}", gemma_status(inspection, verify, None));
+            }
+        }
+        Action::OpenaiModels { url } => {
+            let models = lumen::local_openai::list_models_for_url(&url)?;
+            println!(
+                "{}",
+                serde_json::to_string(&json!({"url": url, "models": models}))?
+            );
         }
         Action::GemmaStatus { gemma_home, verify } => {
             let conn = lumen::open_read(&db)?;
@@ -815,12 +913,20 @@ fn main() -> Result<()> {
         }
         Action::SemanticServe {
             gemma_home,
+            openai,
             check_access,
         } => {
-            let mut session = lumen::GemmaSearchSession::open(
-                &db,
-                &GemmaModel::installed(gemma_home.as_deref())?,
-            )?;
+            let mut session = match openai.config() {
+                Some(config) => lumen::GemmaSearchSession::open_local_openai_with_gemma_home(
+                    &db,
+                    &config,
+                    gemma_home.as_deref(),
+                )?,
+                None => lumen::GemmaSearchSession::open(
+                    &db,
+                    &GemmaModel::installed(gemma_home.as_deref())?,
+                )?,
+            };
             serve_gemma(
                 io::stdin().lock(),
                 io::BufWriter::new(io::stdout().lock()),
@@ -833,9 +939,15 @@ fn main() -> Result<()> {
                 },
             )?;
         }
-        Action::Status { include_scope } => {
+        Action::Status {
+            include_scope,
+            openai,
+        } => {
             let conn = lumen::open_read(&db)?;
-            let mut report = lumen::status(&conn)?;
+            let mut report = match openai.config() {
+                Some(config) => lumen::status_with_local_openai(&conn, &config)?,
+                None => lumen::status(&conn)?,
+            };
             if include_scope && let Some(scope) = lumen::saved_index_scope(&conn)? {
                 report["scope"] = json!({
                     "roots": scope.roots,
@@ -985,5 +1097,206 @@ mod tests {
         assert!(Cli::try_parse_from(["lumen", "model-status", "--language", "zh"]).is_ok());
         assert!(Cli::try_parse_from(["lumen", "embed", "--bge"]).is_err());
         assert!(Cli::try_parse_from(["lumen", "model-status", "--bge-home", "/tmp"]).is_err());
+    }
+
+    #[test]
+    fn cli_openai_flags_enforce_pairing_conflicts_and_gemma_home_coexistence() {
+        // Valid OpenAI flag usage across all supported subcommands.
+        for args in [
+            vec![
+                "lumen",
+                "embed",
+                "--openai-url",
+                "http://127.0.0.1:8000/v1",
+                "--openai-model",
+                "bge-m3",
+                "--stream",
+            ],
+            vec![
+                "lumen",
+                "semantic-serve",
+                "--openai-url",
+                "http://127.0.0.1:8000/v1",
+                "--openai-model",
+                "bge-m3",
+                "--gemma-home",
+                "/tmp/gemma",
+            ],
+            vec![
+                "lumen",
+                "model-status",
+                "--openai-url",
+                "http://127.0.0.1:8000/v1",
+                "--openai-model",
+                "bge-m3",
+                "--verify",
+            ],
+            vec![
+                "lumen",
+                "status",
+                "--include-scope",
+                "--openai-url",
+                "http://127.0.0.1:8000/v1",
+                "--openai-model",
+                "bge-m3",
+            ],
+            vec![
+                "lumen",
+                "diagnose",
+                "--openai-url",
+                "http://127.0.0.1:8000/v1",
+                "--openai-model",
+                "bge-m3",
+                "--",
+                "/tmp/doc.txt",
+            ],
+            vec![
+                "lumen",
+                "openai-models",
+                "--url",
+                "http://127.0.0.1:8000/v1",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(&args).is_ok(),
+                "expected valid CLI args: {args:?}"
+            );
+        }
+
+        // Conflicts & missing pair flags must be rejected.
+        for bad in [
+            vec!["lumen", "embed", "--openai-url", "http://127.0.0.1:8000/v1"],
+            vec!["lumen", "embed", "--openai-model", "bge-m3"],
+            vec![
+                "lumen",
+                "embed",
+                "--gemma",
+                "--openai-url",
+                "http://127.0.0.1:8000/v1",
+                "--openai-model",
+                "bge-m3",
+            ],
+            vec![
+                "lumen",
+                "embed",
+                "--helper",
+                "/bin/true",
+                "--openai-url",
+                "http://127.0.0.1:8000/v1",
+                "--openai-model",
+                "bge-m3",
+            ],
+            vec![
+                "lumen",
+                "model-status",
+                "--gemma",
+                "--openai-url",
+                "http://127.0.0.1:8000/v1",
+                "--openai-model",
+                "bge-m3",
+            ],
+            vec!["lumen", "openai-models"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&bad).is_err(),
+                "expected invalid CLI args to be rejected: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_openai_status_emits_expected_local_model_status_fields() {
+        use std::{
+            io::{BufRead, BufReader, Read, Write},
+            net::TcpListener,
+            thread,
+        };
+
+        let bad = local_openai_status(
+            &LocalOpenAiConfig {
+                url: "https://api.openai.com/v1".into(),
+                model: "text-embedding-3-small".into(),
+            },
+            true,
+        );
+        assert_eq!(bad["available"], false);
+        assert_eq!(bad["verified"], false);
+        assert!(bad["signature"].is_null());
+        assert!(bad["dimensions"].is_null());
+        assert!(
+            bad["diagnostic"]
+                .as_str()
+                .is_some_and(|s| s.contains("https"))
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut req_line = String::new();
+                reader.read_line(&mut req_line).unwrap();
+                let mut content_len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let trimmed = line.trim_end_matches(['\r', '\n']);
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = trimmed.split_once(':')
+                        && k.trim().eq_ignore_ascii_case("content-length")
+                    {
+                        content_len = v.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0_u8; content_len];
+                if content_len > 0 {
+                    reader.read_exact(&mut body).unwrap();
+                }
+                let _ = reader;
+                let reply = if req_line.starts_with("GET /v1/models ") {
+                    let payload = r#"{"data":[{"id":"bge-m3"}]}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                        payload.len(),
+                        payload
+                    )
+                } else {
+                    let v = [1.0_f32; 16];
+                    let payload =
+                        serde_json::to_string(&json!({"data": [{"index": 0, "embedding": v}]}))
+                            .unwrap();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                        payload.len(),
+                        payload
+                    )
+                };
+                stream.write_all(reply.as_bytes()).unwrap();
+                let _ = stream.flush();
+            }
+        });
+
+        let cfg = LocalOpenAiConfig {
+            url: format!("http://127.0.0.1:{port}/v1"),
+            model: "bge-m3".into(),
+        };
+        let unchecked = local_openai_status(&cfg, false);
+        assert_eq!(unchecked["available"], true);
+        assert_eq!(unchecked["verified"], false);
+        assert!(unchecked["signature"].is_null());
+        assert!(unchecked["dimensions"].is_null());
+        assert!(unchecked["diagnostic"].is_null());
+
+        let verified = local_openai_status(&cfg, true);
+        assert_eq!(verified["available"], true);
+        assert_eq!(verified["verified"], true);
+        assert_eq!(verified["signature"], "openai-local:bge-m3@16");
+        assert_eq!(verified["dimensions"], 16);
+        assert!(verified["diagnostic"].is_null());
+
+        server.join().unwrap();
     }
 }

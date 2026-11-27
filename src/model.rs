@@ -51,7 +51,7 @@ impl Model {
 }
 
 #[derive(Debug)]
-pub(super) struct Unencodable;
+pub(crate) struct Unencodable;
 
 impl std::fmt::Display for Unencodable {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -65,6 +65,7 @@ impl std::error::Error for Unencodable {}
 pub enum ModelBackend<'a> {
     Helper(&'a Model),
     Gemma(&'a crate::GemmaModel),
+    LocalOpenAi(&'a crate::LocalOpenAiConfig),
 }
 
 #[derive(Clone, Copy)]
@@ -81,6 +82,7 @@ pub(super) struct Encoder<'a> {
 enum EncoderKind<'a> {
     Helper(&'a Model),
     Gemma(crate::gemma::GemmaWorker),
+    LocalOpenAi(crate::local_openai::LocalOpenAiWorker),
 }
 
 impl<'a> ModelBackend<'a> {
@@ -94,6 +96,14 @@ impl<'a> ModelBackend<'a> {
                 signature: crate::gemma::ID.into(),
                 kind: EncoderKind::Gemma(model.start()?),
             }),
+            Self::LocalOpenAi(config) => {
+                let worker = crate::local_openai::LocalOpenAiWorker::new(config)?;
+                let (signature, _) = worker.probe()?;
+                Ok(Encoder {
+                    signature,
+                    kind: EncoderKind::LocalOpenAi(worker),
+                })
+            }
         }
     }
 }
@@ -107,6 +117,10 @@ impl Encoder<'_> {
         let mut vector = match &mut self.kind {
             EncoderKind::Helper(model) => model.encode(text)?,
             EncoderKind::Gemma(worker) => worker.encode(role, text)?,
+            EncoderKind::LocalOpenAi(worker) => match role {
+                Role::Query => worker.encode_query(text)?,
+                Role::Passage => worker.encode_passage(text)?,
+            },
         };
         ensure!(
             (8..=4096).contains(&vector.len()) && vector.iter().all(|x| x.is_finite()),
@@ -126,14 +140,14 @@ impl Encoder<'_> {
     pub fn match_reason(&self) -> &'static str {
         match self.kind {
             EncoderKind::Helper(_) => "semantic",
-            EncoderKind::Gemma(_) => "semantic_candidate",
+            EncoderKind::Gemma(_) | EncoderKind::LocalOpenAi(_) => "semantic_candidate",
         }
     }
 
     pub fn includes(&self, score: f32) -> bool {
         match self.kind {
             EncoderKind::Helper(_) => score > 0.25,
-            EncoderKind::Gemma(_) => score > 0.0,
+            EncoderKind::Gemma(_) | EncoderKind::LocalOpenAi(_) => score > 0.0,
         }
     }
 }

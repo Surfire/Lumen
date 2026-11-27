@@ -3,6 +3,7 @@ use crate::{
     diagnose::read_snapshot,
     document_stamp_sql, gemma,
     index::{DocumentKind, in_explicit_content_root},
+    local_openai::{LocalOpenAiConfig, LocalOpenAiWorker, canonical_model_prefix},
     model::{Role, Unencodable},
     open_write, read_document_stamp, row_hit, saved_index_scope,
     vector::{Matrix, MatrixCache, adaptive_floor, pack},
@@ -12,7 +13,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::{
     collections::HashMap,
     ops::Range,
-    path::Path,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
     time::Instant,
 };
@@ -122,25 +123,33 @@ impl GemmaCoverage {
 }
 
 pub fn gemma_coverage(conn: &Connection) -> Result<GemmaCoverage> {
+    local_openai_coverage(conn, gemma::ID, gemma::DIMENSIONS)
+}
+
+pub fn local_openai_coverage(
+    conn: &Connection,
+    model_id: &str,
+    dims: usize,
+) -> Result<GemmaCoverage> {
     let tx = conn
         .is_autocommit()
         .then(|| conn.unchecked_transaction())
         .transpose()?;
-    let coverage = read_gemma_coverage(tx.as_deref().unwrap_or(conn))?;
+    let coverage = read_model_coverage(tx.as_deref().unwrap_or(conn), model_id, dims)?;
     if let Some(tx) = tx {
         tx.commit()?;
     }
     Ok(coverage)
 }
 
-fn read_gemma_coverage(conn: &Connection) -> Result<GemmaCoverage> {
+fn read_model_coverage(conn: &Connection, model_id: &str, dims: usize) -> Result<GemmaCoverage> {
     let mut coverage = GemmaCoverage {
         documents_enabled: documents_enabled(conn)?,
         embedded_chunks: 0,
         skipped_chunks: 0,
         pending: false,
         limited: false,
-        chunk_limit: gemma_limit(),
+        chunk_limit: vector_limit(dims as i64),
     };
     if !coverage.documents_enabled {
         return Ok(coverage);
@@ -155,12 +164,137 @@ fn read_gemma_coverage(conn: &Connection) -> Result<GemmaCoverage> {
         )?;
         return Ok(coverage);
     }
-    (coverage.embedded_chunks, coverage.skipped_chunks) = conn.prepare_cached(&format!(
-        "SELECT count(*) FILTER (WHERE {GEMMA_VECTOR}), count(*) FILTER (WHERE v.vector IS NULL) {GEMMA_LIVE}"
-    ))?.query_row(params![gemma::ID, GEMMA_VECTOR_BYTES], |row| Ok((row.get(0)?, row.get(1)?)))?;
-    coverage.pending = gemma_pending(conn)?;
-    coverage.limited = coverage.pending && gemma_count(conn)? >= coverage.chunk_limit;
+    (coverage.embedded_chunks, coverage.skipped_chunks) = conn
+        .prepare_cached(&format!(
+            "SELECT count(*) FILTER (WHERE {GEMMA_VECTOR}), count(*) FILTER (WHERE v.vector IS NULL) {GEMMA_LIVE}"
+        ))?
+        .query_row(params![model_id, vector_bytes(dims)], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+    coverage.pending = model_pending(conn, model_id)?;
+    coverage.limited = coverage.pending
+        && coverage.chunk_limit > 0
+        && model_count(conn, model_id)? >= coverage.chunk_limit;
     Ok(coverage)
+}
+
+fn parse_prefixed_model_dims(model_id: &str, prefix: &str) -> Option<usize> {
+    let suffix = model_id.strip_prefix(prefix)?;
+    let dims: usize = suffix.parse().ok()?;
+    (8..=4096).contains(&dims).then_some(dims)
+}
+
+pub(crate) fn resolve_stored_local_openai_model(
+    conn: &Connection,
+    model_name: &str,
+) -> Result<Option<(String, usize)>> {
+    let prefix = canonical_model_prefix(model_name);
+    let pending: Option<String> = conn
+        .prepare_cached("SELECT value FROM info WHERE key='gemma_pending_model'")?
+        .query_row([], |row| row.get(0))
+        .optional()?;
+    if let Some(model_id) = pending
+        && let Some(dims) = parse_prefixed_model_dims(&model_id, &prefix)
+    {
+        return Ok(Some((model_id, dims)));
+    }
+    if !has_gemma_store(conn)? {
+        return Ok(None);
+    }
+    // prefix always ends with '@' (0x40); upper bound swaps '@' -> 'A' (0x41)
+    // for an exact B-tree range lookup on PRIMARY KEY(model, ...).
+    let mut upper = prefix.clone();
+    upper.pop();
+    upper.push('A');
+    let from_counts: Option<String> = conn
+        .prepare_cached(
+            "SELECT model FROM semantic_vector_count
+             WHERE model >= ?1 AND model < ?2
+             ORDER BY vectors DESC, model ASC LIMIT 1",
+        )?
+        .query_row(params![&prefix, &upper], |row| row.get(0))
+        .optional()?;
+    if let Some(model_id) = from_counts
+        && let Some(dims) = parse_prefixed_model_dims(&model_id, &prefix)
+    {
+        return Ok(Some((model_id, dims)));
+    }
+    let from_vectors: Option<String> = conn
+        .prepare_cached(
+            "SELECT model FROM semantic_vector
+             WHERE model >= ?1 AND model < ?2
+             LIMIT 1",
+        )?
+        .query_row(params![&prefix, &upper], |row| row.get(0))
+        .optional()?;
+    if let Some(model_id) = from_vectors
+        && let Some(dims) = parse_prefixed_model_dims(&model_id, &prefix)
+    {
+        return Ok(Some((model_id, dims)));
+    }
+    Ok(None)
+}
+
+pub(crate) fn resolve_local_openai_target(
+    conn: &Connection,
+    config: &LocalOpenAiConfig,
+) -> Result<Option<(String, usize)>> {
+    let worker = LocalOpenAiWorker::new(config)?;
+    ensure!(
+        !worker.model().is_empty(),
+        "local OpenAI embedding model must not be empty"
+    );
+    if let Some(stored) = resolve_stored_local_openai_model(conn, worker.model())? {
+        return Ok(Some(stored));
+    }
+    Ok(worker.probe().ok())
+}
+
+pub(crate) fn local_openai_status_coverage(
+    conn: &Connection,
+    config: &LocalOpenAiConfig,
+) -> Result<(Option<String>, Option<usize>, GemmaCoverage)> {
+    let target = resolve_local_openai_target(conn, config)?;
+    if let Some((model_id, dims)) = target {
+        let coverage = local_openai_coverage(conn, &model_id, dims)?;
+        return Ok((Some(model_id), Some(dims), coverage));
+    }
+    let docs_enabled = documents_enabled(conn)?;
+    let pending = if !docs_enabled {
+        false
+    } else if !has_gemma_store(conn)? {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM document JOIN item USING(id) WHERE availability IN ('local','provider_metadata_only'))",
+            [],
+            |row| row.get(0),
+        )?
+    } else {
+        conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM semantic_chunk c JOIN item i ON i.id=c.document_id
+                JOIN document_state ds ON ds.id=c.document_id
+                WHERE i.availability IN ('local','provider_metadata_only')
+             ) OR EXISTS(
+                SELECT 1 FROM semantic_document p JOIN item i ON i.id=p.document_id
+                JOIN document_state ds ON ds.id=p.document_id
+                WHERE p.prepared=0 AND i.availability IN ('local','provider_metadata_only')
+             )",
+            [],
+            |row| row.get(0),
+        )?
+    };
+    Ok((
+        None,
+        None,
+        GemmaCoverage {
+            documents_enabled: docs_enabled,
+            embedded_chunks: 0,
+            skipped_chunks: 0,
+            pending,
+            limited: false,
+            chunk_limit: 0,
+        },
+    ))
 }
 
 fn has_gemma_store(conn: &Connection) -> Result<bool> {
@@ -172,22 +306,37 @@ fn has_gemma_store(conn: &Connection) -> Result<bool> {
         .query_row([], |row| row.get(0))?)
 }
 
-fn gemma_searchable(conn: &Connection) -> Result<bool> {
-    read_snapshot(conn, read_gemma_searchable)
+fn model_searchable(conn: &Connection, model_id: &str, dims: usize) -> Result<bool> {
+    read_snapshot(conn, |snapshot| {
+        read_model_searchable(snapshot, model_id, dims)
+    })
 }
 
-fn read_gemma_searchable(conn: &Connection) -> Result<bool> {
+fn gemma_searchable(conn: &Connection) -> Result<bool> {
+    model_searchable(conn, gemma::ID, gemma::DIMENSIONS)
+}
+
+fn read_model_searchable(conn: &Connection, model_id: &str, dims: usize) -> Result<bool> {
     Ok(documents_enabled(conn)?
         && has_gemma_store(conn)?
         && conn
             .prepare_cached(&format!(
                 "SELECT EXISTS(SELECT 1 {GEMMA_LIVE} AND {GEMMA_VECTOR})"
             ))?
-            .query_row(params![gemma::ID, GEMMA_VECTOR_BYTES], |row| {
+            .query_row(params![model_id, vector_bytes(dims)], |row| {
                 row.get::<_, bool>(0)
             })?)
 }
 
+fn read_gemma_searchable(conn: &Connection) -> Result<bool> {
+    read_model_searchable(conn, gemma::ID, gemma::DIMENSIONS)
+}
+
+fn vector_bytes(dims: usize) -> i64 {
+    (dims * size_of::<f32>()) as i64
+}
+
+#[cfg(test)]
 const GEMMA_VECTOR_BYTES: i64 = (gemma::DIMENSIONS * size_of::<f32>()) as i64;
 
 const GEMMA_LIVE: &str = "FROM semantic_vector v JOIN semantic_chunk c ON c.id=v.chunk_id
@@ -197,6 +346,8 @@ const GEMMA_VECTOR: &str = "typeof(v.vector)='blob' AND length(v.vector) IN (?2/
 const GEMMA_MIN_COSINE: f32 = f32::MIN_POSITIVE;
 const GEMMA_CORPUS_MIN_COSINE: f32 = 0.78;
 const GEMMA_Z_THRESHOLD: f64 = 2.2;
+const LOCAL_OPENAI_CORPUS_MIN_COSINE: f32 = 0.25;
+const LOCAL_OPENAI_Z_THRESHOLD: f64 = 1.5;
 const GEMMA_MIN_CHUNK_BYTES: usize = 24;
 
 fn scope_state(conn: &Connection) -> Result<(Option<String>, bool)> {
@@ -223,7 +374,7 @@ const GEMMA_QUEUE: &str = "FROM semantic_chunk c JOIN item i ON i.id=c.document_
 
 const GEMMA_QUEUE_FAST: &str = "FROM gemma_pending_chunk CROSS JOIN semantic_chunk c ON c.id=gemma_pending_chunk.chunk_id CROSS JOIN item i ON i.id=c.document_id CROSS JOIN document_state ds ON ds.id=c.document_id WHERE i.availability IN ('local','provider_metadata_only')";
 
-fn has_gemma_pending_queue(conn: &Connection) -> Result<bool> {
+fn has_model_pending_queue(conn: &Connection, model_id: &str) -> Result<bool> {
     let tables: bool = conn
         .prepare_cached(
             "SELECT count(*)=2 FROM sqlite_schema
@@ -237,14 +388,46 @@ fn has_gemma_pending_queue(conn: &Connection) -> Result<bool> {
         .prepare_cached("SELECT value FROM info WHERE key='gemma_pending_model'")?
         .query_row([], |row| row.get(0))
         .optional()?;
-    Ok(model.as_deref() == Some(gemma::ID))
+    Ok(model.as_deref() == Some(model_id))
 }
 
-pub(crate) fn ensure_gemma_queue(conn: &Connection) -> Result<()> {
-    if has_gemma_pending_queue(conn)? || !has_gemma_store(conn)? {
+#[cfg(test)]
+fn has_gemma_pending_queue(conn: &Connection) -> Result<bool> {
+    has_model_pending_queue(conn, gemma::ID)
+}
+
+/// Preserve an already-active `openai-local:` or built-in Gemma pending queue on
+/// generic writer opens (`watch`/`content`), initializing Gemma when absent or stale.
+pub(crate) fn ensure_active_pending_queue(conn: &Connection) -> Result<()> {
+    if !has_gemma_store(conn)? {
         return Ok(());
     }
-    let model_sql = gemma::ID.replace('\'', "''");
+    let tables: bool = conn
+        .prepare_cached(
+            "SELECT count(*)=2 FROM sqlite_schema
+             WHERE type='table' AND name IN ('gemma_pending_chunk','semantic_vector')",
+        )?
+        .query_row([], |row| row.get(0))?;
+    if tables {
+        let model: Option<String> = conn
+            .prepare_cached("SELECT value FROM info WHERE key='gemma_pending_model'")?
+            .query_row([], |row| row.get(0))
+            .optional()?;
+        if model
+            .as_deref()
+            .is_some_and(|m| m == gemma::ID || m.starts_with("openai-local:"))
+        {
+            return Ok(());
+        }
+    }
+    ensure_model_queue(conn, gemma::ID)
+}
+
+pub(crate) fn ensure_model_queue(conn: &Connection, model_id: &str) -> Result<()> {
+    if has_model_pending_queue(conn, model_id)? || !has_gemma_store(conn)? {
+        return Ok(());
+    }
+    let model_sql = model_id.replace('\'', "''");
     let ddl = format!(
         "CREATE TABLE IF NOT EXISTS gemma_pending_chunk(chunk_id INTEGER PRIMARY KEY);
          DROP TRIGGER IF EXISTS gemma_pending_chunk_inserted;
@@ -290,16 +473,20 @@ pub(crate) fn ensure_gemma_queue(conn: &Connection) -> Result<()> {
              SELECT 1 FROM semantic_vector v INDEXED BY semantic_vector_chunk
              WHERE v.model=?1 AND v.chunk_id=c.id
          )",
-        [gemma::ID],
+        [model_id],
     )?;
     db.execute(
         "INSERT OR REPLACE INTO info(key,value) VALUES('gemma_pending_model',?1)",
-        [gemma::ID],
+        [model_id],
     )?;
     if let Some(tx) = tx {
         tx.commit()?;
     }
     Ok(())
+}
+
+pub(crate) fn ensure_gemma_queue(conn: &Connection) -> Result<()> {
+    ensure_model_queue(conn, gemma::ID)
 }
 
 fn gemma_queue_fetch_sql(fast: bool) -> String {
@@ -318,8 +505,8 @@ fn gemma_queue_fetch_sql(fast: bool) -> String {
     }
 }
 
-fn gemma_pending(conn: &Connection) -> Result<bool> {
-    if has_gemma_pending_queue(conn)? {
+fn model_pending(conn: &Connection, model_id: &str) -> Result<bool> {
+    if has_model_pending_queue(conn, model_id)? {
         return Ok(conn
             .prepare_cached(&format!(
                 "SELECT EXISTS(SELECT 1 {GEMMA_QUEUE_FAST}) OR EXISTS(
@@ -336,18 +523,28 @@ fn gemma_pending(conn: &Connection) -> Result<bool> {
             JOIN document_state ds ON ds.id=p.document_id
             WHERE p.prepared=0 AND i.availability IN ('local','provider_metadata_only'))"
         ))?
-        .query_row([gemma::ID], |row| row.get(0))?)
+        .query_row([model_id], |row| row.get(0))?)
 }
 
-fn gemma_count(conn: &Connection) -> Result<i64> {
+#[cfg(test)]
+fn gemma_pending(conn: &Connection) -> Result<bool> {
+    model_pending(conn, gemma::ID)
+}
+
+fn model_count(conn: &Connection, model_id: &str) -> Result<i64> {
     Ok(conn
         .prepare_cached(
             "SELECT coalesce((SELECT vectors FROM semantic_vector_count WHERE model=?1),0)",
         )?
-        .query_row([gemma::ID], |row| row.get(0))?)
+        .query_row([model_id], |row| row.get(0))?)
 }
 
-pub(super) fn diagnose_gemma(conn: &Connection, document: i64) -> Result<crate::diagnose::Reason> {
+pub(super) fn diagnose_model(
+    conn: &Connection,
+    document: i64,
+    model_id: &str,
+    dims: usize,
+) -> Result<crate::diagnose::Reason> {
     use crate::diagnose::Reason;
     if !has_gemma_store(conn)? {
         return Ok(Reason::PendingGemma);
@@ -359,7 +556,7 @@ pub(super) fn diagnose_gemma(conn: &Connection, document: i64) -> Result<crate::
          FROM semantic_chunk c LEFT JOIN semantic_vector v ON v.chunk_id=c.id AND v.model=?1
          WHERE c.document_id=?3"
         ))?
-        .query_row(params![gemma::ID, GEMMA_VECTOR_BYTES, document], |r| {
+        .query_row(params![model_id, vector_bytes(dims), document], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         })?;
     if indexed > 0 {
@@ -375,10 +572,15 @@ pub(super) fn diagnose_gemma(conn: &Connection, document: i64) -> Result<crate::
     if prepared == Some(true) && total == skipped {
         return Ok(Reason::GemmaSkipped);
     }
-    if gemma_count(conn)? >= gemma_limit() {
+    let limit = vector_limit(dims as i64);
+    if limit > 0 && model_count(conn, model_id)? >= limit {
         return Ok(Reason::GemmaLimited);
     }
     Ok(Reason::PendingGemma)
+}
+
+pub(super) fn diagnose_gemma(conn: &Connection, document: i64) -> Result<crate::diagnose::Reason> {
+    diagnose_model(conn, document, gemma::ID, gemma::DIMENSIONS)
 }
 
 fn gemma_limit() -> i64 {
@@ -420,8 +622,24 @@ impl PassageEncoder for gemma::GemmaWorker {
     }
 }
 
-fn embed_gemma_batch(
+impl PassageEncoder for LocalOpenAiWorker {
+    fn encode_passage(&mut self, text: &str) -> Result<Vec<f32>> {
+        LocalOpenAiWorker::encode_passage(self, text)
+    }
+
+    fn batch_size(&self) -> usize {
+        crate::local_openai::PASSAGE_BATCH
+    }
+
+    fn encode_passages(&mut self, texts: &[&str]) -> Result<Vec<Option<Vec<f32>>>> {
+        LocalOpenAiWorker::encode_passages(self, texts)
+    }
+}
+
+fn embed_model_batch(
     conn: &mut Connection,
+    model_id: &str,
+    dims: usize,
     encoder: &mut impl PassageEncoder,
     max: usize,
     initial_scope: Option<&str>,
@@ -431,8 +649,8 @@ fn embed_gemma_batch(
     if !enabled || initial_scope.is_some_and(|expected| scope_now.as_deref() != Some(expected)) {
         return Ok((EmbedBatch::default(), true));
     }
-    let limit = gemma_limit();
-    if gemma_count(conn)? >= limit || !gemma_pending(conn)? {
+    let limit = vector_limit(dims as i64);
+    if model_count(conn, model_id)? >= limit || !model_pending(conn, model_id)? {
         return Ok((EmbedBatch::default(), false));
     }
     let max = max.clamp(1, MAX_BATCH);
@@ -440,7 +658,7 @@ fn embed_gemma_batch(
     let mut prepared = 0;
     let mut after = 0_i64;
     let extra_budget = max.max(32);
-    let fast_queue = has_gemma_pending_queue(conn)?;
+    let fast_queue = has_model_pending_queue(conn, model_id)?;
     let fetch_sql = gemma_queue_fetch_sql(fast_queue);
     while items.len() < max {
         if stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
@@ -457,7 +675,7 @@ fn embed_gemma_batch(
         let rows = if fast_queue {
             stmt.query_map(params![after, remaining], map_row)?
         } else {
-            stmt.query_map(params![gemma::ID, after, remaining], map_row)?
+            stmt.query_map(params![model_id, after, remaining], map_row)?
         };
         // A short fetch drains the queue, so later chunks come from newly
         // prepared documents whose AUTOINCREMENT ids exceed every fetched id.
@@ -480,8 +698,10 @@ fn embed_gemma_batch(
         let (scope_now, enabled) = scope_state(conn)?;
         let scope_mismatch =
             initial_scope.is_some_and(|expected| scope_now.as_deref() != Some(expected));
-        let has_more =
-            enabled && !scope_mismatch && gemma_count(conn)? < limit && gemma_pending(conn)?;
+        let has_more = enabled
+            && !scope_mismatch
+            && model_count(conn, model_id)? < limit
+            && model_pending(conn, model_id)?;
         return Ok((
             EmbedBatch {
                 has_more,
@@ -491,7 +711,7 @@ fn embed_gemma_batch(
         ));
     }
 
-    let remaining_cap = (limit - gemma_count(conn)?).max(0) as usize;
+    let remaining_cap = (limit - model_count(conn, model_id)?).max(0) as usize;
     let mut encoded = Vec::with_capacity(items.len());
     let mut valid_encoded = 0usize;
     let mut stopped = false;
@@ -506,12 +726,19 @@ fn embed_gemma_batch(
         let texts: Vec<&str> = group.iter().map(|(_, text)| text.as_str()).collect();
         let vectors = encoder
             .encode_passages(&texts)
-            .context("compute next Gemma document chunk")?;
+            .context("compute next semantic document chunk")?;
         ensure!(
             vectors.len() == group.len(),
-            "Gemma returned a mismatched passage batch"
+            "embedding encoder returned a mismatched passage batch"
         );
         for ((id, _), vector) in group.iter().zip(vectors) {
+            if let Some(ref values) = vector {
+                ensure!(
+                    values.len() == dims,
+                    "embedding encoder returned {} dimensions, expected {dims}",
+                    values.len()
+                );
+            }
             valid_encoded += usize::from(vector.is_some());
             encoded.push((*id, vector.map(|vector| pack(&vector))));
         }
@@ -526,7 +753,7 @@ fn embed_gemma_batch(
         {
             scope_changed = true;
         } else {
-            let mut count = gemma_count(&tx)?;
+            let mut count = model_count(&tx, model_id)?;
             let mut insert = tx.prepare_cached(
                 "INSERT OR IGNORE INTO semantic_vector(model,chunk_id,vector)
                  SELECT ?1,c.id,?3 FROM semantic_chunk c JOIN item i ON i.id=c.document_id
@@ -536,7 +763,7 @@ fn embed_gemma_batch(
                 if vector.is_some() && count >= limit {
                     break;
                 }
-                let saved = insert.execute(params![gemma::ID, id, vector])?;
+                let saved = insert.execute(params![model_id, id, vector])?;
                 if vector.is_some() {
                     count += saved as i64;
                     report.new_embeddings += saved;
@@ -551,10 +778,30 @@ fn embed_gemma_batch(
     let (scope_now, enabled) = scope_state(conn)?;
     let scope_mismatch =
         initial_scope.is_some_and(|expected| scope_now.as_deref() != Some(expected));
-    report.has_more =
-        enabled && !scope_mismatch && gemma_count(conn)? < limit && gemma_pending(conn)?;
+    report.has_more = enabled
+        && !scope_mismatch
+        && model_count(conn, model_id)? < limit
+        && model_pending(conn, model_id)?;
     let yielded = stopped || scope_changed || !enabled || scope_mismatch;
     Ok((report, yielded))
+}
+
+fn embed_gemma_batch(
+    conn: &mut Connection,
+    encoder: &mut impl PassageEncoder,
+    max: usize,
+    initial_scope: Option<&str>,
+    stop: Option<&AtomicBool>,
+) -> Result<(EmbedBatch, bool)> {
+    embed_model_batch(
+        conn,
+        gemma::ID,
+        gemma::DIMENSIONS,
+        encoder,
+        max,
+        initial_scope,
+        stop,
+    )
 }
 
 fn embed_gemma(conn: &mut Connection, model: &crate::GemmaModel, max: usize) -> Result<EmbedBatch> {
@@ -563,24 +810,30 @@ fn embed_gemma(conn: &mut Connection, model: &crate::GemmaModel, max: usize) -> 
         "Gemma requires explicit document indexing scope"
     );
     ensure_gemma_queue(conn)?;
-    if gemma_count(conn)? >= gemma_limit() || !gemma_pending(conn)? {
+    if model_count(conn, gemma::ID)? >= gemma_limit() || !model_pending(conn, gemma::ID)? {
         return Ok(EmbedBatch::default());
     }
     let mut encoder = model.start()?;
     Ok(embed_gemma_batch(conn, &mut encoder, max, None, None)?.0)
 }
 
-fn stream_gemma_with<E: PassageEncoder>(
+fn stream_model_with<E: PassageEncoder>(
     conn: &mut Connection,
+    model_id: &str,
+    dims: usize,
     max: usize,
     stop: &AtomicBool,
     connect: impl FnOnce() -> Result<E>,
     mut emit: impl FnMut(&EmbedBatch) -> Result<()>,
 ) -> Result<()> {
     let (initial_scope, enabled) = scope_state(conn)?;
-    ensure!(enabled, "Gemma requires explicit document indexing scope");
-    ensure_gemma_queue(conn)?;
-    if gemma_count(conn)? >= gemma_limit() || !gemma_pending(conn)? {
+    ensure!(
+        enabled,
+        "semantic indexing requires explicit document indexing scope"
+    );
+    ensure_model_queue(conn, model_id)?;
+    let limit = vector_limit(dims as i64);
+    if model_count(conn, model_id)? >= limit || !model_pending(conn, model_id)? {
         emit(&EmbedBatch::default())?;
         return Ok(());
     }
@@ -590,8 +843,10 @@ fn stream_gemma_with<E: PassageEncoder>(
             break;
         }
         let started = Instant::now();
-        let (batch, yielded) = embed_gemma_batch(
+        let (batch, yielded) = embed_model_batch(
             conn,
+            model_id,
+            dims,
             &mut encoder,
             max,
             initial_scope.as_deref(),
@@ -611,8 +866,89 @@ fn stream_gemma_with<E: PassageEncoder>(
     Ok(())
 }
 
+fn stream_gemma_with<E: PassageEncoder>(
+    conn: &mut Connection,
+    max: usize,
+    stop: &AtomicBool,
+    connect: impl FnOnce() -> Result<E>,
+    emit: impl FnMut(&EmbedBatch) -> Result<()>,
+) -> Result<()> {
+    stream_model_with(conn, gemma::ID, gemma::DIMENSIONS, max, stop, connect, emit)
+}
+
+pub fn embed_local_openai(
+    database: &Path,
+    config: &LocalOpenAiConfig,
+    max: usize,
+) -> Result<usize> {
+    Ok(embed_local_openai_batch(database, config, max)?.new_embeddings)
+}
+
+pub fn embed_local_openai_batch(
+    database: &Path,
+    config: &LocalOpenAiConfig,
+    max: usize,
+) -> Result<EmbedBatch> {
+    let database = absolute(database)?;
+    ensure!(
+        crate::open_read(&database).and_then(|conn| documents_enabled(&conn))?,
+        "local OpenAI embedding requires explicit document indexing scope"
+    );
+    let mut worker = LocalOpenAiWorker::new(config)?;
+    let (model_id, dims) = worker.probe()?;
+    let (mut conn, _lease) = open_write(&database, false)?;
+    ensure_model_queue(&conn, &model_id)?;
+    if model_count(&conn, &model_id)? >= vector_limit(dims as i64)
+        || !model_pending(&conn, &model_id)?
+    {
+        return Ok(EmbedBatch::default());
+    }
+    Ok(embed_model_batch(&mut conn, &model_id, dims, &mut worker, max, None, None)?.0)
+}
+
+pub fn stream_local_openai(
+    database: &Path,
+    config: &LocalOpenAiConfig,
+    max: usize,
+    stop: &AtomicBool,
+    emit: impl FnMut(&EmbedBatch) -> Result<()>,
+) -> Result<()> {
+    let database = absolute(database)?;
+    ensure!(
+        crate::open_read(&database).and_then(|conn| documents_enabled(&conn))?,
+        "local OpenAI embedding requires explicit document indexing scope"
+    );
+    let worker = LocalOpenAiWorker::new(config)?;
+    let (model_id, dims) = worker.probe()?;
+    let (mut conn, _lease) = open_write(&database, false)?;
+    let mut worker = Some(worker);
+    stream_model_with(
+        &mut conn,
+        &model_id,
+        dims,
+        max,
+        stop,
+        || worker.take().context("local OpenAI worker already started"),
+        emit,
+    )
+}
+
+pub(super) enum LocalOpenAiImageBackend {
+    None,
+    Ready(gemma::GemmaWorker),
+    LazyHome(Option<PathBuf>),
+    #[cfg(test)]
+    Fixture(Box<dyn FnMut() -> Vec<f32> + Send>),
+}
+
 pub(super) enum GemmaQuery {
     Worker(gemma::GemmaWorker),
+    LocalOpenAi {
+        worker: LocalOpenAiWorker,
+        model_id: String,
+        dims: usize,
+        image_backend: LocalOpenAiImageBackend,
+    },
     #[cfg(test)]
     Fixture(Box<dyn FnMut() -> Vec<f32> + Send>),
 }
@@ -621,18 +957,22 @@ impl GemmaQuery {
     pub fn encode(&mut self, text: &str) -> Result<Vec<f32>> {
         match self {
             Self::Worker(worker) => worker.encode(Role::Query, text),
+            Self::LocalOpenAi { worker, .. } => worker.encode_query(text),
             #[cfg(test)]
             Self::Fixture(encode) => Ok(encode()),
         }
     }
 }
 
+pub type SemanticSearchSession = GemmaSearchSession;
+
 pub struct GemmaSearchSession {
     conn: Connection,
     worker: GemmaQuery,
     matrix: MatrixCache<Paragraph>,
     /// Present when the Gemma image projector is installed: stored image
-    /// vectors are blended into unified semantic results.
+    /// vectors are blended into unified semantic results for built-in Gemma,
+    /// and queried independently via `search_images` for Local OpenAI sessions.
     images: Option<crate::image_search::ImageCache>,
 }
 
@@ -701,12 +1041,117 @@ impl GemmaSearchSession {
         })
     }
 
+    pub fn open_local_openai(
+        database: &Path,
+        config: &LocalOpenAiConfig,
+        image_gemma: Option<&crate::GemmaModel>,
+    ) -> Result<Self> {
+        let conn = crate::open_read(database)?;
+        let worker = LocalOpenAiWorker::new(config)?;
+        let (model_id, dims) = worker.probe()?;
+        let has_text = model_searchable(&conn, &model_id, dims)?;
+        let has_projector = image_gemma.is_some_and(crate::GemmaModel::has_image_projector);
+        let has_images = has_projector && crate::image_search::has_vectors(&conn)?;
+        ensure!(
+            has_text || has_images,
+            "no current local OpenAI embeddings: run lumen embed --openai-url ... --openai-model ... first"
+        );
+        let image_backend = if has_images {
+            let model = image_gemma.expect("image_gemma present when has_images");
+            let started = model.start().and_then(|mut w| {
+                w.probe()?;
+                Ok(w)
+            });
+            match started {
+                Ok(w) => LocalOpenAiImageBackend::Ready(w),
+                Err(_) if has_text => LocalOpenAiImageBackend::None,
+                Err(err) => return Err(err),
+            }
+        } else {
+            LocalOpenAiImageBackend::None
+        };
+        let images =
+            (!matches!(image_backend, LocalOpenAiImageBackend::None)).then(Default::default);
+        Ok(Self {
+            conn,
+            worker: GemmaQuery::LocalOpenAi {
+                worker,
+                model_id,
+                dims,
+                image_backend,
+            },
+            matrix: MatrixCache::default(),
+            images,
+        })
+    }
+
+    /// Open a Local OpenAI text session while deferring built-in Gemma startup
+    /// until `search_images` is explicitly called, avoiding cold-start overhead
+    /// on pure text queries.
+    pub fn open_local_openai_with_gemma_home(
+        database: &Path,
+        config: &LocalOpenAiConfig,
+        gemma_home: Option<&Path>,
+    ) -> Result<Self> {
+        let conn = crate::open_read(database)?;
+        let worker = LocalOpenAiWorker::new(config)?;
+        let (model_id, dims) = worker.probe()?;
+        let has_text = model_searchable(&conn, &model_id, dims)?;
+        let has_projector =
+            crate::GemmaModel::installed(gemma_home).is_ok_and(|m| m.has_image_projector());
+        let has_images = has_projector && crate::image_search::has_vectors(&conn)?;
+        ensure!(
+            has_text || has_images,
+            "no current local OpenAI embeddings: run lumen embed --openai-url ... --openai-model ... first"
+        );
+        let image_backend = if has_projector {
+            LocalOpenAiImageBackend::LazyHome(gemma_home.map(Path::to_path_buf))
+        } else {
+            LocalOpenAiImageBackend::None
+        };
+        Ok(Self {
+            conn,
+            worker: GemmaQuery::LocalOpenAi {
+                worker,
+                model_id,
+                dims,
+                image_backend,
+            },
+            matrix: MatrixCache::default(),
+            images: has_projector.then(Default::default),
+        })
+    }
+
     pub fn search(&mut self, query: &str, limit: usize) -> Result<Vec<Hit>> {
         let query = query.trim();
         if query.is_empty() || query.len() > 512 || !crate::query_allows_semantic(query) {
             return Ok(Vec::new());
         }
         let limit = limit.clamp(1, 100);
+        if let GemmaQuery::LocalOpenAi {
+            worker,
+            model_id,
+            dims,
+            ..
+        } = &mut self.worker
+        {
+            // Local OpenAI text search is strictly decoupled from Gemma image vectors.
+            let vector = match worker.encode_query(query) {
+                Ok(vector) => vector,
+                Err(error) if error.is::<Unencodable>() => return Ok(Vec::new()),
+                Err(error) => return Err(error),
+            };
+            ensure!(
+                vector.len() == *dims,
+                "local OpenAI query vector dimensions ({}) differ from expected ({dims})",
+                vector.len()
+            );
+            let mut hits = read_snapshot(&self.conn, |snapshot| {
+                rank_model(snapshot, model_id, *dims, &vector, limit, &mut self.matrix)
+            })?;
+            hits.retain(|hit| !crate::external::is_external(Path::new(&hit.path)));
+            return Ok(hits);
+        }
         let Some(images) = &mut self.images else {
             let mut hits =
                 search_gemma(&self.conn, query, limit, &mut self.worker, &mut self.matrix)?;
@@ -737,10 +1182,39 @@ impl GemmaSearchSession {
         let Some(images) = &mut self.images else {
             return Ok(Vec::new());
         };
-        let vector = match self.worker.encode(query) {
-            Ok(vector) => vector,
-            Err(error) if error.is::<Unencodable>() => return Ok(Vec::new()),
-            Err(error) => return Err(error),
+        let vector = match &mut self.worker {
+            GemmaQuery::LocalOpenAi { image_backend, .. } => {
+                // Image search always uses built-in Gemma 2 + mmproj, never external OpenAI vectors.
+                if let LocalOpenAiImageBackend::LazyHome(home) = image_backend {
+                    let model = crate::GemmaModel::installed(home.as_deref())?;
+                    if !model.has_image_projector() {
+                        *image_backend = LocalOpenAiImageBackend::None;
+                        return Ok(Vec::new());
+                    }
+                    let mut started = model.start()?;
+                    started.probe()?;
+                    *image_backend = LocalOpenAiImageBackend::Ready(started);
+                }
+                match image_backend {
+                    LocalOpenAiImageBackend::None | LocalOpenAiImageBackend::LazyHome(_) => {
+                        return Ok(Vec::new());
+                    }
+                    LocalOpenAiImageBackend::Ready(worker) => {
+                        match worker.encode(Role::Query, query) {
+                            Ok(vector) => vector,
+                            Err(error) if error.is::<Unencodable>() => return Ok(Vec::new()),
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    #[cfg(test)]
+                    LocalOpenAiImageBackend::Fixture(encode) => encode(),
+                }
+            }
+            worker => match worker.encode(query) {
+                Ok(vector) => vector,
+                Err(error) if error.is::<Unencodable>() => return Ok(Vec::new()),
+                Err(error) => return Err(error),
+            },
         };
         let mut hits =
             crate::image_search::rank_with_query(&self.conn, images, &vector, limit.clamp(1, 20))?;
@@ -871,6 +1345,9 @@ impl EmbedBatch {
                 let (mut conn, _lease) = open_write(&database, false)?;
                 stream_gemma_with(&mut conn, max, stop, || model.start(), &mut emit)
             }
+            ModelBackend::LocalOpenAi(config) => {
+                stream_local_openai(&database, config, max, stop, emit)
+            }
             other => {
                 let (mut conn, _lease) = open_write(&database, false)?;
                 let mut encoder = other.connect()?;
@@ -904,6 +1381,9 @@ impl EmbedBatch {
 }
 
 pub fn embed_batch(database: &Path, model: ModelBackend<'_>, max: usize) -> Result<EmbedBatch> {
+    if let ModelBackend::LocalOpenAi(config) = model {
+        return embed_local_openai_batch(database, config, max);
+    }
     if matches!(model, ModelBackend::Gemma(_)) {
         ensure!(
             crate::open_read(database).and_then(|conn| documents_enabled(&conn))?,
@@ -1161,6 +1641,34 @@ pub(super) fn search(
             &mut MatrixCache::default(),
         );
     }
+    if let ModelBackend::LocalOpenAi(config) = model {
+        let worker = LocalOpenAiWorker::new(config)?;
+        let (model_id, dims) = worker.probe()?;
+        ensure!(
+            read_model_searchable(conn, &model_id, dims)?,
+            "no current local OpenAI paragraph embeddings: run lumen embed --openai-url ... --openai-model ... first"
+        );
+        let vector = match worker.encode_query(query) {
+            Ok(vector) => vector,
+            Err(error) if error.is::<Unencodable>() => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        ensure!(
+            vector.len() == dims,
+            "local OpenAI query vector dimensions ({}) differ from expected ({dims})",
+            vector.len()
+        );
+        return read_snapshot(conn, |snapshot| {
+            rank_model(
+                snapshot,
+                &model_id,
+                dims,
+                &vector,
+                limit,
+                &mut MatrixCache::default(),
+            )
+        });
+    }
     let mut encoder = model.connect()?;
     let signature = encoder.signature().to_owned();
     let validate = |conn: &Connection| -> Result<State> {
@@ -1279,18 +1787,34 @@ fn rank_gemma(
     limit: usize,
     cache: &mut MatrixCache<Paragraph>,
 ) -> Result<Vec<Hit>> {
+    rank_model(snapshot, gemma::ID, gemma::DIMENSIONS, query, limit, cache)
+}
+
+fn rank_model(
+    snapshot: &Connection,
+    model_id: &str,
+    dims: usize,
+    query: &[f32],
+    limit: usize,
+    cache: &mut MatrixCache<Paragraph>,
+) -> Result<Vec<Hit>> {
+    ensure!(
+        query.len() == dims,
+        "stored and query embedding dimensions differ ({} vs {dims})",
+        query.len()
+    );
     let matrix = cache.get_for_bucket(snapshot, "vec_generation", |snapshot| {
         let Some(scope) = saved_index_scope(snapshot)?.filter(|scope| scope.documents) else {
-            return Ok(Matrix::new(gemma::DIMENSIONS));
+            return Ok(Matrix::new(dims));
         };
         if !has_gemma_store(snapshot)? {
-            return Ok(Matrix::new(gemma::DIMENSIONS));
+            return Ok(Matrix::new(dims));
         }
         load_paragraphs(
             snapshot,
-            gemma::DIMENSIONS,
+            dims,
             &format!("SELECT c.document_id,c.id,i.path,v.vector,c.end_byte-c.start_byte {GEMMA_LIVE} AND {GEMMA_VECTOR} AND i.kind='file'"),
-            params![gemma::ID, GEMMA_VECTOR_BYTES],
+            params![model_id, vector_bytes(dims)],
             |path| paragraph_path_allowed(&scope, path),
         )
     })?;
@@ -1313,12 +1837,17 @@ fn rank_gemma(
         })
         .collect();
     let finite_count = scores.iter().filter(|s| s.is_finite()).count();
+    let (corpus_min_cosine, z_threshold) = if model_id == gemma::ID {
+        (GEMMA_CORPUS_MIN_COSINE, GEMMA_Z_THRESHOLD)
+    } else {
+        (LOCAL_OPENAI_CORPUS_MIN_COSINE, LOCAL_OPENAI_Z_THRESHOLD)
+    };
     let min_cosine = if finite_count >= 8 {
-        GEMMA_CORPUS_MIN_COSINE
+        corpus_min_cosine
     } else {
         GEMMA_MIN_COSINE
     };
-    let floor = adaptive_floor(&scores, min_cosine, GEMMA_Z_THRESHOLD);
+    let floor = adaptive_floor(&scores, min_cosine, z_threshold);
     rank(
         snapshot,
         matrix,
@@ -2560,6 +3089,267 @@ mod tests {
         assert!(!gemma_pending(&conn).unwrap());
 
         drop(conn);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_openai_coexists_with_gemma_switches_pending_queue_and_decouples_images() {
+        use std::{
+            io::{BufRead, BufReader, Read, Write},
+            net::TcpListener,
+            sync::{
+                Arc,
+                atomic::{AtomicBool, AtomicUsize},
+            },
+            thread,
+        };
+
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-openai-coexist-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let docs = root.join("docs");
+        let media = root.join("media");
+        fs::create_dir_all(&docs).unwrap();
+        fs::create_dir_all(&media).unwrap();
+        let solar = docs.join("solar.txt");
+        let finance = docs.join("finance.txt");
+        fs::write(
+            &solar,
+            "Solar panel azimuth and photovoltaic battery guidance.",
+        )
+        .unwrap();
+        fs::write(
+            &finance,
+            "Quarterly balance sheet and operating margin report.",
+        )
+        .unwrap();
+        let photo = media.join("mountain.png");
+        fs::write(&photo, "fake png fixture").unwrap();
+
+        let database = root.join("index.sqlite");
+        crate::scan(
+            &database,
+            &Scope {
+                roots: vec![docs.clone(), media.clone()],
+                documents: true,
+                content_roots: Some(vec![docs.clone()]),
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        crate::image_scope(&database, Some(&media)).unwrap();
+        crate::index_content(&database, 10).unwrap();
+
+        // Seed built-in Gemma text vectors (768-d) AND Gemma image vector (768-d).
+        {
+            let (mut conn, _lease) = open_write(&database, false).unwrap();
+            while prepare_next_document(&mut conn, true).unwrap() {}
+            let mut gemma_vec = vec![0.0_f32; gemma::DIMENSIONS];
+            gemma_vec[0] = 1.0;
+            conn.execute(
+                "INSERT INTO semantic_vector(model,chunk_id,vector)
+                 SELECT ?1, c.id, ?2 FROM semantic_chunk c",
+                params![gemma::ID, pack(&gemma_vec)],
+            )
+            .unwrap();
+            let stamp = crate::diagnose::local_stamp(&photo, false).unwrap();
+            conn.execute(
+                "INSERT INTO image_embedding SELECT id,?1,?2,?3 FROM item WHERE path=?4",
+                params![
+                    crate::IMAGE_MODEL_ID,
+                    stamp,
+                    pack(&gemma_vec),
+                    photo.to_str().unwrap()
+                ],
+            )
+            .unwrap();
+            let gcov = gemma_coverage(&conn).unwrap();
+            assert_eq!(gcov.embedded_chunks, 2);
+            assert!(!gcov.pending);
+        }
+
+        // Start a real local loopback OpenAI-compatible mock server serving 16-d vectors.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop_server = Arc::new(AtomicBool::new(false));
+        let stop_flag = stop_server.clone();
+        let openai_calls = Arc::new(AtomicUsize::new(0));
+        let openai_calls_srv = openai_calls.clone();
+        let server = thread::spawn(move || {
+            while !stop_flag.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        let mut reader = BufReader::new(&mut stream);
+                        let mut req_line = String::new();
+                        if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                            continue;
+                        }
+                        let mut content_len = 0usize;
+                        loop {
+                            let mut line = String::new();
+                            reader.read_line(&mut line).unwrap();
+                            let trimmed = line.trim_end_matches(['\r', '\n']);
+                            if trimmed.is_empty() {
+                                break;
+                            }
+                            if let Some((k, v)) = trimmed.split_once(':')
+                                && k.trim().eq_ignore_ascii_case("content-length")
+                            {
+                                content_len = v.trim().parse().unwrap();
+                            }
+                        }
+                        let mut body = vec![0_u8; content_len];
+                        if content_len > 0 {
+                            reader.read_exact(&mut body).unwrap();
+                        }
+                        let _ = reader;
+                        openai_calls_srv.fetch_add(1, Ordering::AcqRel);
+                        let req: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let inputs = req["input"].as_array().unwrap();
+                        let data: Vec<_> = inputs
+                            .iter()
+                            .enumerate()
+                            .map(|(i, value)| {
+                                let text = value.as_str().unwrap_or("");
+                                let mut v = vec![0.0_f32; 16];
+                                if text.contains("Solar") || text.contains("solar") {
+                                    v[0] = 1.0;
+                                } else {
+                                    v[1] = 1.0;
+                                }
+                                serde_json::json!({"index": i, "embedding": v})
+                            })
+                            .collect();
+                        let payload =
+                            serde_json::to_string(&serde_json::json!({"data": data})).unwrap();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                            payload.len(),
+                            payload
+                        );
+                        stream.write_all(response.as_bytes()).unwrap();
+                        let _ = stream.flush();
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let config = LocalOpenAiConfig {
+            url: format!("http://127.0.0.1:{port}/v1"),
+            model: "bge-m3".into(),
+        };
+        let model_id = "openai-local:bge-m3@16";
+
+        // Before embedding with Local OpenAI, diagnose reports PendingGemma while Gemma is Indexed.
+        assert_eq!(
+            crate::diagnose(&database, &solar).semantic,
+            crate::DiagnoseReason::Indexed
+        );
+        assert_eq!(
+            crate::diagnose_local_openai(&database, &solar, &config)
+                .unwrap()
+                .semantic,
+            crate::DiagnoseReason::PendingGemma
+        );
+
+        // Stream embed with Local OpenAI: atomically switches gemma_pending_model without deleting Gemma vectors.
+        let stop_embed = AtomicBool::new(false);
+        let mut streamed = Vec::new();
+        stream_local_openai(&database, &config, 1, &stop_embed, |batch| {
+            streamed.push((batch.new_embeddings, batch.skipped_chunks, batch.has_more));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(streamed, [(1, 0, true), (1, 0, false)]);
+
+        // Re-opening via open_write (like watch/content) must preserve the active openai-local pending queue.
+        {
+            let (conn, _lease) = open_write(&database, false).unwrap();
+            assert!(has_model_pending_queue(&conn, model_id).unwrap());
+            let ocov = local_openai_coverage(&conn, model_id, 16).unwrap();
+            assert_eq!(ocov.embedded_chunks, 2);
+            assert!(!ocov.pending);
+            // Coexistence: Gemma's 768-d vectors remain 100% intact!
+            let gcov = gemma_coverage(&conn).unwrap();
+            assert_eq!(gcov.embedded_chunks, 2);
+            assert!(!gcov.pending);
+            let status_json = crate::status_with_local_openai(&conn, &config).unwrap();
+            assert_eq!(status_json["local_openai"]["model_id"], model_id);
+            assert_eq!(status_json["local_openai"]["dimensions"], 16);
+            assert_eq!(status_json["gemma"]["embedded_chunks"], 2);
+            assert_eq!(status_json["gemma"]["pending"], false);
+        }
+
+        // Diagnose now reports Indexed for Local OpenAI as well.
+        assert_eq!(
+            crate::diagnose_local_openai(&database, &solar, &config)
+                .unwrap()
+                .semantic,
+            crate::DiagnoseReason::Indexed
+        );
+
+        // Verify text-vs-image decoupling in GemmaSearchSession:
+        // - search() uses 16-d LocalOpenAiWorker against semantic_vector ONLY (never image_embedding)
+        // - search_images() uses independent 768-d Gemma image backend against image_embedding ONLY
+        let gemma_img_calls = Arc::new(AtomicUsize::new(0));
+        let gemma_img_calls_cb = gemma_img_calls.clone();
+        let mut session = GemmaSearchSession {
+            conn: crate::open_read(&database).unwrap(),
+            worker: GemmaQuery::LocalOpenAi {
+                worker: LocalOpenAiWorker::new(&config).unwrap(),
+                model_id: model_id.into(),
+                dims: 16,
+                image_backend: LocalOpenAiImageBackend::Fixture(Box::new(move || {
+                    gemma_img_calls_cb.fetch_add(1, Ordering::AcqRel);
+                    let mut v = vec![0.0_f32; gemma::DIMENSIONS];
+                    v[0] = 1.0;
+                    v
+                })),
+            },
+            matrix: MatrixCache::default(),
+            images: Some(Default::default()),
+        };
+
+        let text_hits = session.search("solar panel guidance", 10).unwrap();
+        assert_eq!(text_hits.len(), 1);
+        assert_eq!(text_hits[0].name, "solar.txt");
+        assert_eq!(text_hits[0].matched_by, "semantic_candidate");
+        // Image backend was NEVER invoked during text search, and no image hit leaked in!
+        assert_eq!(gemma_img_calls.load(Ordering::Acquire), 0);
+
+        let calls_before_img = openai_calls.load(Ordering::Acquire);
+        let img_hits = session.search_images("mountain landscape", 10).unwrap();
+        assert_eq!(img_hits.len(), 1);
+        assert_eq!(img_hits[0].path, photo.to_str().unwrap());
+        assert_eq!(img_hits[0].matched_by, "image_embedding");
+        // Local OpenAI server was NEVER called for image search; Gemma image backend ran once!
+        assert_eq!(openai_calls.load(Ordering::Acquire), calls_before_img);
+        assert_eq!(gemma_img_calls.load(Ordering::Acquire), 1);
+
+        // Switching pending queue back to Gemma atomically restores gemma_pending_model.
+        {
+            let (conn, _lease) = open_write(&database, false).unwrap();
+            ensure_gemma_queue(&conn).unwrap();
+            assert!(has_gemma_pending_queue(&conn).unwrap());
+            assert_eq!(
+                local_openai_coverage(&conn, model_id, 16)
+                    .unwrap()
+                    .embedded_chunks,
+                2
+            );
+            assert_eq!(gemma_coverage(&conn).unwrap().embedded_chunks, 2);
+        }
+
+        drop(session);
+        stop_server.store(true, Ordering::Release);
+        server.join().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 }

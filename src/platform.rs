@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use std::fs::{self, File};
-use std::io::Read;
-use std::path::Path;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -324,16 +324,61 @@ fn is_resident(path: &Path, meta: &fs::Metadata) -> bool {
     !dataless(meta) && matches!(availability(path, meta), "local" | "provider_metadata_only")
 }
 
-/// Accept resident regular files only (local or hydrated cloud files with
-/// `SF_DATALESS == 0`), no symlink of any component on macOS. Placeholders
-/// remain unreadable even if a race changes flags after preflight.
-pub fn read_local(path: &Path, limit: u64) -> Result<Vec<u8>> {
-    read_local_checked(path, limit, None)
+/// Open handle to a verified resident regular file (local or hydrated cloud
+/// file with `SF_DATALESS == 0`), keeping thread-level `NoMaterialization`
+/// active until the file descriptor is closed.
+pub(crate) struct CheckedLocalFile {
+    file: File,
+    path: PathBuf,
+    limit: u64,
+    dev: u64,
+    ino: u64,
+    expected_stamp: String,
+    #[cfg(target_os = "macos")]
+    _io: NoMaterialization,
 }
 
-pub(crate) fn read_local_checked(path: &Path, limit: u64, stamp: Option<&str>) -> Result<Vec<u8>> {
+impl CheckedLocalFile {
+    /// Re-verify via `fstat` that the open file remained a resident regular
+    /// file within `limit` and with an unchanged metadata stamp.
+    pub(crate) fn verify_unchanged(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let after = self.file.metadata()?;
+        if !after.is_file()
+            || after.dev() != self.dev
+            || after.ino() != self.ino
+            || after.len() > self.limit
+            || !is_resident(&self.path, &after)
+            || !crate::index::stamp_matches(&self.expected_stamp, &crate::index::stamp(&after))
+        {
+            bail!("file changed while reading");
+        }
+        Ok(())
+    }
+}
+
+impl Read for CheckedLocalFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.file.read(buf)
+    }
+}
+
+impl Seek for CheckedLocalFile {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.file.seek(pos)
+    }
+}
+
+/// Open a resident regular file (local or hydrated cloud file with
+/// `SF_DATALESS == 0`) without following symlinks on any path component and
+/// without materializing cloud placeholders.
+pub(crate) fn open_local_checked(
+    path: &Path,
+    limit: u64,
+    stamp: Option<&str>,
+) -> Result<CheckedLocalFile> {
     #[cfg(target_os = "macos")]
-    let _io = NoMaterialization::enter()?;
+    let io = NoMaterialization::enter()?;
     let preflight = fs::symlink_metadata(path)?;
     if !preflight.is_file() || preflight.len() > limit || !is_resident(path, &preflight) {
         bail!("not a small resident regular file");
@@ -356,25 +401,119 @@ pub(crate) fn read_local_checked(path: &Path, limit: u64, stamp: Option<&str>) -
     {
         bail!("file changed or is not resident");
     }
-    if stamp.is_some_and(|expected| {
-        !crate::index::stamp_matches(expected, &crate::index::stamp(&opened))
-    }) {
+    let opened_stamp = crate::index::stamp(&opened);
+    if stamp.is_some_and(|expected| !crate::index::stamp_matches(expected, &opened_stamp)) {
         bail!("file changed before reading");
     }
+    Ok(CheckedLocalFile {
+        file,
+        path: path.to_path_buf(),
+        limit,
+        dev: opened.dev(),
+        ino: opened.ino(),
+        expected_stamp: opened_stamp,
+        #[cfg(target_os = "macos")]
+        _io: io,
+    })
+}
+
+/// Accept resident regular files only (local or hydrated cloud files with
+/// `SF_DATALESS == 0`), no symlink of any component on macOS. Placeholders
+/// remain unreadable even if a race changes flags after preflight.
+#[allow(dead_code)]
+pub fn read_local(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    read_local_checked(path, limit, None)
+}
+
+pub(crate) fn read_local_checked(path: &Path, limit: u64, stamp: Option<&str>) -> Result<Vec<u8>> {
+    let mut file = open_local_checked(path, limit, stamp)?;
     let mut data = Vec::new();
-    Read::take(&file, limit + 1).read_to_end(&mut data)?;
+    Read::take(&mut file, limit + 1).read_to_end(&mut data)?;
     if data.len() as u64 > limit {
         bail!("file exceeded size limit");
     }
-    if let Some(stamp) = stamp {
-        let after = file.metadata()?;
-        if !crate::index::stamp_matches(stamp, &crate::index::stamp(&after))
-            || !is_resident(path, &after)
-        {
-            bail!("file changed while reading");
-        }
-    }
+    file.verify_unchanged()?;
     Ok(data)
+}
+
+/// Decode a Windows codepage byte slice (e.g. 936 GBK, 950 Big5, 932 Shift-JIS,
+/// 1252 Windows-1252) to UTF-8 via CoreFoundation on macOS.
+#[cfg(target_os = "macos")]
+pub(crate) fn decode_codepage(codepage: u32, bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    use std::ffi::c_void;
+    type Cf = *const c_void;
+    const K_CF_STRING_ENCODING_INVALID_ID: u32 = 0xffff_ffff;
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringConvertWindowsCodepageToEncoding(codepage: u32) -> u32;
+        fn CFStringCreateWithBytes(
+            allocator: Cf,
+            bytes: *const u8,
+            num_bytes: isize,
+            encoding: u32,
+            is_external: u8,
+        ) -> Cf;
+        fn CFStringGetLength(text: Cf) -> isize;
+        fn CFStringGetMaximumSizeForEncoding(length: isize, encoding: u32) -> isize;
+        fn CFStringGetCString(text: Cf, buffer: *mut u8, size: isize, encoding: u32) -> u8;
+        fn CFRelease(object: Cf);
+    }
+    let encoding = unsafe { CFStringConvertWindowsCodepageToEncoding(codepage) };
+    if encoding == K_CF_STRING_ENCODING_INVALID_ID {
+        return None;
+    }
+    let len = isize::try_from(bytes.len()).ok()?;
+    let cf = unsafe { CFStringCreateWithBytes(std::ptr::null(), bytes.as_ptr(), len, encoding, 0) };
+    if cf.is_null() {
+        return None;
+    }
+    let max_size = unsafe {
+        let cf_len = CFStringGetLength(cf);
+        CFStringGetMaximumSizeForEncoding(cf_len, K_CF_STRING_ENCODING_UTF8)
+    };
+    if max_size < 0 {
+        unsafe { CFRelease(cf) };
+        return None;
+    }
+    let cap = (max_size as usize).checked_add(1)?;
+    let mut buf = vec![0u8; cap];
+    let ok = unsafe {
+        let ok = CFStringGetCString(
+            cf,
+            buf.as_mut_ptr(),
+            buf.len() as isize,
+            K_CF_STRING_ENCODING_UTF8,
+        ) != 0;
+        CFRelease(cf);
+        ok
+    };
+    if !ok {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    buf.truncate(end);
+    String::from_utf8(buf).ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn decode_codepage(codepage: u32, bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    match codepage {
+        65001 => std::str::from_utf8(bytes).ok().map(str::to_owned),
+        1252 => Some(
+            bytes
+                .iter()
+                .map(|&b| crate::legacy_office::cp1252_byte(b))
+                .collect(),
+        ),
+        _ => None,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1032,5 +1171,83 @@ mod tests {
         let started = std::time::Instant::now();
         pace_stream_batch(Duration::from_millis(10), &stop);
         assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn open_local_checked_enforces_symlink_cap_stamp_seek_and_verify() {
+        use std::os::unix::fs::symlink;
+
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-open-checked-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let file_path = root.join("sample.bin");
+        fs::write(&file_path, b"0123456789abcdef").unwrap();
+        let meta = fs::symlink_metadata(&file_path).unwrap();
+        let live_stamp = crate::index::stamp(&meta);
+
+        // Symlink leaf and symlink ancestor must be rejected.
+        let link_file = root.join("link.bin");
+        symlink(&file_path, &link_file).unwrap();
+        assert!(open_local_checked(&link_file, 64, None).is_err());
+
+        let subdir = root.join("real_dir");
+        fs::create_dir_all(&subdir).unwrap();
+        let nested = subdir.join("inside.bin");
+        fs::write(&nested, b"hello").unwrap();
+        let link_dir = root.join("link_dir");
+        symlink(&subdir, &link_dir).unwrap();
+        assert!(open_local_checked(&link_dir.join("inside.bin"), 64, None).is_err());
+
+        // Size cap rejection.
+        assert!(open_local_checked(&file_path, 8, None).is_err());
+
+        // Stamp mismatch rejection.
+        assert!(open_local_checked(&file_path, 64, Some("0:0:16:0:0")).is_err());
+
+        // Seek + read + verify_unchanged on valid resident file.
+        assert_eq!(read_local(&file_path, 64).unwrap(), b"0123456789abcdef");
+        let mut checked = open_local_checked(&file_path, 64, Some(&live_stamp)).unwrap();
+        assert_eq!(checked.seek(SeekFrom::Start(10)).unwrap(), 10);
+        let mut tail = [0u8; 6];
+        checked.read_exact(&mut tail).unwrap();
+        assert_eq!(&tail, b"abcdef");
+        checked.verify_unchanged().unwrap();
+
+        // In-place mutation invalidates verify_unchanged().
+        fs::write(&file_path, b"mutated payload with different size").unwrap();
+        assert!(checked.verify_unchanged().is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn decode_codepage_handles_cjk_and_western_codepages() {
+        // Empty input always succeeds.
+        assert_eq!(decode_codepage(936, b"").as_deref(), Some(""));
+        // Windows-1252: Euro sign + smart quotes + accented Latin.
+        assert_eq!(
+            decode_codepage(1252, &[0x80, b' ', 0x93, b'c', b'a', b'f', 0xE9, 0x94]).as_deref(),
+            Some("€ “café”")
+        );
+        // GBK (936): "中文测试"
+        assert_eq!(
+            decode_codepage(936, &[0xD6, 0xD0, 0xCE, 0xC4, 0xB2, 0xE2, 0xCA, 0xD4]).as_deref(),
+            Some("中文测试")
+        );
+        // Big5 (950): "繁體中文"
+        assert_eq!(
+            decode_codepage(950, &[0xC1, 0x63, 0xC5, 0xE9, 0xA4, 0xA4, 0xA4, 0xE5]).as_deref(),
+            Some("繁體中文")
+        );
+        // Shift-JIS (932): "日本語"
+        assert_eq!(
+            decode_codepage(932, &[0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA]).as_deref(),
+            Some("日本語")
+        );
+        // Unknown Windows codepage returns None.
+        assert_eq!(decode_codepage(999_999, b"abc"), None);
     }
 }

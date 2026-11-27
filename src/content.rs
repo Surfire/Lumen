@@ -308,8 +308,13 @@ type JobPosition = (i64, i64);
 const JOBS_TOP: JobPosition = (i64::MAX, i64::MIN);
 /// After the oldest job.
 const JOBS_END: JobPosition = (i64::MIN, i64::MAX);
-/// Small resident text/DOCX files extracted together on scoped threads.
-const PARALLEL_WORKERS: usize = 8;
+/// Dynamic worker count for in-process extraction of resident text and Office files.
+fn parallel_workers() -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4);
+    (cpus * 2 / 3).clamp(4, 12)
+}
 
 fn parse_position(raw: &str) -> Option<JobPosition> {
     let (mtime, id) = raw.split_once(':')?;
@@ -332,12 +337,22 @@ fn save_cursor(conn: &Connection, (mtime, id): JobPosition) -> Result<()> {
     Ok(())
 }
 
-/// Text and OOXML Office files are read in-process; PDF and OCR run helpers with
-/// their own deadlines and stay sequential.
+/// Text, subtitle, RTF, OOXML, and legacy OLE2 Office files are read in-process;
+/// PDF and OCR run helpers with their own deadlines and stay sequential.
 fn parallel_kind(coverage: &Coverage, path: &Path) -> bool {
     matches!(
         eligible_kind(coverage, path),
-        Some(DocumentKind::Text | DocumentKind::Docx | DocumentKind::Xlsx | DocumentKind::Pptx)
+        Some(
+            DocumentKind::Text
+                | DocumentKind::Docx
+                | DocumentKind::Xlsx
+                | DocumentKind::Pptx
+                | DocumentKind::LegacyDoc
+                | DocumentKind::LegacyXls
+                | DocumentKind::LegacyPpt
+                | DocumentKind::Rtf
+                | DocumentKind::Subtitle
+        )
     ) && coverage.permits_content(path)
 }
 
@@ -549,12 +564,7 @@ fn extract_parallel(
         jobs.iter().map(|_| std::sync::Mutex::new(None)).collect();
     let cached: Vec<std::sync::Mutex<Option<String>>> =
         cached.into_iter().map(std::sync::Mutex::new).collect();
-    let workers = jobs.len().min(PARALLEL_WORKERS).min(
-        std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1)
-            .max(2),
-    );
+    let workers = jobs.len().min(parallel_workers());
     std::thread::scope(|threads| {
         for _ in 0..workers {
             threads.spawn(|| {
@@ -778,12 +788,14 @@ pub struct ContentCategories {
     pub code: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ContentSubfolder {
     pub path: String,
     pub name: String,
     pub count: u64,
     pub suggested_noise: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_reason: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -795,6 +807,123 @@ pub struct ContentPreview {
 
 const PREVIEW_SUBFOLDERS: usize = 8;
 const NOISY_FOLDER_FILES: u64 = 2000;
+const PROTECTED_KB_VOLUME: u64 = 5000;
+const SEQUENTIAL_FRAME_THRESHOLD: u64 = 100;
+const IMAGE_DUMP_THRESHOLD: u64 = 200;
+
+#[derive(Default)]
+struct FolderStats {
+    count: u64,
+    images: u64,
+    sequential_frames: u64,
+    ai_artifacts: u64,
+}
+
+fn is_ai_runtime_dir_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "comfyui"
+            | "huggingface"
+            | "modelscope"
+            | ".ollama"
+            | "ollama"
+            | ".omlx"
+            | "omlx"
+            | "stable-diffusion"
+            | "stable-diffusion-webui"
+            | "sd-webui"
+            | "automatic1111"
+            | "invokeai"
+            | "lmstudio"
+            | "lm-studio"
+            | "webui-forge"
+            | "koboldcpp"
+            | "text-generation-webui"
+            | "oobabooga"
+            | "vllm"
+            | "llama.cpp"
+    )
+}
+
+fn is_ai_weight_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("safetensors")
+                || ext.eq_ignore_ascii_case("gguf")
+                || ext.eq_ignore_ascii_case("ckpt")
+                || ext.eq_ignore_ascii_case("onnx")
+                || ext.eq_ignore_ascii_case("pth")
+                || ext.eq_ignore_ascii_case("mlmodel")
+        })
+}
+
+fn is_sequential_frame(path: &Path, category: ContentCategory) -> bool {
+    if category != ContentCategory::Image {
+        return false;
+    }
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let trimmed = stem.trim_end_matches(['_', '-']);
+    let trailing_digits = trimmed.bytes().rev().take_while(u8::is_ascii_digit).count();
+    if trailing_digits >= 3 {
+        return true;
+    }
+    if trailing_digits >= 1 {
+        let prefix = trimmed[..trimmed.len() - trailing_digits].trim_end_matches(['_', '-', ' ']);
+        if prefix.eq_ignore_ascii_case("frame")
+            || prefix.eq_ignore_ascii_case("frames")
+            || prefix.eq_ignore_ascii_case("seq")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_knowledge_base_dir(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    const KB_NAMES: &[&str] = &["obsidian", "notes", "vault", "wiki", "knowledge"];
+    KB_NAMES.iter().any(|kw| {
+        lower == *kw
+            || lower.starts_with(&format!("{kw}-"))
+            || lower.starts_with(&format!("{kw}_"))
+            || lower.starts_with(&format!("{kw} "))
+            || lower.ends_with(&format!("-{kw}"))
+            || lower.ends_with(&format!("_{kw}"))
+            || lower.ends_with(&format!(" {kw}"))
+    })
+}
+
+fn classify_folder_noise(name: &str, stats: &FolderStats) -> Option<&'static str> {
+    if is_knowledge_base_dir(name) {
+        if crate::content_noise_dir(name) {
+            return Some("noise_dir");
+        }
+        if stats.count >= PROTECTED_KB_VOLUME {
+            return Some("high_volume");
+        }
+        return None;
+    }
+    if is_ai_runtime_dir_name(name) || stats.ai_artifacts > 0 {
+        return Some("ai_runtime");
+    }
+    if crate::content_noise_dir(name) {
+        return Some("noise_dir");
+    }
+    if stats.sequential_frames >= SEQUENTIAL_FRAME_THRESHOLD {
+        return Some("sequential_frames");
+    }
+    if stats.count >= IMAGE_DUMP_THRESHOLD && stats.images * 5 >= stats.count * 4 {
+        return Some("image_dump");
+    }
+    if stats.count >= NOISY_FOLDER_FILES {
+        return Some("high_volume");
+    }
+    None
+}
 
 /// Estimate what a content scope would index from the filename catalog alone.
 /// Read-only, and it never stats or opens any indexed file.
@@ -829,7 +958,7 @@ pub fn preview_content_scope(
     };
     let roots: Vec<PathBuf> = roots.iter().filter(|root| !nested(root)).cloned().collect();
     let mut preview = ContentPreview::default();
-    let mut folders: HashMap<PathBuf, u64> = HashMap::new();
+    let mut folders: HashMap<PathBuf, FolderStats> = HashMap::new();
     let mut select = snapshot.prepare(
         "SELECT path FROM item WHERE path>=?1 AND path<?2 AND kind='file'
          AND availability IN ('local','provider_metadata_only')",
@@ -841,6 +970,15 @@ pub fn preview_content_scope(
         let mut rows = select.query(params![format!("{text}/"), format!("{text}0")])?;
         while let Some(row) = rows.next()? {
             let path = Path::new(row.get_ref(0)?.as_str()?);
+            if is_ai_weight_file(path)
+                && let Some(parent) = path.strip_prefix(root).ok().and_then(Path::parent)
+            {
+                let mut folder = root.clone();
+                for part in parent.components().take(2) {
+                    folder.push(part);
+                    folders.entry(folder.clone()).or_default().ai_artifacts += 1;
+                }
+            }
             if filter.excludes(path, &roots) {
                 continue;
             }
@@ -856,28 +994,43 @@ pub fn preview_content_scope(
                 ContentCategory::Image => &mut counter.images,
                 ContentCategory::Code => &mut counter.code,
             } += 1;
+            let is_image = category == ContentCategory::Image;
+            let is_frame = is_sequential_frame(path, category);
             let Some(parent) = path.strip_prefix(root).ok().and_then(Path::parent) else {
                 continue;
             };
             let mut folder = root.clone();
             for part in parent.components().take(2) {
                 folder.push(part);
-                *folders.entry(folder.clone()).or_default() += 1;
+                let stats = folders.entry(folder.clone()).or_default();
+                stats.count += 1;
+                if is_image {
+                    stats.images += 1;
+                }
+                if is_frame {
+                    stats.sequential_frames += 1;
+                }
             }
         }
     }
-    let mut folders: Vec<_> = folders.into_iter().collect();
-    folders.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut folders: Vec<_> = folders
+        .into_iter()
+        .filter(|(_, stats)| stats.count > 0)
+        .collect();
+    folders.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(&b.0)));
     preview.top_subfolders = folders
         .into_iter()
         .take(PREVIEW_SUBFOLDERS)
-        .filter_map(|(path, count)| {
+        .filter_map(|(path, stats)| {
             let name = path.file_name()?.to_str()?.to_owned();
+            let noise_reason = classify_folder_noise(&name, &stats).map(str::to_owned);
+            let suggested_noise = noise_reason.is_some();
             Some(ContentSubfolder {
-                suggested_noise: crate::content_noise_dir(&name) || count >= NOISY_FOLDER_FILES,
                 path: path.into_os_string().into_string().ok()?,
                 name,
-                count,
+                count: stats.count,
+                suggested_noise,
+                noise_reason,
             })
         })
         .collect();
@@ -1338,6 +1491,227 @@ mod tests {
         )
         .unwrap();
         assert_eq!((code.by_category.code, code.by_category.images), (1, 0));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preview_content_scope_classifies_noise_reasons_and_protects_knowledge_bases() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "lumen-content-noise-reasons-{}",
+                std::process::id()
+            ));
+        let _ = fs::remove_dir_all(&root);
+        let docs = root.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(docs.join("seed.md"), "seed").unwrap();
+        let database = root.join("index.db");
+        crate::index::scan(
+            &database,
+            &Scope {
+                roots: vec![docs.clone()],
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+
+        let conn = Connection::open(&database).unwrap();
+        let base = docs.to_str().unwrap();
+        // 1. ai_runtime: folder containing .safetensors weights + indexable files
+        conn.execute(
+            "INSERT INTO item(path,display,kind,availability,name,full,initials,searchable_path)
+             VALUES (?1||'/my_sd/checkpoints/flux.safetensors','flux.safetensors','file','local','flux','f','f','f')",
+            [base],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO item(path,display,kind,availability,name,full,initials,searchable_path)
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<30)
+             SELECT ?1||'/my_sd/prompt_'||i||'.txt','p','file','local','p','p','p','p' FROM n",
+            [base],
+        )
+        .unwrap();
+        // 2. sequential_frames: 110 frame_0001.png .. frame_0110.png
+        conn.execute(
+            "INSERT INTO item(path,display,kind,availability,name,full,initials,searchable_path)
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<110)
+             SELECT ?1||'/renders/frame_'||printf('%04d', i)||'.png','f','file','local','f','f','f','f' FROM n",
+            [base],
+        )
+        .unwrap();
+        // 3. image_dump: 220 non-sequential images (>= 80% images)
+        conn.execute(
+            "INSERT INTO item(path,display,kind,availability,name,full,initials,searchable_path)
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<220)
+             SELECT ?1||'/screenshots/shot_'||i||'_final.png','s','file','local','s','s','s','s' FROM n",
+            [base],
+        )
+        .unwrap();
+        // 4. Protected knowledge-base folder with 2500 notes (< 5000)
+        conn.execute(
+            "INSERT INTO item(path,display,kind,availability,name,full,initials,searchable_path)
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2500)
+             SELECT ?1||'/Obsidian/note_'||i||'.md','n','file','local','n','n','n','n' FROM n",
+            [base],
+        )
+        .unwrap();
+        // 5. Huge knowledge-base folder with 5000 notes (>= 5000 -> high_volume)
+        conn.execute(
+            "INSERT INTO item(path,display,kind,availability,name,full,initials,searchable_path)
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<5000)
+             SELECT ?1||'/wiki/page_'||i||'.md','w','file','local','w','w','w','w' FROM n",
+            [base],
+        )
+        .unwrap();
+        // 6. Regular high-volume folder (2100 files -> high_volume)
+        conn.execute(
+            "INSERT INTO item(path,display,kind,availability,name,full,initials,searchable_path)
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2100)
+             SELECT ?1||'/exports/item_'||i||'.txt','e','file','local','e','e','e','e' FROM n",
+            [base],
+        )
+        .unwrap();
+        drop(conn);
+        fs::remove_dir_all(&docs).unwrap();
+
+        let preview = preview_content_scope(&database, vec![docs.clone()], None).unwrap();
+        let find = |name: &str| {
+            preview
+                .top_subfolders
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap_or_else(|| panic!("missing subfolder {name}: {:?}", preview.top_subfolders))
+        };
+
+        let obsidian = find("Obsidian");
+        assert!(!obsidian.suggested_noise);
+        assert_eq!(obsidian.noise_reason, None);
+
+        let wiki = find("wiki");
+        assert!(wiki.suggested_noise);
+        assert_eq!(wiki.noise_reason.as_deref(), Some("high_volume"));
+
+        let exports = find("exports");
+        assert!(exports.suggested_noise);
+        assert_eq!(exports.noise_reason.as_deref(), Some("high_volume"));
+
+        let screenshots = find("screenshots");
+        assert!(screenshots.suggested_noise);
+        assert_eq!(screenshots.noise_reason.as_deref(), Some("image_dump"));
+
+        let renders = find("renders");
+        assert!(renders.suggested_noise);
+        assert_eq!(renders.noise_reason.as_deref(), Some("sequential_frames"));
+
+        let my_sd = find("my_sd");
+        assert!(my_sd.suggested_noise);
+        assert_eq!(my_sd.noise_reason.as_deref(), Some("ai_runtime"));
+
+        // Direct noise_dir classification + dynamic worker range check.
+        assert_eq!(
+            classify_folder_noise(
+                "dist",
+                &FolderStats {
+                    count: 5,
+                    ..FolderStats::default()
+                }
+            ),
+            Some("noise_dir")
+        );
+        assert!((4..=12).contains(&parallel_workers()));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn indexes_legacy_office_rtf_and_subtitle_documents_with_version_tags() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-content-legacy-ext-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let docs = root.join("docs");
+        let cloud_dir = docs.join("Library/CloudStorage/OneDrive-Test");
+        fs::create_dir_all(&cloud_dir).unwrap();
+        fs::write(
+            docs.join("contract.doc"),
+            crate::legacy_office::tests::build_synthetic_doc(false),
+        )
+        .unwrap();
+        fs::write(
+            docs.join("ledger.xls"),
+            crate::legacy_office::tests::build_synthetic_xls(false),
+        )
+        .unwrap();
+        // Hydrated cloud file (SF_DATALESS == 0, availability == "provider_metadata_only")
+        fs::write(
+            cloud_dir.join("deck.ppt"),
+            crate::legacy_office::tests::build_synthetic_ppt(),
+        )
+        .unwrap();
+        fs::write(
+            docs.join("memo.rtf"),
+            br"{\rtf1\ansi\ansicpg936\uc1{\fonttbl{\f0 Song;}} \'d6\'d0\'ce\'c4RTF\par body}",
+        )
+        .unwrap();
+        fs::write(
+            docs.join("talk.vtt"),
+            "WEBVTT\n\n00:00:05.000 --> 00:00:08.000\n<b>会议纪要要点</b>\n",
+        )
+        .unwrap();
+        fs::write(
+            docs.join("clip.srt"),
+            "1\n00:01:02,000 --> 00:01:05,000\n字幕搜索测试\n",
+        )
+        .unwrap();
+        let database = root.join("index.db");
+        crate::index::scan(
+            &database,
+            &Scope {
+                roots: vec![docs.clone()],
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        apply_content_scope(&database, vec![docs.clone()], false).unwrap();
+        let batch = index_content(&database, 16).unwrap();
+        assert_eq!((batch.indexed, batch.pending), (6, 0));
+
+        let conn = open_read(&database).unwrap();
+        let stamps: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT i.display, ds.stamp FROM item i JOIN document_state ds ON i.id=ds.id ORDER BY i.display",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(stamps.len(), 6);
+        assert!(stamps[0].0 == "clip.srt" && stamps[0].1.ends_with(":subtitle-v1"));
+        assert!(stamps[1].0 == "contract.doc" && stamps[1].1.ends_with(":doc-v1"));
+        assert!(stamps[2].0 == "deck.ppt" && stamps[2].1.ends_with(":ppt-v1"));
+        assert!(stamps[3].0 == "ledger.xls" && stamps[3].1.ends_with(":xls-v1"));
+        assert!(stamps[4].0 == "memo.rtf" && stamps[4].1.ends_with(":rtf-v1"));
+        assert!(stamps[5].0 == "talk.vtt" && stamps[5].1.ends_with(":subtitle-v1"));
+
+        for (query, expected_suffix) in [
+            ("中文合同条款", "contract.doc"),
+            ("财务报表", "ledger.xls"),
+            ("年度架构评审", "deck.ppt"),
+            ("中文RTF", "memo.rtf"),
+            ("会议纪要要点", "talk.vtt"),
+            ("字幕搜索测试", "clip.srt"),
+        ] {
+            let hits = crate::search(&conn, query, crate::Mode::Text, 5, None).unwrap();
+            assert_eq!(hits.len(), 1, "query={query} hits={hits:?}");
+            assert!(
+                hits[0].path.ends_with(expected_suffix),
+                "query={query} path={}",
+                hits[0].path
+            );
+        }
+
         fs::remove_dir_all(root).unwrap();
     }
 }

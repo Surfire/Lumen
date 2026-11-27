@@ -1,6 +1,6 @@
 use super::{
     MAX_DOCUMENT, PdfHelperPolicy, ScanPhase, ScanProgressReporter, ScanStats, Scope, absolute,
-    docx, norm, open_write, platform, with_suffix,
+    docx, legacy_office, norm, open_write, platform, with_suffix,
 };
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -1481,18 +1481,13 @@ fn open_resident_document(
 }
 
 fn read_resident_document(path: &Path, expected: &fs::Metadata, limit: u64) -> Result<Vec<u8>> {
-    ensure!(expected.len() <= limit, "file exceeded size limit");
-    let file =
-        open_resident_document(path, expected)?.context("file changed or is not resident")?;
-    let mut data = Vec::new();
-    Read::take(&file, limit + 1).read_to_end(&mut data)?;
-    ensure!(data.len() as u64 <= limit, "file exceeded size limit");
-    let after = file.metadata()?;
     ensure!(
-        platform::availability(path, &after) != "placeholder" && stamp(&after) == stamp(expected),
-        "file changed while reading"
+        expected.is_file()
+            && platform::availability(path, expected) != "placeholder"
+            && expected.len() <= limit,
+        "file exceeded size limit or is not resident"
     );
-    Ok(data)
+    platform::read_local_checked(path, limit, Some(&stamp(expected)))
 }
 
 pub(super) fn document_version(
@@ -1505,6 +1500,11 @@ pub(super) fn document_version(
         DocumentKind::Docx => "docx-v1",
         DocumentKind::Xlsx => "xlsx-v1",
         DocumentKind::Pptx => "pptx-v1",
+        DocumentKind::LegacyDoc => "doc-v1",
+        DocumentKind::LegacyXls => "xls-v1",
+        DocumentKind::LegacyPpt => "ppt-v1",
+        DocumentKind::Rtf => "rtf-v1",
+        DocumentKind::Subtitle => "subtitle-v1",
         DocumentKind::Pdf => coverage.pdf.as_ref().map_or("", |pdf| pdf.format.as_str()),
         DocumentKind::Image => "lumen-image-ocr:vision-text-v1",
     };
@@ -1651,6 +1651,11 @@ pub(super) enum DocumentKind {
     Docx,
     Xlsx,
     Pptx,
+    LegacyDoc,
+    LegacyXls,
+    LegacyPpt,
+    Rtf,
+    Subtitle,
     Pdf,
     Image,
 }
@@ -1661,6 +1666,11 @@ impl DocumentKind {
             "docx" => Some(Self::Docx),
             "xlsx" => Some(Self::Xlsx),
             "pptx" => Some(Self::Pptx),
+            "doc" => Some(Self::LegacyDoc),
+            "xls" => Some(Self::LegacyXls),
+            "ppt" => Some(Self::LegacyPpt),
+            "rtf" => Some(Self::Rtf),
+            "srt" | "vtt" => Some(Self::Subtitle),
             "pdf" => Some(Self::Pdf),
             // Source and config files are plain UTF-8 text; ContentFilter
             // decides whether they are eligible.
@@ -1680,15 +1690,44 @@ impl DocumentKind {
         meta: &fs::Metadata,
         pdf: Option<&PdfExtractor>,
     ) -> Result<crate::content::Extracted> {
-        let read = |limit| match platform::availability(path, meta) {
-            "local" => platform::read_local(path, limit),
-            _ => read_resident_document(path, meta, limit),
+        let expected_stamp = stamp(meta);
+        let read = |limit| {
+            ensure!(
+                meta.is_file()
+                    && platform::availability(path, meta) != "placeholder"
+                    && meta.len() <= limit,
+                "file exceeded size limit or is not resident"
+            );
+            platform::read_local_checked(path, limit, Some(&expected_stamp))
+        };
+        let stream = |limit, parse: fn(&mut platform::CheckedLocalFile) -> Result<String>| {
+            ensure!(
+                meta.is_file()
+                    && platform::availability(path, meta) != "placeholder"
+                    && meta.len() <= limit,
+                "file exceeded size limit or is not resident"
+            );
+            let mut file = platform::open_local_checked(path, limit, Some(&expected_stamp))?;
+            let text = parse(&mut file)?;
+            file.verify_unchanged()?;
+            Ok(text)
         };
         let body = match self {
             Self::Text => String::from_utf8(read(MAX_DOCUMENT)?)?,
-            Self::Docx => docx::text(&read(docx::MAX_ARCHIVE)?)?,
-            Self::Xlsx => docx::xlsx_text(&read(docx::MAX_ARCHIVE)?)?,
-            Self::Pptx => docx::pptx_text(&read(docx::MAX_PPTX_ARCHIVE)?)?,
+            Self::Docx => stream(docx::MAX_ARCHIVE, |f| docx::text_from_reader(f))?,
+            Self::Xlsx => stream(docx::MAX_ARCHIVE, |f| docx::xlsx_text_from_reader(f))?,
+            Self::Pptx => stream(docx::MAX_PPTX_ARCHIVE, |f| docx::pptx_text_from_reader(f))?,
+            Self::LegacyDoc => stream(legacy_office::MAX_LEGACY_OFFICE, |f| {
+                legacy_office::doc_text(f)
+            })?,
+            Self::LegacyXls => stream(legacy_office::MAX_LEGACY_OFFICE, |f| {
+                legacy_office::xls_text(f)
+            })?,
+            Self::LegacyPpt => stream(legacy_office::MAX_LEGACY_OFFICE, |f| {
+                legacy_office::ppt_text(f)
+            })?,
+            Self::Rtf => legacy_office::rtf_text(&read(legacy_office::MAX_RTF)?)?,
+            Self::Subtitle => legacy_office::subtitle_text(&read(legacy_office::MAX_SUBTITLE)?)?,
             Self::Pdf => {
                 return extract_pdf(read(24 * 1024 * 1024)?, pdf.context("missing PDF helper")?);
             }

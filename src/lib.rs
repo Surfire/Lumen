@@ -8,6 +8,7 @@ mod gemma;
 mod image_decode;
 mod image_search;
 mod index;
+mod legacy_office;
 mod model;
 mod name_fast;
 mod pinyin;
@@ -155,6 +156,11 @@ const CONTENT_NOISE_DIRS: &[&str] = &[
     "bower_components",
     "wandb",
     "checkpoints",
+    "comfyui",
+    "huggingface",
+    "modelscope",
+    ".ollama",
+    ".omlx",
 ];
 const CONTENT_NOISE_NAMES: &[&str] = &[
     "package-lock.json",
@@ -205,7 +211,8 @@ impl ContentFilter {
         let extension = path.extension()?.to_str()?.to_ascii_lowercase();
         let category = match extension.as_str() {
             "pdf" => ContentCategory::Pdf,
-            "docx" | "xlsx" | "pptx" => ContentCategory::Docx,
+            "docx" | "xlsx" | "pptx" | "doc" | "xls" | "ppt" | "rtf" => ContentCategory::Docx,
+            "srt" | "vtt" => ContentCategory::Text,
             ext if PROSE_EXTENSIONS.contains(&ext) => ContentCategory::Text,
             ext if CODE_EXTENSIONS.contains(&ext) => ContentCategory::Code,
             _ if image_decode::supported_path(path) => ContentCategory::Image,
@@ -1314,6 +1321,30 @@ mod scope_tests {
             filter.category(Path::new("/d/a.TXT")),
             Some(ContentCategory::Text)
         );
+        for ext in ["doc", "xls", "ppt", "rtf"] {
+            assert_eq!(
+                filter.category(Path::new(&format!("/d/sample.{ext}"))),
+                Some(ContentCategory::Docx),
+                "{ext}"
+            );
+        }
+        for ext in ["srt", "vtt"] {
+            assert_eq!(
+                filter.category(Path::new(&format!("/d/lecture.{ext}"))),
+                Some(ContentCategory::Text),
+                "{ext}"
+            );
+        }
+        assert!(filter.excludes(Path::new("/Users/a/tmp/Docs/call.transcript.md"), &roots));
+        for ai_dir in ["ComfyUI", "huggingface", "ModelScope", ".ollama", ".omlx"] {
+            assert!(
+                filter.excludes(
+                    Path::new(&format!("/Users/a/tmp/Docs/{ai_dir}/notes.txt")),
+                    &roots
+                ),
+                "{ai_dir}"
+            );
+        }
         assert_eq!(filter.category(Path::new("/d/a.swift")), None);
         assert_eq!(filter.category(Path::new("/d/a.bin")), None);
     }

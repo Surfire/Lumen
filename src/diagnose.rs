@@ -576,14 +576,25 @@ fn text_state(
     let Some(kind) = DocumentKind::for_path(&file.path) else {
         return Reason::Unsupported;
     };
-    if kind == DocumentKind::Image && !scope.image_ocr {
-        return Reason::Unsupported;
-    }
-    if kind == DocumentKind::Pdf
-        && scope.pdf_helper.is_none()
-        && scope.pdf_helper_policy != Some(PdfHelperPolicy::Bundled)
-    {
-        return Reason::PdfHelperUnconfigured;
+    match kind {
+        DocumentKind::Image if !scope.image_ocr => return Reason::Unsupported,
+        DocumentKind::Pdf
+            if scope.pdf_helper.is_none()
+                && scope.pdf_helper_policy != Some(PdfHelperPolicy::Bundled) =>
+        {
+            return Reason::PdfHelperUnconfigured;
+        }
+        DocumentKind::Text
+        | DocumentKind::Docx
+        | DocumentKind::Xlsx
+        | DocumentKind::Pptx
+        | DocumentKind::LegacyDoc
+        | DocumentKind::LegacyXls
+        | DocumentKind::LegacyPpt
+        | DocumentKind::Rtf
+        | DocumentKind::Subtitle
+        | DocumentKind::Pdf
+        | DocumentKind::Image => {}
     }
     if name != Reason::Indexed {
         return name;
@@ -983,5 +994,45 @@ mod tests {
         assert_eq!(diagnosis.text, Reason::CloudNameOnly);
         assert_eq!(diagnosis.semantic, Reason::CloudNameOnly);
         assert_eq!(diagnosis.availability, Some("placeholder"));
+    }
+
+    #[test]
+    fn diagnose_recognizes_legacy_office_rtf_and_subtitle_kinds() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE item(id INTEGER PRIMARY KEY,path TEXT,kind TEXT,availability TEXT);
+             CREATE TABLE document(id INTEGER PRIMARY KEY,body TEXT,normalized TEXT);
+             CREATE TABLE document_state(id INTEGER PRIMARY KEY,stamp TEXT);",
+        )
+        .unwrap();
+        let scope = Scope {
+            roots: vec!["/docs".into()],
+            documents: true,
+            ..Scope::default()
+        };
+        for (id, ext) in [
+            (1, "doc"),
+            (2, "xls"),
+            (3, "ppt"),
+            (4, "rtf"),
+            (5, "srt"),
+            (6, "vtt"),
+        ] {
+            let path = PathBuf::from(format!("/docs/sample.{ext}"));
+            conn.execute(
+                "INSERT INTO item VALUES(?1,?2,'file','local')",
+                rusqlite::params![id, path.to_str().unwrap()],
+            )
+            .unwrap();
+            let file = Selected {
+                path,
+                availability: "local",
+                stamp: Some("1:2:3:4:5".into()),
+                symlink_target: None,
+            };
+            let diagnosis = inspect_file(&conn, &scope, &file);
+            assert_eq!(diagnosis.name, Reason::Indexed, "{ext}");
+            assert_eq!(diagnosis.text, Reason::NotIndexed, "{ext}");
+        }
     }
 }

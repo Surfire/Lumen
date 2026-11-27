@@ -3,11 +3,12 @@ use anyhow::{Context, Result, bail, ensure};
 use quick_xml::{
     XmlVersion, escape::resolve_xml_entity, events::Event, name::ResolveResult, reader::NsReader,
 };
-use std::io::{Cursor, Read};
-use zip::{CompressionMethod, ZipArchive};
+use std::io::{Cursor, Read, Seek, SeekFrom};
+use zip::{CompressionMethod, ZipArchive, result::ZipError};
 
-pub(super) const MAX_ARCHIVE: u64 = 16 * 1024 * 1024;
-pub(super) const MAX_PPTX_ARCHIVE: u64 = 64 * 1024 * 1024;
+pub(super) const MAX_ARCHIVE: u64 = 64 * 1024 * 1024;
+pub(super) const MAX_PPTX_ARCHIVE: u64 = 256 * 1024 * 1024;
+const MAX_TOTAL_XML_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RELATIONSHIPS: u64 = 128 * 1024;
 const MAX_MAIN_XML: u64 = 8 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
@@ -21,22 +22,76 @@ const STRICT_OFFICE_DOCUMENT: &str =
 const WORD: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const STRICT_WORD: &str = "http://purl.oclc.org/ooxml/wordprocessingml/main";
 
+fn stream_len<R: Seek>(reader: &mut R) -> Result<u64> {
+    let len = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(0))?;
+    Ok(len)
+}
+
 /// Interpret only two parts of the supplied package, in memory. The caller
 /// obtains these archive bytes through the local-file availability checks.
+#[allow(dead_code)]
 pub(super) fn text(bytes: &[u8]) -> Result<String> {
     ensure!(
         bytes.len() as u64 <= MAX_ARCHIVE,
         "DOCX exceeds the archive limit"
     );
-    let mut archive = ZipArchive::new(Cursor::new(bytes)).context("open DOCX archive")?;
-    ensure!(archive.len() <= MAX_ENTRIES, "DOCX has too many parts");
-    let relationships = xml_part(&mut archive, "_rels/.rels", MAX_RELATIONSHIPS)?;
-    let main = main_part(&relationships)?;
-    document_text(&xml_part(&mut archive, &main, MAX_MAIN_XML)?)
+    text_from_reader(Cursor::new(bytes))
 }
 
-fn xml_part(archive: &mut ZipArchive<Cursor<&[u8]>>, name: &str, limit: u64) -> Result<String> {
+/// Stream only the relationship and main document XML parts directly from a
+/// seekable archive without buffering unrelated package entries.
+pub(super) fn text_from_reader<R: Read + Seek>(mut reader: R) -> Result<String> {
+    ensure!(
+        stream_len(&mut reader)? <= MAX_ARCHIVE,
+        "DOCX exceeds the archive limit"
+    );
+    let mut archive = ZipArchive::new(reader).context("open DOCX archive")?;
+    ensure!(archive.len() <= MAX_ENTRIES, "DOCX has too many parts");
+    let mut remaining_xml = MAX_TOTAL_XML_BYTES;
+    let relationships = xml_part(
+        &mut archive,
+        "_rels/.rels",
+        MAX_RELATIONSHIPS,
+        &mut remaining_xml,
+    )?;
+    let main = main_part(&relationships)?;
+    document_text(&xml_part(
+        &mut archive,
+        &main,
+        MAX_MAIN_XML,
+        &mut remaining_xml,
+    )?)
+}
+
+fn xml_part<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    name: &str,
+    limit: u64,
+    remaining_xml: &mut u64,
+) -> Result<String> {
     let file = archive.by_name(name).context("missing DOCX XML part")?;
+    decode_xml_entry(file, limit, remaining_xml)
+}
+
+fn optional_xml_part<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    name: &str,
+    limit: u64,
+    remaining_xml: &mut u64,
+) -> Result<Option<String>> {
+    match archive.by_name(name) {
+        Ok(file) => decode_xml_entry(file, limit, remaining_xml).map(Some),
+        Err(ZipError::FileNotFound) => Ok(None),
+        Err(error) => Err(error).context("open Office XML part"),
+    }
+}
+
+fn decode_xml_entry<R: Read>(
+    file: zip::read::ZipFile<'_, R>,
+    limit: u64,
+    remaining_xml: &mut u64,
+) -> Result<String> {
     ensure!(
         file.is_file()
             && matches!(
@@ -46,12 +101,22 @@ fn xml_part(archive: &mut ZipArchive<Cursor<&[u8]>>, name: &str, limit: u64) -> 
             && file.size() <= limit,
         "unsupported DOCX part or XML size exceeds limit"
     );
+    ensure!(
+        file.size() <= *remaining_xml,
+        "Office XML exceeds aggregate decompression budget"
+    );
+    let cap = limit.min(*remaining_xml);
     let mut bytes = Vec::new();
-    file.take(limit + 1).read_to_end(&mut bytes)?;
+    file.take(cap + 1).read_to_end(&mut bytes)?;
     ensure!(
         bytes.len() as u64 <= limit,
         "DOCX XML exceeds decompression limit"
     );
+    ensure!(
+        bytes.len() as u64 <= *remaining_xml,
+        "Office XML exceeds aggregate decompression budget"
+    );
+    *remaining_xml -= bytes.len() as u64;
     if let Some(marker) = bytes.first_chunk::<2>() {
         let decode = match marker {
             [0xff, 0xfe] => Some(u16::from_le_bytes as fn([u8; 2]) -> u16),
@@ -269,7 +334,11 @@ fn append_bounded(body: &mut String, separator: &mut &str, text: &str) -> bool {
     false
 }
 
-fn numbered_parts(archive: &ZipArchive<Cursor<&[u8]>>, prefix: &str, suffix: &str) -> Vec<String> {
+fn numbered_parts<R: Read + Seek>(
+    archive: &ZipArchive<R>,
+    prefix: &str,
+    suffix: &str,
+) -> Vec<String> {
     let mut parts: Vec<(u32, String)> = archive
         .file_names()
         .filter_map(|name| {
@@ -344,16 +413,33 @@ fn parse_shared_strings(xml: &str) -> Result<Vec<String>> {
 
 /// Extract searchable cell text from an `.xlsx` workbook in memory without
 /// touching the filesystem or adding third-party dependencies.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn xlsx_text(bytes: &[u8]) -> Result<String> {
     ensure!(
         bytes.len() as u64 <= MAX_ARCHIVE,
         "XLSX exceeds the archive limit"
     );
-    let mut archive = ZipArchive::new(Cursor::new(bytes)).context("open XLSX archive")?;
+    xlsx_text_from_reader(Cursor::new(bytes))
+}
+
+/// Stream shared strings and worksheet XML directly from a seekable `.xlsx`
+/// archive without buffering media or other unrelated package entries.
+pub(super) fn xlsx_text_from_reader<R: Read + Seek>(mut reader: R) -> Result<String> {
+    ensure!(
+        stream_len(&mut reader)? <= MAX_ARCHIVE,
+        "XLSX exceeds the archive limit"
+    );
+    let mut archive = ZipArchive::new(reader).context("open XLSX archive")?;
     ensure!(archive.len() <= MAX_ENTRIES, "XLSX has too many parts");
-    let shared = match xml_part(&mut archive, "xl/sharedStrings.xml", MAX_SHARED_STRINGS_XML) {
-        Ok(xml) => parse_shared_strings(&xml)?,
-        Err(_) => Vec::new(),
+    let mut remaining_xml = MAX_TOTAL_XML_BYTES;
+    let shared = match optional_xml_part(
+        &mut archive,
+        "xl/sharedStrings.xml",
+        MAX_SHARED_STRINGS_XML,
+        &mut remaining_xml,
+    )? {
+        Some(xml) => parse_shared_strings(&xml)?,
+        None => Vec::new(),
     };
     let sheets = numbered_parts(&archive, "xl/worksheets/sheet", ".xml");
     ensure!(!sheets.is_empty(), "XLSX has no worksheets");
@@ -361,9 +447,7 @@ pub(super) fn xlsx_text(bytes: &[u8]) -> Result<String> {
     let mut body = String::new();
     let mut separator = "";
     'sheets: for sheet_name in sheets {
-        let Ok(xml) = xml_part(&mut archive, &sheet_name, MAX_SHEET_XML) else {
-            continue;
-        };
+        let xml = xml_part(&mut archive, &sheet_name, MAX_SHEET_XML, &mut remaining_xml)?;
         let mut reader = xml_reader(&xml);
         let mut depth = 0usize;
         let mut cell_type = String::new();
@@ -462,13 +546,25 @@ pub(super) fn xlsx_text(bytes: &[u8]) -> Result<String> {
 }
 
 /// Extract searchable slide and speaker-note text from a `.pptx` presentation in memory.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn pptx_text(bytes: &[u8]) -> Result<String> {
     ensure!(
         bytes.len() as u64 <= MAX_PPTX_ARCHIVE,
         "PPTX exceeds the archive limit"
     );
-    let mut archive = ZipArchive::new(Cursor::new(bytes)).context("open PPTX archive")?;
+    pptx_text_from_reader(Cursor::new(bytes))
+}
+
+/// Stream only slide and speaker-note XML parts from a seekable `.pptx`
+/// archive, skipping `ppt/media/*` without buffering the whole archive.
+pub(super) fn pptx_text_from_reader<R: Read + Seek>(mut reader: R) -> Result<String> {
+    ensure!(
+        stream_len(&mut reader)? <= MAX_PPTX_ARCHIVE,
+        "PPTX exceeds the archive limit"
+    );
+    let mut archive = ZipArchive::new(reader).context("open PPTX archive")?;
     ensure!(archive.len() <= MAX_ENTRIES, "PPTX has too many parts");
+    let mut remaining_xml = MAX_TOTAL_XML_BYTES;
     let mut parts = numbered_parts(&archive, "ppt/slides/slide", ".xml");
     parts.extend(numbered_parts(
         &archive,
@@ -480,9 +576,7 @@ pub(super) fn pptx_text(bytes: &[u8]) -> Result<String> {
     let mut body = String::new();
     let mut separator = "";
     'parts: for part_name in parts {
-        let Ok(xml) = xml_part(&mut archive, &part_name, MAX_SLIDE_XML) else {
-            continue;
-        };
+        let xml = xml_part(&mut archive, &part_name, MAX_SLIDE_XML, &mut remaining_xml)?;
         let mut reader = xml_reader(&xml);
         let mut depth = 0usize;
         let mut in_text = false;
@@ -621,5 +715,100 @@ mod office_tests {
         let pos2 = extracted.find("第二页风险分析").unwrap();
         let pos_note = extracted.find("重点核对现金流").unwrap();
         assert!(pos1 < pos2 && pos2 < pos_note, "{extracted}");
+    }
+
+    #[test]
+    fn streams_large_pptx_file_skipping_media_entries() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-pptx-stream-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("deck.pptx");
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            zip.start_file("ppt/media/blob.bin", stored).unwrap();
+            let chunk = vec![0xABu8; 1024 * 1024];
+            for _ in 0..21 {
+                zip.write_all(&chunk).unwrap();
+            }
+            let deflated =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            zip.start_file("ppt/slides/slide1.xml", deflated).unwrap();
+            zip.write_all(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+                   <p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+                          xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+                     <p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>流式解析大型演示文稿</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld>
+                   </p:sld>"#
+                    .as_bytes(),
+            )
+            .unwrap();
+            zip.finish().unwrap();
+        }
+        assert!(std::fs::metadata(&path).unwrap().len() > 20 * 1024 * 1024);
+        let file = std::fs::File::open(&path).unwrap();
+        let extracted = pptx_text_from_reader(file).unwrap();
+        assert!(extracted.contains("流式解析大型演示文稿"), "{extracted}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_multipart_xml_exceeding_total_decompression_budget() {
+        // Each slide is ~3 MiB (< MAX_SLIDE_XML = 4 MiB), but 12 slides total ~36 MiB
+        // (> MAX_TOTAL_XML_BYTES = 32 MiB) while compressing to a few kilobytes.
+        let padding = " ".repeat(3 * 1024 * 1024);
+        let slide_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+               <p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+                      xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+                 <p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>slide</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld>
+                 <!--{padding}-->
+               </p:sld>"#
+        );
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut cursor);
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            for i in 1..=12 {
+                zip.start_file(format!("ppt/slides/slide{i}.xml"), options)
+                    .unwrap();
+                zip.write_all(slide_xml.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let err = pptx_text(&cursor.into_inner()).unwrap_err();
+        assert!(
+            err.to_string().contains("budget"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn extracts_docx_via_slice_and_streaming_reader() {
+        let bytes = make_zip(&[
+            (
+                "_rels/.rels",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+                   <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                     <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+                   </Relationships>"#,
+            ),
+            (
+                "word/document.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+                   <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+                     <w:body><w:p><w:r><w:t>合同正文摘要</w:t></w:r></w:p></w:body>
+                   </w:document>"#,
+            ),
+        ]);
+        assert_eq!(text(&bytes).unwrap(), "合同正文摘要");
+        assert_eq!(
+            text_from_reader(Cursor::new(&bytes)).unwrap(),
+            "合同正文摘要"
+        );
     }
 }

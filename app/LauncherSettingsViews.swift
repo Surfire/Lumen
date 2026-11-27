@@ -566,7 +566,8 @@ struct LauncherSettings: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 14) {
                 filterToggle("PDF", \.enable_pdf)
-                filterToggle("DOCX", \.enable_docx)
+                filterToggle("Office", \.enable_docx)
+                    .help("DOCX / XLSX / PPTX")
                 filterToggle(model.t("文本", "Text"), \.enable_text)
                 filterToggle(model.t("图片", "Images"), \.enable_images)
             }

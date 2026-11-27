@@ -12,7 +12,7 @@ use std::{
 
 #[path = "name_soa.rs"]
 mod soa;
-use soa::{MAX_INDEX_BYTES, NameIndex};
+use soa::{NameIndex, default_index_budget};
 
 // SQLite remains the query path while building or when the byte budget is exceeded.
 const REBUILD_DELAY: Duration = Duration::from_millis(1200);
@@ -426,7 +426,7 @@ fn drop_off_hot_path(index: Option<NameIndex>) {
 
 impl NameFast {
     pub(super) fn new(db: &Path, conn: &Connection) -> Self {
-        Self::with_budget(db, conn, MAX_INDEX_BYTES)
+        Self::with_budget(db, conn, default_index_budget())
     }
 
     fn with_budget(db: &Path, conn: &Connection, budget: usize) -> Self {

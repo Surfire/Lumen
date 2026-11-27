@@ -98,9 +98,11 @@ final class GemmaAssetManager: ObservableObject {
         self.home = home
         self.manifest = manifest
         self.defaults = defaults
-        // Smart default: the mainland China mirror when the region suggests HuggingFace is unreachable.
+        // Smart default: the mainland China mirror when the region or timezone suggests HuggingFace is unreachable.
         let stored = defaults?.string(forKey: "gemma.mirror.v1").flatMap(GemmaMirror.init(rawValue:))
-        mirror = stored ?? (Locale.current.region?.identifier == "CN" ? .hfMirror : .huggingFace)
+        let tz = TimeZone.current.identifier
+        let chinaZone = tz == "Asia/Shanghai" || tz == "Asia/Chongqing" || tz == "Asia/Harbin" || tz == "Asia/Urumqi"
+        mirror = stored ?? ((Locale.current.region?.identifier == "CN" || chinaZone) ? .hfMirror : .huggingFace)
         refresh()
     }
 

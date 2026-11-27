@@ -332,12 +332,12 @@ fn save_cursor(conn: &Connection, (mtime, id): JobPosition) -> Result<()> {
     Ok(())
 }
 
-/// Text and DOCX are read in-process; PDF and OCR run helpers with their own
-/// deadlines and stay sequential.
+/// Text and OOXML Office files are read in-process; PDF and OCR run helpers with
+/// their own deadlines and stay sequential.
 fn parallel_kind(coverage: &Coverage, path: &Path) -> bool {
     matches!(
         eligible_kind(coverage, path),
-        Some(DocumentKind::Text | DocumentKind::Docx)
+        Some(DocumentKind::Text | DocumentKind::Docx | DocumentKind::Xlsx | DocumentKind::Pptx)
     ) && coverage.permits_content(path)
 }
 

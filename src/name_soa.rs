@@ -14,6 +14,24 @@ use std::{
 };
 
 pub(super) const MAX_INDEX_BYTES: usize = 256 * 1024 * 1024;
+const HIGH_RAM_INDEX_BYTES: usize = 512 * 1024 * 1024;
+
+pub(super) fn default_index_budget() -> usize {
+    if crate::platform::physical_memory_bytes() >= 64 * 1024 * 1024 * 1024 {
+        HIGH_RAM_INDEX_BYTES
+    } else {
+        MAX_INDEX_BYTES
+    }
+}
+
+fn path_has_noise_or_backup_segment(path: &Path) -> bool {
+    path.components().any(|part| {
+        part.as_os_str().to_str().is_some_and(|name| {
+            crate::development_noise_name(name) || crate::backup_or_archive_segment(name)
+        })
+    })
+}
+
 const DIRECTORY: u8 = 1;
 const PACKAGE: u8 = 2;
 const USER_AREA: u8 = 4;
@@ -22,6 +40,42 @@ const LOCAL: u8 = 0;
 const PROVIDER: u8 = 16;
 const PLACEHOLDER: u8 = 32;
 const HAS_EXTRA: u8 = 64;
+const INSTALLED_APP: u8 = 128;
+
+fn is_installed_app_dir(parent: &Path, home: Option<&Path>) -> bool {
+    parent.starts_with("/Applications")
+        || parent.starts_with("/System/Applications")
+        || home.is_some_and(|h| parent.starts_with(h.join("Applications")))
+}
+
+#[inline]
+fn rank_prefix(
+    worst: u8,
+    sum: u16,
+    flags: u8,
+    mtime: u32,
+    kind: Kind,
+) -> (u8, u16, bool, bool, Reverse<u32>, u8) {
+    let installed_app = flags & INSTALLED_APP != 0 && flags & NOISE == 0;
+    // Installed apps under /Applications, /System/Applications, or ~/Applications
+    // share top priority with the user's home area and outrank non-app matches
+    // at the same lexical tier even when their bundle mtime is older.
+    let deprioritized = (flags & NOISE != 0) || (!installed_app && flags & USER_AREA == 0);
+    (
+        worst,
+        sum,
+        deprioritized,
+        !installed_app,
+        Reverse(mtime),
+        match kind {
+            Kind::App => 0,
+            Kind::Doc => 1,
+            Kind::Folder if flags & PACKAGE == 0 => 1,
+            Kind::Folder => Kind::Other as u8,
+            _ => kind as u8,
+        },
+    )
+}
 
 #[derive(Default)]
 struct Pool {
@@ -231,7 +285,7 @@ impl Word<'_> {
 // cleanliness, recency, and kind. Width and lexical path stabilize ties.
 #[derive(Eq, PartialEq)]
 struct Ranked<'a> {
-    score: (u8, u16, bool, Reverse<u32>, u8, usize),
+    score: (u8, u16, bool, bool, Reverse<u32>, u8, usize),
     parent: &'a str,
     display: &'a str,
     id: usize,
@@ -337,7 +391,11 @@ impl NameIndex {
                     USER_AREA
                 } else {
                     0
-                } | if crate::development_noise(parent_path, &[])
+                } | if is_installed_app_dir(parent_path, home.as_deref()) {
+                    INSTALLED_APP
+                } else {
+                    0
+                } | if path_has_noise_or_backup_segment(parent_path)
                     || crate::sensitive_path(parent_path)
                     || crate::system_path(parent_path)
                 {
@@ -365,7 +423,8 @@ impl NameIndex {
                 }
             }
             if flags & USER_AREA != 0
-                && (crate::development_noise(Path::new(display), &[])
+                && (crate::development_noise_name(display)
+                    || crate::backup_or_archive_segment(display)
                     || crate::sensitive_path(Path::new(display)))
             {
                 flags |= NOISE;
@@ -383,9 +442,13 @@ impl NameIndex {
                     initials,
                 ]);
             }
+            let item_kind = Kind::classify(name, directory);
+            if item_kind != Kind::App {
+                flags &= !INSTALLED_APP;
+            }
             push(&mut index.parent_ids, parent_id);
             push(&mut index.flags, flags);
-            push(&mut index.kinds, Kind::classify(name, directory));
+            push(&mut index.kinds, item_kind);
             push(&mut index.mtime, mtime.clamp(0, i64::from(u32::MAX)) as u32);
             if index.capacity_bytes() > budget {
                 return Ok(None);
@@ -429,7 +492,9 @@ impl NameIndex {
     fn name_tier(&self, id: usize, word: &Word<'_>) -> Option<u8> {
         let name = self.names.get(id);
         let text = word.text;
-        if name == text {
+        if name == text
+            || (self.flags[id] & INSTALLED_APP != 0 && name.strip_suffix(".app") == Some(text))
+        {
             return Some(0);
         }
         if name.starts_with(text) {
@@ -549,19 +614,7 @@ impl NameIndex {
             worst = worst.max(tier);
             sum += u16::from(tier);
         }
-        let prefix = (
-            worst,
-            sum,
-            flags & (USER_AREA | NOISE) != USER_AREA,
-            Reverse(self.mtime[id]),
-            match kind {
-                Kind::App => 0,
-                Kind::Doc => 1,
-                Kind::Folder if flags & PACKAGE == 0 => 1,
-                Kind::Folder => Kind::Other as u8,
-                _ => kind as u8,
-            },
-        );
+        let prefix = rank_prefix(worst, sum, flags, self.mtime[id], kind);
         if heap.peek().is_some_and(|top| {
             heap.len() == ctx.limit
                 && prefix
@@ -571,6 +624,7 @@ impl NameIndex {
                         top.score.2,
                         top.score.3,
                         top.score.4,
+                        top.score.5,
                     )
         }) {
             return;
@@ -584,6 +638,7 @@ impl NameIndex {
                 prefix.2,
                 prefix.3,
                 prefix.4,
+                prefix.5,
                 display.chars().count(),
             ),
             parent: self.parent_paths.get(parent_id),
@@ -676,7 +731,10 @@ impl NameIndex {
                 let mut heap = BinaryHeap::<Ranked<'_>>::with_capacity(limit);
                 scan_pool_chunk(&self.names, start, end, needle, |id| {
                     let name = self.names.get(id);
-                    let tier = if name == primary.text {
+                    let tier = if name == primary.text
+                        || (self.flags[id] & INSTALLED_APP != 0
+                            && name.strip_suffix(".app") == Some(primary.text))
+                    {
                         0
                     } else if name.starts_with(primary.text) {
                         1
@@ -873,19 +931,15 @@ mod tests {
             }
             let (display, _, _) = index.extras(id);
             let display = if display.is_empty() { name } else { display };
+            let prefix = rank_prefix(worst, sum, flags, index.mtime[id], kind);
             let ranked = Ranked {
                 score: (
-                    worst,
-                    sum,
-                    flags & (USER_AREA | NOISE) != USER_AREA,
-                    Reverse(index.mtime[id]),
-                    match kind {
-                        Kind::App => 0,
-                        Kind::Doc => 1,
-                        Kind::Folder if flags & PACKAGE == 0 => 1,
-                        Kind::Folder => Kind::Other as u8,
-                        _ => kind as u8,
-                    },
+                    prefix.0,
+                    prefix.1,
+                    prefix.2,
+                    prefix.3,
+                    prefix.4,
+                    prefix.5,
                     display.chars().count(),
                 ),
                 parent: index.parent_paths.get(parent_id),
@@ -1065,6 +1119,80 @@ mod tests {
                 "parallel parity mismatch for {q:?}"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn installed_apps_outrank_home_staging_and_live_files_outrank_backups() {
+        let dir = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-soa-rank-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("index.sqlite");
+        let (writer, _) = crate::open_write(&db, false).unwrap();
+        let home = crate::absolute(Path::new(&std::env::var_os("HOME").unwrap())).unwrap();
+        let rows = [
+            (
+                PathBuf::from("/Applications/Blender.app"),
+                "directory",
+                "",
+                "",
+                500,
+            ),
+            (
+                home.join("LocalAI/data/update-manager/staging/hermes/blender"),
+                "directory",
+                "",
+                "",
+                900,
+            ),
+            (
+                home.join("LocalAI/library/obsidian-vault/项目笔记"),
+                "directory",
+                "xiangmubiji",
+                "xmbj",
+                600,
+            ),
+            (
+                home.join("LocalAI/backups/retention/daily/20261126/项目笔记"),
+                "directory",
+                "xiangmubiji",
+                "xmbj",
+                950,
+            ),
+        ];
+        for (path, kind, full, initials, mtime) in rows {
+            let path_str = path.to_str().unwrap();
+            let display = path.file_name().unwrap().to_str().unwrap();
+            writer
+                .execute(
+                    "INSERT INTO item VALUES(NULL,?1,?2,?3,'local',?4,?5,?6,?7,?8)",
+                    rusqlite::params![
+                        path_str,
+                        display,
+                        kind,
+                        crate::norm(display),
+                        full,
+                        initials,
+                        crate::norm(path_str),
+                        mtime,
+                    ],
+                )
+                .unwrap();
+        }
+        drop(writer);
+        let (_, index) = NameIndex::load(&db, &AtomicBool::new(false), MAX_INDEX_BYTES)
+            .unwrap()
+            .unwrap();
+        let app_hits = index.search("blender", None, 5);
+        assert_eq!(app_hits[0].path, "/Applications/Blender.app");
+        let note_hits = index.search("项目笔记", None, 5);
+        assert!(
+            note_hits[0].path.ends_with("obsidian-vault/项目笔记"),
+            "expected live vault entry first, got {:?}",
+            note_hits.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

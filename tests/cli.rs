@@ -837,8 +837,12 @@ mod live {
                 .unwrap();
             assert!(full.starts_with(new_full), "{full}");
             assert!(initials.starts_with(new_initials), "{initials}");
-            tx.execute("DELETE FROM name_fts WHERE rowid=?1", [id])
-                .unwrap();
+            tx.execute(
+                "INSERT INTO name_fts(name_fts,rowid,name,full,initials,searchable_path)
+                 VALUES('delete',?1,?2,?3,?4,?5)",
+                rusqlite::params![id, name, full, initials, path],
+            )
+            .unwrap();
             tx.execute(
                 "UPDATE item SET full=?2,initials=?3 WHERE id=?1",
                 rusqlite::params![id, old_full, old_initials],
@@ -1614,8 +1618,10 @@ printf 'second batch text'
             [checkpoint.to_string()],
         )
         .unwrap();
-        db.execute_batch("PRAGMA user_version=2; DELETE FROM info WHERE key IN ('scope_policy_v3','scope_policy_v4');")
-            .unwrap();
+        db.execute_batch(
+            "PRAGMA user_version=2; DELETE FROM info WHERE key IN ('scope_policy_v3','scope_policy_v4','scope_policy_v5');",
+        )
+        .unwrap();
         let prior_scan = info("scan");
         let mut serve = Serve::new(&f);
         assert_eq!(serve.names("retired-scope", "name").len(), 2);
@@ -1685,7 +1691,7 @@ printf 'second batch text'
         .unwrap();
         // Simulate a catalog already reconciled by the previous policy.
         db.execute_batch(
-            "DELETE FROM info WHERE key IN ('scope_policy_v4','watch_checkpoint_v1');
+            "DELETE FROM info WHERE key IN ('scope_policy_v4','scope_policy_v5','watch_checkpoint_v1');
              INSERT OR REPLACE INTO info VALUES('scope_policy_v3','true');",
         )
         .unwrap();

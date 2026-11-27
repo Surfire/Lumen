@@ -52,8 +52,8 @@ use std::{
 use unicode_normalization::UnicodeNormalization;
 
 pub const MAX_DOCUMENT: u64 = 2 * 1024 * 1024;
-const SCHEMA_VERSION: i64 = 4;
-const LEGACY_SCHEMA_VERSIONS: std::ops::RangeInclusive<i64> = 1..=3;
+const SCHEMA_VERSION: i64 = 5;
+const LEGACY_SCHEMA_VERSIONS: std::ops::RangeInclusive<i64> = 1..=4;
 const DATABASE_APPLICATION_ID: i64 = 0x4c554d4e; // LUMN
 
 pub fn standard_database() -> PathBuf {
@@ -205,7 +205,7 @@ impl ContentFilter {
         let extension = path.extension()?.to_str()?.to_ascii_lowercase();
         let category = match extension.as_str() {
             "pdf" => ContentCategory::Pdf,
-            "docx" => ContentCategory::Docx,
+            "docx" | "xlsx" | "pptx" => ContentCategory::Docx,
             ext if PROSE_EXTENSIONS.contains(&ext) => ContentCategory::Text,
             ext if CODE_EXTENSIONS.contains(&ext) => ContentCategory::Code,
             _ if image_decode::supported_path(path) => ContentCategory::Image,
@@ -313,6 +313,7 @@ impl Scope {
     fn excludes(&self, path: &Path) -> bool {
         self.deny.iter().any(|p| platform::denied_by(path, p))
             || sensitive_path(path)
+            || transient_noise_file(path)
             || development_noise(path, &self.roots)
             || (system_path(path)
                 && !self.roots.iter().any(|root| {
@@ -370,6 +371,7 @@ fn system_path(path: &Path) -> bool {
             "/private/tmp",
             "/cores",
             "/Network",
+            "/Users/Deleted Users",
         ]
         .iter()
         .any(|p| path.starts_with(p))
@@ -380,6 +382,74 @@ fn is_build_target_dir(parent: &Path, target_dir: &Path) -> bool {
         .iter()
         .any(|marker| fs::symlink_metadata(parent.join(marker)).is_ok())
         || fs::symlink_metadata(target_dir.join("CACHEDIR.TAG")).is_ok()
+}
+
+pub(crate) fn is_python_venv_dir(dir: &Path) -> bool {
+    fs::symlink_metadata(dir.join("pyvenv.cfg")).is_ok()
+}
+
+pub(crate) fn is_venv_dir_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower == "venv"
+        || lower.starts_with("venv-")
+        || lower.starts_with("venv_")
+        || lower.ends_with("-venv")
+        || lower.ends_with("_venv")
+    {
+        return true;
+    }
+    lower.strip_prefix("venv").is_some_and(|rest| {
+        !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+    })
+}
+
+pub(crate) fn development_noise_name(name: &str) -> bool {
+    [
+        "node_modules",
+        "DerivedData",
+        "__pycache__",
+        "Pods",
+        "bower_components",
+        "CMakeFiles",
+        "site-packages",
+        "dist-packages",
+    ]
+    .iter()
+    .any(|noise| name.eq_ignore_ascii_case(noise))
+        || is_venv_dir_name(name)
+}
+
+/// High-frequency transient sidecars, database journals, heartbeat files and
+/// Office lock files that churn FSEvents without representing user documents.
+pub(crate) fn transient_noise_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if name.starts_with("~$") {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    [
+        "-wal",
+        "-shm",
+        "-journal",
+        ".heartbeat",
+        ".part",
+        ".crdownload",
+    ]
+    .iter()
+    .any(|suffix| lower.ends_with(suffix))
+}
+
+/// Backup, retention, staging, and explicit archive folders stay searchable
+/// by name but rank behind live user files in the in-memory index.
+pub(crate) fn backup_or_archive_segment(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "backups" | "backup" | "retention" | "staging" | "archive" | "archives"
+    ) || name.contains("作废归档")
+        || name.contains("旧版归档")
 }
 
 fn development_noise(path: &Path, roots: &[PathBuf]) -> bool {
@@ -396,18 +466,7 @@ fn development_noise(path: &Path, roots: &[PathBuf]) -> bool {
         if let Some(name) = part.as_os_str().to_str() {
             // Hidden directories (including .venv, .gradle, .cargo, etc.)
             // are already excluded by sensitive_path.
-            if [
-                "node_modules",
-                "DerivedData",
-                "venv",
-                "__pycache__",
-                "Pods",
-                "bower_components",
-                "CMakeFiles",
-            ]
-            .iter()
-            .any(|noise| name.eq_ignore_ascii_case(noise))
-            {
+            if development_noise_name(name) {
                 return true;
             }
             if name.eq_ignore_ascii_case("target") {
@@ -580,10 +639,12 @@ fn catalog_schema(conn: &Connection) -> rusqlite::Result<(i64, i64)> {
 fn migrate_catalog(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // Another writer may have migrated while we were acquiring the lock.
-    let uninitialized = match catalog_schema(&tx)? {
+    let (uninitialized, prior_version) = match catalog_schema(&tx)? {
         (DATABASE_APPLICATION_ID, SCHEMA_VERSION) => return Ok(()),
-        (DATABASE_APPLICATION_ID, version) if LEGACY_SCHEMA_VERSIONS.contains(&version) => false,
-        (0, 0) => true,
+        (DATABASE_APPLICATION_ID, version) if LEGACY_SCHEMA_VERSIONS.contains(&version) => {
+            (false, version)
+        }
+        (0, 0) => (true, 0),
         _ => bail!("not a supported Lumen index; no changes made"),
     };
     if uninitialized {
@@ -595,13 +656,22 @@ fn migrate_catalog(conn: &mut Connection) -> Result<()> {
           full TEXT NOT NULL, initials TEXT NOT NULL, searchable_path TEXT NOT NULL
         );
         CREATE VIRTUAL TABLE IF NOT EXISTS name_fts USING fts5(name,full,initials,searchable_path,
-          tokenize='trigram');
+          content='item', content_rowid='id', tokenize='trigram');
         CREATE TABLE IF NOT EXISTS document(id INTEGER PRIMARY KEY, body TEXT NOT NULL,
           normalized TEXT NOT NULL);
         CREATE VIRTUAL TABLE IF NOT EXISTS content_fts USING fts5(body, tokenize='trigram');
         CREATE TABLE IF NOT EXISTS embedding(id INTEGER PRIMARY KEY, vector BLOB NOT NULL);
         CREATE TABLE IF NOT EXISTS info(key TEXT PRIMARY KEY, value TEXT NOT NULL);
     ",
+        )?;
+    } else if prior_version < 5 {
+        // Convert legacy standalone name_fts into an external-content FTS5 table
+        // backed by `item`, eliminating the duplicate `name_fts_content` copy.
+        tx.execute_batch(
+            "DROP TABLE IF EXISTS name_fts;
+             CREATE VIRTUAL TABLE name_fts USING fts5(name,full,initials,searchable_path,
+               content='item', content_rowid='id', tokenize='trigram');
+             INSERT INTO name_fts(name_fts) VALUES('rebuild');",
         )?;
     }
     tx.execute_batch(
@@ -621,8 +691,8 @@ fn migrate_catalog(conn: &mut Connection) -> Result<()> {
         // Retain the user's scope settings, but require a policy pass and a
         // fresh journal seed even if the serialized scope is unchanged.
         tx.execute(
-            "DELETE FROM info WHERE key IN ('scope_policy_v3','watch_checkpoint_v1',
-             'watch_replay_overlap_v1','watch_reconciled_at','walk_sample')",
+            "DELETE FROM info WHERE key IN ('scope_policy_v3','scope_policy_v4',
+             'watch_checkpoint_v1','watch_replay_overlap_v1','watch_reconciled_at','walk_sample')",
             [],
         )?;
     }
@@ -1398,6 +1468,95 @@ mod scope_tests {
         assert!(excerpt.ends_with("\n…"));
         assert!(excerpt.chars().count() <= 1010);
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn excludes_python_venv_variants_site_packages_deleted_users_and_transient_files() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-opt-noise-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let custom_venv = root.join("LocalAI/runtimes/kokoro-tts");
+        let named_venv = root.join("Projects/app/venv-py312");
+        let normal = root.join("Projects/app/docs");
+        for dir in [&custom_venv, &named_venv, &normal] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(custom_venv.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        fs::write(custom_venv.join("ht"), "haitian").unwrap();
+        fs::write(named_venv.join("site.py"), "x").unwrap();
+        fs::write(normal.join("contract.md"), "ok").unwrap();
+
+        let scope = Scope {
+            roots: vec![root.clone()],
+            ..Scope::default()
+        };
+        assert!(!scope.allows(&named_venv.join("site.py")));
+        assert!(!scope.allows(&root.join("any/lib/python3.12/site-packages/spacy/lang/ht")));
+        assert!(!scope.allows(&root.join("any/kanban.db-wal")));
+        assert!(!scope.allows(&root.join("any/kanban.db-shm")));
+        assert!(!scope.allows(&root.join("any/gateway.heartbeat")));
+        assert!(!scope.allows(&root.join("any/~$预算表.xlsx")));
+        assert!(scope.allows(&normal.join("contract.md")));
+        assert!(scope.allows(&normal.join("Cargo.lock")));
+
+        // Verify PEP 405 `pyvenv.cfg` stops directory traversal into custom-named venvs.
+        let db = root.join("venv-test.sqlite");
+        crate::scan(&db, &scope).unwrap();
+        let reader = open_read(&db).unwrap();
+        let leaked: i64 = reader
+            .query_row(
+                "SELECT count(*) FROM item WHERE path LIKE '%kokoro-tts/%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            leaked, 0,
+            "custom-named pyvenv.cfg subtree must not be descended"
+        );
+        drop(reader);
+
+        let default_scope = Scope::default();
+        assert!(!default_scope.allows(Path::new("/Users/Deleted Users/old/Library/config")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn external_content_name_fts_has_no_duplicate_content_table_and_migrates_v4() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("lumen-v5-fts-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let db = root.join("index.sqlite");
+        let file = root.join("季度合同.txt");
+        fs::write(&file, "content").unwrap();
+        crate::scan(
+            &db,
+            &Scope {
+                roots: vec![root.clone()],
+                ..Scope::default()
+            },
+        )
+        .unwrap();
+        let reader = open_read(&db).unwrap();
+        let has_content_shadow: bool = reader
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='name_fts_content')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            !has_content_shadow,
+            "external-content name_fts must not duplicate rows in name_fts_content"
+        );
+        let hits = crate::search(&reader, "季度合同", Mode::Name, 5, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "季度合同.txt");
+        drop(reader);
         fs::remove_dir_all(root).unwrap();
     }
 }

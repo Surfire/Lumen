@@ -508,7 +508,7 @@ pub(super) fn restrict_scope(conn: &mut Connection, coverage: &Coverage) -> Resu
         .optional()?;
     // Seed newly eligible resident provider rows even when reopening an
     // unchanged scope saved by an older engine.
-    const NAME_POLICY: &str = "scope_policy_v4";
+    const NAME_POLICY: &str = "scope_policy_v5";
     const CONTENT_POLICY: &str = "cloud_content_policy_v1";
     let (names_reconciled, content_reconciled) = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM info WHERE key=?1), EXISTS(SELECT 1 FROM info WHERE key=?2)",
@@ -538,7 +538,7 @@ pub(super) fn restrict_scope(conn: &mut Connection, coverage: &Coverage) -> Resu
             }
         }
     }
-    purge(&tx)?;
+    let purged = purge(&tx)?;
     if !coverage.scope.documents {
         tx.execute_batch("DELETE FROM content_fts; DELETE FROM document; DELETE FROM document_state; DELETE FROM embedding; DELETE FROM content_job;")?;
     } else if coverage.scope.content_roots.is_some()
@@ -557,6 +557,9 @@ pub(super) fn restrict_scope(conn: &mut Connection, coverage: &Coverage) -> Resu
         write_info(&tx, CONTENT_POLICY, &true)?;
     }
     tx.commit()?;
+    if purged >= 10_000 {
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
+    }
     Ok(())
 }
 
@@ -818,7 +821,8 @@ fn hide_unverified(tx: &Transaction<'_>) -> Result<usize> {
 fn purge(tx: &Transaction<'_>) -> Result<usize> {
     tx.execute_batch(
         "DELETE FROM stale WHERE id IN (SELECT id FROM unverified) OR id IN (SELECT id FROM observed);
-         DELETE FROM name_fts WHERE rowid IN (SELECT id FROM stale);
+         INSERT INTO name_fts(name_fts, rowid, name, full, initials, searchable_path)
+           SELECT 'delete', id, name, full, initials, searchable_path FROM item WHERE id IN (SELECT id FROM stale);
          DELETE FROM content_fts WHERE rowid IN (SELECT id FROM stale);
          DELETE FROM document WHERE id IN (SELECT id FROM stale);
          DELETE FROM document_state WHERE id IN (SELECT id FROM stale);
@@ -999,7 +1003,8 @@ impl<'a> Walk<'a> {
                 self.stats.skipped += 1;
                 continue;
             };
-            let opaque = directory && opaque_package(&path);
+            let opaque = directory
+                && (opaque_package(&path) || (!is_root && crate::is_python_venv_dir(&path)));
             let mut descend =
                 recursive && directory && !is_symlink && availability != "placeholder" && !opaque;
             if !recursive && directory && !is_symlink && availability != "placeholder" && !opaque {
@@ -1469,6 +1474,8 @@ pub(super) fn document_version(
     let extractor = match kind {
         DocumentKind::Text => "",
         DocumentKind::Docx => "docx-v1",
+        DocumentKind::Xlsx => "xlsx-v1",
+        DocumentKind::Pptx => "pptx-v1",
         DocumentKind::Pdf => coverage.pdf.as_ref().map_or("", |pdf| pdf.format.as_str()),
         DocumentKind::Image => "lumen-image-ocr:vision-text-v1",
     };
@@ -1613,6 +1620,8 @@ pub(crate) fn document_version_matches(stored: &str, live: &str) -> bool {
 pub(super) enum DocumentKind {
     Text,
     Docx,
+    Xlsx,
+    Pptx,
     Pdf,
     Image,
 }
@@ -1621,6 +1630,8 @@ impl DocumentKind {
     pub(super) fn for_path(path: &Path) -> Option<Self> {
         match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
             "docx" => Some(Self::Docx),
+            "xlsx" => Some(Self::Xlsx),
+            "pptx" => Some(Self::Pptx),
             "pdf" => Some(Self::Pdf),
             // Source and config files are plain UTF-8 text; ContentFilter
             // decides whether they are eligible.
@@ -1647,6 +1658,8 @@ impl DocumentKind {
         let body = match self {
             Self::Text => String::from_utf8(read(MAX_DOCUMENT)?)?,
             Self::Docx => docx::text(&read(docx::MAX_ARCHIVE)?)?,
+            Self::Xlsx => docx::xlsx_text(&read(docx::MAX_ARCHIVE)?)?,
+            Self::Pptx => docx::pptx_text(&read(docx::MAX_PPTX_ARCHIVE)?)?,
             Self::Pdf => {
                 return extract_pdf(read(24 * 1024 * 1024)?, pdf.context("missing PDF helper")?);
             }

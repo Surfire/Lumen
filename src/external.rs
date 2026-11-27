@@ -770,7 +770,9 @@ pub fn forget_volume(database: &Path, uuid: &str) -> Result<bool> {
     let removed = tx.execute("DELETE FROM info WHERE key=?1", [KEY])? > 0;
     // Retire private metadata transactionally without unlinking the SQLite
     // database under a reader or releasing the writer lease early.
-    tx.execute_batch("DELETE FROM name_fts; DELETE FROM item; DELETE FROM info;")?;
+    tx.execute_batch(
+        "INSERT INTO name_fts(name_fts) VALUES('delete-all'); DELETE FROM item; DELETE FROM info;",
+    )?;
     tx.commit()?;
     invalidate_cache(database);
     Ok(removed)

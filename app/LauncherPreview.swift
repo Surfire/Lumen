@@ -114,18 +114,22 @@ final class LocalPreviewPanel: NSPanel {
             view = display
         }
         self.url = url
-        super.init(contentRect: frame, styleMask: [.titled, .closable, .resizable],
+        super.init(contentRect: frame, styleMask: [.titled, .closable, .resizable, .nonactivatingPanel],
                    backing: .buffered, defer: false)
         self.title = title
         isReleasedWhenClosed = false
-        hidesOnDeactivate = true
+        isFloatingPanel = true
+        hidesOnDeactivate = false
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         minSize = NSSize(width: 400, height: 300)
         contentView = view
         if let destination { pdf?.go(to: destination) }
     }
 
     override var canBecomeKey: Bool { true }
-    override func cancelOperation(_ sender: Any?) { close() }
+    override func cancelOperation(_ sender: Any?) {
+        if let onToggle { onToggle() } else { close() }
+    }
 
     override func close() {
         guard !closed else { return }
@@ -141,7 +145,7 @@ final class LocalPreviewPanel: NSPanel {
     override func sendEvent(_ event: NSEvent) {
         if event.type == .keyDown {
             let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
-            if modifiers.isEmpty && event.keyCode == kVK_Space ||
+            if modifiers.isEmpty && (event.keyCode == kVK_Space || event.keyCode == kVK_Escape) ||
                 modifiers == [.command] && event.charactersIgnoringModifiers?.lowercased() == "y" {
                 if !event.isARepeat { onToggle?() }
                 return

@@ -237,6 +237,7 @@ pub(super) fn install_han_ending(conn: &Connection) {
 }
 
 const MAX_HAN_OCCURRENCES: i64 = 8192;
+const MAX_HAN_NAME_OCCURRENCES: i64 = 200_000;
 
 // For any occurrence that is not at the end of a field, its next scalar is
 // the third scalar of an existing FTS5 trigram. Seek that prefix in the
@@ -276,7 +277,41 @@ const SHORT_HAN_SQL: &str = "
     SELECT NULL,NULL,NULL,NULL,NULL,-1,0 FROM checked WHERE too_many
     ORDER BY rank,width,path";
 
-fn ranked_short_han(conn: &Connection, query: &str, limit: usize) -> Result<Option<Vec<Hit>>> {
+// Filename-only variant for disk fallback when path occurrences flood 8,192.
+// A full page of rank 0..=2 basename hits cannot be displaced by pinyin/path hits.
+const SHORT_HAN_NAME_SQL: &str = "
+    WITH occurrences AS MATERIALIZED (
+        SELECT doc AS id FROM temp.lumen_name_terms WHERE term>=?1 AND term<?2 AND col='name' LIMIT (?4+1)
+    ), endings AS MATERIALIZED (
+        SELECT id FROM item INDEXED BY item_name_han_ending
+        WHERE availability<>'unverified' AND substr(name,-2) GLOB '[㐀-鿿][㐀-鿿]'
+          AND substr(name,-2)=?1 LIMIT (?4+1)
+    ), checked AS MATERIALIZED (
+        SELECT (SELECT count(*) FROM occurrences)+(SELECT count(*) FROM endings)>?4 AS too_many
+    ), candidates AS MATERIALIZED (
+        SELECT id FROM occurrences WHERE NOT (SELECT too_many FROM checked)
+        UNION
+        SELECT id FROM endings WHERE NOT (SELECT too_many FROM checked)
+    ), ranked AS MATERIALIZED (
+        SELECT i.path,i.display,i.kind,i.availability,'name' AS matched_by,
+               CASE WHEN i.name=?1 THEN 0 WHEN instr(i.name,?1)=1 THEN 1 ELSE 2 END AS rank,
+               length(i.display) AS width
+        FROM candidates c JOIN item i ON i.id=c.id
+        WHERE i.availability<>'unverified' AND instr(i.name,?1)>0
+        ORDER BY rank,width,i.path LIMIT ?3
+    )
+    SELECT path,display,kind,availability,matched_by,rank,width FROM ranked
+    UNION ALL
+    SELECT NULL,NULL,NULL,NULL,NULL,-1,0 FROM checked WHERE too_many
+    ORDER BY rank,width,path";
+
+fn run_short_han_query(
+    conn: &Connection,
+    sql: &str,
+    query: &str,
+    limit: usize,
+    max_occurrences: i64,
+) -> Result<Option<Vec<Hit>>> {
     let mut chars = query.chars();
     let han = |c| matches!(c, '㐀'..='鿿');
     if !(chars.next().is_some_and(han) && chars.next().is_some_and(han) && chars.next().is_none()) {
@@ -294,8 +329,8 @@ fn ranked_short_han(conn: &Connection, query: &str, limit: usize) -> Result<Opti
         "CREATE VIRTUAL TABLE IF NOT EXISTS temp.lumen_name_terms USING fts5vocab(main, name_fts, instance)",
     )?;
     let upper = prefix_end(query).expect("a two-Han query has an upper bound");
-    let mut stmt = conn.prepare_cached(SHORT_HAN_SQL)?;
-    let mut rows = stmt.query(params![query, upper, limit as i64, MAX_HAN_OCCURRENCES])?;
+    let mut stmt = conn.prepare_cached(sql)?;
+    let mut rows = stmt.query(params![query, upper, limit as i64, max_occurrences])?;
     let mut hits = Vec::new();
     while let Some(row) = rows.next()? {
         if row.get::<_, i64>(5)? < 0 {
@@ -304,6 +339,25 @@ fn ranked_short_han(conn: &Connection, query: &str, limit: usize) -> Result<Opti
         hits.push(row_hit(row, &row.get::<_, String>(4)?)?);
     }
     Ok(Some(hits))
+}
+
+fn ranked_short_han(conn: &Connection, query: &str, limit: usize) -> Result<Option<Vec<Hit>>> {
+    run_short_han_query(conn, SHORT_HAN_SQL, query, limit, MAX_HAN_OCCURRENCES)
+}
+
+fn ranked_short_han_names(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+) -> Result<Option<Vec<Hit>>> {
+    Ok(run_short_han_query(
+        conn,
+        SHORT_HAN_NAME_SQL,
+        query,
+        limit,
+        MAX_HAN_NAME_OCCURRENCES,
+    )?
+    .and_then(|hits| (hits.len() == limit).then_some(hits)))
 }
 
 /// A bounded disk candidate set for a structured query with only short
@@ -319,6 +373,9 @@ pub(super) fn short_han_seed(conn: &Connection, words: &[String]) -> Result<Opti
 
 pub(super) fn search_disk(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Hit>> {
     if let Some(hits) = ranked_prefix(conn, query, limit)? {
+        return Ok(hits);
+    }
+    if let Some(hits) = ranked_short_han_names(conn, query, limit)? {
         return Ok(hits);
     }
     if let Some(hits) = ranked_short_han(conn, query, limit)? {
@@ -1064,6 +1121,98 @@ mod tests {
         let hits = search_disk(&conn, "鹿鸣", 60)?;
         assert_eq!(hits.len(), 60);
         assert_eq!(hits[0].name, "1鹿鸣");
+        Ok(())
+    }
+
+    #[test]
+    fn short_han_names_skips_path_flood_and_matches_full_scan() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        let baseline = Connection::open_in_memory()?;
+        for db in [&conn, &baseline] {
+            db.execute_batch(
+                "CREATE TABLE item(id INTEGER PRIMARY KEY, path TEXT, display TEXT, kind TEXT,
+                                  availability TEXT, name TEXT, full TEXT, initials TEXT, searchable_path TEXT);
+                 CREATE VIRTUAL TABLE name_fts USING fts5(name,full,initials,searchable_path,tokenize='trigram');",
+            )?;
+            let mut next_id = 1_i64;
+            let mut insert = |path: &str, name: &str| -> Result<()> {
+                db.execute(
+                    "INSERT INTO item VALUES(?1,?2,?3,'file','local',?3,'','',?4)",
+                    params![next_id, path, name, path],
+                )?;
+                next_id += 1;
+                Ok(())
+            };
+            for i in 0..9000 {
+                insert(
+                    &format!("/scope/方案目录/{i:04}-misc.txt"),
+                    &format!("{i:04}-misc.txt"),
+                )?;
+            }
+            insert("/scope/exact/方案", "方案")?;
+            for i in 0..25 {
+                insert(
+                    &format!("/scope/prefix/方案{i:02}.md"),
+                    &format!("方案{i:02}.md"),
+                )?;
+            }
+            for i in 0..25 {
+                insert(
+                    &format!("/scope/mid/测试方案{i:02}.txt"),
+                    &format!("测试方案{i:02}.txt"),
+                )?;
+            }
+            for i in 0..20 {
+                insert(
+                    &format!("/scope/end/{i:02}试点方案"),
+                    &format!("{i:02}试点方案"),
+                )?;
+            }
+            insert("/scope/partial/青梅.txt", "青梅.txt")?;
+            insert("/scope/partial/山前青梅", "山前青梅")?;
+            for i in 0..3 {
+                insert(
+                    &format!("/scope/青梅目录/{i}-note.txt"),
+                    &format!("{i}-note.txt"),
+                )?;
+            }
+            db.execute(
+                "INSERT INTO name_fts(rowid,name,full,initials,searchable_path)
+                 SELECT id,name,full,initials,searchable_path FROM item",
+                [],
+            )?;
+        }
+        install_han_ending(&conn);
+
+        assert!(ranked_short_han(&conn, "方案", 60)?.is_none());
+        let shape = |hits: Vec<Hit>| {
+            hits.into_iter()
+                .map(|h| (h.path, h.name, h.kind, h.availability, h.matched_by))
+                .collect::<Vec<_>>()
+        };
+        let fast = ranked_short_han_names(&conn, "方案", 60)?
+            .expect("full basename page must bypass flooded path scan");
+        let full = shape(search_disk(&baseline, "方案", 60)?);
+        assert_eq!(fast.len(), 60);
+        assert_eq!(shape(fast), full);
+        assert_eq!(shape(search_disk(&conn, "方案", 60)?), full);
+
+        assert!(ranked_short_han_names(&conn, "青梅", 60)?.is_none());
+        let partial = search_disk(&conn, "青梅", 60)?;
+        assert_eq!(
+            partial
+                .iter()
+                .map(|h| (h.name.as_str(), h.matched_by.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("青梅.txt", "name"),
+                ("山前青梅", "name"),
+                ("0-note.txt", "path"),
+                ("1-note.txt", "path"),
+                ("2-note.txt", "path"),
+            ]
+        );
+        assert_eq!(shape(partial), shape(search_disk(&baseline, "青梅", 60)?));
         Ok(())
     }
 }

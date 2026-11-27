@@ -2931,6 +2931,9 @@ final class LauncherSmoke {
 
         try type("late lexical delivery", into: app)
         try await until("the lexical name lane was held") { self.exists("late-name-started") }
+        try await Task.sleep(for: .milliseconds(60))
+        try check(!model.hits.contains { $0.name == "body-before-name.md" },
+                  "body results flashed before higher-priority names arrived")
         try check(model.searching && model.selectedHit == nil, "blocked serve left old rows actionable")
         let bodyResponder = try editor(app)
         try signal("finish-late-name")
@@ -3183,13 +3186,14 @@ final class LauncherSmoke {
         }
         app.contextActions.run(windowPreview)
         try await until("explicit Preview in Window opened the PDFKit view on page 2") { app.localPreview?.displayedPDFPage == 2 }
-        guard let preview = app.localPreview else { throw Failure("preview panel missing") }
-        // The titled preview needs an active app to remain key. Keep both windows offscreen.
+        guard let initialPreview = app.localPreview else { throw Failure("preview panel missing") }
+        // Verify both non-activating preview handoff and focus leaving after activation.
         do {
             try check(NSApp.setActivationPolicy(.accessory), "could not enable activation for the preview focus test")
             defer {
                 app.panel.orderOut(nil)
-                preview.close()
+                app.localPreview?.close()
+                initialPreview.close()
                 NSApp.setActivationPolicy(.prohibited)
             }
             func focusPreview(_ preview: LocalPreviewPanel) async throws {
@@ -3202,17 +3206,46 @@ final class LauncherSmoke {
                           model.query == "zircon calibration" && model.selection == pdfPath,
                           "settled focus did not move to the preview while preserving the search session (previewKey=\(preview.isKeyWindow), panelKey=\(app.panel.isKeyWindow), presented=\(app.searchPresented), active=\(NSApp.isActive), query=\(model.query), selection=\(model.selection ?? "nil"))")
             }
-            func verifyFocusLeft(_ message: String) async throws {
+            func verifyFocusLeft(_ preview: LocalPreviewPanel, _ message: String) async throws {
                 try await until(message) {
                     !app.panel.isKeyWindow && !preview.isKeyWindow && !app.searchPresented &&
                     model.query.isEmpty && model.selection == nil
                 }
             }
+            func reopenWindowPreview() async throws -> LocalPreviewPanel {
+                try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+                guard let action = app.contextActions.items.firstIndex(where: { $0.id == "quick-look" }) else {
+                    throw Failure("missing explicit window preview action")
+                }
+                app.contextActions.run(action)
+                try await until("reopening created a new preview") {
+                    app.localPreview != nil && app.localPreview !== initialPreview
+                }
+                guard let reopened = app.localPreview else { throw Failure("reopened preview panel missing") }
+                return reopened
+            }
+
+            try check(!NSApp.isActive, "expected app to start inactive before non-activating preview test")
+            try await focusPreview(initialPreview)
+            guard let escapeEvent = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                                                     timestamp: 0, windowNumber: initialPreview.windowNumber,
+                                                     context: nil, characters: "\u{1b}",
+                                                     charactersIgnoringModifiers: "\u{1b}",
+                                                     isARepeat: false, keyCode: UInt16(kVK_Escape)) else {
+                throw Failure("cannot make preview Escape event")
+            }
+            initialPreview.sendEvent(escapeEvent)
+            try await until("Escape in local preview did not return key focus to search") {
+                app.localPreview == nil && app.panel.isKeyWindow && app.searchPresented &&
+                model.query == "zircon calibration" && model.selection == pdfPath
+            }
+
+            let preview = try await reopenWindowPreview()
             NSApp.activate(ignoringOtherApps: true)
             try await until("app did not activate for the preview focus test") { NSApp.isActive }
             try await focusPreview(preview)
             NSApp.deactivate()
-            try await verifyFocusLeft("focus leaving the preview did not dismiss and reset search")
+            try await verifyFocusLeft(preview, "focus leaving the preview did not dismiss and reset search")
 
             app.showSearch()
             _ = try await findPDF()
@@ -3226,7 +3259,7 @@ final class LauncherSmoke {
             try await focusPreview(nextPreview)
             app.panel.orderOut(nil) // Prevent AppKit from restoring key focus to search when the preview closes.
             nextPreview.close()
-            try await verifyFocusLeft("closing the preview without returning focus to search did not dismiss it")
+            try await verifyFocusLeft(nextPreview, "closing the preview without returning focus to search did not dismiss it")
         }
         app.showSearch()
         _ = try await findPDF()

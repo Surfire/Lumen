@@ -569,6 +569,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if sender === localPreview {
+            closeLocalPreview()
+            return false
+        }
         if !(sender is SearchPanel) { return true }
         dismissSearch()
         return false
@@ -1322,11 +1326,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     func makeLocalPreviewKey() {
         guard let localPreview else { return }
-        #if LUMEN_SMOKE
-        if smoke == nil { NSApp.activate() }
-        #else
-        NSApp.activate()
-        #endif
         localPreview.makeKeyAndOrderFront(nil)
     }
 

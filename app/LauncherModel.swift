@@ -636,6 +636,7 @@ final class Launcher: ObservableObject {
         let publish = { [weak self] in
             guard let self, self.revision == revision, !self.closed else { return }
             let complete = names != nil && text != nil
+            guard names != nil else { return }
             // Keep the same query's preview rows in place during a watch refresh.
             // They remain nonactionable until refreshed, and watch independently drops a stale stamp.
             guard complete || !keepStablePreviewRows else { return }
@@ -872,16 +873,14 @@ final class Launcher: ObservableObject {
         guard resultsRevision == revision, relatedRevision != revision,
               shouldFindRelatedExcerpts(directCount: directHits.count) else { return }
         if case .unavailable = localModelState { return }
+        if localModelState == .checking || localModelState == .unchecked { return }
         set(\.semanticBusy, to: true)
-        if localModelState == .checking { return }
         let current = revision
         semanticDebounce?.cancel()
         semanticDebounce = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(260))
+            try? await Task.sleep(for: .milliseconds(120))
             guard !Task.isCancelled, let self, !self.closed, self.revision == current else { return }
-            if self.localModelState == .unchecked || self.localModelState == .available {
-                self.verifyLocalModel()
-            } else if self.localModelState == .ready {
+            if self.localModelState == .available || self.localModelState == .ready {
                 self.searchRelatedExcerpts(revision: current)
             } else if self.localModelState != .checking {
                 self.set(\.semanticBusy, to: false)
@@ -913,6 +912,7 @@ final class Launcher: ObservableObject {
         guard !closed, self.revision == revision, relatedRevision == revision else { return }
         switch reply {
         case .success(let hits):
+            if localModelState != .ready { indexStatus.set(\.localModelState, to: .ready) }
             validatePreviews(hits.filter(\.isSemanticCandidate), revision: revision) { [weak self] available in
                 guard let self, self.relatedRevision == revision else { return }
                 self.publishWithRelated(available)
@@ -920,6 +920,9 @@ final class Launcher: ObservableObject {
             }
         case .failure(let error):
             recordModelFailure(error.detail)
+            if localModelState == .available {
+                indexStatus.set(\.localModelState, to: .unavailable(.verification))
+            }
             publishWithRelated([])
             set(\.semanticBusy, to: false)
             refreshCoverage()

@@ -361,8 +361,11 @@ struct SearchWindow: View {
             }
             return model.title(for: notice)
         }
-        if model.searching || model.semanticBusy {
+        if model.searching {
             return model.t("正在搜索…", "Searching…")
+        }
+        if model.semanticBusy {
+            return model.t("未找到字面匹配，正在查找相关原文…", "No literal matches — checking related excerpts…")
         }
         return model.isImageSearch ? model.t("没有足够接近的图像", "No close image matches")
             : model.t("没有匹配结果", "No matches")

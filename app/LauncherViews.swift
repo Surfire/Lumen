@@ -14,6 +14,7 @@ struct SearchWindow: View {
     @ObservedObject var imageSearch: LauncherImageSearch
     let clipboard: ClipboardManager
     let selectClipboard: (Int64) -> Void
+    let previewClipboard: (ClipboardItem) -> Void
     let activateCommand: () -> Void
     let activateExecution: () -> Void
     let copyOutput: () -> Void
@@ -73,7 +74,10 @@ struct SearchWindow: View {
                 contextRows
             case (.clipboard, _):
                 ClipboardHistoryView(commands: commands, clipboard: clipboard, chinese: model.zh,
-                                     select: selectClipboard, copy: activateCommand, openSettings: showSettings)
+                                     select: selectClipboard, copy: activateCommand, openSettings: showSettings,
+                                     onOpenPreview: previewClipboard)
+            case (.window, _):
+                windowRowsView
             case (.commandCard, _):
                 LauncherCommandCard(commands: commands, provider: translation, chinese: model.zh,
                                     activate: activateCommand, openSettings: showSettings)
@@ -154,7 +158,7 @@ struct SearchWindow: View {
                     if commands.definitionCopied { Text(model.t("已复制", "Copied")) }
                 }
                 Spacer(minLength: 8)
-            case .imageSetup, .clipboard, .commandCard:
+            case .imageSetup, .clipboard, .window, .commandCard:
                 commandFooter(overlay: state.overlay)
             case .search:
                 searchFooter(overlay: state.overlay)
@@ -184,12 +188,18 @@ struct SearchWindow: View {
             if case .contextMenu = overlay {
                 keyHint("↑↓", model.t("选择操作", "Select Action"))
                 keyHint("↵", model.t("执行", "Run"))
-            } else if commands.selectedClipboardItem != nil {
+            } else if let item = commands.selectedClipboardItem {
                 keyHint("↑↓", model.t("选择", "Select"))
                 keyHint("↵", model.t("复制", "Copy"))
+                if item.text == nil {
+                    keyHint(model.t("空格", "Space"), model.t("预览", "Preview"))
+                }
                 Button(action: toggleContextActions) { keyHint("⌘K", model.t("操作", "Actions")) }
                     .buttonStyle(.borderless)
             }
+        case .window:
+            keyHint("↑↓", model.t("选择", "Select"))
+            keyHint("↵", model.t("应用布局", "Apply"))
         case .question:
             switch commands.answer {
             case .loading: keyHint("esc", model.t("取消", "Cancel"))
@@ -217,7 +227,7 @@ struct SearchWindow: View {
             if case .file(let file) = model.selectedResult {
                 keyHint("⌘↵", model.t("在 Finder 中显示", "Show in Finder"))
                 if file.kind == "file" {
-                    keyHint(model.t("空格 / ⌘Y", "Space / ⌘Y"), model.t("预览", "Preview"))
+                    keyHint(model.t("空格 / ⌘Y", "Space / ⌘Y"), model.t("悬浮 / 侧边", "Window / Inline"))
                 }
             }
         }
@@ -306,6 +316,31 @@ struct SearchWindow: View {
                 guard press.modifiers.isEmpty, let result = model.selectedResult else { return .ignored }
                 open(result)
                 return .handled
+            }
+        }
+    }
+
+    private var windowRowsView: some View {
+        let filterQuery: String = {
+            if case .window(let payload) = commands.resolution { return payload }
+            return ""
+        }()
+        let highlight = LauncherHighlight(filterQuery)
+        let selection = commands.windowSelection
+        return ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(commands.windowRows.enumerated()), id: \.element.id) { index, action in
+                        actionRow(action, highlight: highlight, selected: selection == index)
+                            .id(action.id)
+                    }
+                }
+                .padding(.horizontal, 10)
+            }
+            .onChange(of: selection) { _, index in
+                if commands.windowRows.indices.contains(index) {
+                    proxy.scrollTo(commands.windowRows[index].id)
+                }
             }
         }
     }

@@ -2,7 +2,17 @@
 import AppKit
 import ImageIO
 import PDFKit
+import QuickLookThumbnailing
 import UniformTypeIdentifiers
+
+/// Outcome of previewing a file referenced by a clipboard clip. Never downloads cloud-only files.
+enum ClipboardFilePreviewResult: @unchecked Sendable {
+    case cloudPlaceholder
+    case missing
+    case image(NSImage, sizeLabel: String, bytes: Int64)
+    case text(String, isCode: Bool, bytes: Int64)
+    case thumbnail(NSImage?, typeName: String, bytes: Int64)
+}
 
 public struct MacPreviewRenderer: Sendable {
     private static let maxOutput = 4 * 1024 * 1024
@@ -27,6 +37,10 @@ public struct MacPreviewRenderer: Sendable {
                                                                  page: evidence.page,
                                                                  context: context,
                                                                  highlight: evidence.highlight))
+            case .plainText:
+                let text = try Self.readBoundedText(at: item.url, limit: Self.inlineTextBytes)
+                return PreviewDocument(evidence: item.evidence, text: text,
+                                       isCode: Self.isCodeExtension(item.url.pathExtension))
             case .image:
                 return PreviewDocument(visual: .image(try thumbnail(item.url)), evidence: item.evidence)
             case .pdf(let page):
@@ -145,6 +159,84 @@ public struct MacPreviewRenderer: Sendable {
         return matches
     }
 
+    // MARK: Clipboard file clips
+
+    private enum ClipboardFilePlan {
+        case done(ClipboardFilePreviewResult)
+        case needsThumbnail(typeName: String, bytes: Int64)
+    }
+
+    /// Previews a copied file. The resident check (`LocalFile.withResidentFile`, with cloud
+    /// materialization disabled) runs first; a cloud-only file yields `.cloudPlaceholder` and is never fetched.
+    static func clipboardFilePreview(at url: URL) async -> ClipboardFilePreviewResult {
+        let task = Task.detached(priority: .utility) { () -> ClipboardFilePreviewResult in
+            let plan: ClipboardFilePlan
+            do {
+                plan = try LocalFile.withResidentFile(url) { try clipboardFilePlan(url) }
+            } catch is LocalFile.Placeholder {
+                return .cloudPlaceholder
+            } catch {
+                return folderPreview(url) ?? .missing
+            }
+            switch plan {
+            case .done(let result): return result
+            case .needsThumbnail(let typeName, let bytes):
+                guard !Task.isCancelled else { return .missing }
+                // Reached only after the file was confirmed resident on disk.
+                let request = QLThumbnailGenerator.Request(fileAt: url, size: CGSize(width: 480, height: 480),
+                                                           scale: 2, representationTypes: .all)
+                let image = try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: request).nsImage
+                return .thumbnail(image, typeName: typeName, bytes: bytes)
+            }
+        }
+        return await withTaskCancellationHandler(operation: { await task.value }, onCancel: { task.cancel() })
+    }
+
+    /// Folders and packages (.app, .pages, ...). Runs with cloud materialization off, never follows a
+    /// symlink, and reports a dataless directory as a cloud placeholder. The icon comes from the type,
+    /// not from the path, so no directory contents are enumerated.
+    private static func folderPreview(_ url: URL) -> ClipboardFilePreviewResult? {
+        try? LocalFile.withMaterializationDisabled { () -> ClipboardFilePreviewResult? in
+            var info = stat()
+            guard url.isFileURL, lstat(url.path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR else { return nil }
+            if info.st_flags & UInt32(SF_DATALESS) != 0 || LocalFile.isUbiquitousPlaceholder(url) { return .cloudPlaceholder }
+            let type = UTType(filenameExtension: url.pathExtension.lowercased()) ?? .folder
+            return .thumbnail(NSWorkspace.shared.icon(for: type),
+                              typeName: type.localizedDescription ?? "Folder", bytes: 0)
+        }.flatMap { $0 }
+    }
+
+    private static func clipboardFilePlan(_ url: URL) throws -> ClipboardFilePlan {
+        var info = stat()
+        let bytes: Int64 = stat(url.path, &info) == 0 ? Int64(info.st_size) : 0
+        let ext = url.pathExtension.lowercased()
+        let type = UTType(filenameExtension: ext)
+        let renderer = MacPreviewRenderer()
+        if ext == "pdf" {
+            if let document = try? renderer.pdf(url, matchPage: nil, evidence: nil),
+               case .pdf(let data, _, _)? = document.visual, let image = NSImage(data: data) {
+                let pages = PDFDocument(url: url)?.pageCount ?? 1
+                return .done(.image(image, sizeLabel: "PDF · 1/\(pages)", bytes: bytes))
+            }
+        } else if type?.conforms(to: .image) == true {
+            if let data = try? renderer.thumbnail(url), let image = NSImage(data: data) {
+                var label = type?.preferredFilenameExtension?.uppercased() ?? ext.uppercased()
+                if let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+                   let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any],
+                   let w = props[kCGImagePropertyPixelWidth as String] as? Int,
+                   let h = props[kCGImagePropertyPixelHeight as String] as? Int {
+                    label = "\(w) × \(h) · \(label)"
+                }
+                return .done(.image(image, sizeLabel: label, bytes: bytes))
+            }
+        } else if isPlainTextExtension(ext) || type?.conforms(to: .sourceCode) == true || type?.conforms(to: .plainText) == true {
+            if let text = try? readBoundedText(at: url, limit: clipboardTextBytes) {
+                return .done(.text(text, isCode: isCodeExtension(ext) || type?.conforms(to: .sourceCode) == true, bytes: bytes))
+            }
+        }
+        return .needsThumbnail(typeName: type?.localizedDescription ?? (ext.isEmpty ? "File" : ext.uppercased()), bytes: bytes)
+    }
+
     private func png(_ image: CGImage) throws -> Data {
         try Task.checkCancellation()
         let data = NSMutableData()
@@ -159,13 +251,42 @@ public struct MacPreviewRenderer: Sendable {
         return Data(referencing: data)
     }
 
-    private static let plainTextExtensions: Set<String> = [
-        "txt", "md", "markdown", "csv", "tsv", "json", "yaml", "yml", "xml",
-        "html", "htm", "log", "toml", "ini", "rs", "swift", "py", "js", "ts",
-        "tsx", "jsx", "c", "h", "cpp", "hpp", "m", "mm", "go", "rb", "java",
-        "kt", "sh", "zsh", "sql", "css", "scss",
+    private static let proseExtensions: Set<String> = ["txt", "md", "markdown", "log", "csv", "tsv"]
+    private static let codeExtensions: Set<String> = [
+        "json", "yaml", "yml", "xml", "html", "htm", "toml", "ini", "rs", "swift", "py", "js", "ts",
+        "tsx", "jsx", "c", "h", "cpp", "hpp", "m", "mm", "go", "rb", "java", "kt", "sh", "zsh", "sql",
+        "css", "scss", "bash", "cs", "php", "lua", "dart", "vue", "svelte",
     ]
+    private static let plainTextExtensions = proseExtensions.union(codeExtensions)
     private static let maxPlainTextBytes = 512 * 1024
+    private static let inlineTextBytes = 16 * 1024
+    private static let clipboardTextBytes = 8 * 1024
+
+    static func isPlainTextExtension(_ ext: String) -> Bool { plainTextExtensions.contains(ext.lowercased()) }
+    static func isCodeExtension(_ ext: String) -> Bool { codeExtensions.contains(ext.lowercased()) }
+
+    /// Reads at most `limit` bytes. Rejects binary content and never splits a UTF-8 scalar at the cap.
+    /// Call only inside `LocalFile.withResidentFile`.
+    private static func readBoundedText(at url: URL, limit: Int) throws -> String {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { throw PreviewFailure.missing }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: limit) else { throw PreviewFailure.invalidContent }
+        let bytes = [UInt8](data)
+        guard !bytes.contains(0) else { throw PreviewFailure.invalidContent }
+        var end = bytes.count
+        if end == limit {
+            // Drop an incomplete trailing scalar: step back over continuation bytes to its lead byte.
+            var lead = end - 1
+            while lead >= 0, end - lead <= 3, bytes[lead] & 0xC0 == 0x80 { lead -= 1 }
+            if lead >= 0, bytes[lead] >= 0xC0 {
+                let needed = bytes[lead] >= 0xF0 ? 4 : (bytes[lead] >= 0xE0 ? 3 : 2)
+                if end - lead < needed { end = lead }
+            }
+        }
+        guard let text = String(data: Data(bytes[..<end]), encoding: .utf8) else { throw PreviewFailure.invalidContent }
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw PreviewFailure.noExcerpt }
+        return text
+    }
 
     private static func plainTextContext(at url: URL, evidence: PreviewEvidence) -> String? {
         guard plainTextExtensions.contains(url.pathExtension.lowercased()),

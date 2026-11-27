@@ -12,6 +12,7 @@ enum PanelMode: Equatable {
     case translation(TranslationCommand)
     case imageSetup
     case clipboard
+    case window
     case commandCard
     case definition(word: String, text: String?, loading: Bool)
     case search
@@ -46,6 +47,8 @@ struct PanelState: Equatable {
             mode = .imageSetup
         } else if commands.isClipboardCommand {
             mode = .clipboard
+        } else if commands.isWindowCommand {
+            mode = .window
         } else if commands.showsCard {
             mode = .commandCard
         } else if let definition = commands.definition {
@@ -119,6 +122,8 @@ enum PanelGeometry {
             } else {
                 bodyHeight = ClipboardHistoryView.height
             }
+        case .window:
+            bodyHeight = CGFloat(min(max(rows.count, 1), maximumVisibleRows)) * standardRowHeight
         case .search:
             if case .contextMenu(let count) = state.overlay {
                 bodyHeight = CGFloat(min(count, maximumVisibleRows)) * standardRowHeight
@@ -148,6 +153,8 @@ final class LauncherCommands: ObservableObject {
     @Published private(set) var selection = 0
     @Published private(set) var clipboardRows: [ClipboardItem] = []
     @Published private(set) var clipboardSelection: Int64?
+    @Published private(set) var windowRows: [LaunchAction] = []
+    @Published private(set) var windowSelection = 0
     @Published private(set) var answer: LumenQuickAnswer.State = .idle
     @Published private var partialAnswer = ""
     @Published private(set) var copied = false
@@ -177,11 +184,13 @@ final class LauncherCommands: ObservableObject {
 
     var isImageCommand: Bool { if case .image = resolution { return true }; return false }
     var isClipboardCommand: Bool { if case .clipboard = resolution { return true }; return false }
+    var isWindowCommand: Bool { if case .window = resolution { return true }; return false }
+    var selectedWindowAction: LaunchAction? { windowRows.indices.contains(windowSelection) ? windowRows[windowSelection] : nil }
     var selectedClipboardItem: ClipboardItem? { clipboardRows.first { $0.id == clipboardSelection } }
     var showsCard: Bool {
         switch resolution {
         case .discovery, .question, .web, .missingArgument, .argumentTooLong: return true
-        case .search, .translation, .image, .clipboard: return false
+        case .search, .translation, .image, .clipboard, .window: return false
         }
     }
     var selectedEntry: LumenCommandCatalog.Entry? { entries.indices.contains(selection) ? entries[selection] : nil }
@@ -313,6 +322,27 @@ final class LauncherCommands: ObservableObject {
     func moveClipboard(_ delta: Int) {
         guard let index = clipboardRows.firstIndex(where: { $0.id == clipboardSelection }) else { return }
         chooseClipboard(clipboardRows[min(max(0, index + delta), clipboardRows.count - 1)].id)
+    }
+
+    /// `filter` defaults to the text after `win`; pass it only to override the parsed resolution.
+    func updateWindowActions(_ filter: String? = nil, isPortrait: Bool, resetSelection: Bool = false) {
+        var query = ""
+        if let filter { query = filter }
+        else if case .window(let payload) = resolution { query = payload }
+        let rows = isWindowCommand ? LaunchCatalog.windowActions(isPortrait: isPortrait, query: query) : []
+        let selectedID = selectedWindowAction?.id
+        if windowRows != rows { windowRows = rows }
+        let next = resetSelection ? 0 : (rows.firstIndex { $0.id == selectedID } ?? 0)
+        if windowSelection != next { windowSelection = next }
+    }
+
+    func moveWindowSelection(_ delta: Int) {
+        guard !windowRows.isEmpty else { return }
+        windowSelection = min(max(0, windowSelection + delta), windowRows.count - 1)
+    }
+
+    func chooseWindowAction(_ id: String) {
+        if let index = windowRows.firstIndex(where: { $0.id == id }) { windowSelection = index }
     }
 
     func move(_ delta: Int) { selection = min(max(0, selection + delta), max(0, entries.count - 1)) }
@@ -530,13 +560,13 @@ struct LauncherCommandCard: View {
             }
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, commands.resolution == .discovery ? 8 : 10)
+        .padding(.vertical, commands.resolution == .discovery ? 6 : 10)
     }
 
     private var discovery: some View {
         ScrollViewReader { scroll in
             ScrollView {
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 1) {
                     ForEach(Array(commands.entries.enumerated()), id: \.element.commandID) { index, item in
                         Button {
                             commands.choose(index)
@@ -550,7 +580,7 @@ struct LauncherCommandCard: View {
                                 Spacer()
                                 if let host = item.destinationHost { Text(host).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
                             }
-                            .padding(.horizontal, 8).frame(height: 27)
+                            .padding(.horizontal, 8).frame(height: 23)
                             .background(commands.selection == index ? Color.accentColor.opacity(0.17) : .clear,
                                         in: RoundedRectangle(cornerRadius: 6))
                         }
@@ -579,6 +609,7 @@ struct LauncherCommandCard: View {
         case "maps": return t("搜索 Google 地图", fallback)
         case "img": return t("按画面搜索图片", "Search Images by Description")
         case "clipboard": return t("剪贴板历史", "Clipboard History")
+        case "window": return t("窗口管理与自动分屏", "Window Management & Auto-Tile")
         default: return fallback
         }
     }

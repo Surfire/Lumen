@@ -84,6 +84,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
     private var configuredKey: HotKey?
     private var actionInFlight = false
+    private var activeDisplayIsPortrait = false
     private(set) var localPreview: LocalPreviewPanel?
     private(set) var searchPresented = false
     private var searchPresentationGeneration: UInt64 = 0
@@ -147,12 +148,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             return field.bounds.contains(field.convert(point, from: nil))
         }
         panel.onSpace = { [weak self] in
-            guard let self, self.panel.browsing else { return false }
+            guard let self else { return false }
             let state = self.panelState
-            guard state.mode == .search else { return false }
             if case .contextMenu = state.overlay { return false }
+            if state.mode == .clipboard, let clip = self.commands.selectedClipboardItem, clip.text == nil {
+                if self.localPreview != nil { self.closeLocalPreview() }
+                else { self.previewClipboardItem(clip) }
+                return true
+            }
+            guard self.panel.browsing, state.mode == .search else { return false }
             guard case .file(let hit) = self.model.selectedResult else { return false }
-            self.togglePreview(hit, native: true)
+            self.togglePreview(hit, native: true, allowCloudDownload: true)
             return true
         }
         panel.onFileAction = { [weak self] action in
@@ -194,8 +200,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             imageSearch: imageSearch,
             clipboard: clipboard,
             selectClipboard: { [weak self] id in
+                self?.panel.browsing = true
                 self?.commands.chooseClipboard(id)
                 self?.focusSearch()
+            },
+            previewClipboard: { [weak self] item in
+                self?.previewClipboardItem(item)
             },
             activateCommand: { [weak self] in self?.activateCommand() },
             activateExecution: { [weak self] in self?.activateExecution() },
@@ -306,6 +316,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         #else
         configureResidentUI()
         #endif
+        NSApp.appearance = model.appearanceMode.nsAppearance
+        model.$appearanceMode.dropFirst().sink { mode in
+            NSApp.appearance = mode.nsAppearance
+        }.store(in: &cancellables)
         model.$language.dropFirst().sink { [weak self] _ in
             DispatchQueue.main.async { [weak self] in self?.updateLanguage() }
         }.store(in: &cancellables)
@@ -327,6 +341,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 guard let self else { return }
                 if self.contextActions.isOpen, self.panelState.mode == .clipboard { self.contextActions.close() }
                 self.updatePresentation()
+            }
+        }.store(in: &cancellables)
+        commands.$windowSelection.removeDuplicates().dropFirst().sink { [weak self] _ in
+            DispatchQueue.main.async { [weak self] in
+                self?.schedulePresentationUpdate()
             }
         }.store(in: &cancellables)
         clipboard.$items.dropFirst().sink { [weak self] items in
@@ -509,7 +528,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     @objc func showSearch() {
         let firstShow = !searchPresented
-        if firstShow { windowManagement.captureTarget() }
+        if firstShow {
+            windowManagement.captureTarget()
+        }
         searchPresentationGeneration &+= 1
         searchPresented = true
         model.setSearchPresented(true)
@@ -517,8 +538,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             let mouse = NSEvent.mouseLocation
             if let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main {
                 let visible = screen.visibleFrame
+                activeDisplayIsPortrait = visible.height > visible.width
                 panel.setFrameTopLeftPoint(NSPoint(x: visible.midX - panel.frame.width / 2,
                                                    y: visible.maxY - visible.height / 3))
+            } else {
+                activeDisplayIsPortrait = false
             }
         }
         updatePresentation()
@@ -657,9 +681,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             contextActions.close()
             inlinePreview.close()
         }
+        if previousCommand != next, case .window = next {
+            activeDisplayIsPortrait = windowManagement.activeDisplayIsPortrait(for: windowManagement.targetPID)
+        }
         commands.update(next, raw: text, catalog: catalog)
         if priorRaw != text || previousCommand != next {
             commands.matchExecutables(executableActions, in: model, resetSelection: true)
+            if case .window = next {
+                commands.updateWindowActions(isPortrait: activeDisplayIsPortrait, resetSelection: true)
+            } else if case .window = previousCommand {
+                commands.updateWindowActions(isPortrait: activeDisplayIsPortrait, resetSelection: true)
+            }
         }
         translation.setCommand(translationCommand)
         if previousCommand != next {
@@ -792,6 +824,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func selectRow(_ result: LauncherResult, doubleClick: Bool) {
+        if panelState.mode == .window, case .action(let action) = result {
+            commands.chooseWindowAction(action.id)
+            updatePresentation()
+            if doubleClick { open(result) }
+            return
+        }
         panel.browsing = true
         model.set(\.selectedID, to: result.id)
         updatePresentation()
@@ -808,7 +846,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         case (.clipboard, .contextMenu), (.search, .contextMenu):
             contextActions.move(delta)
         case (.clipboard, _):
+            panel.browsing = true
             commands.moveClipboard(delta)
+        case (.window, _):
+            commands.moveWindowSelection(delta)
         case (.search, _):
             panel.browsing = true
             model.moveSelection(delta)
@@ -865,7 +906,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 translation.cancel()
                 return
             }
-        case .imageSetup, .clipboard, .search:
+        case .imageSetup, .clipboard, .window, .search:
             break
         }
         if !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -928,7 +969,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             showClipboardActions()
         case .search:
             showSearchContextActions()
-        case .scriptOutput, .translation, .imageSetup, .commandCard, .definition:
+        case .scriptOutput, .translation, .imageSetup, .window, .commandCard, .definition:
             break
         }
     }
@@ -1017,6 +1058,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             contextActions.run()
         case (.clipboard, _), (.commandCard, _):
             activateCommand()
+        case (.window, _):
+            if let action = commands.selectedWindowAction { runAction(action) }
         case (.translation, _):
             activateTranslation()
         case (.search, _):
@@ -1025,7 +1068,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func open(_ result: LauncherResult) {
-        guard case .search = panelState.mode else { return }
+        guard panelState.mode == .search || panelState.mode == .window else { return }
         switch result {
         case .file(let hit): openFile(hit)
         case .action(let action): runAction(action)
@@ -1130,7 +1173,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 if case .shortcut(let value) = row { return value == saved && model.application(for: value) == action }
                 return false
             }
-        } ?? model.containsCurrentAction(action)
+        } ?? (commands.isWindowCommand ? commands.windowRows.contains(action) : model.containsCurrentAction(action))
         guard searchPresented, current, !actionInFlight else { return }
         if case .system(.define(let word)) = action.destination {
             contextActions.close()
@@ -1303,19 +1346,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
     }
 
-    private func showLocalPreview(_ hit: SearchHit, at url: URL) throws {
+    private func previewMetrics() -> (visible: NSRect, maxSize: NSSize, scale: CGFloat) {
         let activeScreen = panel.screen
             ?? NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) })
             ?? NSScreen.main
         let visible = activeScreen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1200, height: 800)
         let maxSize = NSSize(width: min(visible.width * 0.78, 1100), height: min(visible.height * 0.80, 860))
         let scale = activeScreen?.backingScaleFactor ?? 2
-        let highlight = hit.isSemanticCandidate ? hit.snippet : model.query
-        guard let preview = try inlinePreview.withResidentFile(url, expectedStamp: nil, {
-            LocalPreviewPanel(url: url, title: hit.name, page: hit.pdf_page,
-                              highlight: highlight, snippet: hit.snippet,
-                              maxSize: maxSize, backingScale: scale)
-        }) else { throw PreviewFailure.invalidContent }
+        return (visible, maxSize, scale)
+    }
+
+    private func presentLocalPreview(_ preview: LocalPreviewPanel, on visible: NSRect) {
         localPreview?.close()
         localPreview = preview
         preview.onToggle = { [weak self] in self?.closeLocalPreview() }
@@ -1333,6 +1374,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                                        y: visible.midY - preview.frame.height / 2))
         makeLocalPreviewKey()
         #endif
+    }
+
+    private func showLocalPreview(_ hit: SearchHit, at url: URL) throws {
+        let metrics = previewMetrics()
+        let highlight = hit.isSemanticCandidate ? hit.snippet : model.query
+        guard let preview = try inlinePreview.withResidentFile(url, expectedStamp: nil, {
+            LocalPreviewPanel(url: url, title: hit.name, page: hit.pdf_page,
+                              highlight: highlight, snippet: hit.snippet,
+                              maxSize: metrics.maxSize, backingScale: metrics.scale)
+        }) else { throw PreviewFailure.invalidContent }
+        presentLocalPreview(preview, on: metrics.visible)
+    }
+
+    private func previewClipboardItem(_ item: ClipboardItem) {
+        guard searchPresented, commands.isClipboardCommand, item.text == nil else { return }
+        if localPreview != nil { closeLocalPreview(); return }
+        let metrics = previewMetrics()
+        if let path = item.filePath {
+            let url = URL(fileURLWithPath: path)
+            do {
+                guard let preview = try inlinePreview.withResidentFile(url, expectedStamp: nil, {
+                    LocalPreviewPanel(url: url, title: url.lastPathComponent,
+                                      maxSize: metrics.maxSize, backingScale: metrics.scale)
+                }) else { model.previewFailed(); return }
+                presentLocalPreview(preview, on: metrics.visible)
+            } catch {
+                model.previewFailed()
+            }
+            return
+        }
+        let store = clipboard.store
+        let expectedID = item.id
+        Task.detached(priority: .utility) {
+            guard let data = try? store.image(id: expectedID), let image = NSImage(data: data) else { return }
+            await MainActor.run { [weak self] in
+                guard let self, self.searchPresented, self.commands.isClipboardCommand,
+                      self.commands.clipboardSelection == expectedID,
+                      let preview = LocalPreviewPanel(image: image, title: self.model.t("剪贴板图片", "Clipboard Image"),
+                                                      maxSize: metrics.maxSize, backingScale: metrics.scale) else { return }
+                self.presentLocalPreview(preview, on: metrics.visible)
+            }
+        }
     }
 
     func makeLocalPreviewKey() {
@@ -1392,7 +1475,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private func showSearchSettings() {
         switch panelState.mode {
-        case .clipboard: presentSettings(page: .general)
+        case .clipboard, .window: presentSettings(page: .general)
         case .imageSetup: presentSettings(page: .index)
         case .translation: presentSettings(page: .translation)
         case .commandCard: presentSettings(page: isQuestion ? .translation : nil)
@@ -1692,9 +1775,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         applicationIcons.update(for: model.launchMatches + pinnedApps)
         refreshInlinePreview()
         let state = panelState
+        let geometryRows = state.mode == .window
+            ? commands.windowRows.map(LauncherResult.action)
+            : model.visibleResults
         let target = PanelGeometry.size(
             for: state,
-            rows: model.visibleResults,
+            rows: geometryRows,
             showsResults: model.showsResults,
             needsAccessibility: windowManagement.issue == .permissionRequired
         )

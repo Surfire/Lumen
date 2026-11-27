@@ -130,6 +130,19 @@ final class IndexStatusState: ObservableObject {
     }
 }
 
+enum AppearanceMode: String, CaseIterable, Identifiable {
+    case system, light, dark
+
+    var id: String { rawValue }
+    var nsAppearance: NSAppearance? {
+        switch self {
+        case .system: return nil
+        case .light: return NSAppearance(named: .aqua)
+        case .dark: return NSAppearance(named: .darkAqua)
+        }
+    }
+}
+
 @MainActor
 final class Launcher: ObservableObject {
     private static let trailingExtensionRegex = try! NSRegularExpression(pattern: #"\.[A-Za-z0-9]{1,8}$"#)
@@ -161,6 +174,14 @@ final class Launcher: ObservableObject {
             guard language != oldValue else { return }
             defaults?.set(language, forKey: "language")
         }
+    }
+
+    @Published var appearanceMode: AppearanceMode
+
+    func setAppearanceMode(_ mode: AppearanceMode) {
+        guard appearanceMode != mode else { return }
+        appearanceMode = mode
+        defaults?.set(mode.rawValue, forKey: "appearance")
     }
 
     var localModelState: LocalModelState { indexStatus.localModelState }
@@ -333,6 +354,7 @@ final class Launcher: ObservableObject {
                                        scope: initialScope,
                                        contentPaused: defaults?.bool(forKey: "contentIndexingPaused") ?? false)
         language = locale ?? defaults?.string(forKey: "language") ?? "system"
+        appearanceMode = defaults?.string(forKey: "appearance").flatMap(AppearanceMode.init(rawValue:)) ?? .system
         indexStatus.onScopeChanged = { [weak self] nextScope in
             guard let self else { return }
             self.pauseEmbeddings()

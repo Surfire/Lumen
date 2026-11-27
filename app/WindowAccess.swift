@@ -11,6 +11,12 @@ protocol WindowAccessAdapter: Sendable {
     func frame(of window: Window) -> CGRect?
     func setPosition(_ position: CGPoint, of window: Window) -> Bool
     func setSize(_ size: CGSize, of window: Window) -> Bool
+    // Eligible, visible windows of other apps, front to back.
+    func onScreenWindows(excludingPID: pid_t) -> [(window: Window, attributes: WindowAttributes, frame: CGRect)]
+}
+
+extension WindowAccessAdapter {
+    func onScreenWindows(excludingPID: pid_t) -> [(window: Window, attributes: WindowAttributes, frame: CGRect)] { [] }
 }
 
 struct WindowAttributes {
@@ -39,13 +45,21 @@ final class AXWindowAccess<Adapter: WindowAccessAdapter>: @unchecked Sendable {
     private let adapter: Adapter
     // AXUIElement hashes/compares by element identity, not by title or Swift object identity.
     private var history: [(window: Adapter.Window, frame: CGRect)] = []
+    // The frames a whole auto-tile replaced, restored together by one `.restore`.
+    private var batchHistory: [(window: Adapter.Window, frame: CGRect)] = []
     private let capacity = 32
 
     init(adapter: Adapter) { self.adapter = adapter }
 
     func perform(_ command: WindowCommand, targetPID: pid_t?, planner: WindowLayoutPlanner) -> WindowActionIssue? {
         guard adapter.isTrusted() else { return .permissionRequired }
-        guard let targetPID, let (window, original) = eligibleWindow(in: targetPID) else { return .noWindow }
+        if command == .autoTile { return autoTile(targetPID: targetPID, planner: planner) }
+        let target = targetPID.flatMap { eligibleWindow(in: $0) }
+        if command == .restore, !batchHistory.isEmpty,
+           target.map({ target in batchHistory.contains { $0.window == target.0 } || !history.contains { $0.window == target.0 } }) ?? true {
+            return restoreBatch(planner: planner)
+        }
+        guard let (window, original) = target else { return .noWindow }
         var previous: CGRect?
         if command == .restore {
             guard let index = history.firstIndex(where: { $0.window == window }) else { return .noPreviousFrame }
@@ -78,8 +92,58 @@ final class AXWindowAccess<Adapter: WindowAccessAdapter>: @unchecked Sendable {
             forget(window)
             history.append((window, original))
             if history.count > capacity { history.removeFirst() }
+            // A newer single move supersedes the auto-tile this window was part of.
+            if batchHistory.contains(where: { $0.window == window }) { batchHistory.removeAll() }
         }
         return applied ? nil : .couldNotMove
+    }
+
+    private func autoTile(targetPID: pid_t?, planner: WindowLayoutPlanner) -> WindowActionIssue? {
+        let candidates = adapter.onScreenWindows(excludingPID: ProcessInfo.processInfo.processIdentifier)
+            .filter { $0.attributes.isEligible }
+        guard let first = candidates.first else { return .noWindow }
+        let anchor = targetPID.flatMap { eligibleWindow(in: $0)?.1 } ?? first.frame
+        guard let display = planner.displayIndex(for: planner.appKitFrame(anchor)) else { return .couldNotMove }
+        // Front-most windows win the available cells; they then keep their relative on-screen order.
+        let onDisplay = candidates.filter { planner.displayIndex(for: planner.appKitFrame($0.frame)) == display }
+        let cells = planner.autoTilePlan(windowCount: onDisplay.count, on: display)
+        let selected = onDisplay.prefix(cells.count)
+            .sorted { ($0.frame.minY, $0.frame.minX) < ($1.frame.minY, $1.frame.minX) }
+        guard !selected.isEmpty else { return .noWindow }
+
+        // Keep the oldest saved frame of windows tiled again so one restore returns to the original layout.
+        let saved = Dictionary(batchHistory.map { ($0.window, $0.frame) }, uniquingKeysWith: { first, _ in first })
+        batchHistory = selected.map { ($0.window, saved[$0.window] ?? $0.frame) }
+
+        let bounds = planner.axFrame(planner.displays[display].visibleFrame)
+        var applied = 0
+        for (entry, cell) in zip(selected, cells) {
+            let placement = WindowLayoutPlanner.Placement(frame: cell, bounds: bounds)
+            if approximatelyEqual(entry.frame, cell) { applied += 1; continue }
+            _ = adapter.setPosition(cell.origin, of: entry.window)
+            _ = adapter.setSize(cell.size, of: entry.window)
+            let size = validFrame(of: entry.window)?.size ?? cell.size
+            _ = adapter.setPosition(placement.position(for: size), of: entry.window)
+            // An app with a minimum size may not reach the cell exactly; the move still counts.
+            if validFrame(of: entry.window).map({ $0 != entry.frame }) ?? false { applied += 1 }
+        }
+        return applied > 0 ? nil : .couldNotMove
+    }
+
+    private func restoreBatch(planner: WindowLayoutPlanner) -> WindowActionIssue? {
+        let entries = batchHistory
+        batchHistory.removeAll()
+        var restored = 0
+        for entry in entries {
+            guard let current = validFrame(of: entry.window),
+                  let placement = planner.placement(for: .restore, currentAX: current, previousAX: entry.frame) else { continue }
+            _ = adapter.setPosition(placement.frame.origin, of: entry.window)
+            _ = adapter.setSize(placement.frame.size, of: entry.window)
+            let size = validFrame(of: entry.window)?.size ?? placement.frame.size
+            _ = adapter.setPosition(placement.position(for: size), of: entry.window)
+            restored += 1
+        }
+        return restored > 0 ? nil : .noPreviousFrame
     }
 
     private func eligibleWindow(in pid: pid_t) -> (Adapter.Window, CGRect)? {
@@ -150,6 +214,52 @@ struct NativeWindowAccessAdapter: WindowAccessAdapter {
         var size = size
         guard let value = AXValueCreate(.cgSize, &size) else { return false }
         return AXUIElementSetAttributeValue(window, Self.size as CFString, value) == .success
+    }
+
+    func onScreenWindows(excludingPID: pid_t) -> [(window: AXUIElement, attributes: WindowAttributes, frame: CGRect)] {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]] else { return [] }
+        let selfPID = ProcessInfo.processInfo.processIdentifier
+        // Layer 0 is the normal window layer; menu bar, Dock and overlays sit above it.
+        var ordered: [(pid: pid_t, bounds: CGRect)] = []
+        for info in list {
+            guard (info[kCGWindowLayer as String] as? Int) == 0,
+                  let pid = info[kCGWindowOwnerPID as String] as? pid_t, pid != excludingPID, pid != selfPID,
+                  (info[kCGWindowAlpha as String] as? Double ?? 1) > 0,
+                  let dictionary = info[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(dictionaryRepresentation: dictionary), !bounds.isEmpty else { continue }
+            ordered.append((pid, bounds))
+        }
+        var eligible: [pid_t: [(window: AXUIElement, attributes: WindowAttributes)]] = [:]
+        var pids: [pid_t] = []
+        for entry in ordered where !pids.contains(entry.pid) { pids.append(entry.pid) }
+        for pid in pids {
+            let app = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(app, 1.0)
+            var value: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
+                  let windows = value as? [AnyObject] else { continue }
+            eligible[pid] = windows.compactMap { item in
+                guard let window = element(item), let attributes = inspect(window), attributes.isEligible else { return nil }
+                return (window, attributes)
+            }
+        }
+        var result: [(window: AXUIElement, attributes: WindowAttributes, frame: CGRect)] = []
+        var seen = Set<AXUIElement>()
+        for entry in ordered {
+            // CGWindow bounds and AX frames share the same top-left global coordinates.
+            guard let match = eligible[entry.pid]?.first(where: {
+                !seen.contains($0.window) && Self.matches($0.attributes.frame, entry.bounds)
+            }) else { continue }
+            seen.insert(match.window)
+            result.append((match.window, match.attributes, match.attributes.frame))
+        }
+        return result
+    }
+
+    private static func matches(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
+        abs(lhs.minX - rhs.minX) <= 2 && abs(lhs.minY - rhs.minY) <= 2
+            && abs(lhs.width - rhs.width) <= 2 && abs(lhs.height - rhs.height) <= 2
     }
 
     private func isSettable(_ attribute: String, of element: AXUIElement) -> Bool {

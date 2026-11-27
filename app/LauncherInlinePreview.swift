@@ -53,6 +53,7 @@ final class LauncherInlinePreview: ObservableObject {
         if ext == "pdf" { return .pdf(matchPage: hit.pdf_page) }
         if UTType(filenameExtension: ext)?.conforms(to: .image) == true { return .image }
         if hit.snippet != nil { return .excerpt }
+        if MacPreviewRenderer.isPlainTextExtension(ext) { return .plainText }
         return nil
     }
 
@@ -119,7 +120,7 @@ final class LauncherInlinePreview: ObservableObject {
         }
         let document = try await withTaskCancellationHandler(operation: { try await task.value },
                                                            onCancel: { task.cancel() })
-        if document.visual == nil, let evidence = document.evidence, evidence.context == nil, let excerptProvider,
+        if document.visual == nil, document.text == nil, let evidence = document.evidence, evidence.context == nil, let excerptProvider,
            let bodyContext = await excerptProvider(item.url.path, evidence.highlight, evidence.text) {
             try Task.checkCancellation()
             return PreviewDocument(visual: nil, evidence: PreviewEvidence(text: evidence.text,

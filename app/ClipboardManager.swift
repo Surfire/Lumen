@@ -13,6 +13,12 @@ final class ClipboardManager: ObservableObject {
     private static let enabledKey = "clipboard.enabled"
     private static let limitKey = "clipboard.retentionCount"
     private static let thumbnailCacheLimit = 32
+    private static let imageTypes: [NSPasteboard.PasteboardType] = [
+        .png, .tiff,
+        NSPasteboard.PasteboardType(UTType.jpeg.identifier),
+        NSPasteboard.PasteboardType(UTType.heic.identifier),
+        NSPasteboard.PasteboardType(UTType.webP.identifier),
+    ]
 
     private enum CaptureOutcome: Sendable {
         case cancelled
@@ -281,6 +287,11 @@ final class ClipboardManager: ObservableObject {
             let wrote: Bool
             if let text = entry.text {
                 wrote = Self.writeInternalString(text, to: pasteboard)
+            } else if let path = entry.filePath {
+                // A real file reference, so Cmd+V pastes the file itself. Nothing is read or downloaded here.
+                let item = NSPasteboardItem()
+                wrote = item.setString(URL(fileURLWithPath: path).absoluteString, forType: .fileURL)
+                    && Self.writeInternalItem(item, to: pasteboard)
             } else if let data = try storeQueue.sync(execute: { try store.image(id: id) }) {
                 let item = NSPasteboardItem()
                 wrote = item.setData(data, forType: .png) && Self.writeInternalItem(item, to: pasteboard)
@@ -354,7 +365,26 @@ final class ClipboardManager: ObservableObject {
         let source = NSWorkspace.shared.frontmostApplication
         let bundleID = source?.bundleIdentifier
         let appName = source?.localizedName
-        let imageType: NSPasteboard.PasteboardType? = types.contains(.png) ? .png : (types.contains(.tiff) ? .tiff : nil)
+        // Copied files win over the icon/preview bitmaps that Finder places beside them.
+        if types.contains(.fileURL),
+           let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
+           let fileURL = urls.first(where: { !store.contains($0) }), pasteboard.changeCount == count {
+            let path = fileURL.path
+            let store = self.store
+            let expectedGeneration = self.clearGeneration
+            let needsFullLoad = !self.loaded || self.failed
+            performStoreWork({ () throws -> CaptureOutcome in
+                guard let upserted = try store.upsertFile(path, capturedAt: capturedAt, bundleID: bundleID, appName: appName) else {
+                    return .unchanged
+                }
+                return needsFullLoad ? .reloaded(try store.items()) : .upserted(upserted)
+            }) { manager, result in
+                guard manager.clearGeneration == expectedGeneration else { return }
+                manager.applyCaptureResult(result)
+            }
+            return nil
+        }
+        let imageType = Self.imageTypes.first { types.contains($0) }
         if let imageType, let bytes = pasteboard.data(forType: imageType) {
             guard pasteboard.changeCount == count else { return nil }
             let store = self.store

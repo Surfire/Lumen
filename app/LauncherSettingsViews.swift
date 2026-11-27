@@ -371,7 +371,19 @@ struct LauncherSettings: View {
                              "Could not change this login item. Check macOS Login Items settings."))
             }
         }
-        group(model.t("语言", "Language")) {
+        group(model.t("外观与语言", "Appearance & Language")) {
+            LabeledContent(model.t("外观", "Appearance")) {
+                Picker(model.t("外观", "Appearance"),
+                       selection: Binding(get: { model.appearanceMode }, set: { model.setAppearanceMode($0) })) {
+                    Text(model.t("跟随系统", "System")).tag(AppearanceMode.system)
+                    Text(model.t("浅色", "Light")).tag(AppearanceMode.light)
+                    Text(model.t("深色", "Dark")).tag(AppearanceMode.dark)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                .accessibilityIdentifier("settings.appearance")
+            }
             LabeledContent(model.t("界面语言", "Interface Language")) {
                 Picker(model.t("界面语言", "Interface Language"),
                        selection: Binding(get: { model.language }, set: { model.set(\.language, to: $0) })) {

@@ -88,7 +88,8 @@ enum LocalFile {
 final class LocalPreviewPanel: NSPanel {
     private let preview: QLPreviewView?
     private let pdf: PDFView?
-    private let url: URL
+    private let imageView: NSImageView?
+    private let url: URL?
     private var closed = false
 
     private static let spreadsheetOrDeckExtensions: Set<String> = [
@@ -103,33 +104,44 @@ final class LocalPreviewPanel: NSPanel {
     private static let videoExtensions: Set<String> = ["mp4", "mov", "m4v", "webm", "mkv"]
     private static let audioExtensions: Set<String> = ["mp3", "m4a", "wav", "flac", "aac", "ogg"]
 
+    private static func fittedSize(
+        width: CGFloat,
+        height: CGFloat,
+        maxSize: NSSize,
+        scaleHint: CGFloat = 1,
+        maxUpscale: CGFloat = 1
+    ) -> NSSize {
+        let minW: CGFloat = 400
+        let minH: CGFloat = 300
+        let maxW = max(minW, maxSize.width)
+        let maxH = max(minH, maxSize.height)
+        guard width > 0, height > 0 else {
+            return NSSize(width: min(680, maxW), height: min(520, maxH))
+        }
+        let targetW = width * scaleHint
+        let targetH = height * scaleHint
+        let ratioScale = min(maxW / targetW, maxH / targetH)
+        let boundedScale = ratioScale < 1 ? ratioScale : min(ratioScale, maxUpscale)
+        var fittedW = round(targetW * boundedScale)
+        var fittedH = round(targetH * boundedScale)
+        if fittedW < minW || fittedH < minH {
+            let up = min(maxW / max(fittedW, 1), maxH / max(fittedH, 1), max(minW / max(fittedW, 1), minH / max(fittedH, 1)))
+            fittedW = min(maxW, round(fittedW * up))
+            fittedH = min(maxH, round(fittedH * up))
+        }
+        return NSSize(width: max(minW, min(maxW, fittedW)), height: max(minH, min(maxH, fittedH)))
+    }
+
     static func preferredContentSize(
         for url: URL,
         page: Int?,
         maxSize: NSSize,
         backingScale: CGFloat = 2
     ) -> NSSize {
-        let minW: CGFloat = 400
-        let minH: CGFloat = 300
-        let maxW = max(minW, maxSize.width)
-        let maxH = max(minH, maxSize.height)
-
+        let maxW = max(400, maxSize.width)
+        let maxH = max(300, maxSize.height)
         func fit(width: CGFloat, height: CGFloat, scaleHint: CGFloat = 1, maxUpscale: CGFloat = 1) -> NSSize {
-            guard width > 0, height > 0 else {
-                return NSSize(width: min(680, maxW), height: min(520, maxH))
-            }
-            let targetW = width * scaleHint
-            let targetH = height * scaleHint
-            let ratioScale = min(maxW / targetW, maxH / targetH)
-            let boundedScale = ratioScale < 1 ? ratioScale : min(ratioScale, maxUpscale)
-            var fittedW = round(targetW * boundedScale)
-            var fittedH = round(targetH * boundedScale)
-            if fittedW < minW || fittedH < minH {
-                let up = min(maxW / max(fittedW, 1), maxH / max(fittedH, 1), max(minW / max(fittedW, 1), minH / max(fittedH, 1)))
-                fittedW = min(maxW, round(fittedW * up))
-                fittedH = min(maxH, round(fittedH * up))
-            }
-            return NSSize(width: max(minW, min(maxW, fittedW)), height: max(minH, min(maxH, fittedH)))
+            Self.fittedSize(width: width, height: height, maxSize: maxSize, scaleHint: scaleHint, maxUpscale: maxUpscale)
         }
 
         let ext = url.pathExtension.lowercased()
@@ -202,6 +214,7 @@ final class LocalPreviewPanel: NSPanel {
             }
             preview = nil
             pdf = display
+            imageView = nil
             destination = target
             view = display
         } else {
@@ -211,6 +224,7 @@ final class LocalPreviewPanel: NSPanel {
             display.previewItem = url as NSURL
             preview = display
             pdf = nil
+            imageView = nil
             view = display
         }
         self.url = url
@@ -235,6 +249,39 @@ final class LocalPreviewPanel: NSPanel {
         }
     }
 
+    init?(
+        image: NSImage,
+        title: String,
+        maxSize: NSSize? = nil,
+        backingScale: CGFloat? = nil
+    ) {
+        let cap = maxSize ?? NSSize(width: 960, height: 760)
+        let rep = image.representations.first
+        let scale = max(backingScale ?? 2, 1)
+        let rawW = rep.map { CGFloat($0.pixelsWide) / scale } ?? image.size.width
+        let rawH = rep.map { CGFloat($0.pixelsHigh) / scale } ?? image.size.height
+        let size = Self.fittedSize(width: max(rawW, image.size.width), height: max(rawH, image.size.height),
+                                   maxSize: cap, scaleHint: 1, maxUpscale: 1.5)
+        let frame = NSRect(origin: .zero, size: size)
+        let display = NSImageView(frame: frame)
+        display.image = image
+        display.imageScaling = .scaleProportionallyUpOrDown
+        display.imageAlignment = .alignCenter
+        preview = nil
+        pdf = nil
+        imageView = display
+        url = nil
+        super.init(contentRect: frame, styleMask: [.titled, .closable, .resizable, .nonactivatingPanel],
+                   backing: .buffered, defer: false)
+        self.title = title
+        isReleasedWhenClosed = false
+        isFloatingPanel = true
+        hidesOnDeactivate = false
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        minSize = NSSize(width: 400, height: 300)
+        contentView = display
+    }
+
     override var canBecomeKey: Bool { true }
     override func cancelOperation(_ sender: Any?) {
         if let onToggle { onToggle() } else { close() }
@@ -246,6 +293,7 @@ final class LocalPreviewPanel: NSPanel {
         preview?.previewItem = nil
         preview?.close()
         pdf?.document = nil
+        imageView?.image = nil
         super.close()
     }
 

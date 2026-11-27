@@ -21,6 +21,8 @@ public enum PreviewKind: Sendable, Equatable {
     /// nil means no match page is known. It must not be labelled a hit.
     case pdf(matchPage: Int?)
     case excerpt
+    /// Bounded inline text or source code from a resident local file.
+    case plainText
     /// Use the inline area for hydration progress, then hand off to Quick Look.
     case quickLook
 }
@@ -48,9 +50,13 @@ public struct PreviewDocument: Sendable, Equatable {
     }
     public let visual: Visual?
     public let evidence: PreviewEvidence?
-    public init(visual: Visual? = nil, evidence: PreviewEvidence? = nil) {
+    public let text: String?
+    public let isCode: Bool
+    public init(visual: Visual? = nil, evidence: PreviewEvidence? = nil, text: String? = nil, isCode: Bool = false) {
         self.visual = visual
         self.evidence = evidence
+        self.text = text
+        self.isCode = isCode
     }
 }
 

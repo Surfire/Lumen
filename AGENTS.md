@@ -1,6 +1,6 @@
 # Lumen Engineering & Anti-Over-Defense Guidelines
 
-This repository implements **Lumen** (`v0.3.3` -> `v0.4`), a native macOS search launcher and local file/document/multimodal index built with Rust (`src/`) and AppKit/SwiftUI (`app/`).
+This repository implements **Lumen** (`v0.5+`), a native macOS search launcher and local file/document/multimodal index built with Rust (`src/`) and AppKit/SwiftUI (`app/`).
 
 ## 6 Anti-Over-Defense Red Lines (Mandatory)
 
@@ -27,6 +27,15 @@ This repository implements **Lumen** (`v0.3.3` -> `v0.4`), a native macOS search
 
 6. **Real regression tests only.**
    - Every bug fix must include a regression test that fails without the fix and asserts real observable behavior. Never weaken existing assertions, add arbitrary sleeps to hide races, or mock out the unit under test.
+
+## MIT Axiomatic Design Gate (Mandatory for New Features & Architecture Changes)
+
+Before writing code for any new feature, new setting/command, data-model change, or cross-process contract (ordinary single-file bug fixes and copy tweaks are exempt), pass this 4-question gate (Independence Axiom + Information Axiom):
+
+1. **FR↔DP Independence (No Split-Brain / No Tangled Controls)**: Does any state, table, or UI control bind two unrelated requirements together? Never keep two competing sources of truth (migrate legacy schemas once on open instead of maintaining dual runtime paths).
+2. **Zero Hot-Path Tax**: Does a low-frequency feature (e.g., window tiling, diagnostics, network shares) add synchronous IPC, disk I/O, or memory overhead to the 95% hot path (panel open, keystroke search, arrow navigation)?
+3. **Minimum Information Content (Delete Before Adding)**: Can smart defaults + deleting legacy code solve the user pain without adding new settings toggles, text fields, dialogs, or child processes? Hide power-user overrides behind progressive disclosure.
+4. **Kernel-Anchored Boundaries & Controlled Growth**: Are security/cloud/network boundaries anchored in real OS attributes (`SF_DATALESS`, `fstatfs` `f_fstypename`, leaf certificate DER) rather than path-string guesses? Keep new subsystem orchestration cohesive in its own module rather than expanding God objects like `app/LumenApp.swift`.
 
 ## Verification Gates
 

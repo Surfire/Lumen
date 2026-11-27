@@ -65,6 +65,21 @@ struct WindowLayoutPlanner {
             frame = command == .topHalf
                 ? CGRect(x: visible.minX, y: split, width: visible.width, height: visible.maxY - split)
                 : CGRect(x: visible.minX, y: visible.minY, width: visible.width, height: split - visible.minY)
+        case .topThird, .middleThird, .bottomThird, .topTwoThirds, .bottomTwoThirds:
+            let split1 = visible.minY + floor(visible.height / 3)
+            let split2 = visible.minY + floor(visible.height * 2 / 3)
+            let band: (CGFloat, CGFloat)
+            switch command {
+            case .topThird: band = (split2, visible.maxY)
+            case .middleThird: band = (split1, split2)
+            case .bottomThird: band = (visible.minY, split1)
+            case .topTwoThirds: band = (split1, visible.maxY)
+            default: band = (visible.minY, split2)
+            }
+            frame = CGRect(x: visible.minX, y: band.0, width: visible.width, height: band.1 - band.0)
+        case .autoTile:
+            // Multi-window layout: see autoTilePlan(windowCount:on:).
+            return nil
         case .maximize: frame = visible
         case .center: frame = centered(size: fit(current.size, in: visible), in: visible)
         case .almostMaximize, .reasonableSize:
@@ -87,6 +102,65 @@ struct WindowLayoutPlanner {
         return Placement(frame: Placement.clamp(axFrame(frame), to: axFrame(bounds)), bounds: axFrame(bounds))
     }
 
+    // Cells for `windowCount` windows on one display, in AX coordinates, ordered top-to-bottom then
+    // left-to-right. Fewer cells than windows means the extra windows are left alone.
+    func autoTilePlan(windowCount: Int, on displayIndex: Int) -> [CGRect] {
+        guard windowCount > 0, displays.indices.contains(displayIndex) else { return [] }
+        let visible = displays[displayIndex].visibleFrame
+        let isPortrait = visible.height > visible.width
+        let cells: [CGRect]
+        switch windowCount {
+        case 1:
+            cells = [visible.width >= 1700
+                ? centered(size: CGSize(width: floor(visible.width * 0.9), height: floor(visible.height * 0.9)), in: visible)
+                : visible]
+        case 2:
+            cells = isPortrait ? Self.rows(2, in: visible) : Self.columns(2, in: visible)
+        case 3:
+            if isPortrait {
+                cells = Self.rows(3, in: visible)
+            } else if visible.width >= 2200 || visible.width / max(visible.height, 1) >= 2.0 {
+                cells = Self.columns(3, in: visible)
+            } else {
+                let split = visible.minX + floor(visible.width * 0.55)
+                let right = CGRect(x: split, y: visible.minY, width: visible.maxX - split, height: visible.height)
+                cells = [CGRect(x: visible.minX, y: visible.minY, width: split - visible.minX, height: visible.height)]
+                    + Self.rows(2, in: right)
+            }
+        case 4:
+            // Four stacked bands keep a narrow portrait display usable; otherwise a 2x2 grid.
+            cells = isPortrait && visible.width < 1000 ? Self.rows(4, in: visible) : Self.grid(columns: 2, rows: 2, in: visible)
+        default:
+            guard visible.width >= 2000 && !isPortrait else { return autoTilePlan(windowCount: 4, on: displayIndex) }
+            cells = Array(Self.grid(columns: 3, rows: 2, in: visible).prefix(windowCount))
+        }
+        let bounds = axFrame(visible)
+        return cells.map { Placement.clamp(axFrame($0), to: bounds) }
+            .sorted { ($0.minY, $0.minX) < ($1.minY, $1.minX) }
+    }
+
+    // AppKit-coordinate slices of `rect`; the last slice absorbs the rounding remainder.
+    private static func columns(_ count: Int, in rect: CGRect) -> [CGRect] {
+        (0..<count).map { index in
+            let minX = rect.minX + floor(rect.width * CGFloat(index) / CGFloat(count))
+            let maxX = index == count - 1 ? rect.maxX : rect.minX + floor(rect.width * CGFloat(index + 1) / CGFloat(count))
+            return CGRect(x: minX, y: rect.minY, width: maxX - minX, height: rect.height)
+        }
+    }
+
+    // Top to bottom (AppKit's Y grows upward).
+    private static func rows(_ count: Int, in rect: CGRect) -> [CGRect] {
+        (0..<count).map { index in
+            let maxY = index == 0 ? rect.maxY : rect.maxY - floor(rect.height * CGFloat(index) / CGFloat(count))
+            let minY = index == count - 1 ? rect.minY : rect.maxY - floor(rect.height * CGFloat(index + 1) / CGFloat(count))
+            return CGRect(x: rect.minX, y: minY, width: rect.width, height: maxY - minY)
+        }
+    }
+
+    private static func grid(columns: Int, rows: Int, in rect: CGRect) -> [CGRect] {
+        Self.rows(rows, in: rect).flatMap { Self.columns(columns, in: $0) }
+    }
+
     private func isCoveredByVisibleFrames(_ frame: CGRect) -> Bool {
         let intersections = displays.map { $0.visibleFrame.intersection(frame) }
             .filter { !$0.isEmpty }.sorted { $0.minY < $1.minY }
@@ -105,7 +179,7 @@ struct WindowLayoutPlanner {
         return !frame.isEmpty
     }
 
-    private func displayIndex(for rect: CGRect) -> Int? {
+    func displayIndex(for rect: CGRect) -> Int? {
         // Prefer largest overlap, then nearest screen for detached/offscreen windows.
         displays.indices.min { lhs, rhs in
             func rank(_ index: Int) -> (CGFloat, CGFloat, Int) {
@@ -138,6 +212,9 @@ enum WindowCommand: String {
     case leftHalf = "left-half", rightHalf = "right-half", topHalf = "top-half", bottomHalf = "bottom-half"
     case maximize, center, almostMaximize = "almost-maximize", reasonableSize = "reasonable-size"
     case nextDisplay = "next-display", previousDisplay = "previous-display", restore
+    case autoTile = "auto-tile"
+    case topThird = "top-third", middleThird = "middle-third", bottomThird = "bottom-third"
+    case topTwoThirds = "top-two-thirds", bottomTwoThirds = "bottom-two-thirds"
 }
 
 enum WindowActionIssue: Error, Equatable {
@@ -166,6 +243,7 @@ final class WindowManagement: ObservableObject {
     private let layout: () -> WindowLayoutPlanner
     private let checkTrust: () -> Bool
     private let openSettings: (URL) -> Void
+    private let detectPortrait: (pid_t?) -> Bool
     private let execute: (WindowCommand, pid_t?, WindowLayoutPlanner, @escaping (WindowActionIssue?) -> Void) -> Void
 
     convenience init() {
@@ -179,10 +257,12 @@ final class WindowManagement: ObservableObject {
     }
 
     init<Adapter: WindowAccessAdapter>(adapter: Adapter, frontmostPID: @escaping () -> pid_t?,
-                                      layout: @escaping () -> WindowLayoutPlanner, openSettings: @escaping (URL) -> Void) {
+                                      layout: @escaping () -> WindowLayoutPlanner, openSettings: @escaping (URL) -> Void,
+                                      detectPortrait: @escaping (pid_t?) -> Bool = WindowManagement.activeDisplayIsPortrait(for:)) {
         self.frontmostPID = frontmostPID
         self.layout = layout
         self.openSettings = openSettings
+        self.detectPortrait = detectPortrait
         checkTrust = { adapter.isTrusted() }
         let access = AXWindowAccess(adapter: adapter)
         // Serialize remote calls and frame history without blocking AppKit on another process.
@@ -194,6 +274,37 @@ final class WindowManagement: ObservableObject {
             }
         }
     }
+
+    /// Orientation of the display a window command would act on: the target app's front window,
+    /// else the display under the mouse, else the main display.
+    nonisolated static func activeDisplayIsPortrait(for targetPID: pid_t?) -> Bool {
+        let screens = NSScreen.screens
+        var screen: NSScreen?
+        if let targetPID, let primary = screens.first,
+           let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+            for info in list where (info[kCGWindowOwnerPID as String] as? pid_t) == targetPID
+                && (info[kCGWindowLayer as String] as? Int) == 0 {
+                guard let dictionary = info[kCGWindowBounds as String] as? NSDictionary,
+                      let bounds = CGRect(dictionaryRepresentation: dictionary), !bounds.isEmpty else { continue }
+                let appKit = CGRect(x: bounds.minX, y: primary.frame.maxY - bounds.maxY, width: bounds.width, height: bounds.height)
+                screen = screens.max { overlap($0.frame, appKit) < overlap($1.frame, appKit) }
+                break
+            }
+        }
+        if screen == nil {
+            let mouse = NSEvent.mouseLocation
+            screen = screens.first { $0.frame.contains(mouse) }
+        }
+        guard let visible = (screen ?? NSScreen.main ?? screens.first)?.visibleFrame else { return false }
+        return visible.height > visible.width
+    }
+
+    private nonisolated static func overlap(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
+        let intersection = lhs.intersection(rhs)
+        return intersection.isNull ? 0 : intersection.width * intersection.height
+    }
+
+    func activeDisplayIsPortrait(for targetPID: pid_t?) -> Bool { detectPortrait(targetPID) }
 
     func captureTarget() {
         targetPID = frontmostPID().flatMap { $0 == ProcessInfo.processInfo.processIdentifier ? nil : $0 }

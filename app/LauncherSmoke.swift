@@ -8,6 +8,7 @@ import ImageIO
 import PDFKit
 import SQLite3
 import SwiftUI
+import UniformTypeIdentifiers
 import zlib
 
 // Runs inside the built app with app-local AppKit and Carbon events and an isolated index.
@@ -57,7 +58,8 @@ final class LauncherSmoke {
         guard exists("content-scenario") else { return nil }
         let directory = directory
         return .init(isPending: { url in
-            ["cloud-preview-placeholder.png", "cloud-quick-look-placeholder.txt"].contains(url.lastPathComponent) &&
+            ["cloud-preview-placeholder.png", "cloud-quick-look-placeholder.txt",
+             "cloud-quick-look-placeholder.docx"].contains(url.lastPathComponent) &&
             !FileManager.default.fileExists(atPath: Self.previewHydrated(url, in: directory).path)
         }, download: { [weak self] url, report in
             guard let self else { throw CancellationError() }
@@ -79,6 +81,8 @@ final class LauncherSmoke {
             let bytes: Data
             if url.pathExtension == "png" {
                 bytes = try Data(contentsOf: corpus.appendingPathComponent("Dropbox/cloud-preview-known.png"))
+            } else if url.pathExtension == "docx" {
+                bytes = Data("Hydrated Quick Look Office fixture.".utf8)
             } else {
                 bytes = Data("Hydrated Quick Look text fixture.".utf8)
             }
@@ -92,10 +96,16 @@ final class LauncherSmoke {
     private var frontmostWindowPID: pid_t? = 42_001
     private let windowAdapter = SmokeWindowAccess()
     private var openedAccessibilitySettings: [URL] = []
+    private var portraitDisplayChecks = 0
+    private var simulatedPortraitDisplay: Bool?
 
     func makeWindowManagement() -> WindowManagement {
         WindowManagement(adapter: windowAdapter, frontmostPID: { [weak self] in self?.frontmostWindowPID },
-                         layout: { Self.windowPlanner }, openSettings: { [weak self] in self?.openedAccessibilitySettings.append($0) })
+                         layout: { Self.windowPlanner }, openSettings: { [weak self] in self?.openedAccessibilitySettings.append($0) },
+                         detectPortrait: { [weak self] _ in
+                             self?.portraitDisplayChecks += 1
+                             return self?.simulatedPortraitDisplay ?? false
+                         })
     }
 
     private lazy var translationSuite = "io.github.surfire.lumen.gui-smoke.\(UUID())"
@@ -722,6 +732,77 @@ final class LauncherSmoke {
         }
         try check(try ClipboardStore(directory: store.directory).items().isEmpty,
                   "Clear All did not remove pins and persisted history")
+
+        // Verify rich file-URL & JPEG capture plus Space preview on clipboard clips.
+        let clipFile = corpus.appendingPathComponent("clipboard-rich-fixture.swift")
+        try Data("let lumenRichClip = true\n".utf8).write(to: clipFile)
+        let richItem = NSPasteboardItem()
+        try check(richItem.setString(clipFile.absoluteString, forType: .fileURL), "could not put fileURL on pasteboard")
+        board.clearContents()
+        try check(board.writeObjects([richItem]), "could not write fileURL pasteboard item")
+        history.poll()
+        guard let fileClip = history.items.first, fileClip.isFile,
+              fileClip.filePath == clipFile.path else {
+            throw Failure("ClipboardManager did not capture Finder fileURL cleanly")
+        }
+        try check(history.copy(id: fileClip.id), "copying back a file clip failed")
+        let pastedURLs = board.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]
+        try check(pastedURLs?.first?.standardizedFileURL.path == clipFile.standardizedFileURL.path,
+                  "copying back a file clip did not restore .fileURL on pasteboard")
+
+        guard let jpegRep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 48, pixelsHigh: 32, bitsPerSample: 8,
+                                             samplesPerPixel: 3, hasAlpha: false, isPlanar: false,
+                                             colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+              let jpegData = jpegRep.representation(using: .jpeg, properties: [.compressionFactor: 0.9]) else {
+            throw Failure("could not create JPEG clipboard fixture")
+        }
+        board.clearContents()
+        try check(board.setData(jpegData, forType: NSPasteboard.PasteboardType(UTType.jpeg.identifier)),
+                  "could not write JPEG fixture to pasteboard")
+        await history.poll()?.value
+        guard let jpegClip = history.items.first, jpegClip.isImage, jpegClip.filePath == nil else {
+            throw Failure("ClipboardManager did not capture public.jpeg image clip")
+        }
+        try type("", into: app)
+        try type("cb ", into: app)
+        try await until("clipboard rich clips loaded into cb rows") {
+            app.commands.clipboardRows.contains { $0.id == jpegClip.id } &&
+                app.commands.clipboardRows.contains { $0.id == fileClip.id } &&
+                app.commands.clipboardSelection == jpegClip.id
+        }
+        // Navigating rows enters browse mode so Space toggles floating preview for files and images.
+        try key(kVK_DownArrow, "\u{f701}", in: app)
+        try check(app.commands.clipboardSelection == fileClip.id && app.panel.browsing,
+                  "Down did not select clipboard file clip or enter browse mode")
+        if exists("capture-icons") {
+            // Warm one offscreen draw pass so SwiftUI's .task(id:) file preview finishes loading before capture.
+            _ = try? render(.aqua, window: app.panel)
+            try await Task.sleep(for: .milliseconds(250))
+            try capture("lumen-clipboard-file-preview.png", appearance: .aqua, window: app.panel)
+            app.panel.appearance = nil
+        }
+        try key(kVK_Space, " ", in: app, throughPanel: true)
+        try await until("Space did not open LocalPreviewPanel for resident clipboard file clip") {
+            app.localPreview?.previewURL?.standardizedFileURL.path == clipFile.standardizedFileURL.path
+        }
+        try key(kVK_Space, " ", in: app, throughPanel: true)
+        try check(app.localPreview == nil && app.searchPresented,
+                  "second Space did not close clipboard file preview")
+        try key(kVK_UpArrow, "\u{f700}", in: app)
+        try check(app.commands.clipboardSelection == jpegClip.id && app.panel.browsing,
+                  "Up did not restore clipboard JPEG clip selection")
+        try key(kVK_Space, " ", in: app, throughPanel: true)
+        try await until("Space did not open LocalPreviewPanel for clipboard image clip") {
+            app.localPreview != nil
+        }
+        try key(kVK_Space, " ", in: app, throughPanel: true)
+        try check(app.localPreview == nil && app.searchPresented,
+                  "second Space did not close clipboard image preview while preserving search")
+        history.clearAll()
+        try await until("clearing rich clipboard fixtures finished") {
+            history.items.isEmpty && app.commands.clipboardRows.isEmpty
+        }
+
         try key(kVK_ANSI_Comma, ",", in: app, throughPanel: true, flags: [.command])
         try check(app.settingsSession.page == .general && !app.searchPresented, "clipboard Settings did not open General")
         if let file = files.first {
@@ -1016,6 +1097,7 @@ final class LauncherSmoke {
         try await verifyPhase1Regressions()
         try await verifyPhase2Regressions(app)
         try await verifyPhase3Regressions(app)
+        try await verifyBuild33Phase1Regressions(app)
         try check(model.indexPhase == .needsIndex && !model.canSearch, "action smoke unexpectedly had a file index")
         func chosen() -> LaunchAction? {
             if case .action(let action)? = model.selectedResult { return action }
@@ -1181,19 +1263,29 @@ final class LauncherSmoke {
         }
         try verifyInternalCopy(app, "Copy File Path")
         try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
-        try await until("Command–Y assigned a local item to the native Quick Look view") { app.localPreview?.previewURL != nil }
+        try await until("Command–Y did not open the inline plain-text preview") {
+            if case .ready(let selection, let document) = app.inlinePreview.state {
+                return selection.url.path == expected.path && selection.kind == .plainText &&
+                    document.text == "Synthetic unified search fixture." && !document.isCode &&
+                    app.localPreview == nil
+            }
+            return false
+        }
+        try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
+        try check(!app.inlinePreview.isOpen && app.inlinePreview.state == .closed &&
+                  app.localPreview == nil && app.searchPresented &&
+                  FileManager.default.fileExists(atPath: expected.path),
+                  "Command–Y did not toggle off the inline plain-text preview while keeping search and file intact")
+        app.panel.browsing = true
+        try key(kVK_Space, " ", in: app, throughPanel: true)
+        try await until("Space in browse mode toggles real Quick Look") { app.localPreview?.previewURL?.path == expected.path }
         guard let preview = app.localPreview, let url = preview.previewURL else { throw Failure("Quick Look had no item") }
         let previewContents = try String(contentsOf: url, encoding: .utf8)
         try check(url.path == expected.path && previewContents == "Synthetic unified search fixture." &&
                   !preview.isVisible && !NSApp.isActive, "Quick Look did not use the original file offscreen")
-        try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
-        try check(app.localPreview == nil && preview.previewURL == nil && app.searchPresented &&
-                  FileManager.default.fileExists(atPath: expected.path),
-                  "Command–Y did not release the Quick Look item while leaving search and the original intact")
         try key(kVK_Space, " ", in: app, throughPanel: true)
-        try await until("Space in browse mode toggles real Quick Look") { app.localPreview?.previewURL != nil }
-        try key(kVK_Space, " ", in: app, throughPanel: true)
-        try check(app.localPreview == nil && app.searchPresented, "Space closed the search rather than just the preview")
+        try check(app.localPreview == nil && preview.previewURL == nil && app.searchPresented,
+                  "Space closed the search rather than just the preview")
         try check(LocalFile.dragURL(for: expected)?.path == expected.path, "the local file did not export a drag URL")
         let similarlyNamed = directory.appendingPathComponent("local/Library/CloudStorage/resident.txt")
         try FileManager.default.createDirectory(at: similarlyNamed.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -2272,8 +2364,16 @@ final class LauncherSmoke {
         let commands = app.commands
         let panel = app.panel
         app.showSearch()
+        let checksBeforeShow = portraitDisplayChecks
+        app.dismissSearch()
+        app.showSearch()
+        try type("archive", into: app)
         try type("?", into: app)
-        try check(commands.resolution == .discovery && commands.selectedEntry?.keyword == "qa", "missing command chooser")
+        try check(portraitDisplayChecks == checksBeforeShow && !NSApp.isActive,
+                  "showSearch or regular typing invoked CGWindowListCopyWindowInfo display orientation probe")
+        try check(commands.resolution == .discovery && commands.selectedEntry?.keyword == "qa" &&
+                  commands.entries.count == 6 && commands.entries.contains { $0.commandID == "window" },
+                  "missing command chooser or win entry")
         if exists("capture-icons") {
             try capture("lumen-command-chooser.png", appearance: .aqua, window: panel)
             panel.appearance = nil
@@ -2283,6 +2383,18 @@ final class LauncherSmoke {
         try key(kVK_UpArrow, "\u{f700}", in: app)
         try key(kVK_Return, "\r", in: app)
         try check(commands.resolution == .missingArgument(commandID: "qa"), "chooser submitted rather than filling")
+        simulatedPortraitDisplay = true
+        defer { simulatedPortraitDisplay = nil }
+        try type("win", into: app)
+        try check(portraitDisplayChecks == checksBeforeShow + 1 && commands.isWindowCommand &&
+                  commands.windowRows.prefix(4).map(\.destination) == [
+                    .window(.autoTile), .window(.topHalf), .window(.bottomHalf), .window(.topThird)
+                  ],
+                  "win did not lazily detect portrait orientation or prioritize portrait splits")
+        if exists("capture-icons") {
+            try capture("lumen-window-commands.png", appearance: .aqua, window: panel)
+            panel.appearance = nil
+        }
         let browserCount = dispatchedQuicklinks.count
         try type("g 武汉 C++ &next=https://example.invalid/#猫", into: app)
         try check(dispatchedQuicklinks.count == browserCount, "typing opened a browser")
@@ -3102,10 +3214,18 @@ final class LauncherSmoke {
         try Data().write(to: provider.appendingPathComponent("cloud-preview-placeholder.png"))
         try Data("Resident Quick Look text fixture.".utf8).write(to: provider.appendingPathComponent("cloud-quick-look-resident.txt"))
         try Data().write(to: provider.appendingPathComponent("cloud-quick-look-placeholder.txt"))
+        try Data().write(to: provider.appendingPathComponent("cloud-quick-look-placeholder.docx"))
         let contextIntro = (0..<24).map { "Intro paragraph line \($0) describing background context." }.joined(separator: "\n")
         let contextTail = (0..<24).map { "Trailing paragraph line \($0) continuing later details." }.joined(separator: "\n")
         try Data("\(contextIntro)\nTarget context anchor paragraph with matching text.\n\(contextTail)".utf8)
             .write(to: selected.appendingPathComponent("long-context-fixture.md"))
+        let codePreviewSource = """
+        struct LumenPreviewFixture {
+            let title: String
+            func render() -> Bool { !title.isEmpty }
+        }
+        """
+        try Data(codePreviewSource.utf8).write(to: selected.appendingPathComponent("code-preview-fixture.swift"))
         model.rebuildSavedIndex()
         try await until("preview fixtures were indexed") { !model.scopePending && model.canSearch && model.watchState == .running }
         app.showSettings()
@@ -3361,6 +3481,25 @@ final class LauncherSmoke {
             app.panel.appearance = nil
         }
 
+        try type("code-preview-fixture", into: app)
+        try await until("name-only code fixture became selectable") {
+            model.selectedHit?.name == "code-preview-fixture.swift" && model.selectedHit?.snippet == nil
+        }
+        try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
+        try await until("Command–Y did not open inline code preview for name-only .swift file") {
+            if case .ready(let selection, let doc) = app.inlinePreview.state {
+                return selection.kind == .plainText && doc.isCode &&
+                    doc.text?.contains("struct LumenPreviewFixture") == true
+            }
+            return false
+        }
+        if exists("capture-preview") {
+            try capture("lumen-inline-code-preview.png", appearance: .aqua, window: app.panel)
+            app.panel.appearance = nil
+        }
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try check(!app.inlinePreview.isOpen && app.searchPresented, "Escape did not close inline code preview cleanly")
+
         try await verifyUnlimitedAndCloudPreview(app, provider: provider)
         try await verifyCloudQuickLook(app, provider: provider)
         try type("outsideexclusivebody", into: app)
@@ -3479,78 +3618,133 @@ final class LauncherSmoke {
         let model = app.model
         let resident = provider.appendingPathComponent("cloud-quick-look-resident.txt")
         let placeholder = provider.appendingPathComponent("cloud-quick-look-placeholder.txt")
+        let docxPlaceholder = provider.appendingPathComponent("cloud-quick-look-placeholder.docx")
         let started = previewDownloadsStarted
         let cancelled = previewDownloadsCancelled
         try type("cloud-quick-look-", into: app)
-        try await until("name-only provider text files were not indexed") {
-            [resident, placeholder].allSatisfy { url in
+        try await until("name-only provider text and docx files were not indexed") {
+            [resident, placeholder, docxPlaceholder].allSatisfy { url in
                 model.hits.contains { $0.path == url.path && $0.isCloudReference && $0.snippet == nil }
             }
         }
         func select(_ url: URL) throws {
             guard let hit = model.hits.first(where: { $0.path == url.path }) else {
-                throw Failure("missing provider text result: \(url.lastPathComponent)")
+                throw Failure("missing provider result: \(url.lastPathComponent)")
             }
             app.commands.choose(.file(hit), in: model)
         }
         func cmdY() throws { try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command]) }
+        func space() throws {
+            app.panel.browsing = true
+            try key(kVK_Space, " ", in: app, throughPanel: true)
+        }
         func escape() throws { try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true) }
 
+        // Resident .txt: Cmd+Y shows inline plainText (0 downloads), Space shows Quick Look window (0 downloads).
         try select(resident)
         try cmdY()
-        try await until("Cmd+Y did not open Quick Look for the resident cloud text file") {
-            app.localPreview?.previewURL == resident
+        try await until("Cmd+Y did not open inline plain-text preview for resident cloud text file") {
+            if case .ready(let sel, let doc) = app.inlinePreview.state {
+                return sel.url == resident && sel.kind == .plainText && doc.text == "Resident Quick Look text fixture." && app.localPreview == nil
+            }
+            return false
         }
-        try check(app.inlinePreview.state == .closed && previewDownloadsStarted == started,
-                  "resident text opened inline preview or requested a download")
+        try check(previewDownloadsStarted == started, "resident cloud text requested a download on Cmd+Y")
         try escape()
-        app.panel.browsing = true
-        try key(kVK_Space, " ", in: app, throughPanel: true)
+        try space()
         try await until("Space did not open Quick Look for the resident cloud text file") {
             app.localPreview?.previewURL == resident
         }
+        try check(previewDownloadsStarted == started, "resident cloud text requested a download on Space")
         try escape()
 
-        // Right-click Quick Look on an UNSELECTED row must select it and hydrate if placeholder.
-        guard let placeholderHit = model.hits.first(where: { $0.path == placeholder.path }) else {
-            throw Failure("missing provider text placeholder hit")
+        // Binary cloud placeholder (.docx): right-click preview, Cmd+Y, and Space share unified download -> Quick Look handoff.
+        guard let docxHit = model.hits.first(where: { $0.path == docxPlaceholder.path }) else {
+            throw Failure("missing provider docx placeholder hit")
         }
         try check(model.selectedHit?.path == resident.path, "resident row was not selected before unselected right-click preview")
-        app.perform(.preview, on: placeholderHit)
-        try await until("right-click Quick Look on an unselected placeholder did not select and start download") {
+        app.perform(.preview, on: docxHit)
+        try await until("right-click Quick Look on an unselected docx placeholder did not select and start download") {
             if case .downloading(let item, 0.4) = app.inlinePreview.state {
-                return item.url == placeholder && model.selectedHit?.path == placeholder.path
+                return item.url == docxPlaceholder && model.selectedHit?.path == docxPlaceholder.path
             }
             return false
         }
         try escape()
         try await until("Escape did not cancel the right-click Quick Look download") { self.previewDownloadsCancelled == cancelled + 1 }
 
-        try select(placeholder)
+        try select(docxPlaceholder)
         try check(app.inlinePreview.state == .closed && app.localPreview == nil && previewDownloadsStarted == started + 1,
-                  "selecting a cloud text file requested a preview without a shortcut")
-        func startDownload() async throws {
-            try cmdY()
-            try await until("Cmd+Y did not show the 40% download ring for the cloud text file") {
-                if case .downloading(let item, 0.4) = app.inlinePreview.state {
-                    return item.url == placeholder && app.inlinePreview.isOpen && app.localPreview == nil
-                }
-                return false
+                  "selecting a cloud docx file requested a preview without a shortcut")
+        try cmdY()
+        try await until("Cmd+Y did not show the 40% download ring for the cloud docx file") {
+            if case .downloading(let item, 0.4) = app.inlinePreview.state {
+                return item.url == docxPlaceholder && app.inlinePreview.isOpen && app.localPreview == nil
             }
+            return false
         }
-        try await startDownload()
         try escape()
-        try await until("Escape did not cancel the Quick Look download") { self.previewDownloadsCancelled == cancelled + 2 }
+        try await until("Escape did not cancel the Cmd+Y docx Quick Look download") { self.previewDownloadsCancelled == cancelled + 2 }
+        try space()
+        try await until("Space did not show the 40% download ring for the cloud docx file") {
+            if case .downloading(let item, 0.4) = app.inlinePreview.state {
+                return item.url == docxPlaceholder && app.inlinePreview.isOpen && app.localPreview == nil
+            }
+            return false
+        }
+        previewDownloadRelease?.yield(())
+        try await until("hydrated cloud docx did not replace the download ring with Quick Look") {
+            app.localPreview?.previewURL == docxPlaceholder && app.inlinePreview.state == .closed
+        }
+        try escape()
+
+        // Cloud text placeholder (.txt): Cmd+Y hydrates into inline plainText; Space hydrates into Quick Look window.
+        try select(placeholder)
+        try check(app.inlinePreview.state == .closed && app.localPreview == nil && previewDownloadsStarted == started + 3,
+                  "selecting a cloud text placeholder started a download without a shortcut")
+        try cmdY()
+        try await until("Cmd+Y did not show the 40% download ring for the cloud text file") {
+            if case .downloading(let item, 0.4) = app.inlinePreview.state {
+                return item.url == placeholder && item.kind == .plainText && app.inlinePreview.isOpen && app.localPreview == nil
+            }
+            return false
+        }
+        try escape()
+        try await until("Escape did not cancel the Cmd+Y text placeholder download") { self.previewDownloadsCancelled == cancelled + 3 }
+        try space()
+        try await until("Space did not show the 40% download ring for the cloud text file") {
+            if case .downloading(let item, 0.4) = app.inlinePreview.state {
+                return item.url == placeholder && item.kind == .quickLook && app.inlinePreview.isOpen && app.localPreview == nil
+            }
+            return false
+        }
+        try escape()
+        try await until("Escape did not cancel the Space Quick Look download") { self.previewDownloadsCancelled == cancelled + 4 }
         try check(app.inlinePreview.state == .closed && app.localPreview == nil && app.searchPresented &&
                   !FileManager.default.fileExists(atPath: Self.previewHydrated(placeholder, in: directory).path),
                   "Escape hydrated the text placeholder, left a preview open, or dismissed search")
-        try await startDownload()
+        try space()
+        try await until("second Space did not restart download for the cloud text file") {
+            if case .downloading(let item, 0.4) = app.inlinePreview.state {
+                return item.url == placeholder && item.kind == .quickLook
+            }
+            return false
+        }
         previewDownloadRelease?.yield(())
         try await until("hydrated cloud text did not replace the download ring with Quick Look") {
             app.localPreview?.previewURL == placeholder && app.inlinePreview.state == .closed
         }
-        try check(previewDownloadsStarted == started + 3 && previewDownloadsCancelled == cancelled + 2,
-                  "Quick Look started extra downloads or did not cancel exactly twice")
+        try escape()
+        // Now resident on disk: Cmd+Y opens inline plainText immediately without another download.
+        try cmdY()
+        try await until("hydrated cloud text did not open inline plainText cleanly") {
+            if case .ready(let item, let doc) = app.inlinePreview.state {
+                return item.url == placeholder && item.kind == .plainText && doc.text == "Hydrated Quick Look text fixture."
+            }
+            return false
+        }
+        try check(previewDownloadsStarted == started + 6 && previewDownloadsCancelled == cancelled + 4,
+                  "Quick Look / inline hydration started extra downloads or did not cancel exactly four times")
         try escape()
 
         // Pressing Return on a cloud placeholder must open via NSWorkspace (no .online block).
@@ -3563,7 +3757,7 @@ final class LauncherSmoke {
         try check(model.searchNotice == nil, "opening a cloud placeholder raised an online-only error notice")
         opened = nil
         app.showSearch()
-        print("Cloud text Quick Look passed (resident, unselected right-click, progress, Escape, hydrated handoff, Return open)")
+        print("Cloud preview & Quick Look passed (unified .txt/.docx Space + Cmd+Y, progress, Escape cancel, hydrated handoff)")
     }
 
     private func writeSparsePreviewPDF(to url: URL) throws {
@@ -3826,11 +4020,20 @@ final class LauncherSmoke {
         try check(hit.isResident && !hit.isPlaceholder, "resident cloud file was misclassified as placeholder")
         try check(LocalFile.dragURL(for: hit)?.path == hit.path, "a resident cloud row did not export a file drag URL")
         try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
-        try check(app.contextActions.items.map(\.id) == ["open", "reveal", "preview", "copy-name", "copy-path"],
+        try check(app.contextActions.items.map(\.id) == ["open", "reveal", "preview", "quick-look", "copy-name", "copy-path"],
                   "resident cloud Cmd+K actions were incomplete: \(app.contextActions.items.map(\.id))")
         try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
         try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
-        try await until("Quick Look did not open the resident provider file") { app.localPreview?.previewURL?.path == hit.path }
+        try await until("Cmd+Y did not open inline plain-text preview for resident provider file") {
+            if case .ready(let sel, let doc) = app.inlinePreview.state {
+                return sel.url.path == hit.path && sel.kind == .plainText && doc.text == "Synthetic provider path."
+            }
+            return false
+        }
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        app.panel.browsing = true
+        try key(kVK_Space, " ", in: app, throughPanel: true)
+        try await until("Space did not open Quick Look for the resident provider file") { app.localPreview?.previewURL?.path == hit.path }
         try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
         revealed = nil
         try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
@@ -3943,12 +4146,29 @@ final class LauncherSmoke {
             try FileManager.default.removeItem(at: replaced)
             try FileManager.default.createSymbolicLink(at: replaced, withDestinationURL: corpus.appendingPathComponent("notes.md"))
             try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
+            try await until("Cmd+Y allowed a 1-level symlinked resident plain-text file") {
+                if case .ready(let sel, let doc) = app.inlinePreview.state {
+                    return sel.url.path == replacedPath && sel.kind == .plainText &&
+                        doc.text == "The archive appears only in the body of this document."
+                }
+                return false
+            }
+            try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+            app.panel.browsing = true
+            try key(kVK_Space, " ", in: app, throughPanel: true)
             try await until("Quick Look allowed a 1-level symlinked resident file") {
                 app.localPreview?.previewURL?.path == replacedPath
             }
             try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
             try FileManager.default.removeItem(at: replaced)
             try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
+            try await until("inline preview rejected a genuinely missing file before the watcher ran") {
+                if case .unavailable(let sel, .missing) = app.inlinePreview.state { return sel.url.path == replacedPath }
+                return false
+            }
+            try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+            app.panel.browsing = true
+            try key(kVK_Space, " ", in: app, throughPanel: true)
             try await until("Quick Look rejected a genuinely missing file before the watcher ran") {
                 model.searchNotice?.problem == .stale
             }
@@ -5187,6 +5407,193 @@ final class LauncherSmoke {
         if try !condition() { throw Failure(message) }
     }
 
+    private func verifyBuild33Phase1Regressions(_ app: AppDelegate) async throws {
+        let root = URL(fileURLWithPath: IndexScope.folderPath(directory), isDirectory: true)
+            .appendingPathComponent("phase1-b33-regressions", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        // 1. Plain-text bounded preview: clean multibyte UTF-8 truncation at 16 KB & NUL byte rejection.
+        let renderer = MacPreviewRenderer()
+        let prefixASCII = String(repeating: "a", count: 16_382)
+        let boundaryUTF8 = root.appendingPathComponent("utf8-boundary.txt")
+        try Data((prefixASCII + "界tail").utf8).write(to: boundaryUTF8)
+        let doc = try renderer.load(.init(id: boundaryUTF8.path, revision: "", url: boundaryUTF8, kind: .plainText),
+                                    isPending: { _ in false })
+        try check(doc.text == prefixASCII && !doc.isCode, "plainText split multibyte UTF-8 scalar or misdetected code")
+
+        let nulFile = root.appendingPathComponent("binary.json")
+        try Data([0x7b, 0x00, 0x7d]).write(to: nulFile)
+        var rejectedNul = false
+        do {
+            _ = try renderer.load(.init(id: nulFile.path, revision: "", url: nulFile, kind: .plainText),
+                                  isPending: { _ in false })
+        } catch PreviewFailure.invalidContent {
+            rejectedNul = true
+        }
+        try check(rejectedNul, "plainText preview accepted binary file containing NUL bytes")
+
+        // 2. ClipboardStore legacy DB migration (adding file_path idempotently while keeping existing rows).
+        let legacyDir = root.appendingPathComponent("legacy-clip/Clipboard", isDirectory: true)
+        try FileManager.default.createDirectory(at: legacyDir, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: legacyDir.path)
+        let dbFile = legacyDir.appendingPathComponent(".history.sqlite")
+        do {
+            var db: OpaquePointer?
+            try check(sqlite3_open_v2(dbFile.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK,
+                      "could not create legacy clipboard DB")
+            defer { sqlite3_close(db) }
+            try check(sqlite3_exec(db, """
+                CREATE TABLE clips (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    text TEXT, image BLOB, thumbnail BLOB,
+                    captured REAL NOT NULL, bundle_id TEXT, app_name TEXT,
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    digest BLOB NOT NULL, recency INTEGER NOT NULL UNIQUE
+                );
+                INSERT INTO clips (text, captured, digest, recency)
+                VALUES ('Legacy clip row', 1700000000, X'000102', 1);
+                """, nil, nil, nil) == SQLITE_OK, "could not seed legacy clipboard table")
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dbFile.path)
+        let migratedStore = ClipboardStore(directory: legacyDir)
+        let loadedLegacy = try migratedStore.items()
+        try check(loadedLegacy.count == 1 && loadedLegacy[0].text == "Legacy clip row" && loadedLegacy[0].filePath == nil,
+                  "legacy clipboard DB migration altered or lost existing clip rows")
+        let addedFile = try migratedStore.upsertFile(boundaryUTF8.path, capturedAt: .now, bundleID: nil, appName: nil)
+        try check(addedFile?.item.filePath == boundaryUTF8.path, "upsertFile failed after legacy migration")
+
+        // 3. MacPreviewRenderer.clipboardFilePreview across resident PNG, PDF, code/text, directory, and missing file.
+        let pngURL = root.appendingPathComponent("clip-img.png")
+        guard let pngRep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 36, pixelsHigh: 18, bitsPerSample: 8,
+                                            samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+              let pngBytes = pngRep.representation(using: .png, properties: [:]) else {
+            throw Failure("could not allocate clipboard preview PNG fixture")
+        }
+        try pngBytes.write(to: pngURL)
+        if case .image(_, let label, let bytes) = await MacPreviewRenderer.clipboardFilePreview(at: pngURL) {
+            try check(label.contains("36 × 18") && bytes == Int64(pngBytes.count),
+                      "clipboardFilePreview misreported image dimensions: \(label)")
+        } else { throw Failure("clipboardFilePreview did not return .image for resident PNG") }
+
+        let pdfURL = root.appendingPathComponent("clip-doc.pdf")
+        let generatedPDF = PDFDocument()
+        let blankPage = PDFPage()
+        generatedPDF.insert(blankPage, at: 0)
+        try check(generatedPDF.write(to: pdfURL), "could not write PDF clipboard fixture")
+        if case .image(_, let pdfLabel, _) = await MacPreviewRenderer.clipboardFilePreview(at: pdfURL) {
+            try check(pdfLabel == "PDF · 1/1", "clipboardFilePreview misreported PDF label: \(pdfLabel)")
+        } else { throw Failure("clipboardFilePreview did not render PDF page 1") }
+
+        let swiftClip = root.appendingPathComponent("clip-code.swift")
+        try Data("struct ClipCode { let x = 1 }\n".utf8).write(to: swiftClip)
+        if case .text(let snippet, true, _) = await MacPreviewRenderer.clipboardFilePreview(at: swiftClip) {
+            try check(snippet.contains("struct ClipCode"), "clipboardFilePreview returned wrong code snippet")
+        } else { throw Failure("clipboardFilePreview did not return .text(isCode: true) for .swift") }
+
+        let clipFolder = root.appendingPathComponent("ClipFolder", isDirectory: true)
+        try FileManager.default.createDirectory(at: clipFolder, withIntermediateDirectories: true)
+        if case .thumbnail = await MacPreviewRenderer.clipboardFilePreview(at: clipFolder) {} else {
+            throw Failure("clipboardFilePreview did not return .thumbnail for resident folder")
+        }
+        if case .missing = await MacPreviewRenderer.clipboardFilePreview(at: root.appendingPathComponent("absent.txt")) {} else {
+            throw Failure("clipboardFilePreview did not return .missing for missing path")
+        }
+
+        // 4. Window Management: `?` -> `win`, orientation-aware ordering, portrait thirds, multi-window autoTile, batch restore.
+        let catalog = LumenCommandCatalog()
+        try check(catalog.resolve("win") == .window("") && catalog.resolve("win 上") == .window("上"),
+                  "LumenCommandCatalog did not resolve win command")
+        let portraitOrder = LaunchCatalog.windowActions(isPortrait: true).prefix(8).map(\.destination)
+        try check(portraitOrder == [.window(.autoTile), .window(.topHalf), .window(.bottomHalf),
+                                    .window(.topThird), .window(.middleThird), .window(.bottomThird),
+                                    .window(.topTwoThirds), .window(.bottomTwoThirds)],
+                  "portrait win command did not prioritize autoTile + top/bottom/thirds")
+        let landscapeOrder = LaunchCatalog.windowActions(isPortrait: false).prefix(3).map(\.destination)
+        try check(landscapeOrder == [.window(.autoTile), .window(.leftHalf), .window(.rightHalf)],
+                  "landscape win command did not prioritize autoTile + left/right")
+
+        // Portrait display: frame (0,0,1080,1920), visibleFrame (0,40,1080,1842). AX Y top = 1920 - maxY.
+        let portraitPlanner = WindowLayoutPlanner(displays: [
+            .init(frame: CGRect(x: 0, y: 0, width: 1080, height: 1920),
+                  visibleFrame: CGRect(x: 0, y: 40, width: 1080, height: 1842)),
+        ])
+        let origPortrait = CGRect(x: 50, y: 100, width: 400, height: 300)
+        // Thirds math: 1842 / 3 = 614 each -> split1 AppKit = 654, split2 AppKit = 1268, visible top = 1882 -> AX y = 38.
+        let thirdExpected: [(WindowCommand, CGRect)] = [
+            (.topThird, CGRect(x: 0, y: 38, width: 1080, height: 614)),
+            (.middleThird, CGRect(x: 0, y: 652, width: 1080, height: 614)),
+            (.bottomThird, CGRect(x: 0, y: 1266, width: 1080, height: 614)),
+            (.topTwoThirds, CGRect(x: 0, y: 38, width: 1080, height: 1228)),
+            (.bottomTwoThirds, CGRect(x: 0, y: 652, width: 1080, height: 1228)),
+        ]
+        for (cmd, expectedFrame) in thirdExpected {
+            let actual = portraitPlanner.placement(for: cmd, currentAX: origPortrait)?.frame
+            try check(actual == expectedFrame, "portrait \(cmd) frame mismatch: got \(String(describing: actual)), expected \(expectedFrame)")
+        }
+
+        // autoTile math: 2 & 3 windows on portrait vs landscape, plus AXWindowAccess batch autoTile + restore.
+        try check(portraitPlanner.autoTilePlan(windowCount: 2, on: 0) == [
+            CGRect(x: 0, y: 38, width: 1080, height: 921),
+            CGRect(x: 0, y: 959, width: 1080, height: 921),
+        ], "portrait 2-window autoTile did not split top/bottom")
+        try check(portraitPlanner.autoTilePlan(windowCount: 3, on: 0) == [
+            CGRect(x: 0, y: 38, width: 1080, height: 614),
+            CGRect(x: 0, y: 652, width: 1080, height: 614),
+            CGRect(x: 0, y: 1266, width: 1080, height: 614),
+        ], "portrait 3-window autoTile did not split vertical thirds")
+
+        let landscapePlanner = WindowLayoutPlanner(displays: [Self.windowPlanner.displays[0]])
+        try check(landscapePlanner.autoTilePlan(windowCount: 4, on: 0) == [
+            CGRect(x: 0, y: 38, width: 720, height: 411),
+            CGRect(x: 720, y: 38, width: 720, height: 411),
+            CGRect(x: 0, y: 449, width: 720, height: 411),
+            CGRect(x: 720, y: 449, width: 720, height: 411),
+        ], "landscape 4-window autoTile did not build 2x2 grid")
+
+        let tileAdapter = SmokeWindowAccess()
+        tileAdapter.trusted = true
+        let f1 = CGRect(x: 40, y: 80, width: 500, height: 350)
+        let f2 = CGRect(x: 300, y: 120, width: 520, height: 360)
+        let f3 = CGRect(x: 100, y: 320, width: 480, height: 320)
+        tileAdapter.states = [1: .init(frame: f1), 2: .init(frame: f2), 3: .init(frame: f3)]
+        tileAdapter.onScreen = [1, 2, 3]
+        let tileAccess = AXWindowAccess(adapter: tileAdapter)
+        try check(tileAccess.perform(.autoTile, targetPID: 42_001, planner: portraitPlanner) == nil,
+                  "AXWindowAccess autoTile failed")
+        try check(tileAdapter.states[1]?.frame == CGRect(x: 0, y: 38, width: 1080, height: 614) &&
+                  tileAdapter.states[2]?.frame == CGRect(x: 0, y: 652, width: 1080, height: 614) &&
+                  tileAdapter.states[3]?.frame == CGRect(x: 0, y: 1266, width: 1080, height: 614),
+                  "autoTile did not position all 3 portrait windows cleanly")
+        try check(tileAccess.perform(.restore, targetPID: 42_001, planner: portraitPlanner) == nil &&
+                  tileAdapter.states[1]?.frame == f1 &&
+                  tileAdapter.states[2]?.frame == f2 &&
+                  tileAdapter.states[3]?.frame == f3,
+                  "batch restore did not return all auto-tiled windows to their original frames")
+
+        // 5. AppearanceMode persistence + NSApp.appearance synchronization.
+        let model = app.model
+        let appearanceDefaults = shortcutFixturePreferences ?? UserDefaults.standard
+        let previousAppearance = model.appearanceMode
+        defer {
+            model.setAppearanceMode(previousAppearance)
+            NSApp.appearance = previousAppearance.nsAppearance
+        }
+        model.setAppearanceMode(.dark)
+        try await until("AppearanceMode.dark did not sync NSApp.appearance") {
+            NSApp.appearance?.name == .darkAqua && appearanceDefaults.string(forKey: "appearance") == "dark"
+        }
+        model.setAppearanceMode(.light)
+        try await until("AppearanceMode.light did not sync NSApp.appearance") {
+            NSApp.appearance?.name == .aqua && appearanceDefaults.string(forKey: "appearance") == "light"
+        }
+        model.setAppearanceMode(.system)
+        try await until("AppearanceMode.system did not clear NSApp.appearance") {
+            NSApp.appearance == nil && appearanceDefaults.string(forKey: "appearance") == "system"
+        }
+        print("Build 33 Phase 1 regressions passed (plainText UTF-8/NUL, clipboard migration + rich preview, portrait thirds/autoTile/restore, AppearanceMode)")
+    }
+
     private struct Failure: Error, CustomStringConvertible {
         let description: String
         init(_ description: String) { self.description = description }
@@ -5223,6 +5630,7 @@ private final class SmokeWindowAccess: WindowAccessAdapter, @unchecked Sendable 
     var focused: Int? = 1
     var main: Int?
     var states: [Int: State] = [1: State()]
+    var onScreen: [Int] = []
 
     func isTrusted() -> Bool {
         trustLock.withLock {
@@ -5235,6 +5643,16 @@ private final class SmokeWindowAccess: WindowAccessAdapter, @unchecked Sendable 
         lookups.append(pid)
         lookedUpOnMainThread = lookedUpOnMainThread || Thread.isMainThread
         return pid == 42_001 ? (focused, main) : (nil, nil)
+    }
+
+    func onScreenWindows(excludingPID: pid_t) -> [(window: Int, attributes: WindowAttributes, frame: CGRect)] {
+        onScreen.compactMap { id in
+            guard let state = states[id] else { return nil }
+            let attributes = WindowAttributes(role: state.role, subrole: state.subrole, minimized: state.minimized,
+                                              fullScreen: state.fullScreen, positionSettable: state.positionSettable,
+                                              sizeSettable: state.sizeSettable, frame: state.frame)
+            return (id, attributes, state.frame)
+        }
     }
 
     func inspect(_ window: Int) -> WindowAttributes? {

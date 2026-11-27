@@ -69,6 +69,19 @@ public struct MacInlinePreviewView: View {
                                        hasEvidence: content.evidence != nil)
                             }
                         }
+                        if let text = content.text {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(content.isCode ? label("代码预览", "Code preview") : label("文本预览", "Text preview"))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(verbatim: text)
+                                    .font(content.isCode ? .system(size: 11.5, design: .monospaced) : .callout)
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .accessibilityIdentifier("lumen-inline-preview-text")
+                        }
                         if let evidence = content.evidence {
                             let body = evidence.context ?? evidence.text
                             VStack(alignment: .leading, spacing: 4) {

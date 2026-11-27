@@ -208,10 +208,16 @@ enum LaunchCatalog {
 
     private static func windowActions() -> [LaunchAction] {
         let commands: [(WindowCommand, String, String, String, [String])] = [
+            (.autoTile, "Auto-Tile Windows", "智能自动分屏", "rectangle.grid.2x2", ["auto tile", "tile all", "tile windows", "arrange windows", "auto layout", "自动平铺", "整理窗口", "自动分屏"]),
             (.leftHalf, "Left Half", "左半屏", "rectangle.lefthalf.filled", ["tile left", "window left"]),
             (.rightHalf, "Right Half", "右半屏", "rectangle.righthalf.filled", ["tile right", "window right"]),
             (.topHalf, "Top Half", "上半屏", "rectangle.tophalf.filled", ["tile top", "window top"]),
             (.bottomHalf, "Bottom Half", "下半屏", "rectangle.bottomhalf.filled", ["tile bottom", "window bottom"]),
+            (.topThird, "Top Third", "上三分之一", "rectangle.topthird.inset.filled", ["third top", "tile top third", "上1/3", "上三分一"]),
+            (.middleThird, "Middle Third", "中间三分之一", "rectangle.center.inset.filled", ["third middle", "tile middle third", "中1/3", "中三分一"]),
+            (.bottomThird, "Bottom Third", "下三分之一", "rectangle.bottomthird.inset.filled", ["third bottom", "tile bottom third", "下1/3", "下三分一"]),
+            (.topTwoThirds, "Top Two Thirds", "上三分之二", "rectangle.tophalf.inset.filled", ["two thirds top", "top 2/3", "上2/3", "上三分二"]),
+            (.bottomTwoThirds, "Bottom Two Thirds", "下三分之二", "rectangle.bottomhalf.inset.filled", ["two thirds bottom", "bottom 2/3", "下2/3", "下三分二"]),
             (.maximize, "Maximize", "最大化", "arrow.up.left.and.arrow.down.right", ["max", "maximize window"]),
             (.center, "Center", "居中", "rectangle.center.inset.filled", ["centre", "center window", "窗口居中"]),
             (.almostMaximize, "Almost Maximize", "接近最大化", "arrow.up.left.and.arrow.down.right", ["almost max"]),
@@ -224,6 +230,21 @@ enum LaunchCatalog {
             LaunchAction(id: "window:" + command.rawValue, english: english, chinese: chinese, symbol: symbol,
                          destination: .window(command), aliases: aliases + pinyinAliases(chinese))
         }
+    }
+
+    /// Window actions for the `win` command: auto-tile first, then the splits that suit the display.
+    static func windowActions(isPortrait: Bool, query: String = "") -> [LaunchAction] {
+        let all = windowActions()
+        let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !term.isEmpty {
+            return matches(term, actions: all, includeDictionary: false).map(\.action)
+        }
+        let portrait: [WindowCommand] = [.autoTile, .topHalf, .bottomHalf, .topThird, .middleThird, .bottomThird,
+                                         .topTwoThirds, .bottomTwoThirds, .maximize, .center, .leftHalf, .rightHalf]
+        let landscape: [WindowCommand] = [.autoTile, .leftHalf, .rightHalf, .topHalf, .bottomHalf, .maximize, .center]
+        let order = (isPortrait ? portrait : landscape).map { "window:" + $0.rawValue }
+        func rank(_ action: LaunchAction) -> Int { order.firstIndex(of: action.id) ?? order.count }
+        return all.enumerated().sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }.map(\.element)
     }
 
     static func dictionaryAction(_ query: String) -> LaunchAction? {

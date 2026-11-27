@@ -12,6 +12,11 @@ struct ClipboardItem: Identifiable, Equatable, Sendable {
     let sourceBundleID: String?
     let sourceAppName: String?
     let pinned: Bool
+    /// Absolute path of a copied file reference; its bytes are never stored.
+    let filePath: String?
+
+    var isFile: Bool { filePath != nil }
+    var isImage: Bool { text == nil && filePath == nil }
 
     private struct SearchField: Equatable, Sendable {
         let bytes: [UInt8]
@@ -171,30 +176,34 @@ struct ClipboardItem: Identifiable, Equatable, Sendable {
     private enum SearchMatch { case substring, fuzzy }
     private let searchableFields: [SearchField]
 
-    init(id: Int64, text: String?, capturedAt: Date, sourceBundleID: String?, sourceAppName: String?, pinned: Bool) {
+    init(id: Int64, text: String?, capturedAt: Date, sourceBundleID: String?, sourceAppName: String?, pinned: Bool,
+         filePath: String? = nil) {
         self.id = id
         self.text = text
         self.capturedAt = capturedAt
         self.sourceBundleID = sourceBundleID
         self.sourceAppName = sourceAppName
         self.pinned = pinned
-        searchableFields = [text, sourceAppName, sourceBundleID].compactMap { $0.map(SearchField.init) }
+        self.filePath = filePath
+        let fileFields = filePath.map { [($0 as NSString).lastPathComponent, $0] } ?? []
+        searchableFields = ([text, sourceAppName, sourceBundleID] + fileFields).compactMap { $0.map(SearchField.init) }
     }
 
     private init(id: Int64, text: String?, capturedAt: Date, sourceBundleID: String?, sourceAppName: String?,
-                 pinned: Bool, searchableFields: [SearchField]) {
+                 pinned: Bool, filePath: String?, searchableFields: [SearchField]) {
         self.id = id
         self.text = text
         self.capturedAt = capturedAt
         self.sourceBundleID = sourceBundleID
         self.sourceAppName = sourceAppName
         self.pinned = pinned
+        self.filePath = filePath
         self.searchableFields = searchableFields
     }
 
     func withPinned(_ pinned: Bool) -> ClipboardItem {
         ClipboardItem(id: id, text: text, capturedAt: capturedAt, sourceBundleID: sourceBundleID,
-                      sourceAppName: sourceAppName, pinned: pinned, searchableFields: searchableFields)
+                      sourceAppName: sourceAppName, pinned: pinned, filePath: filePath, searchableFields: searchableFields)
     }
 
     private static func fold(_ value: String) -> String {
@@ -302,24 +311,25 @@ final class ClipboardStore: @unchecked Sendable {
     }
 
     func items() throws -> [ClipboardItem] {
-        typealias RawRow = (id: Int64, text: String?, capturedAt: Date, bundleID: String?, appName: String?, pinned: Bool)
+        typealias RawRow = (id: Int64, text: String?, capturedAt: Date, bundleID: String?, appName: String?, pinned: Bool, filePath: String?)
         let rows: [RawRow] = try lock.withLock {
             guard let db = try databaseLocked() else { return [] }
             return try statement(db, """
-                SELECT id, text, captured, bundle_id, app_name, pinned FROM clips ORDER BY recency DESC
+                SELECT id, text, captured, bundle_id, app_name, pinned, file_path FROM clips ORDER BY recency DESC
                 """) { row in
                 var records: [RawRow] = []
                 while try next(row) {
                     records.append((sqlite3_column_int64(row, 0), text(row, 1),
                                     Date(timeIntervalSince1970: sqlite3_column_double(row, 2)),
-                                    text(row, 3), text(row, 4), sqlite3_column_int(row, 5) != 0))
+                                    text(row, 3), text(row, 4), sqlite3_column_int(row, 5) != 0, text(row, 6)))
                 }
                 return records
             }
         }
         return rows.map {
             ClipboardItem(id: $0.id, text: $0.text, capturedAt: $0.capturedAt,
-                          sourceBundleID: $0.bundleID, sourceAppName: $0.appName, pinned: $0.pinned)
+                          sourceBundleID: $0.bundleID, sourceAppName: $0.appName, pinned: $0.pinned,
+                          filePath: $0.filePath)
         }
     }
 
@@ -334,7 +344,7 @@ final class ClipboardStore: @unchecked Sendable {
         while end != utf8.endIndex, utf8[end] & 0xc0 == 0x80 { utf8.formIndex(before: &end) }
         let bounded = String(decoding: utf8[..<end], as: UTF8.self)
         guard !bounded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        return try upsert(text: bounded, image: nil, thumbnail: nil, bytes: Data(bounded.utf8),
+        return try upsert(text: bounded, image: nil, thumbnail: nil, filePath: nil, bytes: Data(bounded.utf8),
                           capturedAt: capturedAt, bundleID: bundleID, appName: appName)
     }
 
@@ -345,17 +355,29 @@ final class ClipboardStore: @unchecked Sendable {
     func upsertImage(_ png: Data, thumbnail: Data, capturedAt: Date, bundleID: String?, appName: String?) throws -> UpsertResult? {
         guard !png.isEmpty, png.count <= Self.maximumImageBytes,
               !thumbnail.isEmpty, thumbnail.count <= Self.maximumImageBytes else { return nil }
-        return try upsert(text: nil, image: png, thumbnail: thumbnail, bytes: png,
+        return try upsert(text: nil, image: png, thumbnail: thumbnail, filePath: nil, bytes: png,
                           capturedAt: capturedAt, bundleID: bundleID, appName: appName)
     }
 
-    private func upsert(text: String?, image: Data?, thumbnail: Data?, bytes: Data,
+    func addFile(_ path: String, capturedAt: Date, bundleID: String?, appName: String?) throws -> Bool {
+        try upsertFile(path, capturedAt: capturedAt, bundleID: bundleID, appName: appName) != nil
+    }
+
+    /// Records a reference to a copied file. Only the path is stored; the file is never read here.
+    func upsertFile(_ path: String, capturedAt: Date, bundleID: String?, appName: String?) throws -> UpsertResult? {
+        guard !path.isEmpty else { return nil }
+        return try upsert(text: nil, image: nil, thumbnail: nil, filePath: path, bytes: Data(path.utf8),
+                          capturedAt: capturedAt, bundleID: bundleID, appName: appName)
+    }
+
+    private func upsert(text: String?, image: Data?, thumbnail: Data?, filePath: String?, bytes: Data,
                         capturedAt: Date, bundleID: String?, appName: String?) throws -> UpsertResult? {
-        // Distinguish text and images even if their bytes match. At capacity with only
-        // pins, don't write a new entry that would immediately be evicted.
+        // Distinguish text, images and files even if their bytes match (domain byte 0 = text,
+        // 1 = image, 2 = file). At capacity with only pins, don't write a new entry that would
+        // immediately be evicted.
         let persistedTimestamp = capturedAt.timeIntervalSince1970
         let storedCapturedAt = Date(timeIntervalSince1970: persistedTimestamp)
-        var digest = Data([image == nil ? 0 : 1])
+        var digest = Data([filePath != nil ? 2 : (image == nil ? 0 : 1)])
         digest.append(contentsOf: SHA256.hash(data: bytes))
         let committed: (id: Int64, pinned: Bool, evicted: Set<Int64>)? = try lock.withLock {
             guard let db = try databaseLocked(create: true) else { throw StoreError.unavailable }
@@ -383,8 +405,8 @@ final class ClipboardStore: @unchecked Sendable {
                     return (existing.id, existing.pinned, [])
                 }
                 try statement(db, """
-                    INSERT INTO clips (text, image, thumbnail, captured, bundle_id, app_name, digest, recency)
-                    SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(MAX(recency), 0) + 1 FROM clips
+                    INSERT INTO clips (text, image, thumbnail, captured, bundle_id, app_name, digest, file_path, recency)
+                    SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?9, COALESCE(MAX(recency), 0) + 1 FROM clips
                     HAVING (SELECT COUNT(*) FROM clips WHERE pinned = 1) < ?8
                     """) { row in
                     try bind(text, to: row, at: 1)
@@ -395,6 +417,7 @@ final class ClipboardStore: @unchecked Sendable {
                     try bind(appName, to: row, at: 6)
                     try bind(digest, to: row, at: 7)
                     try requireOK(sqlite3_bind_int64(row, 8, Int64(limit)))
+                    try bind(filePath, to: row, at: 9)
                     _ = try next(row)
                 }
                 guard sqlite3_changes(db) != 0 else { return nil }
@@ -405,7 +428,8 @@ final class ClipboardStore: @unchecked Sendable {
         }
         guard let committed else { return nil }
         let item = ClipboardItem(id: committed.id, text: text, capturedAt: storedCapturedAt,
-                                 sourceBundleID: bundleID, sourceAppName: appName, pinned: committed.pinned)
+                                 sourceBundleID: bundleID, sourceAppName: appName, pinned: committed.pinned,
+                                 filePath: filePath)
         return UpsertResult(item: item, evictedIDs: committed.evicted)
     }
 
@@ -595,12 +619,24 @@ final class ClipboardStore: @unchecked Sendable {
                     digest BLOB NOT NULL, recency INTEGER NOT NULL UNIQUE
                 );
                 """)
+            try addFilePathColumnIfNeeded(db)
             connection = db
             return db
         } catch {
             sqlite3_close(handle)
             throw error
         }
+    }
+
+    // Idempotent: databases created before file clips lack the column.
+    private func addFilePathColumnIfNeeded(_ db: OpaquePointer) throws {
+        let hasColumn = try statement(db, "PRAGMA table_info(clips)") { row in
+            while try next(row) {
+                if text(row, 1) == "file_path" { return true }
+            }
+            return false
+        }
+        if !hasColumn { try execute(db, "ALTER TABLE clips ADD COLUMN file_path TEXT") }
     }
 
     // Close the permission-setting descriptor before SQLite takes POSIX locks.

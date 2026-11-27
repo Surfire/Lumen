@@ -10,6 +10,7 @@ public enum LumenCommandResolution: Equatable, Sendable {
     case question(String)
     case image(String)
     case clipboard(String)
+    case window(String)
     case web(commandID: String, title: String, url: URL)
 }
 
@@ -69,7 +70,7 @@ public struct LumenCommandCatalog: Sendable {
 
     public static let maximumURLArgumentBytes = 2_048
     public static let maximumQuestionBytes = 16_384
-    private static let reservedVerbs: Set<String> = ["qa", "tr", "translate", "img", "cb", "clip"]
+    private static let reservedVerbs: Set<String> = ["qa", "tr", "translate", "img", "cb", "clip", "win"]
     private static let defaultLinks = builtInLinks([
         ("google", "g", "Search Google", "https://www.google.com/search", "q")
     ])
@@ -95,7 +96,7 @@ public struct LumenCommandCatalog: Sendable {
     /// opt-in built-ins so enabling those searches cannot redirect an existing alias.
     public init(includeOptionalLinks: Bool = false, additionalLinks: [LumenHTTPSQueryLink] = [], chinese: Bool = true) {
         var table: [String: LumenHTTPSQueryLink] = [:]
-        var usedIDs = Set(["qa", "translate", "discover", "img", "clipboard"])
+        var usedIDs = Set(["qa", "translate", "discover", "img", "clipboard", "window"])
         let optionals = includeOptionalLinks ? (chinese ? Self.optionalLinksZH : Self.optionalLinksEN) : []
         for link in Self.defaultLinks + additionalLinks + optionals {
             guard !Self.reservedVerbs.contains(link.keyword), table[link.keyword] == nil,
@@ -110,7 +111,8 @@ public struct LumenCommandCatalog: Sendable {
          .init(keyword: "qa", title: "Ask Model", commandID: "qa", destinationHost: nil),
          .init(keyword: "tr", title: "Translate", commandID: "translate", destinationHost: nil),
          .init(keyword: "img", title: "Search Images", commandID: "img", destinationHost: nil),
-         .init(keyword: "cb", title: "Clipboard History", commandID: "clipboard", destinationHost: nil)]
+         .init(keyword: "cb", title: "Clipboard History", commandID: "clipboard", destinationHost: nil),
+         .init(keyword: "win", title: "Window Management", commandID: "window", destinationHost: nil)]
         + links.values.sorted { $0.keyword < $1.keyword }.map {
             Entry(keyword: $0.keyword, title: $0.title, commandID: $0.commandID, destinationHost: $0.destinationHost)
         }
@@ -128,9 +130,13 @@ public struct LumenCommandCatalog: Sendable {
               token.utf8.allSatisfy({ $0 < 128 }) else { return .search }
         let keyword = token.lowercased()
         let isClipboard = keyword == "cb" || keyword == "clip"
-        guard let delimiter else { return isClipboard ? .clipboard("") : .search }
+        guard let delimiter else {
+            if isClipboard { return .clipboard("") }
+            return keyword == "win" ? .window("") : .search
+        }
         let payload = input[input.index(after: delimiter)...].trimmingCharacters(in: .whitespacesAndNewlines)
         if isClipboard { return .clipboard(payload) }
+        if keyword == "win" { return .window(payload) }
         if keyword == "img" {
             if payload.isEmpty { return .missingArgument(commandID: "img") }
             if payload.utf8.count > 8192 { return .argumentTooLong(commandID: "img", maximumUTF8Bytes: 8192) }

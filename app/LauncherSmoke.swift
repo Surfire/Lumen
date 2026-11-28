@@ -4709,8 +4709,20 @@ final class LauncherSmoke {
             throw Failure("wiki command failed to resolve under locale catalogs")
         }
 
+        // 8. Default file action toggle: revealInFinder prioritizes Finder for regular files/folders while keeping .app direct-launch.
+        let savedFileAction = app.model.fileDefaultAction
+        defer { app.model.setFileDefaultAction(savedFileAction) }
+        let appBundleHit = SearchHit(path: "/Applications/Demo.app", name: "Demo.app", kind: "directory",
+                                     availability: "local", matched_by: "name", snippet: nil, document_stamp: nil, pdf_page: nil)
+        app.model.setFileDefaultAction(.open)
+        try check(!app.model.prefersRevealInFinder(for: plainHit) && !app.model.prefersRevealInFinder(for: appBundleHit),
+                  "default .open file action should not prefer Finder reveal")
+        app.model.setFileDefaultAction(.revealInFinder)
+        try check(app.model.prefersRevealInFinder(for: plainHit) && !app.model.prefersRevealInFinder(for: appBundleHit),
+                  ".revealInFinder should apply to regular files while launching .app bundles directly")
+
         try type("", into: app)
-        print("Phase 2 core regressions passed (HotKey, PanelGeometry, ranking, 2-Han semantic trigger, image-status retry, Tab, calc ^/commas, wiki locale)")
+        print("Phase 2 core regressions passed (HotKey, PanelGeometry, ranking, 2-Han semantic trigger, image-status retry, Tab, calc ^/commas, wiki locale, fileDefaultAction)")
     }
 
     private func verifyPhase3Regressions(_ app: AppDelegate) async throws {

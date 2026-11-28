@@ -175,6 +175,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             if case .contextMenu = state.overlay { return }
             guard case .file(let hit) = self.model.selectedResult else { return }
             if action == .preview { self.togglePreview(hit, allowCloudDownload: true) }
+            else if action == .reveal && self.model.prefersRevealInFinder(for: hit) { self.openFile(hit) }
             else { self.perform(action, on: hit) }
         }
         let content = SearchBackdrop()
@@ -1052,13 +1053,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
         if case .calculation = selected {
             item("copy", "复制结果", "Copy Result", "doc.on.doc") { [weak self] in self?.open(selected) }
+        } else if case .file(let hit) = selected, model.prefersRevealInFinder(for: hit) {
+            item("reveal", "在 Finder 中显示", "Show in Finder", "return") { [weak self] in
+                self?.revealInFinder(hit, dismissAfter: true)
+            }
+            item("open", "打开", "Open", "arrow.up.right.square") { [weak self] in self?.openFile(hit) }
         } else {
             item("open", "打开", "Open", "return") { [weak self] in self?.open(selected) }
         }
 
         switch selected {
         case .file(let hit):
-            item("reveal", "在 Finder 中显示", "Show in Finder", "folder") { [weak self] in self?.revealInFinder(hit) }
+            if !model.prefersRevealInFinder(for: hit) {
+                item("reveal", "在 Finder 中显示", "Show in Finder", "folder") { [weak self] in self?.revealInFinder(hit) }
+            }
             if hit.kind == "file" {
                 if let mediaURL = Self.linkedMediaURL(forSubtitlePath: hit.path) {
                     let ext = mediaURL.pathExtension.lowercased()
@@ -1143,7 +1151,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private func open(_ result: LauncherResult) {
         guard panelState.mode == .search || panelState.mode == .window else { return }
         switch result {
-        case .file(let hit): openFile(hit)
+        case .file(let hit):
+            if model.prefersRevealInFinder(for: hit) { revealInFinder(hit, dismissAfter: true) }
+            else { openFile(hit) }
         case .action(let action): runAction(action)
         case .shortcut(let shortcut): openShortcut(shortcut)
         case .calculation(let calculation):
@@ -1365,18 +1375,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
     }
 
-    func revealInFinder(_ hit: SearchHit) {
+    func revealInFinder(_ hit: SearchHit, dismissAfter: Bool = false) {
         model.resolve(hit, action: .reveal) { [weak self] url in
-            #if LUMEN_SMOKE
             guard let self else { return }
+            #if LUMEN_SMOKE
             if let smoke = self.smoke {
                 smoke.revealed = url
+                if dismissAfter {
+                    self.model.noteFileOpened(hit)
+                    self.dismissSearch()
+                }
                 return
             }
-            #else
-            guard self != nil else { return }
             #endif
             NSWorkspace.shared.activateFileViewerSelecting([url])
+            if dismissAfter { self.model.noteFileOpened(hit) }
+            self.dismissSearch()
         }
     }
 

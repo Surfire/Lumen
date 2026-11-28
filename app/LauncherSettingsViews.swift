@@ -508,6 +508,28 @@ struct LauncherSettings: View {
             }
         }
 
+        LumenSettingsCard(title: model.t("搜索结果", "Search Results"), icon: "folder") {
+            LumenSettingsWell(padding: 12) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(model.t("文件默认操作", "DEFAULT FILE ACTION").uppercased())
+                        .font(.system(size: 10, weight: .semibold))
+                        .tracking(0.8)
+                        .foregroundStyle(SettingsTheme.textTertiary)
+                    Picker(model.t("文件默认操作", "Default File Action"),
+                           selection: Binding(get: { model.fileDefaultAction },
+                                              set: { model.setFileDefaultAction($0) })) {
+                        Text(model.t("直接打开", "Open File")).tag(FileDefaultAction.open)
+                        Text(model.t("打开所在文件夹", "Show in Finder")).tag(FileDefaultAction.revealInFinder)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .accessibilityIdentifier("settings.file-default-action")
+                }
+            }
+            note(model.t("选择「打开所在文件夹」后，回车或双击会在 Finder 中定位该文件并收起搜索框，按 ⌘↵ 可直接打开；应用程序仍直接启动。",
+                         "When set to Show in Finder, Return or double-click reveals the item in Finder and closes search, while ⌘↵ opens it directly. Applications still launch directly."))
+        }
+
         LumenSettingsCard(title: model.t("剪贴板历史", "Clipboard History"), icon: "clipboard") {
             ClipboardSettingsView(clipboard: clipboard, chinese: model.zh)
         }

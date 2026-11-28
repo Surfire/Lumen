@@ -146,6 +146,13 @@ enum AppearanceMode: String, CaseIterable, Identifiable {
     }
 }
 
+enum FileDefaultAction: String, CaseIterable, Identifiable {
+    case open
+    case revealInFinder
+
+    var id: String { rawValue }
+}
+
 @MainActor
 final class Launcher: ObservableObject {
     private static let trailingExtensionRegex = try! NSRegularExpression(pattern: #"\.[A-Za-z0-9]{1,8}$"#)
@@ -186,6 +193,19 @@ final class Launcher: ObservableObject {
         guard appearanceMode != mode else { return }
         appearanceMode = mode
         defaults?.set(mode.rawValue, forKey: "appearance")
+    }
+
+    @Published var fileDefaultAction: FileDefaultAction
+
+    func setFileDefaultAction(_ action: FileDefaultAction) {
+        guard fileDefaultAction != action else { return }
+        fileDefaultAction = action
+        defaults?.set(action.rawValue, forKey: "fileDefaultAction")
+    }
+
+    func prefersRevealInFinder(for hit: SearchHit) -> Bool {
+        fileDefaultAction == .revealInFinder
+            && URL(fileURLWithPath: hit.path).pathExtension.lowercased() != "app"
     }
 
     var localModelState: LocalModelState { indexStatus.localModelState }
@@ -377,6 +397,8 @@ final class Launcher: ObservableObject {
                                        contentPaused: defaults?.bool(forKey: "contentIndexingPaused") ?? false)
         language = locale ?? defaults?.string(forKey: "language") ?? "system"
         appearanceMode = defaults?.string(forKey: "appearance").flatMap(AppearanceMode.init(rawValue:)) ?? .system
+        fileDefaultAction = defaults?.string(forKey: "fileDefaultAction")
+            .flatMap(FileDefaultAction.init(rawValue:)) ?? .open
         indexStatus.onScopeChanged = { [weak self] nextScope in
             guard let self else { return }
             self.pauseEmbeddings()

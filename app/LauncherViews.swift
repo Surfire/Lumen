@@ -223,12 +223,15 @@ struct SearchWindow: View {
         }
         if showsResults {
             keyHint("↑↓", model.t("选择", "Select"))
-            keyHint("↵", model.t("打开", "Open"))
             if case .file(let file) = model.selectedResult {
-                keyHint("⌘↵", model.t("在 Finder 中显示", "Show in Finder"))
+                let revealPrimary = model.prefersRevealInFinder(for: file)
+                keyHint("↵", revealPrimary ? model.t("打开所在文件夹", "Show in Finder") : model.t("打开", "Open"))
+                keyHint("⌘↵", revealPrimary ? model.t("直接打开", "Open") : model.t("在 Finder 中显示", "Show in Finder"))
                 if file.kind == "file" {
                     keyHint(model.t("空格 / ⌘Y", "Space / ⌘Y"), model.t("悬浮 / 侧边", "Window / Inline"))
                 }
+            } else {
+                keyHint("↵", model.t("打开", "Open"))
             }
         }
         if !model.canSearch {
@@ -511,7 +514,7 @@ struct SearchWindow: View {
         .simultaneousGesture(TapGesture(count: 2).onEnded { selectRow(.file(hit), true) })
         .accessibilityElement(children: .contain)
         .accessibilityAddTraits(selected ? .isSelected : [])
-        .accessibilityAction(named: Text(model.t("打开", "Open"))) { open(.file(hit)) }
+        .accessibilityAction(named: Text(model.t("打开", "Open"))) { fileAction(.open, hit) }
         .accessibilityAction(named: Text(model.t("在 Finder 中显示", "Show in Finder"))) { fileAction(.reveal, hit) }
         .accessibilityActions {
             if hit.kind == "file" {
@@ -521,8 +524,13 @@ struct SearchWindow: View {
             Button(model.t("复制路径", "Copy Path")) { fileAction(.copyPath, hit) }
         }
         .contextMenu {
-            Button(model.t("打开", "Open")) { fileAction(.open, hit) }
-            Button(model.t("在 Finder 中显示", "Show in Finder")) { fileAction(.reveal, hit) }
+            if model.prefersRevealInFinder(for: hit) {
+                Button(model.t("在 Finder 中显示 · ↵", "Show in Finder · ↵")) { fileAction(.reveal, hit) }
+                Button(model.t("打开 · ⌘↵", "Open · ⌘↵")) { fileAction(.open, hit) }
+            } else {
+                Button(model.t("打开", "Open")) { fileAction(.open, hit) }
+                Button(model.t("在 Finder 中显示", "Show in Finder")) { fileAction(.reveal, hit) }
+            }
             Button(model.t("快速查看 · ⌘Y", "Quick Look · ⌘Y")) { fileAction(.preview, hit) }
                 .disabled(hit.kind != "file")
             Divider()

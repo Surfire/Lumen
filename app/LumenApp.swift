@@ -159,6 +159,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         panel.onAnswerPage = { [weak self] delta in self?.commands.pageAnswer(delta) ?? false }
         panel.onSettings = { [weak self] in self?.showSearchSettings() }
         panel.onCommandReturn = { [weak self] in self?.replaceTranslationSelectionIfAvailable() ?? false }
+        panel.onDismissContext = { [weak self] in
+            guard let self, self.model.activeContext != nil else { return false }
+            self.dismissSelectionContext()
+            return true
+        }
         panel.isSearchFieldClick = { [weak self] point in
             guard let field = self?.searchField else { return false }
             return field.bounds.contains(field.convert(point, from: nil))
@@ -245,6 +250,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             activateTranslation: { [weak self] in self?.activateTranslation() },
             toggleContextActions: { [weak self] in self?.toggleContextActions() },
             showSettings: { [weak self] in self?.showSearchSettings() },
+            openSnippets: { [weak self] prefill in self?.openSnippetsSettings(prefill: prefill) },
             beginIndex: { [weak self] in self?.startBackgroundIndex() },
             open: { [weak self] in self?.open($0) },
             selectRow: { [weak self] result, doubleClick in self?.selectRow(result, doubleClick: doubleClick) },
@@ -354,7 +360,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                          bookmarkLibrary: smoke?.makeBookmarkLibrary(),
                          personalDataStore: smoke?.makePersonalDataStore(),
                          definitionLookup: smoke?.makeDefinitionLookup(),
-                         clipboard: clipboardManager)
+                         snippetsDirectory: smoke?.makeSnippetsDirectory())
         externalVolumes = ExternalVolumeCatalog(engine: engine)
         imageSearch = LauncherImageSearch(engine: engine, defaults: defaults)
         translation = smoke?.makeTranslationModel() ?? TranslationPanelModel()
@@ -373,7 +379,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         self.engine = engine
         let clipboardManager = ClipboardManager(defaults: .standard, pasteboard: .general)
         clipboard = clipboardManager
-        model = Launcher(engine: engine, defaults: defaults, clipboard: clipboardManager)
+        model = Launcher(engine: engine, defaults: defaults)
         externalVolumes = ExternalVolumeCatalog(engine: engine)
         imageSearch = LauncherImageSearch(engine: engine, defaults: defaults)
         translation = TranslationPanelModel()
@@ -439,6 +445,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
         }.store(in: &cancellables)
         clipboard.start()
+        model.snippets.migrateLegacyClipboardTemplates(from: clipboard.store)
         windowManagement.$issue.removeDuplicates().dropFirst().sink { [weak self] _ in
             self?.schedulePresentationUpdate()
         }.store(in: &cancellables)
@@ -760,7 +767,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         translation.setCommand(nil)
         inlinePreview.close()
         commands.closeDefinition()
-        commands.clearTemplateEditRequest()
         if commands.visibleExecution != nil { commands.cancelExecution() }
         commands.update(.search, raw: "", catalog: catalog)
         commands.matchExecutables([], in: model, resetSelection: true)
@@ -850,9 +856,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             default:
                 break
             }
-        }
-        if previousCommand != next, case .clipboard = previousCommand {
-            commands.clearTemplateEditRequest()
         }
         if priorRaw != text || previousCommand != next {
             contextActions.close()
@@ -979,7 +982,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         model.setActiveContext(nil)
         searchFieldAction()
         updatePresentation()
-        focusSearch()
+        if searchField.currentEditor() == nil || panel.firstResponder !== searchField.currentEditor() {
+            focusSearch()
+        }
     }
 
     private func handleTabCompletion(in textView: NSTextView) {
@@ -1192,11 +1197,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 self?.clipboard.remove(id: clip.id)
             }
         ]
-        if clip.text != nil {
-            items.append(.init(id: "edit-template", title: model.t("编辑短语模板…", "Edit Snippet Template…"),
-                               symbol: "pencil") { [weak self] in
-                self?.commands.requestTemplateEdit(for: clip)
-                self?.updatePresentation()
+        if let text = clip.text {
+            items.append(.init(id: "save-as-snippet", title: model.t("存为短语…", "Save as Snippet…"),
+                               symbol: "text.badge.plus") { [weak self] in
+                self?.openSnippetsSettings(prefill: text)
             })
         }
         contextActions.show(items)
@@ -1390,13 +1394,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             item("toggle-pin", shortcut.pinned ? "取消固定" : "固定", shortcut.pinned ? "Unpin" : "Pin", "pin") { [weak self] in
                 self?.model.shortcuts.togglePin(shortcut)
             }
-        case .snippet(let clip):
-            item("copy-snippet", "复制展开内容", "Copy Expanded", "return") { [weak self] in self?.open(result) }
-            item("toggle-pin", clip.pinned ? "取消固定" : "固定", clip.pinned ? "Unpin" : "Pin", "pin") { [weak self] in
-                self?.clipboard.togglePin(id: clip.id)
+        case .snippet(let snippet):
+            item("paste-snippet", "粘贴展开内容", "Paste Expanded", "return") { [weak self] in
+                self?.open(result)
             }
-            item("edit-template", "编辑短语模板…", "Edit Snippet Template…", "pencil") { [weak self] in
-                self?.openSnippetTemplateEditor(for: clip)
+            item("copy-snippet", "复制展开内容", "Copy Expanded", "doc.on.doc") { [weak self] in
+                self?.copySnippetAndDismiss(snippet)
+            }
+            item("toggle-snippet-pin",
+                 snippet.pinnedToHome ? "取消首页置顶" : "在首页置顶",
+                 snippet.pinnedToHome ? "Unpin from Home" : "Pin to Home",
+                 "pin") { [weak self] in
+                self?.model.snippets.togglePinToHome(snippet.id)
+            }
+            item("manage-snippets", "管理常用短语…", "Manage Snippets…", "text.badge.plus") { [weak self] in
+                self?.openSnippetsSettings(prefill: nil)
             }
         case .finderFolder(let folder):
             if model.activeFileDialog != nil {
@@ -1468,9 +1480,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             } else {
                 openShortcut(shortcut)
             }
-        case .snippet(let item):
+        case .snippet(let snippet):
             guard searchPresented, model.visibleResults.contains(result) else { return }
-            if clipboard.copyExpanded(item) != nil {
+            let expanded = model.snippets.expand(snippet, liveClipboardText: clipboard.currentPasteboardPreviewText())
+            if ClipboardManager.writeInternalString(expanded, to: targetPasteboard) {
+                model.snippets.noteUsed(snippet.id)
                 dismissSearch()
                 pasteIntoPreviousAppIfPermitted()
             } else {
@@ -2021,17 +2035,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         updatePresentation()
     }
 
-    private func openSnippetTemplateEditor(for item: ClipboardItem) {
-        guard searchPresented else { return }
-        if let editor = searchField.currentEditor() as? NSTextView {
-            editor.string = "cb "
+    private func copySnippetAndDismiss(_ snippet: SavedSnippet) {
+        let expanded = model.snippets.expand(snippet, liveClipboardText: clipboard.currentPasteboardPreviewText())
+        if ClipboardManager.writeInternalString(expanded, to: targetPasteboard) {
+            model.snippets.noteUsed(snippet.id)
+            if searchPresented { dismissSearch() }
+        } else {
+            model.openingFailed()
         }
-        searchField.stringValue = "cb "
-        literalCommand = nil
-        searchFieldAction()
-        commands.chooseClipboard(item.id)
-        commands.requestTemplateEdit(for: item)
-        updatePresentation()
+    }
+
+    private func openSnippetsSettings(prefill: String?) {
+        if searchPresented { dismissSearch() }
+        settingsSession.pendingSnippetContent = prefill
+        presentSettings(page: .snippets)
     }
 
     private func navigateActiveDialog(_ dialog: FileDialogContext, hit: SearchHit) {
@@ -2458,6 +2475,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if let settings, (notification.object as? NSWindow) === settings {
             model.setSettingsPresented(false)
             settings.makeFirstResponder(nil)
+            settingsSession.pendingSnippetContent = nil
             translation.endSettingsSession()
             model.clearFileDiagnosis()
         }
@@ -2859,6 +2877,7 @@ final class SearchPanel: NSPanel {
     var onAnswerPage: ((Int) -> Bool)?
     var onSettings: (() -> Void)?
     var onCommandReturn: (() -> Bool)?
+    var onDismissContext: (() -> Bool)?
     override var canBecomeKey: Bool { true }
 
     private func handleCommand(_ event: NSEvent) -> Bool {
@@ -2866,6 +2885,10 @@ final class SearchPanel: NSPanel {
         guard event.type == .keyDown, (firstResponder as? NSTextView)?.hasMarkedText() != true else { return false }
         let key = event.charactersIgnoringModifiers?.lowercased()
         if modifiers == [.command], key == "," { onSettings?(); return true }
+        if modifiers == [.command, .shift],
+           event.keyCode == kVK_Delete || event.keyCode == kVK_ForwardDelete {
+            return onDismissContext?() ?? false
+        }
         if modifiers == [.shift], event.keyCode == kVK_Return || event.keyCode == kVK_ANSI_KeypadEnter,
            onClipboardActions?() == true { return true }
         if modifiers == [.command] {

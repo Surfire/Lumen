@@ -175,6 +175,7 @@ final class Launcher: ObservableObject {
     let personalDataStore: PersonalDataStore
     let definitionLookup: @Sendable (String) -> String?
     let shortcuts: ShortcutLibrary
+    let snippets: SnippetLibrary
     private var shortcutChanges: AnyCancellable?
     private var storeChanges: Set<AnyCancellable> = []
     @Published var selectedID: String?
@@ -273,7 +274,6 @@ final class Launcher: ObservableObject {
     private var contentWriter: Process?
     private let engine: LauncherEngine
     private let defaults: UserDefaults?
-    private let clipboard: ClipboardManager?
     private var watchSupported: Bool?
     private var watchReportsProgress = false
     private var watchSupportsCachedStart = false
@@ -408,7 +408,9 @@ final class Launcher: ObservableObject {
     private func computeVisibleResults() -> [LauncherResult] {
         guard hasQuery else {
             let finder = activeFileDialog != nil ? openFinderFolders.map(LauncherResult.finderFolder) : []
-            return finder + shortcuts.home.map(LauncherResult.shortcut)
+            return finder
+                + shortcuts.home.map(LauncherResult.shortcut)
+                + snippets.homeItems.map(LauncherResult.snippet)
         }
         if isImageSearch || activeScopedDirectory != nil || activeAliasFolder != nil {
             return hits.map(LauncherResult.file)
@@ -430,8 +432,8 @@ final class Launcher: ObservableObject {
         let commands = native + saved + executables
         let result = calculation.map { [LauncherResult.calculation($0)] } ?? []
         let filteredQuery = LauncherFileQuery(query).isFiltered
-        let snippets: [(LauncherResult, Double)] = (!filteredQuery ? (clipboard?.matchingTemplates(for: query) ?? []) : []).map {
-            (.snippet($0.item), Double($0.score))
+        let snippetResults: [(LauncherResult, Double)] = (!filteredQuery ? snippets.matches(query) : []).map {
+            (.snippet($0.snippet), Double($0.score))
         }
         let bookmarks: [(LauncherResult, Double)] = filteredQuery
             ? []
@@ -442,7 +444,7 @@ final class Launcher: ObservableObject {
         let dictionary: [(LauncherResult, Double)] = (!filteredQuery ? dictionaryQuickResult : nil).map {
             [(.dictionary($0), 68.0)]
         } ?? []
-        let extras = snippets + bookmarks + personal + dictionary
+        let extras = snippetResults + bookmarks + personal + dictionary
         guard !commands.isEmpty || !extras.isEmpty else { return result + hits.map(LauncherResult.file) }
         let files: [(LauncherResult, Double)] = hits.map { hit in
             // Keep lexical order on ties. Regular use can move a direct file above a partial command match.
@@ -490,11 +492,10 @@ final class Launcher: ObservableObject {
         bookmarkLibrary: BookmarkLibrary? = nil,
         personalDataStore: PersonalDataStore? = nil,
         definitionLookup: (@Sendable (String) -> String?)? = nil,
-        clipboard: ClipboardManager? = nil
+        snippetsDirectory: URL? = nil
     ) {
         self.engine = engine
         self.defaults = defaults
-        self.clipboard = clipboard
         let storeDefaults = defaults
             ?? UserDefaults(suiteName: "io.github.surfire.lumen.ephemeral.\(UUID().uuidString)")
             ?? .standard
@@ -511,6 +512,12 @@ final class Launcher: ObservableObject {
         let frecency = LauncherFrecency(defaults: defaults)
         self.frecency = frecency
         shortcuts = ShortcutLibrary(defaults: defaults)
+        let resolvedSnippetsDirectory = snippetsDirectory ?? (
+            defaults == nil
+                ? FileManager.default.temporaryDirectory.appendingPathComponent("lumen-ephemeral-snippets-\(UUID().uuidString)", isDirectory: true)
+                : SnippetLibrary.defaultDirectory
+        )
+        self.snippets = SnippetLibrary(directory: resolvedSnippetsDirectory)
         builtInActions = LaunchCatalog.systemActions()
         let content = defaults?.stringArray(forKey: "contentRootPaths") ?? []
         let initialScope = IndexScope(roots: IndexScope.storedPaths("roots", in: defaults),
@@ -566,10 +573,9 @@ final class Launcher: ObservableObject {
                 self.reconcileSelection()
             }
         }.store(in: &storeChanges)
-        self.clipboard?.$templates.dropFirst().sink { [weak self] _ in
+        self.snippets.objectWillChange.sink { [weak self] in
             DispatchQueue.main.async { [weak self] in
-                guard let self, !self.closed, self.hasQuery, !self.isImageSearch,
-                      self.activeScopedDirectory == nil, self.activeAliasFolder == nil else { return }
+                guard let self, !self.closed else { return }
                 self.rebuildVisibleResults()
                 self.reconcileSelection()
             }

@@ -172,7 +172,6 @@ final class LauncherCommands: ObservableObject {
     @Published private(set) var definition: DictionaryDefinition?
     @Published private(set) var definitionCopied = false
     @Published private(set) var definitionPage = 0
-    @Published private(set) var pendingTemplateEditItem: ClipboardItem?
     private var executionTask: Task<Void, Never>?
     private var feedbackTask: Task<Void, Never>?
     private var definitionTask: Task<Void, Never>?
@@ -322,14 +321,6 @@ final class LauncherCommands: ObservableObject {
 
     func chooseClipboard(_ id: Int64) {
         if clipboardRows.contains(where: { $0.id == id }) { clipboardSelection = id }
-    }
-
-    func requestTemplateEdit(for item: ClipboardItem) {
-        pendingTemplateEditItem = item
-    }
-
-    func clearTemplateEditRequest() {
-        if pendingTemplateEditItem != nil { pendingTemplateEditItem = nil }
     }
 
     func moveClipboard(_ delta: Int) {

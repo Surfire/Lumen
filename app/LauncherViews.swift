@@ -26,6 +26,7 @@ struct SearchWindow: View {
     let activateTranslation: () -> Void
     let toggleContextActions: () -> Void
     let showSettings: () -> Void
+    let openSnippets: (String?) -> Void
     let beginIndex: () -> Void
     let open: (LauncherResult) -> Void
     let selectRow: (LauncherResult, Bool) -> Void
@@ -96,7 +97,7 @@ struct SearchWindow: View {
             case (.clipboard, _):
                 ClipboardHistoryView(commands: commands, clipboard: clipboard, chinese: model.zh,
                                      select: selectClipboard, copy: activateCommand, openSettings: showSettings,
-                                     onOpenPreview: previewClipboard)
+                                     onOpenPreview: previewClipboard, onOpenSnippets: openSnippets)
             case (.window, _):
                 windowRowsView
             case (.commandCard, _):
@@ -438,8 +439,8 @@ struct SearchWindow: View {
                                        symbol: reminder.isCompleted ? "checkmark.circle.fill" : "checklist",
                                        highlight: highlight, selected: selected, detailTruncation: .tail,
                                        badge: (model.t("提醒", "Reminder"), "checklist", false)).id(result.id)
-                        case .snippet(let item):
-                            snippetRow(item, highlight: highlight, selected: selected).id(result.id)
+                        case .snippet(let snippet):
+                            snippetRow(snippet, highlight: highlight, selected: selected).id(result.id)
                         case .finderFolder(let folder):
                             utilityRow(result, title: folder.name,
                                        detail: (folder.path as NSString).abbreviatingWithTildeInPath,
@@ -506,23 +507,28 @@ struct SearchWindow: View {
         }
     }
 
-    private func snippetRow(_ item: ClipboardItem, highlight: LauncherHighlight, selected: Bool) -> some View {
-        let rawTemplate = item.text ?? ""
-        let expanded = ClipboardTemplateExpander.expand(rawTemplate, clipboardText: clipboard.currentPasteboardPreviewText())
-        let displayTitle = expanded
+    private func snippetRow(_ snippet: SavedSnippet, highlight: LauncherHighlight, selected: Bool) -> some View {
+        let expanded = model.snippets.expand(snippet, liveClipboardText: clipboard.currentPasteboardPreviewText())
+        let titleText = snippet.displayTitle
+        let expandedSingleLine = expanded
             .split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
             .joined(separator: " ")
-        let titleText = displayTitle.isEmpty ? (item.alias ?? model.t("短语模板", "Snippet")) : displayTitle
-        let rawSingleLine = rawTemplate
+        let rawSingleLine = snippet.content
             .split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
             .joined(separator: " ")
-        let detailText = ClipboardTemplateExpander.containsVariables(rawTemplate)
-            ? rawSingleLine
-            : model.t("短语模板", "Snippet Template")
+        let detailText: String = {
+            if !expandedSingleLine.isEmpty && expandedSingleLine != titleText {
+                return expandedSingleLine
+            }
+            if ClipboardTemplateExpander.containsVariables(snippet.content) {
+                return rawSingleLine
+            }
+            return model.t("常用短语", "Snippet")
+        }()
 
         return HStack(spacing: 10) {
             Image(systemName: "text.quote").frame(width: 28, height: 28)
@@ -538,29 +544,27 @@ struct SearchWindow: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             HStack(spacing: 6) {
-                if item.pinned {
+                if snippet.pinnedToHome {
                     Image(systemName: "pin.fill")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
-                        .accessibilityLabel(model.t("已固定", "Pinned"))
+                        .accessibilityLabel(model.t("首页置顶", "Pinned to Home"))
                 }
-                if let alias = item.alias, !alias.isEmpty {
-                    Text(verbatim: alias)
-                        .font(.system(size: 10.5, weight: .medium, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(Color.primary.opacity(0.075), in: Capsule())
-                        .lineLimit(1)
-                }
+                Text(verbatim: snippet.alias)
+                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(Color.primary.opacity(0.075), in: Capsule())
+                    .lineLimit(1)
             }
             .fixedSize()
         }
         .padding(.horizontal, 8)
         .frame(height: 44)
         .modifier(ResultRowChrome(selected: selected))
-        .overlay { ActionRowClickView { selectRow(.snippet(item), $0 == 2) }.accessibilityHidden(true) }
+        .overlay { ActionRowClickView { selectRow(.snippet(snippet), $0 == 2) }.accessibilityHidden(true) }
         .contextMenu {
-            ForEach(contextItemsForResult(.snippet(item))) { actionItem in
+            ForEach(contextItemsForResult(.snippet(snippet))) { actionItem in
                 Button {
                     actionItem.perform()
                 } label: {
@@ -570,7 +574,7 @@ struct SearchWindow: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(selected ? .isSelected : [])
-        .accessibilityAction(named: Text(model.t("粘贴", "Paste"))) { open(.snippet(item)) }
+        .accessibilityAction(named: Text(model.t("粘贴", "Paste"))) { open(.snippet(snippet)) }
     }
 
     private func utilityRow(_ result: LauncherResult, title: String, detail: String, symbol: String,
@@ -1042,6 +1046,18 @@ struct FileDialogBanner: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer(minLength: 8)
+            Text("⌘⇧⌫")
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 4.5)
+                .padding(.vertical, 1.5)
+                .background(.primary.opacity(0.065), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .strokeBorder(.primary.opacity(0.11), lineWidth: 0.75)
+                }
+                .fixedSize()
+                .accessibilityIdentifier("selection-context-banner-shortcut")
             Button(action: dismiss) {
                 Image(systemName: "xmark.circle.fill")
                     .font(.system(size: 12))
@@ -1085,6 +1101,18 @@ struct SelectionContextBanner: View {
                     .truncationMode(.tail)
             }
             Spacer(minLength: 8)
+            Text("⌘⇧⌫")
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 4.5)
+                .padding(.vertical, 1.5)
+                .background(.primary.opacity(0.065), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .strokeBorder(.primary.opacity(0.11), lineWidth: 0.75)
+                }
+                .fixedSize()
+                .accessibilityIdentifier("selection-context-banner-shortcut")
             Button(action: dismiss) {
                 Image(systemName: "xmark.circle.fill")
                     .font(.system(size: 12))

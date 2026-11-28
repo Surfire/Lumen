@@ -3,7 +3,7 @@ import ServiceManagement
 import SwiftUI
 
 enum SettingsPage: String, CaseIterable, Identifiable {
-    case general, index, translation, quicklinks, scripts, advanced
+    case general, index, translation, quicklinks, snippets, scripts, advanced
 
     var id: Self { self }
 
@@ -13,6 +13,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .index: return model.t("索引", "Index")
         case .translation: return model.t("AI 与模型", "AI & Models")
         case .quicklinks: return model.t("快捷链接", "Quicklinks")
+        case .snippets: return model.t("常用短语", "Snippets")
         case .scripts: return model.t("脚本与指令", "Scripts")
         case .advanced: return model.t("状态与关于", "Status & About")
         }
@@ -24,6 +25,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .index: return model.t("目录范围、过滤与外置盘", "Folders, filters & volumes")
         case .translation: return model.t("语义、搜图与翻译服务", "Embeddings, images & AI")
         case .quicklinks: return model.t("搜索别名与常用网页", "Aliases & web shortcuts")
+        case .snippets: return model.t("固定短语与变量模板", "Saved phrases & templates")
         case .scripts: return model.t("本地脚本与快捷指令", "Local scripts & Shortcuts")
         case .advanced: return model.t("监听、诊断、更新与版本", "Watch, diagnostics & updates")
         }
@@ -35,6 +37,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .index: return "folder.badge.gearshape"
         case .translation: return "sparkles"
         case .quicklinks: return "link"
+        case .snippets: return "text.badge.plus"
         case .scripts: return "terminal"
         case .advanced: return "waveform.path.ecg"
         }
@@ -69,6 +72,7 @@ final class SettingsSession: ObservableObject {
     @Published var page: SettingsPage? = .general {
         didSet { if page != oldValue { pageChanged(oldValue, page) } }
     }
+    @Published var pendingSnippetContent: String?
     @Published private(set) var draft: IndexScope?
     @Published private(set) var launchAtLogin = false
     @Published private(set) var loginItemNeedsApproval = false
@@ -238,6 +242,13 @@ struct LauncherSettings: View {
                         case .general: general
                         case .index: indexAndPrivacy
                         case .quicklinks: QuicklinksView(model: model, library: model.shortcuts, chooseFolder: chooseQuicklinkFolder)
+                        case .snippets:
+                            SnippetSettingsView(
+                                model: model,
+                                library: model.snippets,
+                                clipboardPreviewText: { clipboard.currentPasteboardPreviewText() },
+                                prefillContent: $session.pendingSnippetContent
+                            )
                         case .translation: aiAndModels
                         case .scripts: scriptsAndShortcuts
                         case .advanced: statusAndAbout
@@ -416,6 +427,8 @@ struct LauncherSettings: View {
                 description: model.t("自定义搜索别名、固定应用与网页直达命令。",
                                      "Custom search aliases, pinned apps, and web shortcuts.")
             )
+        case .snippets:
+            EmptyView()
         case .scripts:
             LumenSettingsHeader(
                 kicker: "SCRIPTS & SHORTCUTS",

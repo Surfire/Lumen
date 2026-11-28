@@ -9,6 +9,7 @@ import PDFKit
 import SQLite3
 import SwiftUI
 import UniformTypeIdentifiers
+import Vision
 import zlib
 
 // Runs inside the built app with app-local AppKit and Carbon events and an isolated index.
@@ -158,6 +159,10 @@ final class LauncherSmoke {
                          automaticPolling: false, sessionCenter: clipboardSession, isConsoleSessionActive: { true })
     }
 
+    func makeSnippetsDirectory() -> URL {
+        clipboardFixtureRoot.appendingPathComponent("Snippets", isDirectory: true)
+    }
+
     func makeTranslationModel() -> TranslationPanelModel {
         TranslationPanelModel(defaults: translationPreferences, client: .init(secrets: translationSecrets, timeout: 3))
     }
@@ -221,7 +226,8 @@ final class LauncherSmoke {
             currencyStore: currencyStore,
             bookmarkLibrary: bookmarkLibrary,
             personalDataStore: personalStore,
-            definitionLookup: makeDefinitionLookup()
+            definitionLookup: makeDefinitionLookup(),
+            snippetsDirectory: directory.appendingPathComponent("iso-snippets-\(UUID().uuidString)", isDirectory: true)
         )
     }
 
@@ -796,8 +802,8 @@ final class LauncherSmoke {
         }
         try type("cb ", into: app)
         try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.shift])
-        try check(app.contextActions.items.map(\.id) == ["copy-clip", "pin-clip", "delete-clip", "edit-template"],
-                  "Shift–Return did not show clipboard actions with template editor: \(app.contextActions.items.map(\.id))")
+        try check(app.contextActions.items.map(\.id) == ["copy-clip", "pin-clip", "delete-clip", "save-as-snippet"],
+                  "Shift–Return did not show clipboard actions with Save as Snippet: \(app.contextActions.items.map(\.id))")
         try key(kVK_DownArrow, "\u{f701}", in: app)
         try key(kVK_Return, "\r", in: app)
         try check(history.items.first?.pinned == true && app.searchPresented && !app.contextActions.isOpen,
@@ -6524,6 +6530,46 @@ final class LauncherSmoke {
         }
     }
 
+    private func findTextView(in view: NSView, containing needle: String) -> NSTextView? {
+        if let tv = view as? NSTextView, tv.string.contains(needle) { return tv }
+        for sub in view.subviews {
+            if let hit = findTextView(in: sub, containing: needle) { return hit }
+        }
+        return nil
+    }
+
+    private func recognizedStrings(in bitmap: NSBitmapImageRep) -> [String] {
+        guard let cgImage = bitmap.cgImage else { return [] }
+        let request = VNRecognizeTextRequest()
+        request.recognitionLanguages = ["zh-Hans", "en-US"]
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = false
+        try? VNImageRequestHandler(cgImage: cgImage, options: [:]).perform([request])
+        return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+    }
+
+    private func hasBannerInk(in bitmap: NSBitmapImageRep, panelSize: CGSize, xPoints: Range<CGFloat>, yPoints: Range<CGFloat>) -> Bool {
+        let scaleX = CGFloat(bitmap.pixelsWide) / max(panelSize.width, 1)
+        let scaleY = CGFloat(bitmap.pixelsHigh) / max(panelSize.height, 1)
+        let minX = max(0, Int(xPoints.lowerBound * scaleX))
+        let maxX = min(bitmap.pixelsWide, Int(xPoints.upperBound * scaleX))
+        let minY = max(0, Int(yPoints.lowerBound * scaleY))
+        let maxY = min(bitmap.pixelsHigh, Int(yPoints.upperBound * scaleY))
+        guard minX < maxX, minY < maxY else { return false }
+        var darkPixels = 0
+        for x in stride(from: minX, to: maxX, by: 1) {
+            for y in stride(from: minY, to: maxY, by: 1) {
+                guard let c = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
+                let luma = 0.2126 * c.redComponent + 0.7152 * c.greenComponent + 0.0722 * c.blueComponent
+                if luma < 0.72 && c.alphaComponent > 0.2 {
+                    darkPixels += 1
+                    if darkPixels >= 18 { return true }
+                }
+            }
+        }
+        return false
+    }
+
     private func accessibilityButtonPoint(identifier: String, in root: NSView, window: NSWindow) -> CGPoint? {
         var visited = Set<ObjectIdentifier>()
         func visit(_ element: AnyObject) -> CGPoint? {
@@ -7168,7 +7214,7 @@ final class LauncherSmoke {
         try check(LauncherSettings.aboutDisplayTitle() == "Lumen", "About title must be strictly Lumen")
         try check(settings.contentMinSize.width >= 740 && settings.contentMinSize.height >= 560,
                   "Settings min size too small: \(settings.contentMinSize)")
-        let expectedRawPages: Set<String> = ["general", "index", "quicklinks", "translation", "scripts", "advanced"]
+        let expectedRawPages: Set<String> = ["general", "index", "quicklinks", "snippets", "translation", "scripts", "advanced"]
         try check(Set(SettingsPage.allCases.map(\.rawValue)) == expectedRawPages,
                   "SettingsPage cases changed: \(SettingsPage.allCases.map(\.rawValue))")
         let model = app.model
@@ -7192,7 +7238,8 @@ final class LauncherSmoke {
             let isoLauncher = Launcher(engine: isoEngine, defaults: isoDefaults, locale: "en",
                                        currencyStore: makeCurrencyStore(),
                                        bookmarkLibrary: makeBookmarkLibrary(),
-                                       personalDataStore: makePersonalDataStore())
+                                       personalDataStore: makePersonalDataStore(),
+                                       snippetsDirectory: directory.appendingPathComponent("v061-snippets-\(UUID().uuidString)", isDirectory: true))
             defer { isoLauncher.close() }
             try check(isoLauncher.textEmbeddingBackend.mode == .builtin, "Launcher did not default to .builtin")
             isoLauncher.applyTextEmbeddingBackend(savedConfig)
@@ -8525,7 +8572,108 @@ final class LauncherSmoke {
                   filePasteboard.string(forType: .string) == "preserve-my-clipboard",
                   "FileDialogBridge timeout wrote Save-As field or failed to return false")
 
+        // Fix 1 regressions: XPC openAndSavePanelService preserves servicePID/dialogElement,
+        // waits for focus after .nonactivatingPanel dismissal, and hard-aborts (0 shortcuts!)
+        // if focus stays on host document editor.
+        let hostPID: pid_t = 77_001
+        let servicePID: pid_t = 88_100
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        let hostDocWindow = FileDialogAXElement.mock("host-doc-window")
+        let hostDocEditor = FileDialogAXElement.mock("host-doc-editor")
+        let remoteSheet = FileDialogAXElement.mock("remote-open-sheet")
+        let remoteBrowser = FileDialogAXElement.mock("remote-open-browser")
+        let remoteOpenBtn = FileDialogAXElement.mock("remote-open-btn")
+        let remoteFocused = FileDialogAXElement.mock("remote-focused-list")
+        let remoteGotoField = FileDialogAXElement.mock("remote-goto-field")
+        let remoteGotoPopover = FileDialogAXElement.mock("remote-goto-popover")
+        let lumenOwnField = FileDialogAXElement.mock("lumen-own-field")
+
+        fileDialogAXAdapter.configureNode(hostDocWindow, role: kAXWindowRole as String, children: [hostDocEditor])
+        fileDialogAXAdapter.configureNode(hostDocEditor, role: kAXTextAreaRole as String, parent: hostDocWindow, window: hostDocWindow)
+        fileDialogAXAdapter.configureNode(remoteSheet, role: kAXSheetRole as String, identifier: "open-panel",
+                                          children: [remoteBrowser, remoteOpenBtn], defaultButton: remoteOpenBtn)
+        fileDialogAXAdapter.configureNode(remoteBrowser, role: kAXBrowserRole as String)
+        fileDialogAXAdapter.configureNode(remoteOpenBtn, role: kAXButtonRole as String, title: "Open")
+        fileDialogAXAdapter.configureNode(remoteFocused, role: kAXOutlineRole as String, parent: remoteSheet,
+                                          window: remoteSheet, topLevel: remoteSheet)
+        fileDialogAXAdapter.configureNode(remoteGotoPopover, role: kAXPopoverRole as String, parent: remoteSheet, children: [remoteGotoField])
+        fileDialogAXAdapter.configureNode(remoteGotoField, role: kAXTextFieldRole as String, identifier: "GoToWindowTextField",
+                                          placeholder: "Go to folder", value: "", enabled: true, parent: remoteGotoPopover)
+        fileDialogAXAdapter.configureNode(lumenOwnField, role: kAXTextFieldRole as String)
+        fileDialogAXAdapter.setElementPID(lumenOwnField, pid: ownPID)
+        fileDialogAXAdapter.configureService(pid: servicePID, windows: [remoteSheet])
+        fileDialogAXAdapter.setElementPID(remoteSheet, pid: servicePID)
+        fileDialogAXAdapter.setElementPID(remoteFocused, pid: servicePID)
+        fileDialogAXAdapter.setElementPID(remoteGotoField, pid: servicePID)
+        fileDialogAXAdapter.configureApp(pid: hostPID, bundleID: "com.apple.TextEdit",
+                                         focusedWindow: hostDocWindow, focusedElement: remoteFocused)
+        fileDialogAXAdapter.setElementPID(hostDocWindow, pid: hostPID)
+        fileDialogAXAdapter.setElementPID(hostDocEditor, pid: hostPID)
+        fileDialogAXAdapter.setActive(true, pid: hostPID)
+
+        // Ensure detectActiveDialog captures servicePID & dialogElement from XPC service element.
+        let hostProxyApp = NSRunningApplication.current
+        _ = hostProxyApp // real frontmostApp is only needed for pid; bridge also accepts context directly.
+        fileDialogAXAdapter.setSystemFocused(remoteFocused)
+        // Also test detectActiveDialog on current PID with XPC focused element -> preserves servicePID & dialogElement.
+        fileDialogAXAdapter.configureApp(pid: testPID, bundleID: "com.apple.TextEdit",
+                                         focusedWindow: hostDocWindow, focusedElement: remoteFocused)
+        fileDialogAXAdapter.setElementPID(remoteFocused, pid: servicePID)
+        let detectedRemote = isoBridge.detectActiveDialog(frontmostApp: NSRunningApplication.current)
+        try check(detectedRemote?.kind == .open &&
+                  detectedRemote?.servicePID == servicePID &&
+                  detectedRemote?.dialogElement == remoteSheet,
+                  "detectActiveDialog did not preserve servicePID/dialogElement for remote XPC dialog: \(String(describing: detectedRemote))")
+
+        // Use non-own hostPID context so Lumen ownPID vs host editor focus guards run identically to production.
+        let remoteHostContext = FileDialogContext(
+            appPID: hostPID,
+            appName: "TextEdit",
+            appBundleID: "com.apple.TextEdit",
+            kind: .open,
+            servicePID: servicePID,
+            dialogElement: remoteSheet
+        )
+
+        // Hard-abort when focus stays on host document editor (must post ZERO shortcuts!).
+        fileDialogAXAdapter.clearWritesAndShortcuts()
+        fileDialogAXAdapter.onShortcut = nil
+        fileDialogAXAdapter.onPerformAction = nil
+        fileDialogAXAdapter.setSystemFocused(hostDocEditor)
+        var hardAbortResult: Bool?
+        isoBridge.navigate(remoteHostContext, toPath: spaceRootPath, isDirectory: true) { hardAbortResult = $0 }
+        try await until("FileDialogBridge hard-abort did not complete") { hardAbortResult != nil }
+        try check(hardAbortResult == false &&
+                  fileDialogAXAdapter.recordedShortcuts().isEmpty &&
+                  fileDialogAXAdapter.lastWrittenValue(for: remoteGotoField) == nil &&
+                  fileDialogAXAdapter.recordedPerformedActions().contains { $0.0 == (kAXRaiseAction as String) && $0.1 == remoteSheet },
+                  "FileDialogBridge posted shortcuts or skipped AXRaise when focus stayed on host editor: shortcuts=\(fileDialogAXAdapter.recordedShortcuts())")
+
+        // Focus starts on Lumen .nonactivatingPanel (ownPID); AXRaise restores dialog focus and navigation succeeds.
+        fileDialogAXAdapter.clearWritesAndShortcuts()
+        fileDialogAXAdapter.setSystemFocused(lumenOwnField)
+        fileDialogAXAdapter.onPerformAction = { [weak fileDialogAXAdapter] action, element in
+            if action == (kAXRaiseAction as String) && element == remoteSheet {
+                fileDialogAXAdapter?.setSystemFocused(remoteFocused)
+            }
+        }
+        fileDialogAXAdapter.onShortcut = { [weak fileDialogAXAdapter] keyCode, flags in
+            if keyCode == CGKeyCode(kVK_ANSI_G) && flags == [.maskCommand, .maskShift] {
+                fileDialogAXAdapter?.setSystemFocused(remoteGotoField)
+            }
+        }
+        var delayedFocusResult: Bool?
+        isoBridge.navigate(remoteHostContext, toPath: spaceRootPath, isDirectory: true) { delayedFocusResult = $0 }
+        try await until("FileDialogBridge delayed dialog focus navigate did not complete") { delayedFocusResult != nil }
+        try check(delayedFocusResult == true &&
+                  fileDialogAXAdapter.lastWrittenValue(for: remoteGotoField) == spaceRootPath &&
+                  fileDialogAXAdapter.recordedShortcuts().filter { $0.0 == CGKeyCode(kVK_ANSI_G) }.count == 1,
+                  "FileDialogBridge failed to wait for dialog focus or write path after AXRaise: result=\(String(describing: delayedFocusResult))")
+        fileDialogAXAdapter.onPerformAction = nil
+
         // End-to-end AppDelegate integration for P0-1.
+        fileDialogAXAdapter.configureApp(pid: testPID, bundleID: "com.test.editor",
+                                         focusedWindow: hostWin, focusedElement: saveAsField)
         fileDialogAXAdapter.clearWritesAndShortcuts()
         fileDialogAXAdapter.setSystemFocused(saveAsField)
         fileDialogAXAdapter.onShortcut = { [weak fileDialogAXAdapter] keyCode, flags in
@@ -8729,19 +8877,71 @@ final class LauncherSmoke {
                 self.pasteIntoPreviousAppCount == pasteCountBeforeReplace + 1
         }
 
-        // Re-open and test context × dismissal resets qa back to .missingArgument.
+        // Re-open and test context dismissal:
+        // 1. SelectionContextBanner renders ⌘⇧⌫ hint alongside close button.
+        // 2. Cmd+Shift+Delete & Cmd+Shift+ForwardDelete clear activeContext while preserving "qa 总结" in searchField.
+        // 3. Submitted QA request excludes the dismissed context.
+        // 4. Cmd+Shift+Delete when activeContext == nil returns false.
         app.showSearch()
-        try type("qa ", into: app)
-        try check(app.commands.resolution == .question("hello world"), "reopened qa did not capture context")
-        model.setActiveContext(nil)
-        app.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: app.searchField))
-        try check(model.activeContext == nil && app.commands.resolution == .missingArgument(commandID: "qa"),
-                  "dismissing context did not restore missingArgument on qa")
+        app.panel.contentView?.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(60))
+        let bannerLight = try render(.aqua, window: app.panel)
+        _ = try render(.darkAqua, window: app.panel)
+        if exists("capture-icons") || exists("capture-snapshots") {
+            if let png = bannerLight.representation(using: .png, properties: [:]) {
+                try png.write(to: directory.appendingPathComponent("lumen-context-banner-light.png"))
+            }
+        }
+        app.panel.appearance = nil
+        // Verify SelectionContextBanner draws the ⌘⇧⌫ keycap hint immediately left of the close button (30pt banner below 56pt header).
+        let panelSize = app.panel.frame.size
+        let bannerYRange = PanelGeometry.headerHeight..<(PanelGeometry.headerHeight + SelectionContextBanner.launcherHeight)
+        try check(hasBannerInk(in: bannerLight, panelSize: panelSize,
+                               xPoints: (panelSize.width - 92)..<(panelSize.width - 34),
+                               yPoints: bannerYRange) &&
+                  hasBannerInk(in: bannerLight, panelSize: panelSize,
+                               xPoints: (panelSize.width - 32)..<(panelSize.width - 10),
+                               yPoints: bannerYRange),
+                  "SelectionContextBanner did not render ⌘⇧⌫ keycap hint beside close button")
+
+        try type("qa 总结", into: app)
+        try check(app.commands.resolution == .question("总结\n\n\"\"\"\nhello world\n\"\"\""),
+                  "qa 总结 did not wrap activeContext before Cmd+Shift+Delete: \(app.commands.resolution)")
+        try key(kVK_Delete, "\u{7f}", in: app, throughPanel: true, flags: [.command, .shift])
+        try check(model.activeContext == nil &&
+                  app.searchField.stringValue == "qa 总结" &&
+                  (try editor(app)).string == "qa 总结" &&
+                  app.commands.resolution == .question("总结"),
+                  "Cmd+Shift+Delete did not clear activeContext while keeping searchField text intact: ctx=\(String(describing: model.activeContext)), text=\(app.searchField.stringValue), res=\(app.commands.resolution)")
+
+        let cmdShiftDeleteAgain = try event(kVK_Delete, "\u{7f}", in: app, flags: [.command, .shift])
+        try check(app.panel.onDismissContext?() == false && !app.panel.performKeyEquivalent(with: cmdShiftDeleteAgain),
+                  "Cmd+Shift+Delete did not return false when activeContext == nil")
+
+        // Submit QA now and verify the HTTP payload sent to the provider excludes the dismissed "hello world" context.
+        let messagesBeforeQA = loopbackHTTP.recordedUserMessages().count
+        try key(kVK_Return, "\r", in: app)
+        try await until("QA after Cmd+Shift+Delete did not finish") {
+            app.commands.answer == .answer("你好世界")
+        }
+        try check(Array(loopbackHTTP.recordedUserMessages().dropFirst(messagesBeforeQA)) == ["总结"],
+                  "submitted QA prompt leaked dismissed context: \(loopbackHTTP.recordedUserMessages())")
+
+        // Also test ForwardDelete (Fn+Cmd+Shift+Delete) dismissal preserving typed text.
+        app.dismissSearch()
+        app.showSearch()
+        try type("qa 总结", into: app)
+        try check(model.activeContext != nil, "reopened search did not capture context for ForwardDelete check")
+        try key(kVK_ForwardDelete, "\u{f728}", in: app, throughPanel: true, flags: [.command, .shift])
+        try check(model.activeContext == nil &&
+                  app.searchField.stringValue == "qa 总结" &&
+                  app.commands.resolution == .question("总结"),
+                  "Cmd+Shift+ForwardDelete did not clear activeContext cleanly")
         app.dismissSearch()
         contextCaptureEnabled = false
         simulatedFrontmostApp = nil
 
-        // MARK: - 5. P2-B Clipboard Templates (SQLite migration, pinned retention, single-pass expansion, main search + cb edit)
+        // MARK: - 5. P2-B Independent SnippetLibrary, Settings Page, Legacy Migration & Crash Removal
         let legacyClipboardRoot = clipboardFixtureRoot.appendingPathComponent("P2BLegacyClipboard", isDirectory: true)
         try fm.createDirectory(at: legacyClipboardRoot, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let legacyDBURL = legacyClipboardRoot.appendingPathComponent(".history.sqlite")
@@ -8797,22 +8997,117 @@ final class LauncherSmoke {
         try check(expanded == "2026-11-28|09:05|2026-11-28 09:05|{{date}} {{clipboard}} literal",
                   "ClipboardTemplateExpander failed single-pass non-recursive expansion: \(expanded)")
 
-        // End-to-end main search .snippet match -> Return expanded copy/paste + cb Cmd+K template editor hook.
+        // SnippetLibrary CRUD, reserved/duplicate/invalid alias rejection, permissions, and legacy migration.
+        let isoSnippetsDir = clipboardFixtureRoot.appendingPathComponent("IsoSnippets", isDirectory: true)
+        let isoLib = SnippetLibrary(directory: isoSnippetsDir)
+        for reservedVerb in ["qa", "tr", "translate", "img", "cb", "clip", "win"] {
+            try check(isoLib.save(alias: reservedVerb, content: "content") == .reservedAlias(reservedVerb),
+                      "SnippetLibrary did not reject reserved verb '\(reservedVerb)'")
+        }
+        try check(isoLib.save(alias: "bad alias", content: "content") == .invalidAlias &&
+                  isoLib.save(alias: "ok", content: "   \n  ") == .emptyContent,
+                  "SnippetLibrary did not reject invalid alias or empty content")
+
+        guard case .saved(let savedInvoice) = isoLib.save(
+            alias: "fapiao",
+            title: "公司发票",
+            content: "抬头：Lumen\n日期：{{date}}",
+            pinnedToHome: true
+        ) else {
+            throw Failure("SnippetLibrary failed to save valid snippet")
+        }
+        try check(isoLib.save(alias: "FAPIAO", content: "dup") == .aliasInUse("fapiao"),
+                  "SnippetLibrary allowed duplicate alias")
+        guard case .saved(let updatedInvoice) = isoLib.save(
+            id: savedInvoice.id,
+            alias: "fapiao",
+            title: "开票信息",
+            content: "抬头：Lumen Inc.\n日期：{{date}}",
+            pinnedToHome: true
+        ) else {
+            throw Failure("SnippetLibrary failed to update existing snippet")
+        }
+        let snippetDirMode = try fm.attributesOfItem(atPath: isoSnippetsDir.path)[.posixPermissions] as? NSNumber
+        let snippetFileMode = try fm.attributesOfItem(atPath: isoSnippetsDir.appendingPathComponent("snippets.json").path)[.posixPermissions] as? NSNumber
+        try check(snippetDirMode?.intValue == 0o700 && snippetFileMode?.intValue == 0o600,
+                  "SnippetLibrary storage permissions were not 0700/0600")
+        let reloadedLib = SnippetLibrary(directory: isoSnippetsDir)
+        try check(reloadedLib.snippets == [updatedInvoice] && reloadedLib.homeItems == [updatedInvoice],
+                  "SnippetLibrary did not round-trip updated snippet from disk")
+        isoLib.togglePinToHome(updatedInvoice.id)
+        try check(isoLib.homeItems.isEmpty, "togglePinToHome did not unpin snippet")
+        isoLib.remove(updatedInvoice.id)
+        try check(isoLib.snippets.isEmpty, "SnippetLibrary.remove did not delete snippet")
+
+        // Legacy ClipboardStore -> SnippetLibrary one-time idempotent migration.
+        let legacyMigrateClipRoot = clipboardFixtureRoot.appendingPathComponent("LegacyMigrateClips", isDirectory: true)
+        let legacyMigrateStore = ClipboardStore(directory: legacyMigrateClipRoot, limit: 10)
+        _ = try legacyMigrateStore.createTemplate(text: "Legacy Template {{date}}", alias: "leg", pinned: true, capturedAt: .now)
+        let migratedLibDir = clipboardFixtureRoot.appendingPathComponent("MigratedSnippets", isDirectory: true)
+        let migratedLib = SnippetLibrary(directory: migratedLibDir)
+        migratedLib.migrateLegacyClipboardTemplates(from: legacyMigrateStore)
+        try check(migratedLib.migratedLegacyClipboard &&
+                  migratedLib.snippets.count == 1 &&
+                  migratedLib.snippets.first?.alias == "leg" &&
+                  migratedLib.snippets.first?.content == "Legacy Template {{date}}",
+                  "SnippetLibrary failed legacy ClipboardStore template migration: \(migratedLib.snippets)")
+        migratedLib.remove(migratedLib.snippets[0].id)
+        migratedLib.migrateLegacyClipboardTemplates(from: legacyMigrateStore)
+        try check(migratedLib.snippets.isEmpty, "SnippetLibrary re-migrated legacy templates after deletion")
+
+        // End-to-end AppDelegate integration:
+        // 1. Save pinned & unpinned snippets into model.snippets; clipboard.clearAll() leaves snippets 100% intact.
+        // 2. Empty search shows pinnedToHome snippet alongside shortcuts.home (and omits unpinned).
+        // 3. Main search .snippet expansion, internal paste, lastUsedAt update, and Cmd+K actions.
         let clipMgr = app.clipboard
         clipMgr.clearAll()
-        var createdTemplate = false
-        clipMgr.saveTemplate(id: nil, text: "Hello on {{date}} from {{clipboard}}", alias: "greet", pinned: true) { ok in
-            createdTemplate = ok
-        }
-        try await until("saveTemplate finished for greet snippet") { createdTemplate }
-        defer { clipMgr.clearAll() }
+        try writeClipboardText("Disposable clip before clearAll")
+        clipMgr.poll()
+        try check(!clipMgr.items.isEmpty, "clipboard fixture failed to record clip")
 
-        try writeClipboardText("LumenSnippetUser")
+        guard case .saved(let greetSnippet) = model.snippets.save(
+            alias: "greet",
+            title: "Greeting Template",
+            content: "Hello on {{date}} from {{clipboard}}",
+            pinnedToHome: true
+        ), case .saved(let sigSnippet) = model.snippets.save(
+            alias: "sig",
+            title: "Signature",
+            content: "Best,\nLumen",
+            pinnedToHome: false
+        ) else {
+            throw Failure("could not save smoke snippets on model.snippets")
+        }
+        defer {
+            model.snippets.remove(greetSnippet.id)
+            model.snippets.remove(sigSnippet.id)
+            clipMgr.clearAll()
+        }
+
+        clipMgr.clearAll()
+        try await until("clipboard.clearAll finished while leaving model.snippets intact") {
+            clipMgr.items.isEmpty
+        }
+        let diskSnippetsAfterClear = SnippetLibrary(directory: model.snippets.directory).snippets
+        try check(model.snippets.snippets.count >= 2 &&
+                  diskSnippetsAfterClear.contains(where: { $0.id == greetSnippet.id }) &&
+                  diskSnippetsAfterClear.contains(where: { $0.id == sigSnippet.id }),
+                  "clipboard.clearAll affected independent SnippetLibrary")
+
+        // Empty search home rows surface pinnedToHome snippets, omitting unpinned ones.
         app.showSearch()
+        try type("", into: app)
+        try await until("empty search home surfaced pinnedToHome snippet") {
+            model.visibleResults.contains(.snippet(greetSnippet)) &&
+                !model.visibleResults.contains(.snippet(sigSnippet))
+        }
+
+        // Main search .snippet match -> Return expands variables, writes internally, notes usage, dismisses, and pastes.
+        try writeClipboardText("LumenSnippetUser")
         try type("greet", into: app)
         try await until("main search surfaced .snippet row for alias greet") {
             if case .snippet(let s)? = model.selectedResult {
-                return s.alias == "greet" && s.pinned
+                return s.id == greetSnippet.id && s.pinnedToHome
             }
             return false
         }
@@ -8823,28 +9118,91 @@ final class LauncherSmoke {
             !app.searchPresented &&
                 self.filePasteboard.string(forType: .string) == todayPrefix &&
                 self.filePasteboard.types?.contains(ClipboardManager.internalType) == true &&
-                self.pasteIntoPreviousAppCount == pasteCountBeforeSnippet + 1
+                self.pasteIntoPreviousAppCount == pasteCountBeforeSnippet + 1 &&
+                model.snippets.snippets.first(where: { $0.id == greetSnippet.id })?.lastUsedAt != nil
         }
 
-        // Open cb, Cmd+K -> edit-template requests ClipboardHistoryView inline editor.
+        // .snippet Cmd+K actions (paste-snippet, copy-snippet, toggle-snippet-pin, manage-snippets).
         app.showSearch()
-        try type("cb ", into: app)
-        try await until("cb loaded greet template") {
-            app.commands.clipboardSelection != nil
+        try type("greet", into: app)
+        try await until("reopened search matched greet snippet") {
+            if case .snippet(let s)? = model.selectedResult { return s.id == greetSnippet.id }
+            return false
         }
         try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
-        guard let editTplIdx = app.contextActions.items.firstIndex(where: { $0.id == "edit-template" }) else {
-            throw Failure("missing edit-template in cb Cmd+K menu: \(app.contextActions.items.map(\.id))")
+        try check(app.contextActions.items.map(\.id) == ["paste-snippet", "copy-snippet", "toggle-snippet-pin", "manage-snippets"],
+                  "snippet Cmd+K menu mismatch: \(app.contextActions.items.map(\.id))")
+        filePasteboard.clearContents()
+        try writeClipboardText("CopyOnlyUser")
+        let expectedCopyOnly = ClipboardTemplateExpander.expand("Hello on {{date}} from CopyOnlyUser")
+        let pasteCountBeforeCopyOnly = pasteIntoPreviousAppCount
+        app.contextActions.run(1) // copy-snippet
+        try await until("copy-snippet copied expanded text without triggering paste") {
+            !app.searchPresented &&
+                self.filePasteboard.string(forType: .string) == expectedCopyOnly &&
+                self.filePasteboard.types?.contains(ClipboardManager.internalType) == true &&
+                self.pasteIntoPreviousAppCount == pasteCountBeforeCopyOnly
         }
-        app.contextActions.run(editTplIdx)
+
+        // ClipboardHistoryView (管理短语… / 存为短语…) + cb Cmd+K save-as-snippet -> Settings .snippets prefill & Light/Dark render.
+        let clipTextForSnippet = "Meeting follow-up for {{date}}"
+        try writeClipboardText(clipTextForSnippet)
+        clipMgr.poll()
+        app.showSearch()
+        try type("cb ", into: app)
+        try await until("cb loaded clip for Save as Snippet check") {
+            app.commands.selectedClipboardItem?.text == clipTextForSnippet
+        }
         app.panel.contentView?.layoutSubtreeIfNeeded()
-        _ = try? render(.aqua, window: app.panel)
-        app.panel.appearance = nil
-        try await until("cb Cmd+K edit-template consumed pending edit request in ClipboardHistoryView") {
-            app.commands.pendingTemplateEditItem == nil
+        try await Task.sleep(for: .milliseconds(60))
+        let cbLight = try render(.aqua, window: app.panel)
+        _ = try render(.darkAqua, window: app.panel)
+        if exists("capture-icons") || exists("capture-snapshots") {
+            if let png = cbLight.representation(using: .png, properties: [:]) {
+                try png.write(to: directory.appendingPathComponent("lumen-clipboard-snippets-light.png"))
+            }
         }
-        app.dismissSearch()
-        print("Wave 2 features passed (P0-2 scope/actions, P2-A folder alias, P0-1 Quick Switch, P1-A context pass-through, P2-B snippets/templates)")
+        app.panel.appearance = nil
+        let cbTexts = recognizedStrings(in: cbLight).joined(separator: " ")
+        try check((cbTexts.contains("管理短语") || cbTexts.contains("Manage Snippets")) &&
+                  (cbTexts.contains("存为短语") || cbTexts.contains("Save as Snippet")),
+                  "ClipboardHistoryView did not render 管理短语… and 存为短语… buttons (recognized: \(cbTexts))")
+
+        try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+        guard let saveSnippetIdx = app.contextActions.items.firstIndex(where: { $0.id == "save-as-snippet" }) else {
+            throw Failure("missing save-as-snippet in cb Cmd+K menu: \(app.contextActions.items.map(\.id))")
+        }
+        app.contextActions.run(saveSnippetIdx)
+        try await until("cb Cmd+K save-as-snippet opened Settings on .snippets and consumed prefill") {
+            app.settings?.contentView?.layoutSubtreeIfNeeded()
+            return !app.searchPresented &&
+                app.settings != nil &&
+                app.settingsSession.page == .snippets &&
+                app.settingsSession.pendingSnippetContent == nil
+        }
+        if let settingsWindow = app.settings {
+            try await Task.sleep(for: .milliseconds(60))
+            let light = try render(.aqua, window: settingsWindow)
+            let dark = try render(.darkAqua, window: settingsWindow)
+            if exists("capture-icons") || exists("capture-snapshots") {
+                if let lp = light.representation(using: .png, properties: [:]) {
+                    try lp.write(to: directory.appendingPathComponent("lumen-settings-snippets-prefill-light.png"))
+                }
+                if let dp = dark.representation(using: .png, properties: [:]) {
+                    try dp.write(to: directory.appendingPathComponent("lumen-settings-snippets-prefill-dark.png"))
+                }
+            }
+            settingsWindow.appearance = nil
+            try check(light.pixelsWide > 0 && dark.pixelsWide > 0, "SnippetSettingsView failed Light/Dark render")
+            if let settingsContent = settingsWindow.contentView {
+                try await until("SnippetSettingsView populated NSTextView with prefilled content") {
+                    settingsContent.layoutSubtreeIfNeeded()
+                    return self.findTextView(in: settingsContent, containing: clipTextForSnippet) != nil
+                }
+            }
+            settingsWindow.close()
+        }
+        print("Wave 2 features + UAT fixes 1/2/3 passed (Quick Switch focus/servicePID, Cmd+Shift+Delete context clear, independent SnippetLibrary + Settings)")
     }
 
     private struct Failure: Error, CustomStringConvertible {
@@ -9115,7 +9473,9 @@ final class SmokeFileDialogAXAdapter: FileDialogAXAdapter, @unchecked Sendable {
     private var activePIDs: Set<pid_t> = []
     private var writtenValues: [FileDialogAXElement: String] = [:]
     private var shortcuts: [(CGKeyCode, CGEventFlags)] = []
+    private var performedActions: [(String, FileDialogAXElement)] = []
     var onShortcut: ((CGKeyCode, CGEventFlags) -> Void)?
+    var onPerformAction: ((String, FileDialogAXElement) -> Void)?
 
     func reset() {
         lock.withLock {
@@ -9133,7 +9493,9 @@ final class SmokeFileDialogAXAdapter: FileDialogAXAdapter, @unchecked Sendable {
             activePIDs.removeAll()
             writtenValues.removeAll()
             shortcuts.removeAll()
+            performedActions.removeAll()
             onShortcut = nil
+            onPerformAction = nil
         }
     }
 
@@ -9143,6 +9505,36 @@ final class SmokeFileDialogAXAdapter: FileDialogAXAdapter, @unchecked Sendable {
         lock.withLock {
             writtenValues.removeAll()
             shortcuts.removeAll()
+            performedActions.removeAll()
+        }
+    }
+
+    func recordedShortcuts() -> [(CGKeyCode, CGEventFlags)] {
+        lock.withLock { shortcuts }
+    }
+
+    func recordedPerformedActions() -> [(String, FileDialogAXElement)] {
+        lock.withLock { performedActions }
+    }
+
+    func setElementPID(_ element: FileDialogAXElement, pid: pid_t) {
+        lock.withLock { elementPIDs[element] = pid }
+    }
+
+    func setActive(_ active: Bool, pid: pid_t) {
+        lock.withLock {
+            if active { activePIDs.insert(pid) }
+            else { activePIDs.remove(pid) }
+        }
+    }
+
+    func configureService(pid: pid_t, windows: [FileDialogAXElement]) {
+        lock.withLock {
+            let appEl = FileDialogAXElement.mock("service-\(pid)")
+            appElements[pid] = appEl
+            bundleIDs[pid] = "com.apple.appkit.xpc.openAndSavePanelService"
+            windowsByPID[pid] = windows
+            focusedWindowByPID[pid] = windows.first
         }
     }
 
@@ -9301,7 +9693,14 @@ final class SmokeFileDialogAXAdapter: FileDialogAXAdapter, @unchecked Sendable {
         }
     }
 
-    func performAction(_ action: String, on element: FileDialogAXElement) -> Bool { true }
+    func performAction(_ action: String, on element: FileDialogAXElement) -> Bool {
+        let callback = lock.withLock { () -> ((String, FileDialogAXElement) -> Void)? in
+            performedActions.append((action, element))
+            return onPerformAction
+        }
+        callback?(action, element)
+        return true
+    }
 
     func postKeyboardShortcut(keyCode: CGKeyCode, flags: CGEventFlags) -> Bool {
         let callback = lock.withLock { () -> ((CGKeyCode, CGEventFlags) -> Void)? in
@@ -9354,6 +9753,11 @@ private final class SmokeLoopbackHTTPServer: @unchecked Sendable {
     let port: UInt16
     private let stopLock = NSLock()
     private var stopped = false
+    private var userMessages: [String] = []
+
+    func recordedUserMessages() -> [String] {
+        stopLock.withLock { userMessages }
+    }
 
     init(replyText: String) throws {
         let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
@@ -9420,6 +9824,14 @@ private final class SmokeLoopbackHTTPServer: @unchecked Sendable {
                         expectedTotal = headerRange.upperBound + contentLength
                     }
                     if let expectedTotal, received.count >= expectedTotal { break }
+                }
+                if let headerRange = received.range(of: Data("\r\n\r\n".utf8)) {
+                    let bodyData = received[headerRange.upperBound...]
+                    if let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any],
+                       let messages = json["messages"] as? [[String: Any]],
+                       let userMessage = messages.last(where: { ($0["role"] as? String) == "user" })?["content"] as? String {
+                        self.stopLock.withLock { self.userMessages.append(userMessage) }
+                    }
                 }
                 responseData.withUnsafeBytes { raw in
                     guard let base = raw.baseAddress else { return }

@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Surfire/Lumen/releases/tag/v0.6.5"><img src="https://img.shields.io/badge/Release-v0.6.5_(Build_43)-e11d48?style=flat-square" alt="Release v0.6.5"></a>
+  <a href="https://github.com/Surfire/Lumen/releases/tag/v0.6.6"><img src="https://img.shields.io/badge/Release-v0.6.6_(Build_44)-e11d48?style=flat-square" alt="Release v0.6.6"></a>
   <a href="https://github.com/Surfire/Lumen/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Surfire/Lumen/ci.yml?branch=main&style=flat-square&label=CI" alt="CI Status"></a>
   <img src="https://img.shields.io/badge/Platform-Apple_Silicon_%7C_macOS_14%2B-1e293b?style=flat-square" alt="Platform">
   <img src="https://img.shields.io/badge/Engine-Rust_%2B_AppKit%2FSwiftUI-0f172a?style=flat-square" alt="Stack">
@@ -39,7 +39,7 @@
 | `Q4 plan pdf` | Multi-keyword search filtered by real extension; wrap `"exact phrases"` in quotes |
 | `xiangmu` / `xm` | Built-in Chinese pinyin or initials matching (`项目计划`), plus app abbreviations like `vsc` or `wx` |
 | `cat` / `img sailboat` | Instant visual image recall from the main bar or explicit `img` multimodal search—100% offline |
-| `Bluetooth` / `25 km in mi` | Jump straight to System Settings or evaluate live math and unit conversions |
+| `Bluetooth` / `$100 to cny` / `ephemeral` | Open System Settings, evaluate cached FX/unit math locally, or view prefix-free Dictionary definitions |
 | `?` / `win` | Browse built-in commands & orientation-aware window tiling with one-click batch restore |
 | `cb` | Opt-in private clipboard history with instant previews for images, code files, URLs, and colors |
 | `tr:zh Meeting postponed` | Streaming inline translation (`Return` copies; works with local oMLX / Ollama or OpenAI APIs) |
@@ -71,6 +71,7 @@
 ### 5. Built-In Native Toolkit
 - **Orientation-Aware Window Tiling (`win`)**: Adapts layouts to landscape, portrait, and ultrawide displays. If an app enforces a large minimum window width or height, Lumen automatically reflows neighboring windows so nothing overlaps, and restores your original layout in one click.
 - **Clipboard History, Streaming AI & Auto-Updates**: Includes an opt-in private clipboard manager (`cb`) that ignores password managers, streaming translation and Q&A (`tr` / `qa`), custom quicklinks, local scripts, Apple Shortcuts, and verified 24-hour auto-updates with automatic rollback protection.
+- **`⌘Space` Replacement & Everyday Spotlight Sources**: Bind `⌘Space` directly once Spotlight is disabled in System Settings, alongside prefix-free macOS Dictionary cards, 0 ms daily cached currency conversions, multi-browser local bookmarks (Chrome/Safari/Arc/Edge/Brave), and strictly opt-in Contacts, Calendar (one-click meeting join), and Reminders search.
 
 ---
 

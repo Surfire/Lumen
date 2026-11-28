@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Surfire/Lumen/releases/tag/v0.6.5"><img src="https://img.shields.io/badge/Release-v0.6.5_(Build_43)-e11d48?style=flat-square" alt="Release v0.6.5"></a>
+  <a href="https://github.com/Surfire/Lumen/releases/tag/v0.6.6"><img src="https://img.shields.io/badge/Release-v0.6.6_(Build_44)-e11d48?style=flat-square" alt="Release v0.6.6"></a>
   <a href="https://github.com/Surfire/Lumen/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Surfire/Lumen/ci.yml?branch=main&style=flat-square&label=CI" alt="CI Status"></a>
   <img src="https://img.shields.io/badge/Platform-Apple_Silicon_%7C_macOS_14%2B-1e293b?style=flat-square" alt="Platform">
   <img src="https://img.shields.io/badge/Engine-Rust_%2B_AppKit%2FSwiftUI-0f172a?style=flat-square" alt="Stack">
@@ -39,7 +39,7 @@
 | `年报 复盘 pdf` | 多关键词同框秒查 + 真实扩展名过滤；支持双引号 `"精确短语"` |
 | `xiangmu` / `xm` | 中文全拼或首字母直接定位「项目计划」等文件与目录；同样支持 `vsc`、`wx` 等应用缩写 |
 | `猫` / `img 帆船` | 主框直接召回高相关本地图片，或用 `img` 显式跨模态搜图与文档，全程离线零上传 |
-| `蓝牙` / `25 km in mi` | 无需等待索引，直接打开系统设置或实时计算数学表达式与单位换算 |
+| `蓝牙` / `$100 to cny` / `ephemeral` | 无需等待索引，直接打开系统设置、本地缓存计算汇率/单位换算或无前缀直查系统词典 |
 | `?` / `win` | 浏览内置指令与自适应窗口分屏（横竖屏智能布局、防重叠重排、一键批量恢复） |
 | `cb` | 私密剪贴板历史，方向键选中即可预览图片、代码文件、链接与色值 |
 | `tr:en 会议改期了` | 输入框内流式翻译，回车一键复制结果（支持本机 oMLX / Ollama 与 OpenAI 兼容服务） |
@@ -71,6 +71,7 @@
 ### 5. 开箱即用的 macOS 原生效率套件
 - **横竖屏自适应分屏（`win`）**：横屏主副分栏、竖屏上中下三分屏、超宽屏多列网格一键切换；遇到有最小尺寸限制的应用窗口自动二次重排（Reflow），不重叠、不留缝，并支持一键恢复分屏前布局。
 - **私密剪贴板、流式翻译与自动更新**：包含默认关闭且自动过滤密码管理器的富媒体剪贴板（`cb`）、流式翻译与问答（`tr` / `qa`）、自定义快捷链接、本地脚本 / Apple 快捷指令，以及带签名校验与回滚保护的 24 小时自动更新检查。
+- **`⌘Space` 接管聚焦与 Spotlight 对齐日常来源**：停用系统聚焦快捷键后可直接绑定 `⌘Space` 唤出 Lumen；同时支持无前缀系统词典直显、0ms 本地缓存汇率换算、Chrome/Safari/Arc/Edge 等本地浏览器书签搜索，以及默认关闭按需授权的通讯录、日历（一键入会）与提醒事项（一键完成）。
 
 ---
 

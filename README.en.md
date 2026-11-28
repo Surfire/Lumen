@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Surfire/Lumen/releases/tag/v0.6.3"><img src="https://img.shields.io/badge/Release-v0.6.3_(Build_41)-e11d48?style=flat-square" alt="Release v0.6.3"></a>
+  <a href="https://github.com/Surfire/Lumen/releases/tag/v0.6.4"><img src="https://img.shields.io/badge/Release-v0.6.4_(Build_42)-e11d48?style=flat-square" alt="Release v0.6.4"></a>
   <a href="https://github.com/Surfire/Lumen/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Surfire/Lumen/ci.yml?branch=main&style=flat-square&label=CI" alt="CI Status"></a>
   <img src="https://img.shields.io/badge/Platform-Apple_Silicon_%7C_macOS_14%2B-1e293b?style=flat-square" alt="Platform">
   <img src="https://img.shields.io/badge/Engine-Rust_%2B_AppKit%2FSwiftUI-0f172a?style=flat-square" alt="Stack">

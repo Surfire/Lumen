@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Surfire/Lumen/releases/tag/v0.6.6"><img src="https://img.shields.io/badge/Release-v0.6.6_(Build_44)-e11d48?style=flat-square" alt="Release v0.6.6"></a>
+  <a href="https://github.com/Surfire/Lumen/releases/tag/v0.7.0"><img src="https://img.shields.io/badge/Release-v0.7.0_(Build_45)-e11d48?style=flat-square" alt="Release v0.7.0"></a>
   <a href="https://github.com/Surfire/Lumen/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Surfire/Lumen/ci.yml?branch=main&style=flat-square&label=CI" alt="CI Status"></a>
   <img src="https://img.shields.io/badge/Platform-Apple_Silicon_%7C_macOS_14%2B-1e293b?style=flat-square" alt="Platform">
   <img src="https://img.shields.io/badge/Engine-Rust_%2B_AppKit%2FSwiftUI-0f172a?style=flat-square" alt="Stack">
@@ -44,6 +44,10 @@
 | `cb` | Opt-in private clipboard history with instant previews for images, code files, URLs, and colors |
 | `tr:zh Meeting postponed` | Streaming inline translation (`Return` copies; works with local oMLX / Ollama or OpenAI APIs) |
 | `qa How to structure a review?` | Prompt-only local or custom AI Q&A; press `Esc` anytime with zero background file or web scraping |
+| Summon inside Open/Save dialog | **Quick Switch** surfaces active Finder windows & whole-disk search to jump dialog paths cleanly |
+| Folder `Tab` / `kh quote` | Multi-level folder scoping (space-safe) & project aliases; `⌘K` copies files, opens Terminal, or Open With |
+| Select text & type `tr` / `qa` | Auto-attaches selection/Finder files/clipboard (`⌘↵` replaces text; `⌘⇧⌫` clears context anytime) |
+| `sig` / `ribao` (Snippet alias) | Dedicated snippet library expands `{{date}}` / `{{time}}` / `{{clipboard}}` and pastes instantly |
 
 ---
 
@@ -69,9 +73,9 @@
 - **Clean External Drive & SMB / NFS Support**: Manages physical USB/Thunderbolt drives separately from mounted SMB, NFS, AFP, and WebDAV network shares—never storing server credentials on disk.
 
 ### 5. Built-In Native Toolkit
-- **Orientation-Aware Window Tiling (`win`)**: Adapts layouts to landscape, portrait, and ultrawide displays. If an app enforces a large minimum window width or height, Lumen automatically reflows neighboring windows so nothing overlaps, and restores your original layout in one click.
-- **Clipboard History, Streaming AI & Auto-Updates**: Includes an opt-in private clipboard manager (`cb`) that ignores password managers, streaming translation and Q&A (`tr` / `qa`), custom quicklinks, local scripts, Apple Shortcuts, and verified 24-hour auto-updates with automatic rollback protection.
-- **`⌘Space` Replacement & Everyday Spotlight Sources**: Bind `⌘Space` directly once Spotlight is disabled in System Settings, alongside prefix-free macOS Dictionary cards, 0 ms daily cached currency conversions, multi-browser local bookmarks (Chrome/Safari/Arc/Edge/Brave), and strictly opt-in Contacts, Calendar (one-click meeting join), and Reminders search.
+- **Dialog Quick Switch, `Tab` Folder Scoping & `⌘K` File Actions**: Summon Lumen inside any app's Open/Save dialog to jump straight to open Finder folders or any searched folder without touching the clipboard or overwriting Save-As filenames. Press **`Tab`** on any folder to drill into space-safe breadcrumb scopes (`Backspace` pops, `Esc` clears), bind short project aliases (`kh quote`), and use `⌘K` to **copy actual file objects** (strict `SF_DATALESS` safe), **Open in Terminal**, or **Open With**.
+- **Selection / Clipboard Context Pass-Through & Dedicated Snippets**: On summon, Lumen optionally captures frontmost selected text, Finder selections, or non-sensitive clipboard text (strictly skipping `AXSecureTextField` and password-manager markers) for `tr` (**`⌘↵` replace in place**), `qa` (**`⌘⇧⌫` strip context anytime**), quicklinks, and scripts. **Settings → Snippets** stores permanent templates with `{{date}}` / `{{time}}` / `{{datetime}}` / `{{clipboard}}` safely outside clipboard history eviction.
+- **Adaptive Tiling (`win`), Clipboard & Everyday Sources**: Includes orientation-aware window tiling with reflow and batch restore, opt-in clipboard history (`cb`), `⌘Space` takeover once OS Spotlight is disabled, prefix-free macOS Dictionary, 0 ms cached FX conversions, multi-browser bookmarks, opt-in Contacts/Calendar/Reminders, and signed auto-updates with rollback.
 
 ---
 
@@ -141,10 +145,10 @@
 | **Local AI & Office Search** | **Free built-in** PDF / modern & legacy Office / subtitles + **Gemma 2 / local oMLX & Ollama** | Keywords & metadata only | Cloud / paid Pro AI | Paid Powerpack + plugins | Free filename search; content/image search is **paid Pro** | **Free open-source** local multimodal search |
 | **Matched PDF Page Preview** | **Jumps straight to matched page + amber highlights** | Opens file or basic preview | Standard Quick Look / extensions | Standard Quick Look | Path locator & basic preview | Passage snippets & chunk citations |
 | **Cloud Safety & NAS** | **Strict zero auto-download guard** + USB & SMB/NFS shares | OS default provider policy | Follows Spotlight / Finder | Follows Spotlight / scripts | Avoids downloading cloud placeholders | Local & selected folders |
-| **Tiling, Clipboard & Suite** | **Reflow window tiling**, rich clipboard, `tr`/`qa`, scripts/Shortcuts | Basic calc & suggestions | **Top strength**: 1,000+ community extensions | **Strength**: Powerpack Workflows | File finding only (no tiling/clipboard) | Deep retrieval only (no launcher suite) |
+| **Quick Switch, Snippets & Tiling** | **Open/Save Quick Switch, `Tab` folder scope, selection pass-through, dedicated Snippets**, reflow tiling, clipboard, `tr`/`qa` | Basic calc & suggestions | **Top strength**: 1,000+ community extensions | **Strength**: Powerpack Workflows | File finding only (no tiling/clipboard) | Deep retrieval only (no launcher suite) |
 | **License & Price** | **100% Free MIT Open Source** | Proprietary macOS | Free core; paid Pro tiers | Free core; paid Powerpack | Filename MIT; Pro closed/paid | **Free Open Source** |
 
-- **Pick Lumen** if you want a 100% open-source native macOS launcher that replaces Spotlight lag with ~1 ms whole-disk search, Chinese pinyin, matched-page PDF highlighting, free offline AI & Office retrieval, cloud/NAS safety, and smart window tiling.
+- **Pick Lumen** if you want a 100% open-source native macOS launcher that replaces Spotlight lag with ~1 ms whole-disk search, Chinese pinyin, matched-page PDF highlighting, Open/Save Quick Switch, selection pass-through & Snippets, free offline AI & Office retrieval, cloud/NAS safety, and smart window tiling.
 - **Pick Raycast / Alfred** if your daily workflow relies heavily on third-party SaaS extension ecosystems (Linear, Notion, Jira, Figma).
 - **Pick Oil Find / DigUp** if you strictly need a minimal file-only locator (Oil Find) or a dedicated deep-parsing research tool (DigUp).
 

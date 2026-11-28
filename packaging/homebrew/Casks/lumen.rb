@@ -1,6 +1,6 @@
 cask "lumen" do
   # Release template: replace version and sha256 from lumen-update.json / SHA256SUMS.txt before publishing.
-  version "0.6.6"
+  version "0.7.0"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
 
   url "https://github.com/Surfire/Lumen/releases/download/v#{version}/Lumen-macos-arm64.zip"

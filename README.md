@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Surfire/Lumen/releases/tag/v0.6.6"><img src="https://img.shields.io/badge/Release-v0.6.6_(Build_44)-e11d48?style=flat-square" alt="Release v0.6.6"></a>
+  <a href="https://github.com/Surfire/Lumen/releases/tag/v0.7.0"><img src="https://img.shields.io/badge/Release-v0.7.0_(Build_45)-e11d48?style=flat-square" alt="Release v0.7.0"></a>
   <a href="https://github.com/Surfire/Lumen/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Surfire/Lumen/ci.yml?branch=main&style=flat-square&label=CI" alt="CI Status"></a>
   <img src="https://img.shields.io/badge/Platform-Apple_Silicon_%7C_macOS_14%2B-1e293b?style=flat-square" alt="Platform">
   <img src="https://img.shields.io/badge/Engine-Rust_%2B_AppKit%2FSwiftUI-0f172a?style=flat-square" alt="Stack">
@@ -44,6 +44,10 @@
 | `cb` | 私密剪贴板历史，方向键选中即可预览图片、代码文件、链接与色值 |
 | `tr:en 会议改期了` | 输入框内流式翻译，回车一键复制结果（支持本机 oMLX / Ollama 与 OpenAI 兼容服务） |
 | `qa 如何整理周报结构` | 本地或自定义大模型即时问答，按 `Esc` 随时取消，绝不后台抓取或上传本地文件 |
+| 打开/保存弹窗内呼出 | **Quick Switch** 置顶当前访达窗口目录，全盘搜目录/文件回车直切弹窗路径（零剪贴板污染） |
+| 文件夹 `Tab` / `kh 报价` | 多层目录作用域下钻（兼容含空格路径）与项目别名限定检索；`⌘K` 支持复制文件、终端打开与打开方式 |
+| 划词/复制后直敲 `tr` / `qa` | 自动带入选中文本/文件或剪贴板上下文，`⌘↵` 替换原文，`⌘⇧⌫` 随时一键剥离上下文 |
+| `sig` / `ribao`（短语别名） | 独立短语库永久保存，自动展开 `{{date}}` / `{{time}}` / `{{clipboard}}` 并一键粘贴 |
 
 ---
 
@@ -69,9 +73,10 @@
 - **移动硬盘与 SMB / NFS 共享原生支持**：清晰区分物理外置移动硬盘与挂载的 NAS 网络共享（SMB / NFS / AFP / WebDAV），绝不在本地落盘保存服务器账号密码。
 
 ### 5. 开箱即用的 macOS 原生效率套件
-- **横竖屏自适应分屏（`win`）**：横屏主副分栏、竖屏上中下三分屏、超宽屏多列网格一键切换；遇到有最小尺寸限制的应用窗口自动二次重排（Reflow），不重叠、不留缝，并支持一键恢复分屏前布局。
-- **私密剪贴板、流式翻译与自动更新**：包含默认关闭且自动过滤密码管理器的富媒体剪贴板（`cb`）、流式翻译与问答（`tr` / `qa`）、自定义快捷链接、本地脚本 / Apple 快捷指令，以及带签名校验与回滚保护的 24 小时自动更新检查。
-- **`⌘Space` 接管聚焦与 Spotlight 对齐日常来源**：停用系统聚焦快捷键后可直接绑定 `⌘Space` 唤出 Lumen；同时支持无前缀系统词典直显、0ms 本地缓存汇率换算、Chrome/Safari/Arc/Edge 等本地浏览器书签搜索，以及默认关闭按需授权的通讯录、日历（一键入会）与提醒事项（一键完成）。
+- **文件弹窗秒切与目录工作流（Quick Switch + `Tab` + `⌘K`）**：在任意应用的「打开 / 保存」弹窗中呼出 Lumen，可一键切换至当前访达窗口目录或全盘模糊搜目录直达（不覆盖保存文件名、不污染剪贴板）；浏览文件夹时按 **`Tab`** 多层下钻（兼容含空格路径）或用项目别名（`kh 报价`）限定搜索，`⌘K` 补齐**复制文件实体、在终端中打开、打开方式与所在目录搜索**。
+- **划词 / 选文件直通与独立常用短语库**：呼出瞬间按需抓取选中文字、访达选中文件或剪贴板文本（严守密码框与密码管理器隐私隔离），直接透传给 `tr`（支持 **`⌘↵` 替换原文**）、`qa`（支持 **`⌘⇧⌫` 一键剥离上下文**）、网页搜索与脚本；「设置 → 常用短语」提供独立持久化短语库，支持动态变量（`{{date}}`、`{{time}}`、`{{datetime}}`、`{{clipboard}}`）且永不被剪贴板历史冲掉。
+- **横竖屏自适应分屏（`win`）与日常系统套件**：支持横竖屏智能布局、防重叠重排与一键恢复；内置私密剪贴板（`cb`）、无前缀系统词典直显、0ms 缓存汇率换算、多浏览器本地书签检索、按需授权的通讯录/日历（一键入会）/提醒事项，以及带签名校验与回滚保护的 24 小时自动更新检查。
+- **`⌘Space` 接管系统聚焦**：停用系统聚焦快捷键后可直接绑定 `⌘Space` 唤出 Lumen。
 
 ---
 
@@ -141,10 +146,10 @@
 | **本地 AI 与文档检索** | **免费内置** PDF / 新老 Office / 字幕全文 + **Gemma 2 / 本地 oMLX & Ollama** | 仅关键词，无本地向量模型 | 官方 AI 需云端 Pro 订阅 | 需付费 Powerpack + 插件 | 文件名免费；正文/搜图需 **付费 Pro** | **免费开源**本地多模态深搜 |
 | **PDF 原页高亮预览** | **直接定位命中页 + 琥珀色段落高亮** | 仅打开文件或基础预览 | 标准 Quick Look / 插件预览 | 标准 Quick Look 预览 | 侧重路径定位与常规预览 | 展示文档切片段落定位 |
 | **云盘防误下载与 NAS** | **严格零误下载保护** + 外置盘与 SMB/NFS 支持 | 依赖系统云盘默认策略 | 跟随 Spotlight 与 Finder | 跟随 Spotlight 与脚本 | 识别云端占位文件防误触 | 面向用户选定的本地目录 |
-| **分屏、剪贴板与工具箱** | **自适应防重叠分屏**、私密剪贴板、`tr`/`qa`、脚本 | 仅基础计算与系统建议 | **强项**：海量第三方插件商店 | **强项**：成熟 Workflows 生态 | 专注找文件，无分屏/剪贴板 | 专注内容深搜，无启动器套件 |
+| **分屏、弹窗切换与效率套件** | **文件弹窗 Quick Switch、`Tab` 作用域、划词直通、常用短语库**、自适应防重叠分屏、私密剪贴板、`tr`/`qa` | 仅基础计算与系统建议 | **强项**：海量第三方插件商店 | **强项**：成熟 Workflows 生态 | 专注找文件，无分屏/剪贴板 | 专注内容深搜，无启动器套件 |
 | **开源与费用** | **MIT 100% 免费开源** | 闭源系统组件 | 基础免费；AI 与高级功能订阅 | 基础免费；Powerpack 付费 | 文件名开源；Pro 版闭源付费 | **免费开源** |
 
-- **什么时候选 Lumen？**：想要彻底摆脱 Spotlight 延迟和中文漏搜，在一个 **纯开源、零云端上传、轻量原生** 的应用里同时获得 **“百万文件毫秒搜索 + PDF 原页高亮 + 免费离线 AI 搜文档/搜图 + 智能分屏与剪贴板”**。
+- **什么时候选 Lumen？**：想要彻底摆脱 Spotlight 延迟和中文漏搜，在一个 **纯开源、零云端上传、轻量原生** 的应用里同时获得 **“百万文件毫秒搜索 + PDF 原页高亮 + 文件弹窗 Quick Switch + 划词直通与短语模板 + 免费离线 AI 搜文档/搜图 + 智能分屏”**。
 - **什么时候选 Raycast / Alfred？**：你的日常工作重度依赖 Jira、Linear、Notion、Figma 等数百个第三方 SaaS 插件生态。
 - **什么时候选 Oil Find / DigUp？**：你只需要一个纯粹极简的文件名查找器（Oil Find），或专门研究文档多模态深度解析（DigUp）。
 

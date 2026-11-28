@@ -5,6 +5,85 @@ import ImageIO
 import SQLite3
 import UniformTypeIdentifiers
 
+enum ClipboardTemplateExpander: Sendable {
+    static let maximumClipboardBytes = 16 * 1024
+    private static let tokens = ["{{date}}", "{{time}}", "{{datetime}}", "{{clipboard}}"]
+    private static let posixLocale = Locale(identifier: "en_US_POSIX")
+    private static let gregorianCalendar = Calendar(identifier: .gregorian)
+
+    static func containsVariables(_ text: String) -> Bool {
+        guard text.contains("{{") else { return false }
+        return tokens.contains { text.contains($0) }
+    }
+
+    static func expand(_ template: String, clipboardText: String? = nil, now: Date = .now,
+                       timeZone: TimeZone = .current) -> String {
+        guard template.contains("{{") else { return template }
+        var output = ""
+        output.reserveCapacity(template.count)
+
+        var dateValue: String?
+        var timeValue: String?
+        var dateTimeValue: String?
+        var clipboardValue: String?
+
+        func formatted(_ format: String) -> String {
+            let formatter = DateFormatter()
+            formatter.calendar = gregorianCalendar
+            formatter.locale = posixLocale
+            formatter.timeZone = timeZone
+            formatter.dateFormat = format
+            return formatter.string(from: now)
+        }
+
+        var index = template.startIndex
+        while index < template.endIndex {
+            if template[index] == "{", template[index...].hasPrefix("{{") {
+                let slice = template[index...]
+                if slice.hasPrefix("{{date}}") {
+                    let value = dateValue ?? formatted("yyyy-MM-dd")
+                    dateValue = value
+                    output.append(value)
+                    index = template.index(index, offsetBy: "{{date}}".count)
+                    continue
+                }
+                if slice.hasPrefix("{{time}}") {
+                    let value = timeValue ?? formatted("HH:mm")
+                    timeValue = value
+                    output.append(value)
+                    index = template.index(index, offsetBy: "{{time}}".count)
+                    continue
+                }
+                if slice.hasPrefix("{{datetime}}") {
+                    let value = dateTimeValue ?? formatted("yyyy-MM-dd HH:mm")
+                    dateTimeValue = value
+                    output.append(value)
+                    index = template.index(index, offsetBy: "{{datetime}}".count)
+                    continue
+                }
+                if slice.hasPrefix("{{clipboard}}") {
+                    let value = clipboardValue ?? Self.cappedUTF8(clipboardText ?? "", maxBytes: maximumClipboardBytes)
+                    clipboardValue = value
+                    output.append(value)
+                    index = template.index(index, offsetBy: "{{clipboard}}".count)
+                    continue
+                }
+            }
+            output.append(template[index])
+            index = template.index(after: index)
+        }
+        return output
+    }
+
+    private static func cappedUTF8(_ value: String, maxBytes: Int) -> String {
+        let utf8 = value.utf8
+        guard utf8.count > maxBytes else { return value }
+        var end = utf8.index(utf8.startIndex, offsetBy: maxBytes, limitedBy: utf8.endIndex) ?? utf8.endIndex
+        while end != utf8.endIndex, utf8[end] & 0xc0 == 0x80 { utf8.formIndex(before: &end) }
+        return String(decoding: utf8[..<end], as: UTF8.self)
+    }
+}
+
 struct ClipboardItem: Identifiable, Equatable, Sendable {
     let id: Int64
     let text: String?    // nil for images; image bytes are read only when needed
@@ -14,9 +93,11 @@ struct ClipboardItem: Identifiable, Equatable, Sendable {
     let pinned: Bool
     /// Absolute path of a copied file reference; its bytes are never stored.
     let filePath: String?
+    let alias: String?
 
     var isFile: Bool { filePath != nil }
     var isImage: Bool { text == nil && filePath == nil }
+    var hasAlias: Bool { alias?.isEmpty == false }
 
     private struct SearchField: Equatable, Sendable {
         let bytes: [UInt8]
@@ -177,7 +258,7 @@ struct ClipboardItem: Identifiable, Equatable, Sendable {
     private let searchableFields: [SearchField]
 
     init(id: Int64, text: String?, capturedAt: Date, sourceBundleID: String?, sourceAppName: String?, pinned: Bool,
-         filePath: String? = nil) {
+         filePath: String? = nil, alias: String? = nil) {
         self.id = id
         self.text = text
         self.capturedAt = capturedAt
@@ -185,12 +266,14 @@ struct ClipboardItem: Identifiable, Equatable, Sendable {
         self.sourceAppName = sourceAppName
         self.pinned = pinned
         self.filePath = filePath
+        let nonEmptyAlias = alias.flatMap { $0.isEmpty ? nil : $0 }
+        self.alias = nonEmptyAlias
         let fileFields = filePath.map { [($0 as NSString).lastPathComponent, $0] } ?? []
-        searchableFields = ([text, sourceAppName, sourceBundleID] + fileFields).compactMap { $0.map(SearchField.init) }
+        searchableFields = ([text, nonEmptyAlias, sourceAppName, sourceBundleID] + fileFields).compactMap { $0.map(SearchField.init) }
     }
 
     private init(id: Int64, text: String?, capturedAt: Date, sourceBundleID: String?, sourceAppName: String?,
-                 pinned: Bool, filePath: String?, searchableFields: [SearchField]) {
+                 pinned: Bool, filePath: String?, alias: String?, searchableFields: [SearchField]) {
         self.id = id
         self.text = text
         self.capturedAt = capturedAt
@@ -198,12 +281,19 @@ struct ClipboardItem: Identifiable, Equatable, Sendable {
         self.sourceAppName = sourceAppName
         self.pinned = pinned
         self.filePath = filePath
+        self.alias = alias
         self.searchableFields = searchableFields
     }
 
     func withPinned(_ pinned: Bool) -> ClipboardItem {
         ClipboardItem(id: id, text: text, capturedAt: capturedAt, sourceBundleID: sourceBundleID,
-                      sourceAppName: sourceAppName, pinned: pinned, filePath: filePath, searchableFields: searchableFields)
+                      sourceAppName: sourceAppName, pinned: pinned, filePath: filePath, alias: alias,
+                      searchableFields: searchableFields)
+    }
+
+    func withMetadata(pinned: Bool, alias: String?) -> ClipboardItem {
+        ClipboardItem(id: id, text: text, capturedAt: capturedAt, sourceBundleID: sourceBundleID,
+                      sourceAppName: sourceAppName, pinned: pinned, filePath: filePath, alias: alias)
     }
 
     private static func fold(_ value: String) -> String {
@@ -310,26 +400,64 @@ final class ClipboardStore: @unchecked Sendable {
         return isPrivate(url.path) || isPrivate(url.resolvingSymlinksInPath().path)
     }
 
-    func items() throws -> [ClipboardItem] {
-        typealias RawRow = (id: Int64, text: String?, capturedAt: Date, bundleID: String?, appName: String?, pinned: Bool, filePath: String?)
-        let rows: [RawRow] = try lock.withLock {
-            guard let db = try databaseLocked() else { return [] }
-            return try statement(db, """
-                SELECT id, text, captured, bundle_id, app_name, pinned, file_path FROM clips ORDER BY recency DESC
-                """) { row in
-                var records: [RawRow] = []
-                while try next(row) {
-                    records.append((sqlite3_column_int64(row, 0), text(row, 1),
-                                    Date(timeIntervalSince1970: sqlite3_column_double(row, 2)),
-                                    text(row, 3), text(row, 4), sqlite3_column_int(row, 5) != 0, text(row, 6)))
-                }
-                return records
+    static func normalizedAlias(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !trimmed.isEmpty, trimmed.count <= 32 else { return nil }
+        let hasForbidden = trimmed.unicodeScalars.contains {
+            CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0)
+        }
+        return hasForbidden ? nil : trimmed
+    }
+
+    private static func validatedOptionalAlias(_ raw: String?) -> (valid: Bool, value: String?) {
+        guard let raw else { return (true, nil) }
+        if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return (true, nil) }
+        guard let normalized = normalizedAlias(raw) else { return (false, nil) }
+        return (true, normalized)
+    }
+
+    private static func boundedText(_ value: String) -> String? {
+        let utf8 = value.utf8
+        var end = utf8.index(utf8.startIndex, offsetBy: maximumTextBytes, limitedBy: utf8.endIndex) ?? utf8.endIndex
+        // Back up at most three bytes to avoid truncating a UTF-8 scalar.
+        while end != utf8.endIndex, utf8[end] & 0xc0 == 0x80 { utf8.formIndex(before: &end) }
+        let bounded = String(decoding: utf8[..<end], as: UTF8.self)
+        return bounded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : bounded
+    }
+
+    private func selectItemsLocked(_ db: OpaquePointer, whereClause: String = "", orderBy: String) throws -> [ClipboardItem] {
+        typealias RawRow = (id: Int64, text: String?, capturedAt: Date, bundleID: String?, appName: String?,
+                            pinned: Bool, filePath: String?, alias: String?)
+        let sql = "SELECT id, text, captured, bundle_id, app_name, pinned, file_path, alias FROM clips \(whereClause) ORDER BY \(orderBy)"
+        let rows: [RawRow] = try statement(db, sql) { row in
+            var records: [RawRow] = []
+            while try next(row) {
+                records.append((sqlite3_column_int64(row, 0), text(row, 1),
+                                Date(timeIntervalSince1970: sqlite3_column_double(row, 2)),
+                                text(row, 3), text(row, 4), sqlite3_column_int(row, 5) != 0,
+                                text(row, 6), text(row, 7)))
             }
+            return records
         }
         return rows.map {
             ClipboardItem(id: $0.id, text: $0.text, capturedAt: $0.capturedAt,
                           sourceBundleID: $0.bundleID, sourceAppName: $0.appName, pinned: $0.pinned,
-                          filePath: $0.filePath)
+                          filePath: $0.filePath, alias: $0.alias)
+        }
+    }
+
+    func items() throws -> [ClipboardItem] {
+        try lock.withLock {
+            guard let db = try databaseLocked() else { return [] }
+            return try selectItemsLocked(db, orderBy: "recency DESC")
+        }
+    }
+
+    func templateItems() throws -> [ClipboardItem] {
+        try lock.withLock {
+            guard let db = try databaseLocked() else { return [] }
+            return try selectItemsLocked(db, whereClause: "WHERE alias IS NOT NULL AND alias != ''",
+                                         orderBy: "pinned DESC, recency DESC")
         }
     }
 
@@ -338,12 +466,7 @@ final class ClipboardStore: @unchecked Sendable {
     }
 
     func upsertText(_ value: String, capturedAt: Date, bundleID: String?, appName: String?) throws -> UpsertResult? {
-        let utf8 = value.utf8
-        var end = utf8.index(utf8.startIndex, offsetBy: Self.maximumTextBytes, limitedBy: utf8.endIndex) ?? utf8.endIndex
-        // Back up at most three bytes to avoid truncating a UTF-8 scalar.
-        while end != utf8.endIndex, utf8[end] & 0xc0 == 0x80 { utf8.formIndex(before: &end) }
-        let bounded = String(decoding: utf8[..<end], as: UTF8.self)
-        guard !bounded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        guard let bounded = Self.boundedText(value) else { return nil }
         return try upsert(text: bounded, image: nil, thumbnail: nil, filePath: nil, bytes: Data(bounded.utf8),
                           capturedAt: capturedAt, bundleID: bundleID, appName: appName)
     }
@@ -370,6 +493,12 @@ final class ClipboardStore: @unchecked Sendable {
                           capturedAt: capturedAt, bundleID: bundleID, appName: appName)
     }
 
+    private static func contentDigest(domainByte: UInt8, bytes: Data) -> Data {
+        var digest = Data([domainByte])
+        digest.append(contentsOf: SHA256.hash(data: bytes))
+        return digest
+    }
+
     private func upsert(text: String?, image: Data?, thumbnail: Data?, filePath: String?, bytes: Data,
                         capturedAt: Date, bundleID: String?, appName: String?) throws -> UpsertResult? {
         // Distinguish text, images and files even if their bytes match (domain byte 0 = text,
@@ -377,18 +506,18 @@ final class ClipboardStore: @unchecked Sendable {
         // immediately be evicted.
         let persistedTimestamp = capturedAt.timeIntervalSince1970
         let storedCapturedAt = Date(timeIntervalSince1970: persistedTimestamp)
-        var digest = Data([filePath != nil ? 2 : (image == nil ? 0 : 1)])
-        digest.append(contentsOf: SHA256.hash(data: bytes))
-        let committed: (id: Int64, pinned: Bool, evicted: Set<Int64>)? = try lock.withLock {
+        let digest = Self.contentDigest(domainByte: filePath != nil ? 2 : (image == nil ? 0 : 1), bytes: bytes)
+        let committed: (id: Int64, pinned: Bool, alias: String?, evicted: Set<Int64>)? = try lock.withLock {
             guard let db = try databaseLocked(create: true) else { throw StoreError.unavailable }
             return try transaction(db) {
                 let existing = try statement(db, """
-                    SELECT id, pinned, recency = (SELECT MAX(recency) FROM clips)
+                    SELECT id, pinned, alias, recency = (SELECT MAX(recency) FROM clips)
                     FROM clips WHERE digest = ? ORDER BY recency DESC LIMIT 1
-                    """) { row -> (id: Int64, pinned: Bool, newest: Bool)? in
+                    """) { row -> (id: Int64, pinned: Bool, alias: String?, newest: Bool)? in
                     try bind(digest, to: row, at: 1)
                     guard try next(row) else { return nil }
-                    return (sqlite3_column_int64(row, 0), sqlite3_column_int(row, 1) != 0, sqlite3_column_int(row, 2) != 0)
+                    return (sqlite3_column_int64(row, 0), sqlite3_column_int(row, 1) != 0,
+                            self.text(row, 2), sqlite3_column_int(row, 3) != 0)
                 }
                 if let existing {
                     guard !existing.newest else { return nil }
@@ -402,7 +531,7 @@ final class ClipboardStore: @unchecked Sendable {
                         try requireOK(sqlite3_bind_int64(row, 4, existing.id))
                         _ = try next(row)
                     }
-                    return (existing.id, existing.pinned, [])
+                    return (existing.id, existing.pinned, existing.alias, [])
                 }
                 try statement(db, """
                     INSERT INTO clips (text, image, thumbnail, captured, bundle_id, app_name, digest, file_path, recency)
@@ -423,13 +552,13 @@ final class ClipboardStore: @unchecked Sendable {
                 guard sqlite3_changes(db) != 0 else { return nil }
                 let id = sqlite3_last_insert_rowid(db)
                 let evicted = try pruneLocked(db, limit: limit)
-                return (id, false, evicted)
+                return (id, false, nil, evicted)
             }
         }
         guard let committed else { return nil }
         let item = ClipboardItem(id: committed.id, text: text, capturedAt: storedCapturedAt,
                                  sourceBundleID: bundleID, sourceAppName: appName, pinned: committed.pinned,
-                                 filePath: filePath)
+                                 filePath: filePath, alias: committed.alias)
         return UpsertResult(item: item, evictedIDs: committed.evicted)
     }
 
@@ -497,6 +626,173 @@ final class ClipboardStore: @unchecked Sendable {
                 let evicted = try pruneLocked(db, limit: limit)
                 return (pinned, evicted)
             }
+        }
+    }
+
+    func setTemplateMetadata(id: Int64, alias: String?, pinned: Bool) throws -> (pinned: Bool, alias: String?, evictedIDs: Set<Int64>)? {
+        let parsedAlias = Self.validatedOptionalAlias(alias)
+        guard parsedAlias.valid else { return nil }
+        let resolvedAlias = parsedAlias.value
+        return try lock.withLock {
+            guard let db = try databaseLocked() else { return nil }
+            return try transaction(db) {
+                let targetText = try statement(db, "SELECT text FROM clips WHERE id = ?1") { row -> (found: Bool, isText: Bool) in
+                    try requireOK(sqlite3_bind_int64(row, 1, id))
+                    guard try next(row) else { return (false, false) }
+                    return (true, text(row, 0) != nil)
+                }
+                guard targetText.found, (resolvedAlias == nil || targetText.isText) else { return nil }
+                if let resolvedAlias, try aliasExistsLocked(db, alias: resolvedAlias, excludingID: id) {
+                    return nil
+                }
+                try statement(db, "UPDATE clips SET alias = ?1, pinned = ?2 WHERE id = ?3") { row in
+                    try bind(resolvedAlias, to: row, at: 1)
+                    try requireOK(sqlite3_bind_int(row, 2, pinned ? 1 : 0))
+                    try requireOK(sqlite3_bind_int64(row, 3, id))
+                    _ = try next(row)
+                }
+                guard sqlite3_changes(db) != 0 else { return nil }
+                let evicted = try pruneLocked(db, limit: limit)
+                return (pinned, resolvedAlias, evicted)
+            }
+        }
+    }
+
+    func createTemplate(text: String, alias: String?, pinned: Bool, capturedAt: Date) throws -> UpsertResult? {
+        guard let bounded = Self.boundedText(text) else { return nil }
+        let parsedAlias = Self.validatedOptionalAlias(alias)
+        guard parsedAlias.valid else { return nil }
+        let resolvedAlias = parsedAlias.value
+        let persistedTimestamp = capturedAt.timeIntervalSince1970
+        let storedCapturedAt = Date(timeIntervalSince1970: persistedTimestamp)
+        let digest = Self.contentDigest(domainByte: 0, bytes: Data(bounded.utf8))
+        return try lock.withLock {
+            guard let db = try databaseLocked(create: true) else { throw StoreError.unavailable }
+            return try transaction(db) {
+                let existing = try statement(db, """
+                    SELECT id, bundle_id, app_name FROM clips WHERE digest = ?1 ORDER BY recency DESC LIMIT 1
+                    """) { row -> (id: Int64, bundleID: String?, appName: String?)? in
+                    try bind(digest, to: row, at: 1)
+                    guard try next(row) else { return nil }
+                    return (sqlite3_column_int64(row, 0), self.text(row, 1), self.text(row, 2))
+                }
+                if let resolvedAlias, try aliasExistsLocked(db, alias: resolvedAlias, excludingID: existing?.id) {
+                    return nil
+                }
+                if let existing {
+                    try statement(db, """
+                        UPDATE clips SET text = ?1, captured = ?2, pinned = ?3, alias = ?4,
+                            recency = COALESCE((SELECT MAX(recency) FROM clips), 0) + 1 WHERE id = ?5
+                        """) { row in
+                        try bind(bounded, to: row, at: 1)
+                        try requireOK(sqlite3_bind_double(row, 2, persistedTimestamp))
+                        try requireOK(sqlite3_bind_int(row, 3, pinned ? 1 : 0))
+                        try bind(resolvedAlias, to: row, at: 4)
+                        try requireOK(sqlite3_bind_int64(row, 5, existing.id))
+                        _ = try next(row)
+                    }
+                    let evicted = try pruneLocked(db, limit: limit)
+                    let item = ClipboardItem(id: existing.id, text: bounded, capturedAt: storedCapturedAt,
+                                             sourceBundleID: existing.bundleID, sourceAppName: existing.appName,
+                                             pinned: pinned, filePath: nil, alias: resolvedAlias)
+                    return UpsertResult(item: item, evictedIDs: evicted)
+                }
+                try statement(db, """
+                    INSERT INTO clips (text, image, thumbnail, captured, bundle_id, app_name, digest, file_path, alias, pinned, recency)
+                    SELECT ?1, NULL, NULL, ?2, NULL, NULL, ?3, NULL, ?4, ?5, COALESCE(MAX(recency), 0) + 1 FROM clips
+                    HAVING (?5 = 1 OR (SELECT COUNT(*) FROM clips WHERE pinned = 1) < ?6)
+                    """) { row in
+                    try bind(bounded, to: row, at: 1)
+                    try requireOK(sqlite3_bind_double(row, 2, persistedTimestamp))
+                    try bind(digest, to: row, at: 3)
+                    try bind(resolvedAlias, to: row, at: 4)
+                    try requireOK(sqlite3_bind_int(row, 5, pinned ? 1 : 0))
+                    try requireOK(sqlite3_bind_int64(row, 6, Int64(limit)))
+                    _ = try next(row)
+                }
+                guard sqlite3_changes(db) != 0 else { return nil }
+                let id = sqlite3_last_insert_rowid(db)
+                let evicted = try pruneLocked(db, limit: limit)
+                let item = ClipboardItem(id: id, text: bounded, capturedAt: storedCapturedAt,
+                                         sourceBundleID: nil, sourceAppName: nil,
+                                         pinned: pinned, filePath: nil, alias: resolvedAlias)
+                return UpsertResult(item: item, evictedIDs: evicted)
+            }
+        }
+    }
+
+    func updateTemplate(id: Int64, text: String, alias: String?, pinned: Bool) throws -> UpsertResult? {
+        guard let bounded = Self.boundedText(text) else { return nil }
+        let parsedAlias = Self.validatedOptionalAlias(alias)
+        guard parsedAlias.valid else { return nil }
+        let resolvedAlias = parsedAlias.value
+        let digest = Self.contentDigest(domainByte: 0, bytes: Data(bounded.utf8))
+        return try lock.withLock {
+            guard let db = try databaseLocked() else { return nil }
+            return try transaction(db) {
+                let existing = try statement(db, """
+                    SELECT text, captured, bundle_id, app_name, digest FROM clips WHERE id = ?1
+                    """) { row -> (capturedAt: Date, bundleID: String?, appName: String?, digest: Data?)? in
+                    try requireOK(sqlite3_bind_int64(row, 1, id))
+                    guard try next(row), self.text(row, 0) != nil else { return nil }
+                    return (Date(timeIntervalSince1970: sqlite3_column_double(row, 1)),
+                            self.text(row, 2), self.text(row, 3), self.data(row, 4))
+                }
+                guard let existing else { return nil }
+                if let resolvedAlias, try aliasExistsLocked(db, alias: resolvedAlias, excludingID: id) {
+                    return nil
+                }
+                var duplicateID: Int64?
+                if existing.digest != digest {
+                    let collision = try statement(db, """
+                        SELECT id, alias FROM clips WHERE digest = ?1 AND id != ?2 LIMIT 1
+                        """) { row -> (id: Int64, hasAlias: Bool)? in
+                        try bind(digest, to: row, at: 1)
+                        try requireOK(sqlite3_bind_int64(row, 2, id))
+                        guard try next(row) else { return nil }
+                        let existingAlias = self.text(row, 1)
+                        return (sqlite3_column_int64(row, 0), existingAlias?.isEmpty == false)
+                    }
+                    if let collision {
+                        guard !collision.hasAlias else { return nil }
+                        duplicateID = collision.id
+                    }
+                }
+                if let duplicateID {
+                    try updateLocked(duplicateID, "DELETE FROM clips WHERE id = ?")
+                }
+                try statement(db, """
+                    UPDATE clips SET text = ?1, digest = ?2, alias = ?3, pinned = ?4 WHERE id = ?5
+                    """) { row in
+                    try bind(bounded, to: row, at: 1)
+                    try bind(digest, to: row, at: 2)
+                    try bind(resolvedAlias, to: row, at: 3)
+                    try requireOK(sqlite3_bind_int(row, 4, pinned ? 1 : 0))
+                    try requireOK(sqlite3_bind_int64(row, 5, id))
+                    _ = try next(row)
+                }
+                guard sqlite3_changes(db) != 0 else { return nil }
+                var evicted = try pruneLocked(db, limit: limit)
+                if let duplicateID { evicted.insert(duplicateID) }
+                let item = ClipboardItem(id: id, text: bounded, capturedAt: existing.capturedAt,
+                                         sourceBundleID: existing.bundleID, sourceAppName: existing.appName,
+                                         pinned: pinned, filePath: nil, alias: resolvedAlias)
+                return UpsertResult(item: item, evictedIDs: evicted)
+            }
+        }
+    }
+
+    private func aliasExistsLocked(_ db: OpaquePointer, alias: String, excludingID: Int64?) throws -> Bool {
+        if let excludingID {
+            return try statement(db, "SELECT 1 FROM clips WHERE alias = ?1 AND id != ?2 LIMIT 1") { row in
+                try bind(alias, to: row, at: 1)
+                try requireOK(sqlite3_bind_int64(row, 2, excludingID))
+                return try next(row)
+            }
+        }
+        return try statement(db, "SELECT 1 FROM clips WHERE alias = ?1 LIMIT 1") { row in
+            try bind(alias, to: row, at: 1)
+            return try next(row)
         }
     }
 
@@ -620,6 +916,7 @@ final class ClipboardStore: @unchecked Sendable {
                 );
                 """)
             try addFilePathColumnIfNeeded(db)
+            try addAliasColumnIfNeeded(db)
             connection = db
             return db
         } catch {
@@ -630,13 +927,22 @@ final class ClipboardStore: @unchecked Sendable {
 
     // Idempotent: databases created before file clips lack the column.
     private func addFilePathColumnIfNeeded(_ db: OpaquePointer) throws {
+        try addColumnIfNeeded(db, named: "file_path", definition: "TEXT")
+    }
+
+    // Idempotent: databases created before templates lack the alias column.
+    private func addAliasColumnIfNeeded(_ db: OpaquePointer) throws {
+        try addColumnIfNeeded(db, named: "alias", definition: "TEXT")
+    }
+
+    private func addColumnIfNeeded(_ db: OpaquePointer, named column: String, definition: String) throws {
         let hasColumn = try statement(db, "PRAGMA table_info(clips)") { row in
             while try next(row) {
-                if text(row, 1) == "file_path" { return true }
+                if text(row, 1) == column { return true }
             }
             return false
         }
-        if !hasColumn { try execute(db, "ALTER TABLE clips ADD COLUMN file_path TEXT") }
+        if !hasColumn { try execute(db, "ALTER TABLE clips ADD COLUMN \(column) \(definition)") }
     }
 
     // Close the permission-setting descriptor before SQLite takes POSIX locks.

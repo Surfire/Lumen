@@ -15,12 +15,18 @@ struct ClipboardHistoryView: View {
     let openSettings: () -> Void
     /// Optional hook for opening a full-size preview of an image or file clip.
     var onOpenPreview: ((ClipboardItem) -> Void)? = nil
+    @State private var editorDraft: TemplateEditorDraft?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
+            HStack(spacing: 8) {
                 Label(t("剪贴板历史", "Clipboard History"), systemImage: "clipboard").font(.headline)
                 Spacer()
+                Button(t("+ 短语", "+ Snippet")) {
+                    openEditor(for: nil)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
                 if !clipboard.enabled && !commands.clipboardRows.isEmpty {
                     Button(t("开启剪贴板历史", "Enable Clipboard History")) {
                         clipboard.setEnabled(true)
@@ -59,13 +65,26 @@ struct ClipboardHistoryView: View {
                     Divider()
                     if let item = commands.selectedClipboardItem {
                         ClipboardItemPreview(item: item, clipboard: clipboard, chinese: chinese, copy: copy,
-                                             onOpenPreview: onOpenPreview)
+                                             onOpenPreview: onOpenPreview,
+                                             onEditTemplate: { openEditor(for: $0) })
                             .id(item.id)
                             .frame(width: 330)
                     }
                 }
             }
         }
+        .overlay {
+            if let draftBinding = Binding($editorDraft) {
+                ClipboardTemplateEditorOverlay(
+                    draft: draftBinding,
+                    clipboard: clipboard,
+                    chinese: chinese,
+                    onCancel: closeEditor,
+                    onSaved: closeEditor
+                )
+            }
+        }
+        .onDisappear { editorDraft = nil }
     }
 
     private var emptyMessage: String {
@@ -96,6 +115,10 @@ struct ClipboardHistoryView: View {
                                     .lineLimit(1)
                             }
                             Spacer(minLength: 0)
+                            if let alias = item.alias, !alias.isEmpty {
+                                ClipboardAliasBadge(alias: alias)
+                                    .layoutPriority(1)
+                            }
                             if item.pinned { Image(systemName: "pin.fill").foregroundStyle(.secondary) }
                         }
                         .padding(.horizontal, 8).frame(height: 34)
@@ -134,6 +157,220 @@ struct ClipboardHistoryView: View {
         if event?.type == .leftMouseUp, event?.clickCount == 2 { copy() }
     }
 
+    private func openEditor(for item: ClipboardItem?) {
+        // Keep Spacebar available for typing inside the inline editor instead of QuickLook.
+        NSApp.windows.compactMap { $0 as? SearchPanel }.forEach { $0.browsing = false }
+        if let item {
+            editorDraft = TemplateEditorDraft(
+                id: item.id,
+                alias: item.alias ?? "",
+                text: item.text ?? "",
+                pinned: item.pinned
+            )
+        } else {
+            editorDraft = TemplateEditorDraft(id: nil, alias: "", text: "", pinned: false)
+        }
+    }
+
+    private func closeEditor() {
+        editorDraft = nil
+        if let panel = NSApp.keyWindow as? SearchPanel, let field = panel.initialFirstResponder {
+            panel.makeFirstResponder(field)
+        }
+    }
+
+    private func t(_ zh: String, _ en: String) -> String { chinese ? zh : en }
+}
+
+private struct TemplateEditorDraft {
+    let id: Int64?
+    var alias: String
+    var text: String
+    var pinned: Bool
+    var errorMessage: String? = nil
+    var saving = false
+}
+
+private struct ClipboardAliasBadge: View {
+    let alias: String
+
+    var body: some View {
+        Text(verbatim: alias)
+            .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Color.primary.opacity(0.08), in: Capsule())
+    }
+}
+
+@MainActor
+private struct ClipboardTemplateEditorOverlay: View {
+    private static let placeholderTokens = ["{{date}}", "{{time}}", "{{datetime}}", "{{clipboard}}"]
+
+    @Binding var draft: TemplateEditorDraft
+    @ObservedObject var clipboard: ClipboardManager
+    let chinese: Bool
+    let onCancel: () -> Void
+    let onSaved: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.22)
+                .contentShape(Rectangle())
+                .onTapGesture {}
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text(draft.id == nil ? t("新建短语模板", "New Snippet Template") : t("编辑短语模板", "Edit Snippet Template"))
+                        .font(.headline)
+                    Spacer()
+                    Button(action: onCancel) {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel(t("关闭", "Close"))
+                }
+
+                HStack(spacing: 8) {
+                    Text(t("别名", "Alias"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 36, alignment: .leading)
+                    TextField(t("可选，例如 sig（1–32 字符，无空格）", "Optional, e.g. sig (1–32 chars, no spaces)"),
+                              text: $draft.alias)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12, design: .monospaced))
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 4) {
+                        Text(t("内容", "Content"))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 4)
+                        ForEach(Self.placeholderTokens, id: \.self) { token in
+                            Button(token) {
+                                draft.text.append(token)
+                                draft.errorMessage = nil
+                            }
+                            .buttonStyle(.borderless)
+                            .font(.system(size: 10, design: .monospaced))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(Color.primary.opacity(0.07), in: Capsule())
+                        }
+                    }
+                    ZStack(alignment: .topLeading) {
+                        TextEditor(text: $draft.text)
+                            .font(.system(size: 12.5))
+                            .scrollContentBackground(.hidden)
+                            .padding(4)
+                        if draft.text.isEmpty {
+                            Text(t("输入内容，可使用 {{date}}、{{time}}、{{datetime}}、{{clipboard}}",
+                                   "Enter text. Supports {{date}}, {{time}}, {{datetime}}, {{clipboard}}"))
+                                .font(.system(size: 12))
+                                .foregroundStyle(.tertiary)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 6)
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    .frame(height: 82)
+                    .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .strokeBorder(Color.primary.opacity(0.15), lineWidth: 1)
+                            .allowsHitTesting(false)
+                    )
+                }
+
+                if ClipboardTemplateExpander.containsVariables(draft.text) {
+                    let preview = ClipboardTemplateExpander.expand(
+                        draft.text,
+                        clipboardText: clipboard.currentPasteboardPreviewText()
+                    )
+                    HStack(spacing: 4) {
+                        Text(t("预览", "Preview"))
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Text(verbatim: preview.isEmpty ? t("（空）", "(empty)") : preview)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
+                }
+
+                Toggle(t("固定（防止被剪贴板历史挤出）", "Pin (keep from history eviction)"), isOn: $draft.pinned)
+                    .toggleStyle(.checkbox)
+                    .controlSize(.small)
+
+                if let errorMessage = draft.errorMessage {
+                    Text(verbatim: errorMessage)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .lineLimit(2)
+                }
+
+                HStack {
+                    Spacer()
+                    Button(t("取消", "Cancel"), action: onCancel)
+                        .controlSize(.small)
+                    Button(t("保存", "Save"), action: save)
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .disabled(draft.saving || draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .padding(14)
+            .frame(maxWidth: 540)
+            .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.14), lineWidth: 1)
+                    .allowsHitTesting(false)
+            )
+            .shadow(color: .black.opacity(0.24), radius: 14, y: 6)
+            .padding(12)
+        }
+    }
+
+    private func save() {
+        switch ClipboardManager.validateTemplate(text: draft.text, alias: draft.alias) {
+        case .emptyText:
+            draft.errorMessage = t("短语内容不能为空。", "Snippet content cannot be empty.")
+            return
+        case .invalidAlias:
+            draft.errorMessage = t("别名需为 1–32 个字符，且不能包含空格或控制字符。",
+                                   "Alias must be 1–32 characters with no spaces or control characters.")
+            return
+        case .reservedAlias(let verb):
+            draft.errorMessage = t("别名不能使用内置命令「\(verb)」。",
+                                   "Alias cannot use reserved command “\(verb)”.")
+            return
+        case .valid:
+            break
+        }
+        draft.errorMessage = nil
+        draft.saving = true
+        clipboard.saveTemplate(id: draft.id, text: draft.text, alias: draft.alias, pinned: draft.pinned) { success in
+            if success {
+                onSaved()
+            } else {
+                draft.saving = false
+                draft.errorMessage = t("无法保存模板，请检查别名是否已被其他短语占用。",
+                                       "Could not save template. The alias may already be in use.")
+            }
+        }
+    }
+
     private func t(_ zh: String, _ en: String) -> String { chinese ? zh : en }
 }
 
@@ -144,6 +381,7 @@ private struct ClipboardItemPreview: View {
     let chinese: Bool
     let copy: () -> Void
     var onOpenPreview: ((ClipboardItem) -> Void)? = nil
+    var onEditTemplate: ((ClipboardItem) -> Void)? = nil
     @State private var thumbnail: NSImage?
     @State private var loadingThumbnail = true
     @State private var imageCaption: String?
@@ -151,8 +389,11 @@ private struct ClipboardItemPreview: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
+            HStack(spacing: 6) {
                 Text(item.isFile ? t("文件", "File") : (item.isImage ? t("图片", "Image") : t("文本", "Text"))).font(.headline)
+                if let alias = item.alias, !alias.isEmpty {
+                    ClipboardAliasBadge(alias: alias)
+                }
                 Spacer()
                 Text(item.capturedAt, format: .dateTime.month().day().hour().minute())
                     .font(.caption).foregroundStyle(.secondary)
@@ -195,8 +436,13 @@ private struct ClipboardItemPreview: View {
                     }
                 }
             }
-            HStack {
+            HStack(spacing: 6) {
                 Button(t("复制", "Copy"), action: copy)
+                if item.text != nil, let onEditTemplate {
+                    Button(item.hasAlias ? t("编辑模板", "Edit Template") : t("模板", "Template")) {
+                        onEditTemplate(item)
+                    }
+                }
                 if item.text == nil, let onOpenPreview {
                     Button(t("预览", "Preview")) { onOpenPreview(item) }
                 }

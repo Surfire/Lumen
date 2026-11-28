@@ -1188,6 +1188,10 @@ pub fn status_with_scope(conn: &Connection, include_scope: bool) -> Result<serde
     Ok(report)
 }
 
+/// Report catalog status with local OpenAI semantic coverage.
+///
+/// Offline, missing-socket, or misconfigured endpoints degrade to read-only
+/// stored coverage or pending status without failing `lumen status`.
 pub fn status_with_local_openai(
     conn: &Connection,
     config: &LocalOpenAiConfig,

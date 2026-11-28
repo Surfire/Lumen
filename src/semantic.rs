@@ -15,7 +15,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 const CHUNK_CHARS: usize = 480;
@@ -184,10 +184,15 @@ fn parse_prefixed_model_dims(model_id: &str, prefix: &str) -> Option<usize> {
     (8..=4096).contains(&dims).then_some(dims)
 }
 
+const LOCAL_OPENAI_STATUS_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+
 pub(crate) fn resolve_stored_local_openai_model(
     conn: &Connection,
     model_name: &str,
 ) -> Result<Option<(String, usize)>> {
+    if crate::local_openai::sanitize_model_name(model_name).is_empty() {
+        return Ok(None);
+    }
     let prefix = canonical_model_prefix(model_name);
     let pending: Option<String> = conn
         .prepare_cached("SELECT value FROM info WHERE key='gemma_pending_model'")?
@@ -239,15 +244,16 @@ pub(crate) fn resolve_local_openai_target(
     conn: &Connection,
     config: &LocalOpenAiConfig,
 ) -> Result<Option<(String, usize)>> {
-    let worker = LocalOpenAiWorker::new(config)?;
-    ensure!(
-        !worker.model().is_empty(),
-        "local OpenAI embedding model must not be empty"
-    );
-    if let Some(stored) = resolve_stored_local_openai_model(conn, worker.model())? {
-        return Ok(Some(stored));
+    let model = config.model.trim();
+    if model.is_empty() {
+        return Ok(None);
     }
-    Ok(worker.probe().ok())
+    if let Ok(worker) = LocalOpenAiWorker::new(config)
+        && let Ok(live) = worker.probe_with_timeout(LOCAL_OPENAI_STATUS_PROBE_TIMEOUT)
+    {
+        return Ok(Some(live));
+    }
+    resolve_stored_local_openai_model(conn, model)
 }
 
 pub(crate) fn local_openai_status_coverage(
@@ -3350,6 +3356,261 @@ mod tests {
         drop(session);
         stop_server.store(true, Ordering::Release);
         server.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_openai_dimension_upgrade_and_offline_status_fallback() {
+        use std::{
+            io::{BufRead, BufReader, Read, Write},
+            net::TcpListener,
+            sync::{Arc, atomic::AtomicUsize},
+            thread,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "lumen-local-openai-dims-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let docs = root.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        let alpha = docs.join("alpha.txt");
+        let beta = docs.join("beta.txt");
+        fs::write(
+            &alpha,
+            "Solar photovoltaic array tilt calibration for seasonal maximum output.",
+        )
+        .unwrap();
+        fs::write(
+            &beta,
+            "Sourdough fermentation schedule with hydration ratios and cold proofing.",
+        )
+        .unwrap();
+        let database = root.join("lumen.sqlite");
+        let scope = Scope {
+            roots: vec![docs.clone()],
+            documents: true,
+            ..Scope::default()
+        };
+        crate::scan(&database, &scope).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop_server = Arc::new(AtomicBool::new(false));
+        let stop_flag = stop_server.clone();
+        let active_dims = Arc::new(AtomicUsize::new(16));
+        let server_dims = active_dims.clone();
+        let server = thread::spawn(move || {
+            while !stop_flag.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        let mut reader = BufReader::new(&mut stream);
+                        let mut req_line = String::new();
+                        if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                            continue;
+                        }
+                        let mut content_len = 0usize;
+                        loop {
+                            let mut line = String::new();
+                            reader.read_line(&mut line).unwrap();
+                            let trimmed = line.trim_end_matches(['\r', '\n']);
+                            if trimmed.is_empty() {
+                                break;
+                            }
+                            if let Some((k, v)) = trimmed.split_once(':')
+                                && k.trim().eq_ignore_ascii_case("content-length")
+                            {
+                                content_len = v.trim().parse().unwrap();
+                            }
+                        }
+                        let mut body = vec![0_u8; content_len];
+                        if content_len > 0 {
+                            reader.read_exact(&mut body).unwrap();
+                        }
+                        let _ = reader;
+                        let req: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let inputs = req["input"].as_array().unwrap();
+                        let dims = server_dims.load(Ordering::Acquire);
+                        let data: Vec<_> = inputs
+                            .iter()
+                            .enumerate()
+                            .map(|(i, value)| {
+                                let text = value.as_str().unwrap_or("");
+                                let mut v = vec![0.0_f32; dims];
+                                if text.contains("Solar") || text.contains("solar") {
+                                    v[0] = 1.0;
+                                } else {
+                                    v[1] = 1.0;
+                                }
+                                serde_json::json!({"index": i, "embedding": v})
+                            })
+                            .collect();
+                        let payload =
+                            serde_json::to_string(&serde_json::json!({"data": data})).unwrap();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                            payload.len(),
+                            payload
+                        );
+                        stream.write_all(response.as_bytes()).unwrap();
+                        let _ = stream.flush();
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let config = LocalOpenAiConfig {
+            url: format!("http://127.0.0.1:{port}/v1"),
+            model: "embed-upgrade".into(),
+        };
+
+        // 1. Embed at 16d and verify status/search.
+        let batch_16 = embed_local_openai_batch(&database, &config, 10).unwrap();
+        assert_eq!(batch_16.new_embeddings, 2);
+        {
+            let conn = crate::open_read(&database).unwrap();
+            let status_16 = crate::status_with_local_openai(&conn, &config).unwrap();
+            assert_eq!(
+                status_16["local_openai"]["model_id"],
+                "openai-local:embed-upgrade@16"
+            );
+            assert_eq!(status_16["local_openai"]["dimensions"], 16);
+            assert_eq!(status_16["local_openai"]["coverage"]["embedded_chunks"], 2);
+            assert_eq!(status_16["local_openai"]["coverage"]["pending"], false);
+        }
+
+        // 2. Upgrade the SAME model name from 16d -> 24d: live probe MUST win over stored @16.
+        active_dims.store(24, Ordering::Release);
+        {
+            let conn = crate::open_read(&database).unwrap();
+            let status_24_before = crate::status_with_local_openai(&conn, &config).unwrap();
+            assert_eq!(
+                status_24_before["local_openai"]["model_id"],
+                "openai-local:embed-upgrade@24"
+            );
+            assert_eq!(status_24_before["local_openai"]["dimensions"], 24);
+            assert_eq!(
+                status_24_before["local_openai"]["coverage"]["embedded_chunks"],
+                0
+            );
+            assert_eq!(
+                status_24_before["local_openai"]["coverage"]["pending"],
+                true
+            );
+        }
+        assert_eq!(
+            crate::diagnose_local_openai(&database, &alpha, &config)
+                .unwrap()
+                .semantic,
+            crate::DiagnoseReason::PendingGemma
+        );
+
+        let batch_24 = embed_local_openai_batch(&database, &config, 10).unwrap();
+        assert_eq!(batch_24.new_embeddings, 2);
+        {
+            let conn = crate::open_read(&database).unwrap();
+            let status_24_after = crate::status_with_local_openai(&conn, &config).unwrap();
+            assert_eq!(
+                status_24_after["local_openai"]["model_id"],
+                "openai-local:embed-upgrade@24"
+            );
+            assert_eq!(status_24_after["local_openai"]["dimensions"], 24);
+            assert_eq!(
+                status_24_after["local_openai"]["coverage"]["embedded_chunks"],
+                2
+            );
+            assert_eq!(
+                status_24_after["local_openai"]["coverage"]["pending"],
+                false
+            );
+        }
+        let mut session_24 =
+            GemmaSearchSession::open_local_openai(&database, &config, None).unwrap();
+        assert_eq!(
+            session_24.search("solar panel tilt", 5).unwrap()[0].name,
+            "alpha.txt"
+        );
+        drop(session_24);
+
+        // 3. Switch back 24d -> 16d (and via localhost URL): reuses existing @16 vectors cleanly!
+        active_dims.store(16, Ordering::Release);
+        let localhost_config = LocalOpenAiConfig {
+            url: format!("http://localhost:{port}/v1"),
+            model: "embed-upgrade".into(),
+        };
+        {
+            let conn = crate::open_read(&database).unwrap();
+            let status_back_16 = crate::status_with_local_openai(&conn, &localhost_config).unwrap();
+            assert_eq!(
+                status_back_16["local_openai"]["model_id"],
+                "openai-local:embed-upgrade@16"
+            );
+            assert_eq!(status_back_16["local_openai"]["dimensions"], 16);
+            assert_eq!(
+                status_back_16["local_openai"]["coverage"]["embedded_chunks"],
+                2
+            );
+            assert_eq!(status_back_16["local_openai"]["coverage"]["pending"], false);
+        }
+        let reuse_batch = embed_local_openai_batch(&database, &localhost_config, 10).unwrap();
+        assert_eq!(reuse_batch.new_embeddings, 0);
+        let mut session_16 =
+            GemmaSearchSession::open_local_openai(&database, &localhost_config, None).unwrap();
+        assert_eq!(
+            session_16.search("solar panel tilt", 5).unwrap()[0].name,
+            "alpha.txt"
+        );
+        drop(session_16);
+
+        // 4. Stop server: status_with_local_openai MUST fall back cleanly to read-only stored coverage
+        //    even when loopback HTTP is offline, Unix socket is missing, or URL is misconfigured.
+        stop_server.store(true, Ordering::Release);
+        server.join().unwrap();
+        {
+            let conn = crate::open_read(&database).unwrap();
+            let offline_http = crate::status_with_local_openai(&conn, &config).unwrap();
+            assert_eq!(
+                offline_http["local_openai"]["model_id"],
+                "openai-local:embed-upgrade@16"
+            );
+            assert_eq!(offline_http["local_openai"]["dimensions"], 16);
+            assert_eq!(
+                offline_http["local_openai"]["coverage"]["embedded_chunks"],
+                2
+            );
+
+            let missing_sock = LocalOpenAiConfig {
+                url: format!("unix://{}", root.join("stopped.sock").display()),
+                model: "embed-upgrade".into(),
+            };
+            let offline_unix = crate::status_with_local_openai(&conn, &missing_sock).unwrap();
+            assert_eq!(
+                offline_unix["local_openai"]["model_id"],
+                "openai-local:embed-upgrade@16"
+            );
+            assert_eq!(offline_unix["local_openai"]["dimensions"], 16);
+
+            let invalid_cfg = LocalOpenAiConfig {
+                url: "https://api.openai.com/v1".into(),
+                model: "never-indexed".into(),
+            };
+            let degraded = crate::status_with_local_openai(&conn, &invalid_cfg).unwrap();
+            assert_eq!(degraded["documents"], 2);
+            assert!(degraded["local_openai"]["model_id"].is_null());
+            assert!(degraded["local_openai"]["dimensions"].is_null());
+            assert_eq!(degraded["local_openai"]["coverage"]["embedded_chunks"], 0);
+            assert_eq!(degraded["local_openai"]["coverage"]["pending"], true);
+        }
+
         fs::remove_dir_all(root).unwrap();
     }
 }

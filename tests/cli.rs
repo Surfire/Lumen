@@ -3010,6 +3010,10 @@ esac
         raw.execute_batch(
             "PRAGMA user_version=1;
              DROP TRIGGER semantic_versioned_chunk_deleted;
+             DROP TRIGGER IF EXISTS gemma_pending_chunk_deleted;
+             DROP TRIGGER IF EXISTS gemma_pending_chunk_inserted;
+             DROP TABLE IF EXISTS gemma_pending_chunk;
+             DELETE FROM info WHERE key='gemma_pending_model';
              DROP TABLE semantic_vector; DROP TABLE semantic_vector_count;",
         )
         .unwrap();
@@ -5123,4 +5127,162 @@ fn content_filter_json_survives_restarts_and_preview_reads_the_catalog() {
         .output()
         .unwrap();
     assert!(!rejected.status.success());
+}
+
+#[test]
+fn local_openai_missing_unix_socket_keeps_status_working_while_failing_probe_and_embed() {
+    let f = Fixture::new();
+    let docs = fs::canonicalize(&f.0).unwrap().join("docs");
+    fs::create_dir_all(&docs).unwrap();
+    fs::write(
+        docs.join("manual.md"),
+        "Orbital rendezvous guidance and thermal radiator calibration notes.",
+    )
+    .unwrap();
+    f.run(&["index", "--root", docs.to_str().unwrap(), "--documents"]);
+
+    let missing_sock = format!("unix://{}", f.0.join("stopped-server.sock").display());
+
+    // 1. status and status --include-scope MUST succeed cleanly when the Unix socket is missing.
+    let status = f.run(&[
+        "status",
+        "--openai-url",
+        &missing_sock,
+        "--openai-model",
+        "m",
+    ]);
+    assert_eq!(status["documents"], 1);
+    assert!(status["local_openai"]["model_id"].is_null());
+    assert!(status["local_openai"]["dimensions"].is_null());
+    assert_eq!(status["local_openai"]["coverage"]["embedded_chunks"], 0);
+    assert_eq!(status["local_openai"]["coverage"]["pending"], true);
+    assert_eq!(status["gemma"]["pending"], true);
+
+    let scoped = f.run(&[
+        "status",
+        "--include-scope",
+        "--openai-url",
+        &missing_sock,
+        "--openai-model",
+        "m",
+    ]);
+    assert_eq!(scoped["documents"], 1);
+    assert_eq!(scoped["scope"]["documents"], true);
+    assert!(scoped["local_openai"]["model_id"].is_null());
+
+    // Misconfigured non-loopback URL also degrades cleanly in status without aborting it.
+    let misconfigured = f.run(&[
+        "status",
+        "--openai-url",
+        "https://api.openai.com/v1",
+        "--openai-model",
+        "m",
+    ]);
+    assert_eq!(misconfigured["documents"], 1);
+    assert!(misconfigured["local_openai"]["model_id"].is_null());
+    assert_eq!(misconfigured["local_openai"]["coverage"]["pending"], true);
+
+    // Text search stays completely usable while the optional local OpenAI server is stopped.
+    assert_eq!(
+        f.run(&["query", "Orbital rendezvous", "--mode", "text"])[0]["name"],
+        "manual.md"
+    );
+
+    // 2. model-status (both unchecked and --verify) MUST report unavailable with Unix socket error.
+    for args in [
+        vec![
+            "model-status",
+            "--openai-url",
+            &missing_sock,
+            "--openai-model",
+            "m",
+        ],
+        vec![
+            "model-status",
+            "--verify",
+            "--openai-url",
+            &missing_sock,
+            "--openai-model",
+            "m",
+        ],
+    ] {
+        let model_status = f.run(&args);
+        assert_eq!(model_status["backend"], "local_openai");
+        assert_eq!(model_status["available"], false);
+        assert_eq!(model_status["verified"], false);
+        let diagnostic = model_status["diagnostic"].as_str().unwrap_or("");
+        assert!(
+            diagnostic.contains("Unix socket"),
+            "expected Unix socket error in diagnostic: {model_status}"
+        );
+    }
+
+    // 3. embed and semantic-serve MUST error cleanly on the missing Unix socket.
+    for args in [
+        vec![
+            "embed",
+            "--openai-url",
+            &missing_sock,
+            "--openai-model",
+            "m",
+        ],
+        vec![
+            "semantic-serve",
+            "--openai-url",
+            &missing_sock,
+            "--openai-model",
+            "m",
+        ],
+    ] {
+        let out = f.cli().args(&args).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "expected command {args:?} to fail on missing Unix socket"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("Unix socket"),
+            "expected Unix socket error in stderr for {args:?}, got: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn v1_downgrade_fixture_cleanly_rebuilds_gemma_pending_queue() {
+    let f = Fixture::new();
+    let root = f.0.join("scope");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("note.md"), "Synthetic v1 downgrade schema check.").unwrap();
+    f.run(&["index", "--root", root.to_str().unwrap(), "--documents"]);
+
+    let raw = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+    raw.execute_batch(
+        "PRAGMA user_version=1;
+         DROP TRIGGER semantic_versioned_chunk_deleted;
+         DROP TRIGGER IF EXISTS gemma_pending_chunk_deleted;
+         DROP TRIGGER IF EXISTS gemma_pending_chunk_inserted;
+         DROP TABLE IF EXISTS gemma_pending_chunk;
+         DELETE FROM info WHERE key='gemma_pending_model';
+         DROP TABLE semantic_vector; DROP TABLE semantic_vector_count;",
+    )
+    .unwrap();
+    drop(raw);
+
+    // Re-opening via CLI write path migrates v1 -> current schema cleanly and restores all triggers.
+    f.run(&["index", "--root", root.to_str().unwrap(), "--documents"]);
+    let raw = rusqlite::Connection::open(f.0.join("test.sqlite")).unwrap();
+    let trigger_count: i64 = raw
+        .query_row(
+            "SELECT count(*) FROM sqlite_schema
+             WHERE type='trigger' AND name IN (
+                'gemma_pending_chunk_inserted',
+                'gemma_pending_chunk_deleted',
+                'gemma_pending_vector_inserted',
+                'gemma_pending_vector_deleted'
+             )",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(trigger_count, 4);
 }

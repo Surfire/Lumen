@@ -110,7 +110,7 @@ pub fn validate_loopback_url(raw: &str) -> Result<ValidatedEndpoint> {
 
 fn validate_unix_endpoint(rest: &str) -> Result<ValidatedEndpoint> {
     ensure!(
-        rest.starts_with('/'),
+        rest.starts_with('/') && rest.len() > 1,
         "unix:// endpoint must specify an absolute socket path (unix:///abs/path.sock)"
     );
     let socket_path = PathBuf::from(rest);
@@ -120,7 +120,6 @@ fn validate_unix_endpoint(rest: &str) -> Result<ValidatedEndpoint> {
             .any(|component| component == Component::ParentDir),
         "unix:// socket path must not contain '..'"
     );
-    verify_unix_socket(&socket_path)?;
     Ok(ValidatedEndpoint::Unix {
         socket_path,
         base_path: String::new(),
@@ -246,18 +245,125 @@ fn normalize_base_path(raw: &str) -> Result<String> {
     Ok(trimmed.to_owned())
 }
 
+const MAX_SANITIZED_MODEL_LEN: usize = 200;
+const MODEL_HASH_HEX_LEN: usize = 12;
+const MAX_HASHED_MODEL_PREFIX_LEN: usize = MAX_SANITIZED_MODEL_LEN - 1 - MODEL_HASH_HEX_LEN;
+
+fn is_safe_model_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '/' | ':' | '+')
+}
+
+fn sha256_hex_12(input: &[u8]) -> String {
+    const INIT: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    #[rustfmt::skip]
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+    fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
+        let mut w = [0_u32; 64];
+        for (i, word) in w[..16].iter_mut().enumerate() {
+            let off = i * 4;
+            *word =
+                u32::from_be_bytes([block[off], block[off + 1], block[off + 2], block[off + 3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+        for (&word, &k) in w.iter().zip(&K) {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(k)
+                .wrapping_add(word);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        for (slot, delta) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *slot = slot.wrapping_add(delta);
+        }
+    }
+
+    let mut state = INIT;
+    let bit_len = (input.len() as u64).wrapping_mul(8);
+    let mut rest = input;
+    while rest.len() >= 64 {
+        let (block, tail) = rest.split_at(64);
+        compress(&mut state, block.try_into().expect("64-byte block"));
+        rest = tail;
+    }
+    let mut block = [0_u8; 64];
+    block[..rest.len()].copy_from_slice(rest);
+    block[rest.len()] = 0x80;
+    if rest.len() + 1 > 56 {
+        compress(&mut state, &block);
+        block.fill(0);
+    }
+    block[56..64].copy_from_slice(&bit_len.to_be_bytes());
+    compress(&mut state, &block);
+
+    let mut hex = String::with_capacity(MODEL_HASH_HEX_LEN);
+    for byte in state
+        .into_iter()
+        .flat_map(u32::to_be_bytes)
+        .take(MODEL_HASH_HEX_LEN / 2)
+    {
+        use fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
+}
+
 /// Sanitize a user-configured model identifier for the canonical signature
 /// `openai-local:<sanitized>@<dims>`.
+///
+/// Preserves exact `<raw>` when trimmed `model` contains only safe ASCII chars
+/// (`a-zA-Z0-9._-/:+`) and `len <= 200`; appends `~<12-hex-sha256>` of the raw
+/// trimmed model whenever characters are sanitized or truncated so distinct raw
+/// names never collide on the same partition key.
 pub fn sanitize_model_name(model: &str) -> String {
     let trimmed = model.trim();
-    let mut out = String::with_capacity(trimmed.len().min(200));
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.len() <= MAX_SANITIZED_MODEL_LEN && trimmed.chars().all(is_safe_model_char) {
+        return trimmed.to_owned();
+    }
+    let mut out = String::with_capacity(
+        trimmed.len().min(MAX_HASHED_MODEL_PREFIX_LEN) + 1 + MODEL_HASH_HEX_LEN,
+    );
     let mut prev_underscore = false;
     for ch in trimmed.chars() {
-        if out.len() >= 200 {
+        if out.len() >= MAX_HASHED_MODEL_PREFIX_LEN {
             break;
         }
-        let safe = ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '/' | ':' | '+');
-        if safe {
+        if is_safe_model_char(ch) {
             out.push(ch);
             prev_underscore = false;
         } else if !prev_underscore && !out.is_empty() {
@@ -268,6 +374,8 @@ pub fn sanitize_model_name(model: &str) -> String {
     while out.ends_with('_') {
         out.pop();
     }
+    out.push('~');
+    out.push_str(&sha256_hex_12(trimmed.as_bytes()));
     out
 }
 
@@ -397,8 +505,12 @@ impl LocalOpenAiWorker {
     }
 
     pub fn probe(&self) -> Result<(String, usize)> {
+        self.probe_with_timeout(PROBE_TIMEOUT)
+    }
+
+    pub fn probe_with_timeout(&self, timeout: Duration) -> Result<(String, usize)> {
         let model = self.require_model()?;
-        let vectors = self.embed_batch(&["lumen"], PROBE_TIMEOUT)?;
+        let vectors = self.embed_batch(&["lumen"], timeout)?;
         ensure!(
             vectors.len() == 1,
             "local OpenAI probe returned {} vectors instead of 1",
@@ -1064,14 +1176,35 @@ mod tests {
             "http://127.0.0.1:8000/v1\r\nX-Injected: 1",
             "ftp://127.0.0.1/v1",
             "unix://relative.sock",
+            "unix:///",
             "unix:///tmp/../etc/passwd",
-            "unix:///nonexistent/lumen-no-such.sock",
         ] {
             assert!(
                 validate_loopback_url(rejected).is_err(),
                 "expected URL to be rejected: {rejected:?}"
             );
         }
+
+        // Syntactically valid missing Unix socket path is allowed at config/worker
+        // construction (cold-start safe) and rejected lazily on transport connect.
+        let missing_unix = "unix:///nonexistent/lumen-no-such.sock";
+        assert!(matches!(
+            validate_loopback_url(missing_unix).unwrap(),
+            ValidatedEndpoint::Unix { ref socket_path, .. }
+                if socket_path == Path::new("/nonexistent/lumen-no-such.sock")
+        ));
+        let missing_worker = LocalOpenAiWorker::new(&LocalOpenAiConfig {
+            url: missing_unix.into(),
+            model: "bge-m3".into(),
+        })
+        .unwrap()
+        .with_api_key(None);
+        assert!(missing_worker.check_reachable().is_err());
+        assert!(missing_worker.list_models().is_err());
+        assert!(missing_worker.probe().is_err());
+        assert!(missing_worker.encode_query("hello").is_err());
+        assert!(missing_worker.encode_passage("hello").is_err());
+        assert!(missing_worker.encode_passages(&["hello"]).is_err());
 
         // Route joining handles /v1 suffix without duplicating /v1/v1.
         let ep_v1 = validate_loopback_url("http://127.0.0.1:8000/v1/").unwrap();
@@ -1225,6 +1358,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let sock_path = root.join("embed.sock");
+        let missing_path = root.join("missing.sock");
         let link_path = root.join("link.sock");
         let regular_path = root.join("regular.txt");
         fs::write(&regular_path, "not a socket").unwrap();
@@ -1232,9 +1366,24 @@ mod tests {
         let listener = UnixListener::bind(&sock_path).unwrap();
         std::os::unix::fs::symlink(&sock_path, &link_path).unwrap();
 
-        // Regular file and symlink to socket MUST both be rejected.
-        assert!(validate_loopback_url(&format!("unix://{}", regular_path.display())).is_err());
-        assert!(validate_loopback_url(&format!("unix://{}", link_path.display())).is_err());
+        // Missing socket, regular file, and symlink-to-socket are accepted at
+        // path-syntax validation time (cold-start safe) and MUST all be rejected
+        // lazily on every transport operation right before UnixStream::connect.
+        for bad_path in [&missing_path, &regular_path, &link_path] {
+            let bad_url = format!("unix://{}", bad_path.display());
+            assert!(validate_loopback_url(&bad_url).is_ok());
+            let bad_worker = LocalOpenAiWorker::new(&LocalOpenAiConfig {
+                url: bad_url,
+                model: "unix-embed".into(),
+            })
+            .unwrap()
+            .with_api_key(None);
+            assert!(bad_worker.check_reachable().is_err());
+            assert!(bad_worker.list_models().is_err());
+            assert!(bad_worker.probe().is_err());
+            assert!(bad_worker.encode_query("hello").is_err());
+            assert!(bad_worker.encode_passage("hello").is_err());
+        }
 
         let handle = thread::spawn(move || {
             for _ in 0..2 {
@@ -1283,5 +1432,108 @@ mod tests {
         );
         handle.join().unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn canonical_model_id_preserves_safe_ascii_and_prevents_collisions() {
+        // Verify pure-Rust SHA-256 prefix against standard NIST test vectors.
+        assert_eq!(sha256_hex_12(b""), "e3b0c44298fc");
+        assert_eq!(sha256_hex_12(b"abc"), "ba7816bf8f01");
+        assert_eq!(
+            sha256_hex_12(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d206"
+        );
+
+        // Safe ASCII names <= 200 bytes keep exact backward-compatible form.
+        for safe in ["bge-m3", "BAAI/bge-m3:latest+fp16", "foo_bar_", "a.b-c"] {
+            assert_eq!(sanitize_model_name(safe), safe);
+            assert_eq!(
+                canonical_model_id(safe, 768),
+                format!("openai-local:{safe}@768")
+            );
+            assert!(!sanitize_model_name(safe).contains('~'));
+        }
+        let exact_200 = "a".repeat(200);
+        assert_eq!(sanitize_model_name(&exact_200), exact_200);
+        assert_eq!(
+            canonical_model_id(&exact_200, 16),
+            format!("openai-local:{exact_200}@16")
+        );
+
+        // Distinct raw names that sanitize to the same prefix MUST produce distinct IDs.
+        let candidates = [
+            "foo_bar", "foo bar", "foo  bar", "foo@bar", "foo~bar", "foo(bar)", "foo_bar!",
+            "foo_bar?",
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for raw in candidates {
+            let sanitized = sanitize_model_name(raw);
+            assert!(
+                sanitized.len() <= MAX_SANITIZED_MODEL_LEN,
+                "sanitized name exceeded bound: {sanitized}"
+            );
+            let id = canonical_model_id(raw, 16);
+            assert!(seen.insert(id.clone()), "collision for {raw:?} -> {id}");
+        }
+        // Safe name stays exact; sanitized ones carry ~<12-hex>.
+        assert_eq!(canonical_model_id("foo_bar", 16), "openai-local:foo_bar@16");
+        let space_id = canonical_model_id("foo bar", 16);
+        assert!(
+            space_id.starts_with("openai-local:foo_bar~") && space_id.ends_with("@16"),
+            "unexpected hashed id: {space_id}"
+        );
+
+        // Names longer than 200 bytes sharing the same 200-char prefix MUST NOT collide
+        // and stay bounded to 200 bytes before @<dims>.
+        let long_a = format!("{}1", "m".repeat(200));
+        let long_b = format!("{}2", "m".repeat(200));
+        let san_a = sanitize_model_name(&long_a);
+        let san_b = sanitize_model_name(&long_b);
+        assert!(san_a.len() <= MAX_SANITIZED_MODEL_LEN);
+        assert!(san_b.len() <= MAX_SANITIZED_MODEL_LEN);
+        assert_ne!(san_a, san_b);
+        assert_ne!(san_a, exact_200);
+
+        // Non-ASCII-only distinct model names stay non-empty and collision-free.
+        let zh = canonical_model_id("中文模型", 16);
+        let ja = canonical_model_id("日本語モデル", 16);
+        assert_ne!(zh, ja);
+        assert!(zh.starts_with("openai-local:~") && zh.ends_with("@16"));
+        assert!(ja.starts_with("openai-local:~") && ja.ends_with("@16"));
+
+        // Empty / whitespace-only still sanitizes to empty.
+        assert!(sanitize_model_name("   ").is_empty());
+    }
+
+    #[test]
+    fn probe_with_timeout_caps_unresponsive_loopback_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            if let Ok((_stream, _)) = listener.accept() {
+                // Hold the connection open without writing a response until test ends.
+                let _ = done_rx.recv_timeout(Duration::from_secs(5));
+            }
+        });
+        let worker = LocalOpenAiWorker::new(&LocalOpenAiConfig {
+            url: format!("http://127.0.0.1:{port}/v1"),
+            model: "slow-model".into(),
+        })
+        .unwrap()
+        .with_api_key(None);
+
+        let started = Instant::now();
+        let err = worker
+            .probe_with_timeout(Duration::from_millis(200))
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        let _ = done_tx.send(());
+        server.join().unwrap();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "probe_with_timeout exceeded bound ({elapsed:?}): {err:#}"
+        );
     }
 }

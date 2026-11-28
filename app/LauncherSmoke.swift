@@ -39,6 +39,20 @@ final class LauncherSmoke {
     private var revealDispatch: ContinuousClock.Instant?
     var wasActivated = false
     var dispatchedQuicklinks: [URL] = []
+    var pasteIntoPreviousAppCount = 0
+    var openedInTerminal: [(directory: URL, terminal: URL)] = []
+    var preferredTerminalOverride: URL?
+    var openedWith: [(file: URL, application: URL)] = []
+    var openWithAppsOverride: ((URL) -> [LauncherFileTools.OpenWithApp])?
+    private var simulatedDatalessPaths = Set<String>()
+    func isSimulatedDataless(_ url: URL) -> Bool {
+        simulatedDatalessPaths.contains(IndexScope.folderPath(url))
+    }
+    var simulatedFrontmostApp: NSRunningApplication?
+    let fileDialogAXAdapter = SmokeFileDialogAXAdapter()
+    let selectionAXAdapter = SmokeSelectionAXAdapter()
+    let contextPasteboard = NSPasteboard.withUniqueName()
+    var contextCaptureEnabled = false
     var chosenQuicklinkFolder: URL?
     var chosenScriptsFolder: URL?
     var chosenSettingsDirectories: [URL]?
@@ -168,6 +182,23 @@ final class LauncherSmoke {
 
     func makePersonalDataStore() -> PersonalDataStore {
         PersonalDataStore(defaults: translationPreferences!, provider: personalDataHarness.makeProvider())
+    }
+
+    func makeFileDialogBridge() -> FileDialogBridge {
+        FileDialogBridge(
+            axAdapter: fileDialogAXAdapter,
+            pollIntervalNanoseconds: 5_000_000,
+            pollTimeoutNanoseconds: 60_000_000
+        )
+    }
+
+    func makeSelectionContextBridge() -> SelectionContextBridge {
+        SelectionContextBridge(axAdapter: selectionAXAdapter)
+    }
+
+    func captureSelectionContext(using bridge: SelectionContextBridge, frontmostApp: NSRunningApplication?) -> CapturedContext? {
+        guard contextCaptureEnabled else { return nil }
+        return bridge.capture(frontmostApp: frontmostApp, pasteboard: contextPasteboard)
     }
 
     func makeIsolatedLauncher(
@@ -765,8 +796,8 @@ final class LauncherSmoke {
         }
         try type("cb ", into: app)
         try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.shift])
-        try check(app.contextActions.items.map(\.id) == ["copy-clip", "pin-clip", "delete-clip"],
-                  "Shift–Return did not show clipboard actions")
+        try check(app.contextActions.items.map(\.id) == ["copy-clip", "pin-clip", "delete-clip", "edit-template"],
+                  "Shift–Return did not show clipboard actions with template editor: \(app.contextActions.items.map(\.id))")
         try key(kVK_DownArrow, "\u{f701}", in: app)
         try key(kVK_Return, "\r", in: app)
         try check(history.items.first?.pinned == true && app.searchPresented && !app.contextActions.isOpen,
@@ -1236,9 +1267,10 @@ final class LauncherSmoke {
         let model = app.model
         try verifyHighlights()
         try await verifyCatalogRegressions()
-        try await verifyEngineRegressions()
-        try await verifyBackgroundEmbeddingInterleavesContent()
-        try await verifyPhase1Regressions()
+        async let engineChecks: Void = verifyEngineRegressions()
+        async let bgEmbedChecks: Void = verifyBackgroundEmbeddingInterleavesContent()
+        async let phase1Checks: Void = verifyPhase1Regressions()
+        _ = try await (engineChecks, bgEmbedChecks, phase1Checks)
         try await verifyPhase2Regressions(app)
         try await verifyPhase3Regressions(app)
         try await verifyBuild33Phase1Regressions(app)
@@ -1370,6 +1402,7 @@ final class LauncherSmoke {
             try "Literal command name fixture".write(to: corpus.appendingPathComponent(verb), atomically: true, encoding: .utf8)
         }
         let fileDefaultFixtures = try makeFileDefaultActionFixtures()
+        let wave2Fixtures = try makeWave2CorpusFixtures()
         app.startBackgroundIndex()
         try await until("the isolated file index became available alongside actions") { model.canSearch && model.watchState == .running }
         try check(model.launcherActivityTitle == nil && model.activityTitle == model.t("正在监听文件变化", "Watching file changes"),
@@ -1526,6 +1559,7 @@ final class LauncherSmoke {
             app.showSearch()
             try await verifyQuicklinks(app)
         }
+        try await verifyWave2Features(app, fixtures: wave2Fixtures)
         print("Unified actions passed: real background app launch, routed Settings URLs, isolated file copies, and native local Quick Look input")
     }
 
@@ -4870,7 +4904,10 @@ final class LauncherSmoke {
         try check(hit.isResident && !hit.isPlaceholder, "resident cloud file was misclassified as placeholder")
         try check(LocalFile.dragURL(for: hit)?.path == hit.path, "a resident cloud row did not export a file drag URL")
         try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
-        try check(app.contextActions.items.map(\.id) == ["open", "reveal", "preview", "quick-look", "copy-name", "copy-path"],
+        try check(app.contextActions.items.map(\.id) == [
+            "open", "reveal", "preview", "quick-look",
+            "copy-name", "copy-path", "copy-file", "search-in-folder", "open-in-terminal", "open-with",
+        ],
                   "resident cloud Cmd+K actions were incomplete: \(app.contextActions.items.map(\.id))")
         try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
         try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command])
@@ -5463,6 +5500,27 @@ final class LauncherSmoke {
         try key(kVK_Tab, "\t", in: app)
         try check(field.string == "unmatched_tab_text" && !field.string.contains("\t"),
                   "Tab inserted a literal tab character")
+        // Verify DirectoryScope header chip & Tab alias entry work without changing headerHeight = 56.
+        try check(PanelGeometry.headerHeight == 56, "PanelGeometry.headerHeight changed from 56")
+        let scopeDummyDir = directory.appendingPathComponent("Phase2AliasScopeProbe", isDirectory: true)
+        try FileManager.default.createDirectory(at: scopeDummyDir, withIntermediateDirectories: true)
+        let scopeDummyPath = IndexScope.folderPath(scopeDummyDir)
+        let aliasShortcut = SavedShortcut(id: UUID(), title: "Alias Scope Probe", alias: "p2sc",
+                                          target: .folder(scopeDummyPath), pinned: false)
+        try check(app.model.shortcuts.save(aliasShortcut), "could not save folder alias shortcut for Tab test")
+        defer {
+            app.model.clearDirectoryScope()
+            app.model.shortcuts.remove(aliasShortcut)
+        }
+        try type("p2sc", into: app)
+        try key(kVK_Tab, "\t", in: app)
+        try check(app.model.activeScopedDirectory == LauncherFileQuery.normalizedDirectoryScope(scopeDummyPath) &&
+                  field.string.isEmpty && !field.string.contains("\t"),
+                  "Tab on folder shortcut alias did not push DirectoryScope and clear search field: \(field.string.debugDescription)")
+        try key(kVK_Delete, "\u{7f}", in: app)
+        try check(app.model.activeScopedDirectory == nil && app.model.scopedDirectories.isEmpty,
+                  "Backspace on empty field did not pop DirectoryScope")
+        app.model.shortcuts.remove(aliasShortcut)
         // 7. Lane 2B checks: calculator exponentiation/comma grouping and locale-aware wiki URLs.
         let power = CalculationResult.evaluate("2^10")
         let nestedPower = CalculationResult.evaluate("2^3^2")
@@ -6048,10 +6106,13 @@ final class LauncherSmoke {
         let model = app.model
         let fm = FileManager.default
 
-        // 1. Tab folder path completion when a folder hit is selected.
+        // 1. Tab folder enters DirectoryScope (clears search field instead of inserting raw path).
         let tabFolder = corpus.appendingPathComponent("Phase2TabFolder", isDirectory: true)
+        let tabChild = tabFolder.appendingPathComponent("phase2-tab-child.txt")
         try fm.createDirectory(at: tabFolder, withIntermediateDirectories: true)
+        try Data("Phase 2 scoped child".utf8).write(to: tabChild)
         let folderPath = IndexScope.folderPath(tabFolder)
+        let childPath = IndexScope.folderPath(tabChild)
         try type("Phase2TabFolder", into: app)
         try await until("Tab folder fixture was indexed") {
             model.hits.contains { $0.path == folderPath && $0.kind == "directory" }
@@ -6059,8 +6120,15 @@ final class LauncherSmoke {
         model.selectedID = folderPath
         try key(kVK_Tab, "\t", in: app)
         let field = try editor(app)
-        try check(field.string == folderPath + "/" && !field.string.contains("\t"),
-                  "Tab did not complete selected folder path + '/': \(field.string.debugDescription)")
+        try check(model.activeScopedDirectory == LauncherFileQuery.normalizedDirectoryScope(folderPath) &&
+                  field.string.isEmpty && !field.string.contains("\t"),
+                  "Tab did not enter DirectoryScope and clear field (scope: \(String(describing: model.activeScopedDirectory)), field: \(field.string.debugDescription))")
+        try await until("DirectoryScope did not list indexed child inside Phase2TabFolder") {
+            model.hits.contains { $0.path == childPath }
+        }
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try check(model.activeScopedDirectory == nil && app.searchPresented,
+                  "Escape did not exit DirectoryScope while keeping search open")
 
         // 2. Unified selection: clicking/selecting a script row immediately closes an open file inline preview and restores 680pt width.
         let imageFixture = corpus.appendingPathComponent("phase2-shared-preview.png")
@@ -8097,6 +8165,688 @@ final class LauncherSmoke {
         print("v0.6.6 Spotlight-parity regressions passed (currency cache & eval, prefix-free dictionary & ranking, bookmarks, opt-in personal data)")
     }
 
+    private struct Wave2CorpusFixtures {
+        let spaceRoot: URL
+        let subFolder: URL
+        let spaceDoc: URL
+        let nestedDoc: URL
+        let clientDir: URL
+        let outsideDir: URL
+        let insideQuote: URL
+        let outsideQuote: URL
+    }
+
+    private func makeWave2CorpusFixtures() throws -> Wave2CorpusFixtures {
+        let fm = FileManager.default
+        let spaceRoot = corpus.appendingPathComponent("Mobile Documents/com~apple~CloudDocs/Scope Space Dir", isDirectory: true)
+        let subFolder = spaceRoot.appendingPathComponent("Sub Folder", isDirectory: true)
+        let spaceDoc = spaceRoot.appendingPathComponent("space-doc.txt")
+        let nestedDoc = subFolder.appendingPathComponent("nested-note.txt")
+        try fm.createDirectory(at: subFolder, withIntermediateDirectories: true)
+        try Data("Space directory document".utf8).write(to: spaceDoc)
+        try Data("Nested directory document".utf8).write(to: nestedDoc)
+
+        let clientDir = corpus.appendingPathComponent("P2AClientDocs", isDirectory: true)
+        let outsideDir = corpus.appendingPathComponent("P2AOtherDocs", isDirectory: true)
+        try fm.createDirectory(at: clientDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: outsideDir, withIntermediateDirectories: true)
+        let insideQuote = clientDir.appendingPathComponent("客户报价单.txt")
+        let outsideQuote = outsideDir.appendingPathComponent("无关报价单.txt")
+        try Data("inside quote".utf8).write(to: insideQuote)
+        try Data("outside quote".utf8).write(to: outsideQuote)
+        return Wave2CorpusFixtures(
+            spaceRoot: spaceRoot,
+            subFolder: subFolder,
+            spaceDoc: spaceDoc,
+            nestedDoc: nestedDoc,
+            clientDir: clientDir,
+            outsideDir: outsideDir,
+            insideQuote: insideQuote,
+            outsideQuote: outsideQuote
+        )
+    }
+
+    private func verifyWave2Features(_ app: AppDelegate, fixtures: Wave2CorpusFixtures) async throws {
+        let model = app.model
+        let fm = FileManager.default
+
+        // MARK: - 1. P0-2 Directory Scope (paths with spaces, multi-level Tab, Backspace pop, Esc clear, Cmd+K actions)
+        let spaceRoot = fixtures.spaceRoot
+        let subFolder = fixtures.subFolder
+        let spaceDoc = fixtures.spaceDoc
+        let nestedDoc = fixtures.nestedDoc
+        let spaceRootPath = IndexScope.folderPath(spaceRoot)
+        let subFolderPath = IndexScope.folderPath(subFolder)
+        let spaceDocPath = IndexScope.folderPath(spaceDoc)
+        let nestedDocPath = IndexScope.folderPath(nestedDoc)
+
+        app.showSearch()
+        try type("Scope Space Dir", into: app)
+        try await until("Scope Space Dir was indexed") {
+            model.hits.contains { $0.path == spaceRootPath && $0.kind == "directory" }
+        }
+        model.selectedID = spaceRootPath
+        try key(kVK_Tab, "\t", in: app)
+        let field = try editor(app)
+        try check(model.activeScopedDirectory == LauncherFileQuery.normalizedDirectoryScope(spaceRootPath) &&
+                  model.scopedDirectories.count == 1 &&
+                  model.activeScopeBreadcrumbs == ["Scope Space Dir"] &&
+                  field.string.isEmpty &&
+                  app.panel.frame.size == PanelGeometry.size(for: app.panelState, rows: model.visibleResults, showsResults: model.showsResults),
+                  "P0-2 Tab did not push Scope Space Dir into DirectoryScope cleanly")
+        try await until("Scope Space Dir listed child folder and file") {
+            model.hits.contains { $0.path == subFolderPath && $0.kind == "directory" } &&
+                model.hits.contains { $0.path == spaceDocPath }
+        }
+
+        // Level 2 Tab drill-down.
+        model.selectedID = subFolderPath
+        try key(kVK_Tab, "\t", in: app)
+        try check(model.scopedDirectories.count == 2 &&
+                  model.activeScopeBreadcrumbs == ["Scope Space Dir", "Sub Folder"] &&
+                  field.string.isEmpty,
+                  "P0-2 second Tab did not drill down into Sub Folder")
+        try await until("Sub Folder scoped search found nested-note.txt and excluded root files") {
+            model.hits.contains { $0.path == nestedDocPath } &&
+                !model.hits.contains { $0.name == "archive-one.txt" }
+        }
+
+        // Non-empty Backspace edits text without popping scope; empty Backspace pops 1 level.
+        try type("n", into: app)
+        try key(kVK_Delete, "\u{7f}", in: app)
+        try check(field.string.isEmpty && model.scopedDirectories.count == 2,
+                  "non-empty Backspace unexpectedly popped directory scope")
+        try key(kVK_Delete, "\u{7f}", in: app)
+        try check(model.scopedDirectories.count == 1 &&
+                  model.activeScopeBreadcrumbs == ["Scope Space Dir"],
+                  "empty Backspace did not pop one directory scope level")
+
+        // Esc on empty scoped query clears directory scope without dismissing panel.
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try check(model.activeScopedDirectory == nil && model.scopedDirectories.isEmpty && app.searchPresented,
+                  "Esc did not clear directory scope while keeping search open")
+
+        // Cmd+K searchInFolder on regular file pushes parent directory scope.
+        try type("nested-note", into: app)
+        try await until("nested-note.txt indexed for searchInFolder") {
+            model.hits.contains { $0.path == nestedDocPath }
+        }
+        model.selectedID = nestedDocPath
+        try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+        guard let searchInFolderIdx = app.contextActions.items.firstIndex(where: { $0.id == "search-in-folder" }) else {
+            throw Failure("missing search-in-folder Cmd+K action for regular file")
+        }
+        app.contextActions.run(searchInFolderIdx)
+        try check(model.activeScopedDirectory == LauncherFileQuery.normalizedDirectoryScope(subFolderPath) &&
+                  field.string.isEmpty && app.searchPresented,
+                  "searchInFolder did not push parent folder scope")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+
+        // Cmd+K copyFile writes .fileURL + internalType, and rejects SF_DATALESS/placeholder without materializing.
+        try type("space-doc", into: app)
+        try await until("space-doc.txt ready for Cmd+K file tools") {
+            model.hits.contains { $0.path == spaceDocPath }
+        }
+        model.selectedID = spaceDocPath
+        let priorClipboardCount = app.clipboard.items.count
+        try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+        guard let copyFileIdx = app.contextActions.items.firstIndex(where: { $0.id == "copy-file" }) else {
+            throw Failure("missing copy-file Cmd+K action")
+        }
+        app.contextActions.run(copyFileIdx)
+        try await until("copyFile wrote fileURL with internal marker") {
+            self.filePasteboard.types?.contains(.fileURL) == true &&
+                self.filePasteboard.types?.contains(ClipboardManager.internalType) == true &&
+                model.searchNotice?.problem == .copiedFile
+        }
+        let copiedURLs = filePasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]
+        try check(copiedURLs?.first?.standardizedFileURL.path == spaceDoc.standardizedFileURL.path,
+                  "copyFile wrote wrong fileURL: \(String(describing: copiedURLs))")
+        app.clipboard.poll()
+        try check(app.clipboard.items.count == priorClipboardCount, "copyFile leaked internal copy into clipboard history")
+
+        try check(LauncherFileTools.isResidentForFileCopy(spaceDoc) &&
+                  !LauncherFileTools.isResidentForFileCopy(directory.appendingPathComponent("missing-file.txt")) &&
+                  !LauncherFileTools.isResidentForFileCopy(URL(string: "https://example.com")!),
+                  "LauncherFileTools.isResidentForFileCopy failed resident/missing/non-file checks")
+
+        filePasteboard.clearContents()
+        let placeholderHit = SearchHit(path: spaceDocPath, name: "space-doc.txt", kind: "file",
+                                       availability: "placeholder", matched_by: "name",
+                                       snippet: nil, document_stamp: nil, pdf_page: nil)
+        app.perform(.copyFile, on: placeholderHit)
+        try check(model.searchNotice?.problem == .cloudCopyBlocked &&
+                  filePasteboard.types?.isEmpty != false,
+                  "copyFile did not block cloud placeholder without writing pasteboard")
+        simulatedDatalessPaths.insert(spaceDocPath)
+        defer { simulatedDatalessPaths.remove(spaceDocPath) }
+        // Clear the prior .cloudCopyBlocked notice so `until` waits for async `resolve` (`actionValidating = false`) before openInTerminal runs.
+        app.perform(.copyName, on: model.selectedHit!)
+        try check(model.searchNotice?.problem == .copiedName, "copyName failed to reset searchNotice before simulated SF_DATALESS check")
+        filePasteboard.clearContents()
+        app.perform(.copyFile, on: model.selectedHit!)
+        try await until("copyFile blocked simulated SF_DATALESS file without writing pasteboard") {
+            model.searchNotice?.problem == .cloudCopyBlocked &&
+                self.filePasteboard.types?.isEmpty != false
+        }
+        simulatedDatalessPaths.remove(spaceDocPath)
+
+        // openInTerminal directory resolution for regular file vs directory.
+        try check(LauncherFileTools.targetDirectoryForTerminal(path: spaceDocPath, isDirectory: false).standardizedFileURL.path
+                  == spaceRoot.standardizedFileURL.path &&
+                  LauncherFileTools.targetDirectoryForTerminal(path: spaceRootPath, isDirectory: true).standardizedFileURL.path
+                  == spaceRoot.standardizedFileURL.path,
+                  "targetDirectoryForTerminal resolved wrong directory")
+        let fakeTerminalURL = URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app", isDirectory: true)
+        preferredTerminalOverride = fakeTerminalURL
+        defer { preferredTerminalOverride = nil }
+        openedInTerminal.removeAll()
+        try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+        guard let termIdx = app.contextActions.items.firstIndex(where: { $0.id == "open-in-terminal" }) else {
+            throw Failure("missing open-in-terminal Cmd+K action")
+        }
+        app.contextActions.run(termIdx)
+        try await until("openInTerminal resolved parent directory for regular file") {
+            self.openedInTerminal.count == 1 && !app.searchPresented
+        }
+        try check(openedInTerminal[0].directory.standardizedFileURL.path == spaceRoot.standardizedFileURL.path,
+                  "openInTerminal did not target parent directory for file")
+
+        // openWith lazy discovery: NOT called on Cmd+K menu open, called ONLY when "open-with" is selected.
+        var openWithDiscoveryCalls = 0
+        let mockApp1 = LauncherFileTools.OpenWithApp(
+            name: "StubEdit",
+            url: URL(fileURLWithPath: "/System/Applications/TextEdit.app", isDirectory: true),
+            bundleID: "com.apple.TextEdit"
+        )
+        openWithAppsOverride = { _ in
+            openWithDiscoveryCalls += 1
+            return [mockApp1]
+        }
+        defer { openWithAppsOverride = nil }
+        app.showSearch()
+        try type("space-doc", into: app)
+        try await until("space-doc reloaded for openWith test") {
+            model.hits.contains { $0.path == spaceDocPath }
+        }
+        model.selectedID = spaceDocPath
+        try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+        try check(openWithDiscoveryCalls == 0, "openWithApplications ran eagerly during Cmd+K menu build")
+        guard let openWithIdx = app.contextActions.items.firstIndex(where: { $0.id == "open-with" }) else {
+            throw Failure("missing open-with Cmd+K action")
+        }
+        app.contextActions.run(openWithIdx)
+        try check(openWithDiscoveryCalls == 1 &&
+                  app.contextActions.isOpen &&
+                  app.contextActions.items.map(\.id) == ["open-with-back", "open-with-app:com.apple.TextEdit"],
+                  "openWith secondary menu or lazy discovery failed: \(app.contextActions.items.map(\.id))")
+        app.contextActions.run(0) // "← Back" restores main Cmd+K menu without re-querying openWith.
+        try check(openWithDiscoveryCalls == 1 &&
+                  app.contextActions.isOpen &&
+                  app.contextActions.items.contains { $0.id == "open-with" },
+                  "openWith back button did not restore main Cmd+K menu")
+        let nextOpenWithIdx = app.contextActions.items.firstIndex(where: { $0.id == "open-with" })!
+        app.contextActions.run(nextOpenWithIdx)
+        openedWith.removeAll()
+        app.contextActions.run(1)
+        try await until("openWith dispatched selected application with target file") {
+            self.openedWith.count == 1 && !app.searchPresented
+        }
+        try check(openedWith[0].file.standardizedFileURL.path == spaceDoc.standardizedFileURL.path &&
+                  openedWith[0].application == mockApp1.url,
+                  "openWith dispatched wrong file or application")
+        try check(!LauncherFileTools.openWithApplications(for: spaceDoc).isEmpty,
+                  "real LaunchServices openWithApplications returned empty for .txt")
+
+        // MARK: - 2. P2-A Folder Alias Search ("kh 报价" scoping + "kh" + Tab DirectoryScope)
+        let clientDir = fixtures.clientDir
+        let insideQuote = fixtures.insideQuote
+        let outsideQuote = fixtures.outsideQuote
+        let clientDirPath = IndexScope.folderPath(clientDir)
+        let insideQuotePath = IndexScope.folderPath(insideQuote)
+        let outsideQuotePath = IndexScope.folderPath(outsideQuote)
+
+        app.showSearch()
+        try type("无关报价单", into: app)
+        try await until("P2-A files indexed") {
+            model.hits.contains { $0.path == outsideQuotePath }
+        }
+        let khShortcut = SavedShortcut(id: UUID(), title: "客户资料", alias: "kh", target: .folder(clientDirPath), pinned: false)
+        try check(model.shortcuts.save(khShortcut), "could not save kh folder shortcut")
+        defer { model.shortcuts.remove(khShortcut) }
+
+        try type("kh 报价", into: app)
+        try await until("kh 报价 scoped search matched only inside kh folder") {
+            model.activeAliasFolder?.id == khShortcut.id &&
+                model.hits.contains { $0.path == insideQuotePath } &&
+                !model.searching
+        }
+        try check(!model.hits.contains { $0.path == outsideQuotePath },
+                  "kh alias search leaked files outside the aliased folder")
+
+        try type("kh", into: app)
+        try key(kVK_Tab, "\t", in: app)
+        try check(model.activeScopedDirectory == LauncherFileQuery.normalizedDirectoryScope(clientDirPath) &&
+                  (try editor(app)).string.isEmpty,
+                  "kh + Tab did not enter DirectoryScope for kh folder")
+        model.clearDirectoryScope()
+        model.shortcuts.remove(khShortcut)
+
+        // MARK: - 3. P0-1 Open/Save Quick Switch (Unit + AppDelegate integration)
+        let isoBridge = makeFileDialogBridge()
+        let testPID = NSRunningApplication.current.processIdentifier
+        fileDialogAXAdapter.reset()
+        defer {
+            fileDialogAXAdapter.reset()
+            simulatedFrontmostApp = nil
+        }
+
+        // Untrusted degradation.
+        try check(isoBridge.detectActiveDialog(frontmostApp: NSRunningApplication.current) == nil &&
+                  isoBridge.openFinderFolders().isEmpty,
+                  "FileDialogBridge did not return nil/empty when AX untrusted")
+        var untrustedNavResult: Bool?
+        isoBridge.navigate(FileDialogContext(appPID: testPID, appName: "TestApp", appBundleID: "com.test.app", kind: .save),
+                           toPath: spaceDocPath, isDirectory: false) { untrustedNavResult = $0 }
+        try check(untrustedNavResult == false, "navigate succeeded while AX untrusted")
+
+        // Static Open vs Save target path resolution.
+        try check(FileDialogBridge.resolvedTargetPath(for: "/Users/test/a.txt", isDirectory: false, in: .open) == "/Users/test/a.txt" &&
+                  FileDialogBridge.resolvedTargetPath(for: "/Users/test/a.txt", isDirectory: false, in: .save) == "/Users/test" &&
+                  FileDialogBridge.resolvedTargetPath(for: "/Users/test/Dir", isDirectory: true, in: .save) == "/Users/test/Dir",
+                  "FileDialogBridge.resolvedTargetPath failed open vs save filename preservation")
+
+        // Configure trusted Save dialog + Finder windows + Go-to-Folder popover simulation.
+        fileDialogAXAdapter.setTrusted(true)
+        let saveSheet = FileDialogAXElement.mock("save-sheet")
+        let hostWin = FileDialogAXElement.mock("host-win")
+        let browserEl = FileDialogAXElement.mock("save-browser")
+        let saveAsField = FileDialogAXElement.mock("save-as-field")
+        let saveBtn = FileDialogAXElement.mock("save-btn")
+        let gotoPopover = FileDialogAXElement.mock("goto-popover")
+        let gotoField = FileDialogAXElement.mock("goto-field")
+
+        fileDialogAXAdapter.configureNode(hostWin, role: kAXWindowRole as String, children: [], sheets: [saveSheet])
+        fileDialogAXAdapter.configureNode(saveSheet, role: kAXSheetRole as String, identifier: "save-panel",
+                                          children: [browserEl, saveAsField, saveBtn], defaultButton: saveBtn)
+        fileDialogAXAdapter.configureNode(browserEl, role: kAXBrowserRole as String)
+        fileDialogAXAdapter.configureNode(saveAsField, role: kAXTextFieldRole as String, identifier: "saveAsNameTextField",
+                                          value: "Untitled.txt", enabled: true, parent: saveSheet)
+        fileDialogAXAdapter.configureNode(saveBtn, role: kAXButtonRole as String, title: "Save")
+        fileDialogAXAdapter.configureNode(gotoPopover, role: kAXPopoverRole as String, parent: saveSheet, children: [gotoField])
+        fileDialogAXAdapter.configureNode(gotoField, role: kAXTextFieldRole as String, identifier: "GoToWindowTextField",
+                                          placeholder: "Go to folder", value: "", enabled: true, parent: gotoPopover)
+        fileDialogAXAdapter.configureApp(pid: testPID, bundleID: "com.test.editor", focusedWindow: hostWin, focusedElement: saveAsField)
+
+        // Finder windows (1 valid resident folder + 1 duplicate + 1 nonexistent folder).
+        let spaceRootFinderURL = URL(fileURLWithPath: spaceRootPath, isDirectory: true)
+        let finderWin1 = FileDialogAXElement.mock("finder-win-1")
+        let finderWin2 = FileDialogAXElement.mock("finder-win-2")
+        let finderWinBad = FileDialogAXElement.mock("finder-win-bad")
+        fileDialogAXAdapter.configureNode(finderWin1, role: kAXWindowRole as String, url: spaceRootFinderURL)
+        fileDialogAXAdapter.configureNode(finderWin2, role: kAXWindowRole as String, url: spaceRootFinderURL)
+        fileDialogAXAdapter.configureNode(finderWinBad, role: kAXWindowRole as String,
+                                          url: directory.appendingPathComponent("MissingFinderDir", isDirectory: true))
+        fileDialogAXAdapter.configureFinder(pid: 99_001, windows: [finderWin1, finderWin2, finderWinBad])
+
+        let detectedSave = isoBridge.detectActiveDialog(frontmostApp: NSRunningApplication.current)
+        try check(detectedSave?.kind == .save && detectedSave?.appPID == testPID,
+                  "detectActiveDialog failed to classify Save sheet: \(String(describing: detectedSave))")
+        let listedFolders = isoBridge.openFinderFolders()
+        try check(listedFolders.map(\.path) == [spaceRootPath],
+                  "openFinderFolders did not deduplicate/filter local folders: \(listedFolders)")
+
+        // Test Go-to-Folder AX write without clipboard mutation + Save-As field protection.
+        filePasteboard.clearContents()
+        filePasteboard.setString("preserve-my-clipboard", forType: .string)
+        fileDialogAXAdapter.onShortcut = { [weak fileDialogAXAdapter] keyCode, flags in
+            guard let adapter = fileDialogAXAdapter else { return }
+            if keyCode == CGKeyCode(kVK_ANSI_G) && flags == [.maskCommand, .maskShift] {
+                adapter.setSystemFocused(gotoField)
+            }
+        }
+        var navSuccess: Bool?
+        isoBridge.navigate(detectedSave!, toPath: spaceDocPath, isDirectory: false) { navSuccess = $0 }
+        try await until("FileDialogBridge navigate did not complete") { navSuccess != nil }
+        try check(navSuccess == true &&
+                  fileDialogAXAdapter.lastWrittenValue(for: gotoField) == spaceRootPath &&
+                  fileDialogAXAdapter.lastWrittenValue(for: saveAsField) == nil &&
+                  filePasteboard.string(forType: .string) == "preserve-my-clipboard",
+                  "FileDialogBridge navigate mutated Save-As field or clipboard or failed path write")
+
+        // Timeout degradation when Go-to-Folder never opens (focus stays on Save-As field).
+        fileDialogAXAdapter.onShortcut = nil
+        fileDialogAXAdapter.setSystemFocused(saveAsField)
+        var timedOutSuccess: Bool?
+        isoBridge.navigate(detectedSave!, toPath: spaceRootPath, isDirectory: true) { timedOutSuccess = $0 }
+        try await until("FileDialogBridge navigate timeout did not settle") { timedOutSuccess != nil }
+        try check(timedOutSuccess == false &&
+                  fileDialogAXAdapter.lastWrittenValue(for: saveAsField) == nil &&
+                  filePasteboard.string(forType: .string) == "preserve-my-clipboard",
+                  "FileDialogBridge timeout wrote Save-As field or failed to return false")
+
+        // End-to-end AppDelegate integration for P0-1.
+        fileDialogAXAdapter.clearWritesAndShortcuts()
+        fileDialogAXAdapter.setSystemFocused(saveAsField)
+        fileDialogAXAdapter.onShortcut = { [weak fileDialogAXAdapter] keyCode, flags in
+            if keyCode == CGKeyCode(kVK_ANSI_G) && flags == [.maskCommand, .maskShift] {
+                fileDialogAXAdapter?.setSystemFocused(gotoField)
+            }
+        }
+        simulatedFrontmostApp = NSRunningApplication.current
+        app.dismissSearch()
+        app.showSearch()
+        try check(model.activeFileDialog?.kind == .save &&
+                  model.openFinderFolders.map(\.path) == [spaceRootPath] &&
+                  model.visibleResults.first == .finderFolder(OpenFinderFolder(path: spaceRootPath, name: "Scope Space Dir")) &&
+                  app.panel.frame.size == PanelGeometry.size(
+                      for: app.panelState, rows: model.visibleResults, showsResults: model.showsResults, hasFileDialogBanner: true
+                  ),
+                  "AppDelegate showSearch did not present Quick Switch banner + Finder folder row")
+
+        // Cmd+Return preserves normal Reveal without dialog navigation.
+        try type("space-doc", into: app)
+        try await until("space-doc loaded under activeFileDialog") {
+            model.hits.contains { $0.path == spaceDocPath }
+        }
+        model.selectedID = spaceDocPath
+        revealed = nil
+        try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
+        try await until("Cmd+Return preserved normal Reveal during Quick Switch") {
+            self.revealed?.path == spaceDocPath && !app.searchPresented && model.activeFileDialog == nil
+        }
+        try check(fileDialogAXAdapter.lastWrittenValue(for: gotoField) == nil,
+                  "Cmd+Return unexpectedly triggered dialog navigation")
+
+        // Plain Return on .finderFolder navigates active dialog & clears activeFileDialog.
+        app.showSearch()
+        try check(model.activeFileDialog?.kind == .save && model.selectedResult == .finderFolder(OpenFinderFolder(path: spaceRootPath, name: "Scope Space Dir")),
+                  "reopened Quick Switch did not auto-select Finder folder")
+        try key(kVK_Return, "\r", in: app)
+        try await until("Return on .finderFolder navigated dialog via FileDialogBridge") {
+            !app.searchPresented &&
+                model.activeFileDialog == nil &&
+                self.fileDialogAXAdapter.lastWrittenValue(for: gotoField) == spaceRootPath
+        }
+
+        // Open dialog + banner dismissal.
+        let openWindow = FileDialogAXElement.mock("open-win")
+        let openField = FileDialogAXElement.mock("open-list")
+        fileDialogAXAdapter.configureNode(openWindow, role: kAXWindowRole as String, subrole: kAXDialogSubrole as String,
+                                          identifier: "open-panel", children: [openField])
+        fileDialogAXAdapter.configureNode(openField, role: kAXOutlineRole as String)
+        fileDialogAXAdapter.configureApp(pid: testPID, bundleID: "com.apple.Preview", focusedWindow: openWindow, focusedElement: openField)
+        app.showSearch()
+        try check(model.activeFileDialog?.kind == .open, "AppDelegate did not detect Open dialog")
+        model.clearFileDialogContext()
+        try check(model.activeFileDialog == nil && model.openFinderFolders.isEmpty,
+                  "clearFileDialogContext did not clear Quick Switch state")
+        app.dismissSearch()
+        fileDialogAXAdapter.reset()
+        simulatedFrontmostApp = nil
+
+        // MARK: - 4. P1-A Selection & Clipboard Context Pass-Through
+        let contextPB = contextPasteboard
+        contextPB.clearContents()
+        let isoContextBridge = makeSelectionContextBridge()
+        selectionAXAdapter.reset()
+        defer {
+            selectionAXAdapter.reset()
+            contextPB.clearContents()
+            contextCaptureEnabled = false
+            simulatedFrontmostApp = nil
+        }
+
+        // Priority & privacy boundaries.
+        selectionAXAdapter.trusted = true
+        contextPB.setString("clipboard fallback text", forType: .string)
+        selectionAXAdapter.focusedByPID[testPID] = SelectionAXElementState(
+            role: "AXTextArea", subrole: nil, selectedText: "selected editor text",
+            isSelectedTextSettable: true, isEditable: true
+        )
+        selectionAXAdapter.selectedFileURLsByPID[testPID] = [spaceDoc]
+        let ctx1 = isoContextBridge.capture(pid: testPID, bundleIdentifier: "com.apple.finder", appName: "Finder", pasteboard: contextPB)
+        try check(ctx1 == .selectedText(text: "selected editor text", appName: "Finder", canReplace: true),
+                  "AXSelectedText did not win priority over Finder files and clipboard: \(String(describing: ctx1))")
+
+        // AXSecureTextField hard-abort without clipboard fallback (role and subrole).
+        selectionAXAdapter.focusedByPID[testPID] = SelectionAXElementState(
+            role: "AXSecureTextField", subrole: nil, selectedText: "secret", isSelectedTextSettable: true, isEditable: true
+        )
+        try check(isoContextBridge.capture(pid: testPID, bundleIdentifier: "com.apple.Safari", appName: "Safari", pasteboard: contextPB) == nil,
+                  "AXSecureTextField role did not hard-abort without clipboard fallback")
+        selectionAXAdapter.focusedByPID[testPID] = SelectionAXElementState(
+            role: "AXTextField", subrole: "AXSecureTextField", selectedText: "secret", isSelectedTextSettable: true, isEditable: true
+        )
+        try check(isoContextBridge.capture(pid: testPID, bundleIdentifier: "com.apple.Safari", appName: "Safari", pasteboard: contextPB) == nil,
+                  "AXSecureTextField subrole did not hard-abort without clipboard fallback")
+
+        // Finder files beat clipboard fallback.
+        selectionAXAdapter.focusedByPID[testPID] = SelectionAXElementState(
+            role: "AXOutline", subrole: nil, selectedText: nil, isSelectedTextSettable: false, isEditable: false
+        )
+        let ctxFiles = isoContextBridge.capture(pid: testPID, bundleIdentifier: "com.apple.finder", appName: "Finder", pasteboard: contextPB)
+        try check(ctxFiles == .selectedFiles(paths: [spaceDoc.standardizedFileURL.path], appName: "Finder"),
+                  "Finder selected files did not beat clipboard fallback: \(String(describing: ctxFiles))")
+
+        // Concealed / transient pasteboard rejection.
+        selectionAXAdapter.focusedByPID.removeValue(forKey: testPID)
+        for marker in ["org.nspasteboard.ConcealedType", "org.nspasteboard.TransientType", "com.agilebits.onepassword"] {
+            let pbItem = NSPasteboardItem()
+            pbItem.setString("sensitive", forType: .string)
+            pbItem.setData(Data(), forType: NSPasteboard.PasteboardType(marker))
+            contextPB.clearContents()
+            contextPB.writeObjects([pbItem])
+            try check(isoContextBridge.capture(pid: testPID, bundleIdentifier: "com.test.app", appName: "App", pasteboard: contextPB) == nil,
+                      "SelectionContextBridge captured sensitive pasteboard type \(marker)")
+        }
+
+        // Non-sensitive clipboard fallback succeeds.
+        contextPB.clearContents()
+        contextPB.setString("plain clipboard text", forType: .string)
+        try check(isoContextBridge.capture(pid: testPID, bundleIdentifier: "com.test.app", appName: "App", pasteboard: contextPB)
+                  == .clipboardText(text: "plain clipboard text"),
+                  "SelectionContextBridge did not fall back to plain clipboard text")
+
+        // End-to-end AppDelegate integration for P1-A (tr + Cmd+Return replace, qa, web quicklink, script, × dismissal).
+        let loopbackHTTP = try SmokeLoopbackHTTPServer(replyText: "你好世界")
+        defer { loopbackHTTP.stop() }
+        app.translation.newProvider()
+        app.translation.editDraft(\.name, value: "Loopback Context Probe")
+        app.translation.editDraft(\.endpoint, value: "http://127.0.0.1:\(loopbackHTTP.port)/v1")
+        app.translation.editDraft(\.model, value: "context-model")
+        app.translation.saveProvider()
+        defer {
+            while app.translation.canRemoveProvider { app.translation.removeProvider() }
+        }
+
+        let ctxScriptDir = directory.appendingPathComponent("P1AContextScripts", isDirectory: true)
+        try fm.createDirectory(at: ctxScriptDir, withIntermediateDirectories: true)
+        let ctxScript = ctxScriptDir.appendingPathComponent("ctx-probe")
+        try Data("#!/bin/sh\n# @lumen.title Context Arg Probe\n# @lumen.argument1 Prompt arg\nprintf '%s' \"$1\"\n".utf8).write(to: ctxScript)
+        try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: ctxScript.path)
+        app.scriptCatalog.selectFolder(ctxScriptDir)
+        app.scriptCatalog.setScriptsEnabled(true)
+        defer { app.scriptCatalog.setScriptsEnabled(false) }
+        try await until("P1-A context script loaded") {
+            !app.scriptCatalog.scriptLoading && app.scriptCatalog.scripts.contains { $0.title == "Context Arg Probe" }
+        }
+
+        selectionAXAdapter.focusedByPID[testPID] = SelectionAXElementState(
+            role: "AXTextArea", subrole: nil, selectedText: "hello world",
+            isSelectedTextSettable: true, isEditable: true
+        )
+        contextCaptureEnabled = true
+        simulatedFrontmostApp = NSRunningApplication.current
+        app.showSearch()
+        try check(model.activeContext == .selectedText(text: "hello world", appName: NSRunningApplication.current.localizedName, canReplace: true) &&
+                  app.panel.frame.size == PanelGeometry.size(
+                      for: app.panelState, rows: model.visibleResults, showsResults: model.showsResults, hasContextBanner: true
+                  ),
+                  "showSearch did not capture AXSelectedText context or update panel geometry")
+
+        // qa empty + non-empty instruction pass-through.
+        try type("qa ", into: app)
+        try check(app.commands.resolution == .question("hello world"),
+                  "qa with empty instruction did not use activeContext: \(app.commands.resolution)")
+        try type("qa summarize", into: app)
+        try check(app.commands.resolution == .question("summarize\n\n\"\"\"\nhello world\n\"\"\""),
+                  "qa with instruction did not wrap activeContext: \(app.commands.resolution)")
+
+        // Web quicklink pass-through ("g ").
+        try type("g ", into: app)
+        guard case .web("google", _, let webURL) = app.commands.resolution,
+              URLComponents(url: webURL, resolvingAgainstBaseURL: false)?.queryItems?.contains(URLQueryItem(name: "q", value: "hello world")) == true else {
+            throw Failure("g with empty argument did not resolve web URL from activeContext: \(app.commands.resolution)")
+        }
+
+        // Script with @lumen.argument1 prefills executionArgument without auto-running.
+        try type("Context Arg Probe", into: app)
+        try key(kVK_Return, "\r", in: app)
+        if case .argument("Prompt arg", required: false)? = app.commands.visibleExecution?.phase {
+            try check(app.commands.executionArgument == "hello world",
+                      "executable prompt did not prefill activeContext: \(app.commands.executionArgument)")
+        } else {
+            throw Failure("Return on Context Arg Probe bypassed interactive argument prompt")
+        }
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+
+        // tr + loopback translation + Cmd+Return replace-in-place.
+        try type("tr", into: app)
+        try check(app.translation.command?.text == "hello world" && app.translation.command?.target == .simplifiedChinese,
+                  "bare tr did not populate from activeContext: \(String(describing: app.translation.command))")
+        try key(kVK_Return, "\r", in: app)
+        try await until("loopback tr did not finish") {
+            app.translation.output == "你好世界" && app.translation.activity == nil
+        }
+        let pasteCountBeforeReplace = pasteIntoPreviousAppCount
+        filePasteboard.clearContents()
+        try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
+        try await until("Cmd+Return replace-in-place did not copy, dismiss, and paste") {
+            !app.searchPresented &&
+                self.filePasteboard.string(forType: .string) == "你好世界" &&
+                self.filePasteboard.types?.contains(ClipboardManager.internalType) == true &&
+                self.pasteIntoPreviousAppCount == pasteCountBeforeReplace + 1
+        }
+
+        // Re-open and test context × dismissal resets qa back to .missingArgument.
+        app.showSearch()
+        try type("qa ", into: app)
+        try check(app.commands.resolution == .question("hello world"), "reopened qa did not capture context")
+        model.setActiveContext(nil)
+        app.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: app.searchField))
+        try check(model.activeContext == nil && app.commands.resolution == .missingArgument(commandID: "qa"),
+                  "dismissing context did not restore missingArgument on qa")
+        app.dismissSearch()
+        contextCaptureEnabled = false
+        simulatedFrontmostApp = nil
+
+        // MARK: - 5. P2-B Clipboard Templates (SQLite migration, pinned retention, single-pass expansion, main search + cb edit)
+        let legacyClipboardRoot = clipboardFixtureRoot.appendingPathComponent("P2BLegacyClipboard", isDirectory: true)
+        try fm.createDirectory(at: legacyClipboardRoot, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let legacyDBURL = legacyClipboardRoot.appendingPathComponent(".history.sqlite")
+        var rawDB: OpaquePointer?
+        try check(sqlite3_open(legacyDBURL.path, &rawDB) == SQLITE_OK, "could not create legacy clipboard sqlite fixture")
+        let createLegacySQL = """
+            CREATE TABLE clips (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT,
+                image BLOB,
+                thumbnail BLOB,
+                captured REAL NOT NULL,
+                bundle_id TEXT,
+                app_name TEXT,
+                digest BLOB NOT NULL,
+                file_path TEXT,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                recency INTEGER NOT NULL
+            );
+            INSERT INTO clips (text, captured, digest, pinned, recency)
+            VALUES ('legacy row before alias column', 1000.0, X'01020304', 0, 1);
+            """
+        try check(sqlite3_exec(rawDB, createLegacySQL, nil, nil, nil) == SQLITE_OK, "could not seed legacy clipboard table")
+        sqlite3_close(rawDB)
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: legacyDBURL.path)
+
+        let migratedStore = ClipboardStore(directory: legacyClipboardRoot, limit: 2)
+        let migratedItems = try migratedStore.items()
+        try check(migratedItems.count == 1 && migratedItems[0].text == "legacy row before alias column" && migratedItems[0].alias == nil,
+                  "ClipboardStore failed idempotent alias column migration on legacy sqlite")
+
+        // Verify explicit pinned:false evicts under limit=2 while pinned:true retains.
+        _ = try migratedStore.createTemplate(text: "Unpinned {{date}}", alias: "unp", pinned: false, capturedAt: .now)
+        _ = try migratedStore.createTemplate(text: "Pinned {{date}}", alias: "pin", pinned: true, capturedAt: .now)
+        _ = try migratedStore.upsertText("Filler 1", capturedAt: .now.addingTimeInterval(1), bundleID: nil, appName: nil)
+        _ = try migratedStore.upsertText("Filler 2", capturedAt: .now.addingTimeInterval(2), bundleID: nil, appName: nil)
+        let afterEviction = try migratedStore.items()
+        try check(afterEviction.contains { $0.alias == "pin" && $0.pinned } &&
+                  !afterEviction.contains { $0.alias == "unp" },
+                  "ClipboardStore did not evict unpinned template or failed to retain pinned template: \(afterEviction)")
+
+        // Single-pass non-recursive variable expansion.
+        let fixedZone = TimeZone(secondsFromGMT: 0)!
+        var utcCal = Calendar(identifier: .gregorian)
+        utcCal.timeZone = fixedZone
+        let fixedDate = utcCal.date(from: DateComponents(year: 2026, month: 11, day: 28, hour: 9, minute: 5))!
+        let expanded = ClipboardTemplateExpander.expand(
+            "{{date}}|{{time}}|{{datetime}}|{{clipboard}}",
+            clipboardText: "{{date}} {{clipboard}} literal",
+            now: fixedDate,
+            timeZone: fixedZone
+        )
+        try check(expanded == "2026-11-28|09:05|2026-11-28 09:05|{{date}} {{clipboard}} literal",
+                  "ClipboardTemplateExpander failed single-pass non-recursive expansion: \(expanded)")
+
+        // End-to-end main search .snippet match -> Return expanded copy/paste + cb Cmd+K template editor hook.
+        let clipMgr = app.clipboard
+        clipMgr.clearAll()
+        var createdTemplate = false
+        clipMgr.saveTemplate(id: nil, text: "Hello on {{date}} from {{clipboard}}", alias: "greet", pinned: true) { ok in
+            createdTemplate = ok
+        }
+        try await until("saveTemplate finished for greet snippet") { createdTemplate }
+        defer { clipMgr.clearAll() }
+
+        try writeClipboardText("LumenSnippetUser")
+        app.showSearch()
+        try type("greet", into: app)
+        try await until("main search surfaced .snippet row for alias greet") {
+            if case .snippet(let s)? = model.selectedResult {
+                return s.alias == "greet" && s.pinned
+            }
+            return false
+        }
+        let pasteCountBeforeSnippet = pasteIntoPreviousAppCount
+        try key(kVK_Return, "\r", in: app)
+        let todayPrefix = ClipboardTemplateExpander.expand("Hello on {{date}} from LumenSnippetUser")
+        try await until("Return on .snippet expanded template, copied internally, dismissed, and pasted") {
+            !app.searchPresented &&
+                self.filePasteboard.string(forType: .string) == todayPrefix &&
+                self.filePasteboard.types?.contains(ClipboardManager.internalType) == true &&
+                self.pasteIntoPreviousAppCount == pasteCountBeforeSnippet + 1
+        }
+
+        // Open cb, Cmd+K -> edit-template requests ClipboardHistoryView inline editor.
+        app.showSearch()
+        try type("cb ", into: app)
+        try await until("cb loaded greet template") {
+            app.commands.clipboardSelection != nil
+        }
+        try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+        guard let editTplIdx = app.contextActions.items.firstIndex(where: { $0.id == "edit-template" }) else {
+            throw Failure("missing edit-template in cb Cmd+K menu: \(app.contextActions.items.map(\.id))")
+        }
+        app.contextActions.run(editTplIdx)
+        app.panel.contentView?.layoutSubtreeIfNeeded()
+        _ = try? render(.aqua, window: app.panel)
+        app.panel.appearance = nil
+        try await until("cb Cmd+K edit-template consumed pending edit request in ClipboardHistoryView") {
+            app.commands.pendingTemplateEditItem == nil
+        }
+        app.dismissSearch()
+        print("Wave 2 features passed (P0-2 scope/actions, P2-A folder alias, P0-1 Quick Switch, P1-A context pass-through, P2-B snippets/templates)")
+    }
+
     private struct Failure: Error, CustomStringConvertible {
         let description: String
         init(_ description: String) { self.description = description }
@@ -8328,5 +9078,371 @@ private final class SmokePersonalDataHarness: @unchecked Sendable {
             }
         )
     }
+}
+
+final class SmokeFileDialogAXAdapter: FileDialogAXAdapter, @unchecked Sendable {
+    struct NodeState {
+        var role: String?
+        var subrole: String?
+        var identifier: String?
+        var title: String?
+        var descriptionText: String?
+        var placeholder: String?
+        var value: String?
+        var enabled: Bool?
+        var url: URL?
+        var parent: FileDialogAXElement?
+        var children: [FileDialogAXElement] = []
+        var sheets: [FileDialogAXElement] = []
+        var proxy: FileDialogAXElement?
+        var window: FileDialogAXElement?
+        var topLevel: FileDialogAXElement?
+        var defaultButton: FileDialogAXElement?
+    }
+
+    private let lock = NSLock()
+    private var trusted = false
+    private var nodes: [FileDialogAXElement: NodeState] = [:]
+    private var bundleIDs: [pid_t: String] = [:]
+    private var appElements: [pid_t: FileDialogAXElement] = [:]
+    private var focusedByPID: [pid_t: FileDialogAXElement] = [:]
+    private var focusedWindowByPID: [pid_t: FileDialogAXElement] = [:]
+    private var mainWindowByPID: [pid_t: FileDialogAXElement] = [:]
+    private var windowsByPID: [pid_t: [FileDialogAXElement]] = [:]
+    private var pidsByBundleID: [String: [pid_t]] = [:]
+    private var elementPIDs: [FileDialogAXElement: pid_t] = [:]
+    private var systemFocused: FileDialogAXElement?
+    private var activePIDs: Set<pid_t> = []
+    private var writtenValues: [FileDialogAXElement: String] = [:]
+    private var shortcuts: [(CGKeyCode, CGEventFlags)] = []
+    var onShortcut: ((CGKeyCode, CGEventFlags) -> Void)?
+
+    func reset() {
+        lock.withLock {
+            trusted = false
+            nodes.removeAll()
+            bundleIDs.removeAll()
+            appElements.removeAll()
+            focusedByPID.removeAll()
+            focusedWindowByPID.removeAll()
+            mainWindowByPID.removeAll()
+            windowsByPID.removeAll()
+            pidsByBundleID.removeAll()
+            elementPIDs.removeAll()
+            systemFocused = nil
+            activePIDs.removeAll()
+            writtenValues.removeAll()
+            shortcuts.removeAll()
+            onShortcut = nil
+        }
+    }
+
+    func setTrusted(_ value: Bool) { lock.withLock { trusted = value } }
+
+    func clearWritesAndShortcuts() {
+        lock.withLock {
+            writtenValues.removeAll()
+            shortcuts.removeAll()
+        }
+    }
+
+    func setSystemFocused(_ element: FileDialogAXElement?) {
+        lock.withLock { systemFocused = element }
+    }
+
+    func lastWrittenValue(for element: FileDialogAXElement) -> String? {
+        lock.withLock { writtenValues[element] }
+    }
+
+    func configureNode(
+        _ element: FileDialogAXElement,
+        role: String? = nil,
+        subrole: String? = nil,
+        identifier: String? = nil,
+        title: String? = nil,
+        descriptionText: String? = nil,
+        placeholder: String? = nil,
+        value: String? = nil,
+        enabled: Bool? = nil,
+        url: URL? = nil,
+        parent: FileDialogAXElement? = nil,
+        children: [FileDialogAXElement] = [],
+        sheets: [FileDialogAXElement] = [],
+        proxy: FileDialogAXElement? = nil,
+        window: FileDialogAXElement? = nil,
+        topLevel: FileDialogAXElement? = nil,
+        defaultButton: FileDialogAXElement? = nil
+    ) {
+        lock.withLock {
+            nodes[element] = NodeState(
+                role: role, subrole: subrole, identifier: identifier, title: title,
+                descriptionText: descriptionText, placeholder: placeholder, value: value,
+                enabled: enabled, url: url, parent: parent, children: children, sheets: sheets,
+                proxy: proxy, window: window, topLevel: topLevel, defaultButton: defaultButton
+            )
+        }
+    }
+
+    func configureApp(
+        pid: pid_t,
+        bundleID: String,
+        focusedWindow: FileDialogAXElement,
+        focusedElement: FileDialogAXElement
+    ) {
+        lock.withLock {
+            let appEl = FileDialogAXElement.mock("app-\(pid)")
+            appElements[pid] = appEl
+            bundleIDs[pid] = bundleID
+            focusedWindowByPID[pid] = focusedWindow
+            mainWindowByPID[pid] = focusedWindow
+            focusedByPID[pid] = focusedElement
+            windowsByPID[pid] = [focusedWindow]
+            elementPIDs[focusedElement] = pid
+            systemFocused = focusedElement
+        }
+    }
+
+    func configureFinder(pid: pid_t, windows: [FileDialogAXElement]) {
+        lock.withLock {
+            let appEl = FileDialogAXElement.mock("finder-\(pid)")
+            appElements[pid] = appEl
+            bundleIDs[pid] = "com.apple.finder"
+            pidsByBundleID["com.apple.finder"] = [pid]
+            windowsByPID[pid] = windows
+        }
+    }
+
+    func isProcessTrusted() -> Bool { lock.withLock { trusted } }
+    func applicationElement(for pid: pid_t) -> FileDialogAXElement? { lock.withLock { appElements[pid] } }
+    func systemFocusedElement() -> FileDialogAXElement? { lock.withLock { systemFocused } }
+    func focusedElement(in pid: pid_t) -> FileDialogAXElement? { lock.withLock { focusedByPID[pid] } }
+    func pid(of element: FileDialogAXElement) -> pid_t? { lock.withLock { elementPIDs[element] } }
+    func bundleIdentifier(for pid: pid_t) -> String? { lock.withLock { bundleIDs[pid] } }
+    func runningApplicationPIDs(bundleIdentifier: String) -> [pid_t] { lock.withLock { pidsByBundleID[bundleIdentifier] ?? [] } }
+    func isApplicationActive(pid: pid_t) -> Bool { lock.withLock { activePIDs.contains(pid) } }
+    func activateApplication(pid: pid_t) -> Bool {
+        _ = lock.withLock { activePIDs.insert(pid) }
+        return true
+    }
+
+    func elementAttribute(_ attribute: String, of element: FileDialogAXElement) -> FileDialogAXElement? {
+        lock.withLock {
+            if let pid = appElements.first(where: { $0.value == element })?.key {
+                switch attribute {
+                case kAXFocusedWindowAttribute: return focusedWindowByPID[pid]
+                case kAXMainWindowAttribute: return mainWindowByPID[pid]
+                case kAXFocusedUIElementAttribute: return focusedByPID[pid]
+                default: break
+                }
+            }
+            guard let node = nodes[element] else { return nil }
+            switch attribute {
+            case kAXParentAttribute: return node.parent
+            case kAXProxyAttribute: return node.proxy
+            case kAXWindowAttribute: return node.window
+            case kAXTopLevelUIElementAttribute: return node.topLevel
+            case kAXDefaultButtonAttribute: return node.defaultButton
+            default: return nil
+            }
+        }
+    }
+
+    func elementsAttribute(_ attribute: String, of element: FileDialogAXElement) -> [FileDialogAXElement] {
+        lock.withLock {
+            if let pid = appElements.first(where: { $0.value == element })?.key,
+               attribute == (kAXWindowsAttribute as String) {
+                return windowsByPID[pid] ?? []
+            }
+            guard let node = nodes[element] else { return [] }
+            switch attribute {
+            case kAXChildrenAttribute: return node.children
+            case "AXSheets": return node.sheets
+            default: return []
+            }
+        }
+    }
+
+    func stringAttribute(_ attribute: String, of element: FileDialogAXElement) -> String? {
+        lock.withLock {
+            guard let node = nodes[element] else { return nil }
+            switch attribute {
+            case kAXRoleAttribute: return node.role
+            case kAXSubroleAttribute: return node.subrole
+            case kAXIdentifierAttribute: return node.identifier
+            case kAXTitleAttribute: return node.title
+            case kAXDescriptionAttribute: return node.descriptionText
+            case kAXPlaceholderValueAttribute: return node.placeholder
+            case kAXValueAttribute: return node.value
+            default: return nil
+            }
+        }
+    }
+
+    func boolAttribute(_ attribute: String, of element: FileDialogAXElement) -> Bool? {
+        lock.withLock {
+            guard attribute == (kAXEnabledAttribute as String) else { return nil }
+            return nodes[element]?.enabled
+        }
+    }
+
+    func urlAttribute(_ attribute: String, of element: FileDialogAXElement) -> URL? {
+        lock.withLock {
+            guard attribute == (kAXDocumentAttribute as String) || attribute == (kAXURLAttribute as String) else { return nil }
+            return nodes[element]?.url
+        }
+    }
+
+    func setStringAttribute(_ attribute: String, value: String, on element: FileDialogAXElement) -> Bool {
+        lock.withLock {
+            guard attribute == (kAXValueAttribute as String) else { return false }
+            writtenValues[element] = value
+            nodes[element]?.value = value
+            return true
+        }
+    }
+
+    func performAction(_ action: String, on element: FileDialogAXElement) -> Bool { true }
+
+    func postKeyboardShortcut(keyCode: CGKeyCode, flags: CGEventFlags) -> Bool {
+        let callback = lock.withLock { () -> ((CGKeyCode, CGEventFlags) -> Void)? in
+            shortcuts.append((keyCode, flags))
+            return onShortcut
+        }
+        callback?(keyCode, flags)
+        return true
+    }
+}
+
+final class SmokeSelectionAXAdapter: SelectionAXAdapter, @unchecked Sendable {
+    private let lock = NSLock()
+    private var trustedState = false
+    private var focusedStates: [pid_t: SelectionAXElementState] = [:]
+    private var selectedFiles: [pid_t: [URL]] = [:]
+
+    var trusted: Bool {
+        get { lock.withLock { trustedState } }
+        set { lock.withLock { trustedState = newValue } }
+    }
+
+    var focusedByPID: [pid_t: SelectionAXElementState] {
+        get { lock.withLock { focusedStates } }
+        set { lock.withLock { focusedStates = newValue } }
+    }
+
+    var selectedFileURLsByPID: [pid_t: [URL]] {
+        get { lock.withLock { selectedFiles } }
+        set { lock.withLock { selectedFiles = newValue } }
+    }
+
+    func reset() {
+        lock.withLock {
+            trustedState = false
+            focusedStates.removeAll()
+            selectedFiles.removeAll()
+        }
+    }
+
+    func isTrusted() -> Bool { trusted }
+    func focusedElementState(in pid: pid_t) -> SelectionAXElementState? { lock.withLock { focusedStates[pid] } }
+    func selectedFileURLs(in pid: pid_t, limit: Int) -> [URL] {
+        lock.withLock { Array((selectedFiles[pid] ?? []).prefix(limit)) }
+    }
+}
+
+private final class SmokeLoopbackHTTPServer: @unchecked Sendable {
+    private let listenFD: Int32
+    let port: UInt16
+    private let stopLock = NSLock()
+    private var stopped = false
+
+    init(replyText: String) throws {
+        let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        var reuse: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = 0
+        addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+
+        let bindResult = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bindResult == 0, Darwin.listen(fd, 8) == 0 else {
+            let code = errno
+            Darwin.close(fd)
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+        }
+        var boundAddr = sockaddr_in()
+        var boundLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafeMutablePointer(to: &boundAddr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.getsockname(fd, $0, &boundLen)
+            }
+        }
+        self.listenFD = fd
+        self.port = UInt16(bigEndian: boundAddr.sin_port)
+
+        let payloadObject: [String: Any] = [
+            "choices": [["message": ["content": replyText], "finish_reason": "stop"]]
+        ]
+        let jsonData = try JSONSerialization.data(withJSONObject: payloadObject)
+        let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(jsonData.count)\r\nConnection: close\r\n\r\n"
+        var responseData = Data(header.utf8)
+        responseData.append(jsonData)
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            while true {
+                guard let self, !self.stopLock.withLock({ self.stopped }) else { break }
+                let clientFD = Darwin.accept(fd, nil, nil)
+                if clientFD < 0 { break }
+                var received = Data()
+                var buf = [UInt8](repeating: 0, count: 4096)
+                var expectedTotal: Int?
+                while true {
+                    let n = Darwin.read(clientFD, &buf, buf.count)
+                    if n <= 0 { break }
+                    received.append(contentsOf: buf.prefix(n))
+                    if expectedTotal == nil, let headerRange = received.range(of: Data("\r\n\r\n".utf8)) {
+                        let headerText = String(decoding: received[..<headerRange.lowerBound], as: UTF8.self)
+                        let contentLength = headerText
+                            .split(separator: "\r\n")
+                            .compactMap { line -> Int? in
+                                let lower = line.lowercased()
+                                guard lower.hasPrefix("content-length:") else { return nil }
+                                return Int(lower.dropFirst("content-length:".count).trimmingCharacters(in: .whitespaces))
+                            }
+                            .first ?? 0
+                        expectedTotal = headerRange.upperBound + contentLength
+                    }
+                    if let expectedTotal, received.count >= expectedTotal { break }
+                }
+                responseData.withUnsafeBytes { raw in
+                    guard let base = raw.baseAddress else { return }
+                    var sent = 0
+                    while sent < raw.count {
+                        let n = Darwin.write(clientFD, base.advanced(by: sent), raw.count - sent)
+                        if n <= 0 { break }
+                        sent += n
+                    }
+                }
+                Darwin.close(clientFD)
+            }
+        }
+    }
+
+    func stop() {
+        stopLock.withLock {
+            guard !stopped else { return }
+            stopped = true
+            Darwin.close(listenFD)
+        }
+    }
+
+    deinit { stop() }
 }
 #endif

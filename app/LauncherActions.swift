@@ -208,6 +208,7 @@ enum LauncherResult: Identifiable, Equatable {
     case file(SearchHit), action(LaunchAction), shortcut(SavedShortcut), calculation(CalculationResult)
     case dictionary(DictionaryQuickResult), bookmark(BookmarkHit), contact(ContactHit)
     case calendarEvent(CalendarEventHit), reminder(ReminderHit)
+    case snippet(ClipboardItem), finderFolder(OpenFinderFolder)
 
     var id: String {
         switch self {
@@ -220,6 +221,8 @@ enum LauncherResult: Identifiable, Equatable {
         case .contact(let c): return "contact:\(c.id)"
         case .calendarEvent(let e): return "event:\(e.id)"
         case .reminder(let r): return "rem:\(r.id)"
+        case .snippet(let item): return "snippet:\(item.id)"
+        case .finderFolder(let folder): return "finder:\(folder.path)"
         }
     }
 }

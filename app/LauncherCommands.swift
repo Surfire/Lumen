@@ -97,7 +97,9 @@ enum PanelGeometry {
         for state: PanelState,
         rows: [LauncherResult],
         showsResults: Bool,
-        needsAccessibility: Bool = false
+        needsAccessibility: Bool = false,
+        hasFileDialogBanner: Bool = false,
+        hasContextBanner: Bool = false
     ) -> CGSize {
         let width: CGFloat
         if case .inlinePreview = state.overlay { width = previewWidth }
@@ -105,6 +107,8 @@ enum PanelGeometry {
 
         let shell = headerHeight + footerHeight
             + (needsAccessibility ? WindowAccessibilityBanner.launcherHeight : 0)
+            + (hasFileDialogBanner ? FileDialogBanner.launcherHeight : 0)
+            + (hasContextBanner ? SelectionContextBanner.launcherHeight : 0)
 
         let bodyHeight: CGFloat
         switch state.mode {
@@ -168,6 +172,7 @@ final class LauncherCommands: ObservableObject {
     @Published private(set) var definition: DictionaryDefinition?
     @Published private(set) var definitionCopied = false
     @Published private(set) var definitionPage = 0
+    @Published private(set) var pendingTemplateEditItem: ClipboardItem?
     private var executionTask: Task<Void, Never>?
     private var feedbackTask: Task<Void, Never>?
     private var definitionTask: Task<Void, Never>?
@@ -317,6 +322,14 @@ final class LauncherCommands: ObservableObject {
 
     func chooseClipboard(_ id: Int64) {
         if clipboardRows.contains(where: { $0.id == id }) { clipboardSelection = id }
+    }
+
+    func requestTemplateEdit(for item: ClipboardItem) {
+        pendingTemplateEditItem = item
+    }
+
+    func clearTemplateEditRequest() {
+        if pendingTemplateEditItem != nil { pendingTemplateEditItem = nil }
     }
 
     func moveClipboard(_ delta: Int) {
@@ -527,6 +540,7 @@ struct LauncherCommandCard: View {
     let chinese: Bool
     let activate: () -> Void
     let openSettings: () -> Void
+    var contextBadge: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -534,6 +548,16 @@ struct LauncherCommandCard: View {
             else {
                 HStack {
                     Label(title, systemImage: symbol).font(.headline)
+                    if case .question = commands.resolution, let contextBadge, !contextBadge.isEmpty {
+                        Text(verbatim: contextBadge)
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(.primary.opacity(0.06), in: Capsule())
+                            .lineLimit(1)
+                            .accessibilityIdentifier("qa-context-badge")
+                    }
                     Spacer(minLength: 8)
                     if commands.answer == .loading {
                         ProgressView().controlSize(.small)

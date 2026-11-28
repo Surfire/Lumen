@@ -6,6 +6,9 @@ struct TranslationResultCard: View {
     let command: TranslationCommand
     let chinese: Bool
     let activate: () -> Void
+    var contextBadge: String? = nil
+    var canReplaceSelection: Bool = false
+    var onReplaceSelection: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -15,12 +18,25 @@ struct TranslationResultCard: View {
                 Text(heading)
                     .font(.system(size: 14, weight: .semibold))
                     .accessibilityIdentifier("translation-target")
+                if let contextBadge, !contextBadge.isEmpty {
+                    Text(verbatim: contextBadge)
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(.primary.opacity(0.06), in: Capsule())
+                        .lineLimit(1)
+                }
                 Spacer()
                 if model.activity == .translating {
                     ProgressView().controlSize(.small)
                         .accessibilityLabel(t("正在翻译", "Translating"))
                     Button(t("取消", "Cancel"), action: model.cancel)
                 } else if !model.output.isEmpty {
+                    if canReplaceSelection, let onReplaceSelection {
+                        Button(t("替换原文本", "Replace"), action: onReplaceSelection)
+                            .accessibilityIdentifier("translation-replace")
+                    }
                     Button(t("复制", "Copy"), action: activate)
                         .accessibilityIdentifier("translation-copy")
                 } else if model.canTranslate {

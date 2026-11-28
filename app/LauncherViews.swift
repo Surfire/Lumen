@@ -32,6 +32,9 @@ struct SearchWindow: View {
     let moveSelection: (Int) -> Void
     let fileAction: (FileAction, SearchHit) -> Void
     let contextItemsForResult: (LauncherResult) -> [ContextActions.Item]
+    let dismissFileDialog: () -> Void
+    let dismissContext: () -> Void
+    let replaceTranslationSelection: () -> Void
 
     static let headerHeight: CGFloat = PanelGeometry.headerHeight
     static let footerHeight: CGFloat = PanelGeometry.footerHeight
@@ -50,13 +53,30 @@ struct SearchWindow: View {
             inlinePreview: inlinePreview
         )
         VStack(spacing: 0) {
+            if let dialog = model.activeFileDialog {
+                FileDialogBanner(dialog: dialog, chinese: model.zh, dismiss: dismissFileDialog)
+                    .frame(height: FileDialogBanner.launcherHeight)
+            }
+            if let context = model.activeContext {
+                SelectionContextBanner(context: context, chinese: model.zh, dismiss: dismissContext)
+                    .frame(height: SelectionContextBanner.launcherHeight)
+            }
             switch (state.mode, state.overlay) {
             case (.scriptOutput(let execution), _):
                 LauncherCommandOutputCard(commands: commands, execution: execution, chinese: model.zh,
                                           run: activateExecution, copy: copyOutput, cancel: cancelExecution)
             case (.translation(let command), _):
-                TranslationResultCard(model: translation, command: command, chinese: model.zh,
-                                      activate: activateTranslation)
+                TranslationResultCard(
+                    model: translation,
+                    command: command,
+                    chinese: model.zh,
+                    activate: activateTranslation,
+                    contextBadge: model.activeContext?.textPayload != nil
+                        ? model.activeContext?.badgeTitle(chinese: model.zh)
+                        : nil,
+                    canReplaceSelection: model.activeContext?.canReplaceInPlace == true,
+                    onReplaceSelection: replaceTranslationSelection
+                )
             case (.imageSetup, _):
                 VStack(alignment: .leading, spacing: 8) {
                     Label(model.t("图像搜索", "Image Search"), systemImage: "photo")
@@ -80,8 +100,16 @@ struct SearchWindow: View {
             case (.window, _):
                 windowRowsView
             case (.commandCard, _):
-                LauncherCommandCard(commands: commands, provider: translation, chinese: model.zh,
-                                    activate: activateCommand, openSettings: showSettings)
+                LauncherCommandCard(
+                    commands: commands,
+                    provider: translation,
+                    chinese: model.zh,
+                    activate: activateCommand,
+                    openSettings: showSettings,
+                    contextBadge: model.activeContext?.textPayload != nil
+                        ? model.activeContext?.badgeTitle(chinese: model.zh)
+                        : nil
+                )
             case (.definition(let word, let text, let loading), _):
                 LauncherDefinitionCard(commands: commands, word: word, text: text, loading: loading,
                                        chinese: model.zh, copy: copyDefinition, close: closeDefinition)
@@ -152,6 +180,9 @@ struct SearchWindow: View {
                     keyHint("esc", model.t("取消", "Cancel"))
                 } else if !translation.output.isEmpty {
                     keyHint("↵", model.t("复制", "Copy"))
+                    if model.activeContext?.canReplaceInPlace == true {
+                        keyHint("⌘↵", model.t("替换原文本", "Replace Selection"))
+                    }
                     if translation.copied { Text(model.t("已复制", "Copied")).accessibilityIdentifier("translation-copied") }
                 } else if translation.canTranslate {
                     keyHint("↵", model.t("翻译", "Translate"))
@@ -230,25 +261,76 @@ struct SearchWindow: View {
         }
         if showsResults {
             keyHint("↑↓", model.t("选择", "Select"))
-            switch model.selectedResult {
-            case .file(let file):
-                keyHint("↵", fileActionTitle(model.primaryFileAction(for: file)))
-                keyHint("⌘↵", fileActionTitle(model.secondaryFileAction(for: file)))
-                if file.kind == "file" {
-                    keyHint(model.t("空格 / ⌘Y", "Space / ⌘Y"), model.t("悬浮 / 侧边", "Window / Inline"))
+            if let dialog = model.activeFileDialog {
+                switch model.selectedResult {
+                case .file(let file):
+                    let isDir = file.kind == "directory"
+                    let enterLabel = (isDir || dialog.kind == .save)
+                        ? model.t("跳转此目录", "Jump to Folder")
+                        : model.t("在弹窗中选中", "Select in Dialog")
+                    keyHint("↵", enterLabel)
+                    keyHint("⌘↵", fileActionTitle(model.secondaryFileAction(for: file)))
+                    if isDir && !file.name.lowercased().hasSuffix(".app") {
+                        keyHint("⇥", model.t("目录内搜索", "Search Inside"))
+                    }
+                case .finderFolder:
+                    keyHint("↵", model.t("跳转此目录", "Jump to Folder"))
+                    keyHint("⇥", model.t("目录内搜索", "Search Inside"))
+                case .shortcut(let shortcut):
+                    if case .folder = shortcut.target {
+                        keyHint("↵", model.t("跳转此目录", "Jump to Folder"))
+                        keyHint("⇥", model.t("目录内搜索", "Search Inside"))
+                    } else {
+                        keyHint("↵", fileActionTitle(.open))
+                    }
+                case .snippet:
+                    keyHint("↵", model.t("粘贴", "Paste"))
+                case .calculation:
+                    keyHint("↵", model.t("复制", "Copy"))
+                case .dictionary:
+                    keyHint("↵", model.t("查看释义", "Define"))
+                case .bookmark:
+                    keyHint("↵", model.t("打开链接", "Open"))
+                case .calendarEvent(let event):
+                    keyHint("↵", event.meetingURL != nil ? model.t("入会", "Join") : model.t("打开", "Open"))
+                case .reminder:
+                    keyHint("↵", model.t("完成", "Complete"))
+                case .contact, .action, .none:
+                    keyHint("↵", fileActionTitle(.open))
                 }
-            case .calculation:
-                keyHint("↵", model.t("复制", "Copy"))
-            case .dictionary:
-                keyHint("↵", model.t("查看释义", "Define"))
-            case .bookmark:
-                keyHint("↵", model.t("打开链接", "Open"))
-            case .calendarEvent(let event):
-                keyHint("↵", event.meetingURL != nil ? model.t("入会", "Join") : model.t("打开", "Open"))
-            case .reminder:
-                keyHint("↵", model.t("完成", "Complete"))
-            case .contact, .action, .shortcut, .none:
-                keyHint("↵", fileActionTitle(.open))
+            } else {
+                switch model.selectedResult {
+                case .file(let file):
+                    keyHint("↵", fileActionTitle(model.primaryFileAction(for: file)))
+                    keyHint("⌘↵", fileActionTitle(model.secondaryFileAction(for: file)))
+                    if file.kind == "directory", !file.name.lowercased().hasSuffix(".app") {
+                        keyHint("⇥", model.t("目录内搜索", "Search Inside"))
+                    } else if file.kind == "file" {
+                        keyHint(model.t("空格 / ⌘Y", "Space / ⌘Y"), model.t("悬浮 / 侧边", "Window / Inline"))
+                    }
+                case .finderFolder:
+                    keyHint("↵", fileActionTitle(.open))
+                    keyHint("⇥", model.t("目录内搜索", "Search Inside"))
+                case .shortcut(let shortcut):
+                    keyHint("↵", fileActionTitle(.open))
+                    if case .folder = shortcut.target {
+                        keyHint("⇥", model.t("目录内搜索", "Search Inside"))
+                    }
+                case .snippet:
+                    keyHint("↵", model.t("粘贴", "Paste"))
+                case .calculation:
+                    keyHint("↵", model.t("复制", "Copy"))
+                case .dictionary:
+                    keyHint("↵", model.t("查看释义", "Define"))
+                case .bookmark:
+                    keyHint("↵", model.t("打开链接", "Open"))
+                case .calendarEvent(let event):
+                    keyHint("↵", event.meetingURL != nil ? model.t("入会", "Join") : model.t("打开", "Open"))
+                case .reminder:
+                    keyHint("↵", model.t("完成", "Complete"))
+                case .contact, .action, .none:
+                    keyHint("↵", fileActionTitle(.open))
+                }
             }
         }
         if !model.canSearch {
@@ -286,6 +368,9 @@ struct SearchWindow: View {
     private func escapeHintLabel(overlay: PanelOverlay) -> String {
         if case .inlinePreview = overlay { return model.t("关闭预览", "Close Preview") }
         if case .contextMenu = overlay { return model.t("关闭操作", "Close Actions") }
+        if model.activeScopedDirectory != nil && model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return model.t("退出目录", "Exit Folder")
+        }
         if model.hasQuery { return model.t("清除", "Clear") }
         return model.t("关闭", "Close")
     }
@@ -306,7 +391,7 @@ struct SearchWindow: View {
     }
 
     private var results: some View {
-        let highlight = LauncherHighlight(model.query)
+        let highlight = LauncherHighlight(model.activeHighlightQuery)
         let selection = model.selectedID
         return ScrollViewReader { proxy in
             ScrollView {
@@ -353,6 +438,13 @@ struct SearchWindow: View {
                                        symbol: reminder.isCompleted ? "checkmark.circle.fill" : "checklist",
                                        highlight: highlight, selected: selected, detailTruncation: .tail,
                                        badge: (model.t("提醒", "Reminder"), "checklist", false)).id(result.id)
+                        case .snippet(let item):
+                            snippetRow(item, highlight: highlight, selected: selected).id(result.id)
+                        case .finderFolder(let folder):
+                            utilityRow(result, title: folder.name,
+                                       detail: (folder.path as NSString).abbreviatingWithTildeInPath,
+                                       symbol: "folder.fill", highlight: highlight, selected: selected,
+                                       badge: (model.t("访达窗口", "Finder"), "macwindow", true)).id(result.id)
                         }
                     }
                 }
@@ -412,6 +504,73 @@ struct SearchWindow: View {
                 }
             }.padding(.horizontal, 8)
         }
+    }
+
+    private func snippetRow(_ item: ClipboardItem, highlight: LauncherHighlight, selected: Bool) -> some View {
+        let rawTemplate = item.text ?? ""
+        let expanded = ClipboardTemplateExpander.expand(rawTemplate, clipboardText: clipboard.currentPasteboardPreviewText())
+        let displayTitle = expanded
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        let titleText = displayTitle.isEmpty ? (item.alias ?? model.t("短语模板", "Snippet")) : displayTitle
+        let rawSingleLine = rawTemplate
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        let detailText = ClipboardTemplateExpander.containsVariables(rawTemplate)
+            ? rawSingleLine
+            : model.t("短语模板", "Snippet Template")
+
+        return HStack(spacing: 10) {
+            Image(systemName: "text.quote").frame(width: 28, height: 28)
+                .foregroundStyle(selected ? Color.accentColor : .secondary)
+                .background(.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 6))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(highlight.text(titleText, size: 13, colorScheme: colorScheme, mode: .action))
+                    .font(.system(size: 13, weight: .medium)).lineLimit(1).truncationMode(.tail)
+                Text(verbatim: detailText)
+                    .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+                    .help(expanded)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: 6) {
+                if item.pinned {
+                    Image(systemName: "pin.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel(model.t("已固定", "Pinned"))
+                }
+                if let alias = item.alias, !alias.isEmpty {
+                    Text(verbatim: alias)
+                        .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Color.primary.opacity(0.075), in: Capsule())
+                        .lineLimit(1)
+                }
+            }
+            .fixedSize()
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 44)
+        .modifier(ResultRowChrome(selected: selected))
+        .overlay { ActionRowClickView { selectRow(.snippet(item), $0 == 2) }.accessibilityHidden(true) }
+        .contextMenu {
+            ForEach(contextItemsForResult(.snippet(item))) { actionItem in
+                Button {
+                    actionItem.perform()
+                } label: {
+                    Label(actionItem.title, systemImage: actionItem.symbol)
+                }
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityAction(named: Text(model.t("粘贴", "Paste"))) { open(.snippet(item)) }
     }
 
     private func utilityRow(_ result: LauncherResult, title: String, detail: String, symbol: String,
@@ -592,9 +751,14 @@ struct SearchWindow: View {
             Button("\(fileActionTitle(secondary)) · ⌘↵") { fileAction(secondary, hit) }
             Button(model.t("内嵌预览 · ⌘Y", "Inline Preview · ⌘Y")) { fileAction(.preview, hit) }
                 .disabled(hit.kind != "file" || hit.name.lowercased().hasSuffix(".app"))
+            if hit.kind == "file" {
+                Button(fileActionTitle(.searchInFolder)) { fileAction(.searchInFolder, hit) }
+            }
             Divider()
             Button(model.t("复制名称 · ⇧⌘C", "Copy Name · ⇧⌘C")) { fileAction(.copyName, hit) }
             Button(model.t("复制路径 · ⌥⌘C", "Copy Path · ⌥⌘C")) { fileAction(.copyPath, hit) }
+            Button(fileActionTitle(.copyFile)) { fileAction(.copyFile, hit) }
+            Button(fileActionTitle(.openInTerminal)) { fileAction(.openInTerminal, hit) }
         }
     }
 
@@ -605,6 +769,10 @@ struct SearchWindow: View {
         case .preview: return model.t("内嵌预览", "Inline Preview")
         case .copyName: return model.t("复制名称", "Copy Name")
         case .copyPath: return model.t("复制路径", "Copy Path")
+        case .copyFile: return model.t("复制文件", "Copy File")
+        case .openInTerminal: return model.t("在终端中打开", "Open in Terminal")
+        case .openWith: return model.t("打开方式…", "Open With…")
+        case .searchInFolder: return model.t("在所在文件夹中搜索", "Search in Parent Folder")
         }
     }
 
@@ -847,6 +1015,166 @@ extension Launcher {
         Duration.seconds(seconds.rounded()).formatted(.units(allowed: [.hours, .minutes, .seconds],
                                                             width: .abbreviated, maximumUnitCount: 2)
             .locale(zh ? Locale(identifier: "zh-Hans") : Locale(identifier: "en")))
+    }
+}
+
+struct FileDialogBanner: View {
+    static let launcherHeight: CGFloat = 34
+    let dialog: FileDialogContext
+    let chinese: Bool
+    let dismiss: () -> Void
+
+    var body: some View {
+        let modeLabel = chinese
+            ? (dialog.kind == .save ? "保存" : "打开")
+            : (dialog.kind == .save ? "Save" : "Open")
+        let title = chinese
+            ? "文件弹窗快速切换 · \(dialog.appName)「\(modeLabel)」"
+            : "Quick Switch · \(dialog.appName) “\(modeLabel)”"
+        HStack(spacing: 8) {
+            Image(systemName: "folder.badge.gearshape")
+                .font(.system(size: 11.5))
+                .foregroundStyle(Color.accentColor)
+                .accessibilityHidden(true)
+            Text(verbatim: title)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 8)
+            Button(action: dismiss) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel(chinese ? "关闭快速切换" : "Dismiss Quick Switch")
+            .accessibilityIdentifier("file-dialog-banner-close")
+        }
+        .padding(.horizontal, 14)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.accentColor.opacity(0.09))
+        .overlay(alignment: .bottom) { Divider() }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("file-dialog-banner")
+    }
+}
+
+struct SelectionContextBanner: View {
+    static let launcherHeight: CGFloat = 30
+    let context: CapturedContext
+    let chinese: Bool
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: context.filePaths.isEmpty ? "text.quote" : "doc.on.doc")
+                .font(.system(size: 11))
+                .foregroundStyle(Color.accentColor)
+                .accessibilityHidden(true)
+            Text(verbatim: context.badgeTitle(chinese: chinese))
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .fixedSize()
+            if let preview = previewSnippet {
+                Text(verbatim: preview)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            Spacer(minLength: 8)
+            Button(action: dismiss) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel(chinese ? "清除附带上下文" : "Clear Attached Context")
+            .accessibilityIdentifier("selection-context-banner-close")
+        }
+        .padding(.horizontal, 14)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.primary.opacity(0.045))
+        .overlay(alignment: .bottom) { Divider() }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("selection-context-banner")
+    }
+
+    private var previewSnippet: String? {
+        if let text = context.textPayload {
+            let singleLine = text
+                .split(whereSeparator: \.isNewline)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+            return singleLine.isEmpty ? nil : singleLine
+        }
+        guard !context.filePaths.isEmpty else { return nil }
+        return context.filePaths.map { ($0 as NSString).lastPathComponent }.joined(separator: ", ")
+    }
+}
+
+struct DirectoryScopeHeaderChip: View {
+    let breadcrumbs: [String]
+    let chinese: Bool
+    let clear: () -> Void
+
+    var body: some View {
+        let displayed = breadcrumbs.count > 2
+            ? ["…"] + Array(breadcrumbs.suffix(2))
+            : breadcrumbs
+        HStack(spacing: 4) {
+            Image(systemName: "folder.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(Color.accentColor)
+                .accessibilityHidden(true)
+            Text(verbatim: displayed.joined(separator: " › "))
+                .font(.system(size: 12, weight: .medium))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Button(action: clear) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel(chinese ? "退出目录范围" : "Clear Directory Scope")
+            .accessibilityIdentifier("directory-scope-chip-clear")
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .frame(maxWidth: 260)
+        .background(Color.accentColor.opacity(0.12), in: Capsule())
+        .overlay(Capsule().strokeBorder(Color.accentColor.opacity(0.24), lineWidth: 0.75))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("directory-scope-chip")
+    }
+}
+
+struct FolderAliasHeaderPill: View {
+    let title: String
+    let alias: String
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "folder.fill")
+                .font(.system(size: 10.5))
+                .foregroundStyle(Color.accentColor)
+                .accessibilityHidden(true)
+            Text(verbatim: title.isEmpty ? alias : title)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3.5)
+        .frame(maxWidth: 165)
+        .background(Color.primary.opacity(0.06), in: Capsule())
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("folder-alias-pill")
     }
 }
 

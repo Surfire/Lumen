@@ -70,6 +70,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var statusMenuUpdateScheduled = false
     let externalVolumes: ExternalVolumeCatalog
     let translation: TranslationPanelModel
+    private let fileDialogBridge: FileDialogBridge
+    private let selectionContextBridge: SelectionContextBridge
+    private var scopeChipHost: NSHostingView<DirectoryScopeHeaderChip>?
+    private var aliasPillHost: NSHostingView<FolderAliasHeaderPill>?
+    private var searchFieldLeadingDefault: NSLayoutConstraint?
+    private var searchFieldLeadingAfterScope: NSLayoutConstraint?
+    private var searchFieldTrailingDefault: NSLayoutConstraint?
+    private var searchFieldTrailingBeforeAlias: NSLayoutConstraint?
     private(set) var settings: NSPanel?
     private lazy var updateSettings = UpdateSettings(defaults: defaults ?? .standard)
     private var shouldManageLoginItem: Bool {
@@ -150,6 +158,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
         panel.onAnswerPage = { [weak self] delta in self?.commands.pageAnswer(delta) ?? false }
         panel.onSettings = { [weak self] in self?.showSearchSettings() }
+        panel.onCommandReturn = { [weak self] in self?.replaceTranslationSelectionIfAvailable() ?? false }
         panel.isSearchFieldClick = { [weak self] point in
             guard let field = self?.searchField else { return false }
             return field.bounds.contains(field.convert(point, from: nil))
@@ -173,10 +182,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             let state = self.panelState
             guard state.mode == .search else { return }
             if case .contextMenu = state.overlay { return }
-            guard case .file(let hit) = self.model.selectedResult else { return }
-            if action == .preview { self.togglePreview(hit, allowCloudDownload: true) }
-            else if action == .reveal { self.perform(self.model.secondaryFileAction(for: hit), on: hit) }
-            else { self.perform(action, on: hit) }
+            switch self.model.selectedResult {
+            case .file(let hit):
+                if action == .preview { self.togglePreview(hit, allowCloudDownload: true) }
+                else if action == .reveal { self.perform(self.model.secondaryFileAction(for: hit), on: hit) }
+                else { self.perform(action, on: hit) }
+            case .finderFolder(let folder) where action == .reveal:
+                self.revealPathInFinder(folder.path)
+            case .shortcut(let shortcut) where action == .reveal:
+                if case .folder(let path) = shortcut.target {
+                    self.revealPathInFinder(path)
+                }
+            default:
+                break
+            }
         }
         let content = SearchBackdrop()
         let icon = NSImageView(image: NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil) ?? NSImage())
@@ -233,25 +252,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             fileAction: { [weak self] action, hit in self?.perform(action, on: hit) },
             contextItemsForResult: { [weak self] result in
                 self?.searchContextItems(for: result, requireSelected: false) ?? []
-            }
+            },
+            dismissFileDialog: { [weak self] in self?.dismissFileDialogQuickSwitch() },
+            dismissContext: { [weak self] in self?.dismissSelectionContext() },
+            replaceTranslationSelection: { [weak self] in _ = self?.replaceTranslationSelectionIfAvailable() }
         ))
         results.translatesAutoresizingMaskIntoConstraints = false
         results.sizingOptions = []
+        let scopeChip = NSHostingView(rootView: DirectoryScopeHeaderChip(breadcrumbs: [], chinese: model.zh) { [weak self] in
+            self?.clearDirectoryScopeFromChip()
+        })
+        scopeChip.translatesAutoresizingMaskIntoConstraints = false
+        scopeChip.sizingOptions = [.intrinsicContentSize]
+        scopeChip.setContentHuggingPriority(.required, for: .horizontal)
+        scopeChip.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+        scopeChip.isHidden = true
+        self.scopeChipHost = scopeChip
+
+        let aliasPill = NSHostingView(rootView: FolderAliasHeaderPill(title: "", alias: ""))
+        aliasPill.translatesAutoresizingMaskIntoConstraints = false
+        aliasPill.sizingOptions = [.intrinsicContentSize]
+        aliasPill.setContentHuggingPriority(.required, for: .horizontal)
+        aliasPill.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+        aliasPill.isHidden = true
+        self.aliasPillHost = aliasPill
+
+        searchField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        searchField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
         content.addSubview(icon)
+        content.addSubview(scopeChip)
         content.addSubview(searchField)
+        content.addSubview(aliasPill)
         content.addSubview(close)
         content.addSubview(results)
         panel.contentView = content
         panel.initialFirstResponder = searchField
+
+        let leadingDefault = searchField.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 10)
+        let leadingAfterScope = searchField.leadingAnchor.constraint(equalTo: scopeChip.trailingAnchor, constant: 8)
+        let trailingDefault = searchField.trailingAnchor.constraint(equalTo: close.leadingAnchor, constant: -11)
+        let trailingBeforeAlias = searchField.trailingAnchor.constraint(equalTo: aliasPill.leadingAnchor, constant: -8)
+        self.searchFieldLeadingDefault = leadingDefault
+        self.searchFieldLeadingAfterScope = leadingAfterScope
+        self.searchFieldTrailingDefault = trailingDefault
+        self.searchFieldTrailingBeforeAlias = trailingBeforeAlias
+
         NSLayoutConstraint.activate([
             searchField.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
             icon.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
             icon.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
             icon.widthAnchor.constraint(equalToConstant: 22),
             icon.heightAnchor.constraint(equalToConstant: 26),
-            searchField.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 10),
-            searchField.trailingAnchor.constraint(equalTo: close.leadingAnchor, constant: -11),
+            scopeChip.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 10),
+            scopeChip.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
+            leadingDefault,
+            trailingDefault,
             searchField.heightAnchor.constraint(equalToConstant: 32),
+            aliasPill.trailingAnchor.constraint(equalTo: close.leadingAnchor, constant: -11),
+            aliasPill.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
             close.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
             close.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
             close.widthAnchor.constraint(equalToConstant: 22),
@@ -286,17 +345,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                                     database: smoke?.database ?? locations.database,
                                     syntheticRoot: smoke?.corpus, gemmaHome: smoke?.gemmaHome)
         self.engine = engine
+        let clipboardManager = smoke?.makeClipboardManager() ?? ClipboardManager(defaults: .standard, pasteboard: .general)
+        clipboard = clipboardManager
         model = Launcher(engine: engine,
                          defaults: defaults,
                          locale: smoke?.language,
                          currencyStore: smoke?.makeCurrencyStore(),
                          bookmarkLibrary: smoke?.makeBookmarkLibrary(),
                          personalDataStore: smoke?.makePersonalDataStore(),
-                         definitionLookup: smoke?.makeDefinitionLookup())
+                         definitionLookup: smoke?.makeDefinitionLookup(),
+                         clipboard: clipboardManager)
         externalVolumes = ExternalVolumeCatalog(engine: engine)
         imageSearch = LauncherImageSearch(engine: engine, defaults: defaults)
-        clipboard = smoke?.makeClipboardManager() ?? ClipboardManager(defaults: .standard, pasteboard: .general)
         translation = smoke?.makeTranslationModel() ?? TranslationPanelModel()
+        fileDialogBridge = smoke?.makeFileDialogBridge() ?? FileDialogBridge()
+        selectionContextBridge = smoke?.makeSelectionContextBridge() ?? SelectionContextBridge()
         super.init()
     }
     #else
@@ -308,11 +371,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         let locations = Self.defaultEngineLocations()
         let engine = LauncherEngine(executable: locations.executable, database: locations.database)
         self.engine = engine
-        model = Launcher(engine: engine, defaults: defaults)
+        let clipboardManager = ClipboardManager(defaults: .standard, pasteboard: .general)
+        clipboard = clipboardManager
+        model = Launcher(engine: engine, defaults: defaults, clipboard: clipboardManager)
         externalVolumes = ExternalVolumeCatalog(engine: engine)
         imageSearch = LauncherImageSearch(engine: engine, defaults: defaults)
-        clipboard = ClipboardManager(defaults: .standard, pasteboard: .general)
         translation = TranslationPanelModel()
+        fileDialogBridge = FileDialogBridge()
+        selectionContextBridge = SelectionContextBridge()
         super.init()
     }
     #endif
@@ -591,6 +657,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         let firstShow = !searchPresented
         if firstShow {
             windowManagement.captureTarget()
+            #if LUMEN_SMOKE
+            let frontmostApp = smoke?.simulatedFrontmostApp ?? (smoke == nil ? NSWorkspace.shared.frontmostApplication : nil)
+            #else
+            let frontmostApp = NSWorkspace.shared.frontmostApplication
+            #endif
+            if let dialog = fileDialogBridge.detectActiveDialog(frontmostApp: frontmostApp) {
+                let finderFolders = fileDialogBridge.openFinderFolders()
+                model.setFileDialogContext(dialog, finderFolders: finderFolders)
+                model.setActiveContext(nil)
+            } else {
+                model.setFileDialogContext(nil, finderFolders: [])
+                #if LUMEN_SMOKE
+                let captured = smoke != nil
+                    ? smoke?.captureSelectionContext(using: selectionContextBridge, frontmostApp: frontmostApp)
+                    : selectionContextBridge.capture(frontmostApp: frontmostApp, pasteboard: targetPasteboard)
+                #else
+                let captured = selectionContextBridge.capture(frontmostApp: frontmostApp, pasteboard: targetPasteboard)
+                #endif
+                model.setActiveContext(captured)
+            }
         }
         searchPresentationGeneration &+= 1
         searchPresented = true
@@ -674,17 +760,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         translation.setCommand(nil)
         inlinePreview.close()
         commands.closeDefinition()
+        commands.clearTemplateEditRequest()
         if commands.visibleExecution != nil { commands.cancelExecution() }
         commands.update(.search, raw: "", catalog: catalog)
         commands.matchExecutables([], in: model, resetSelection: true)
         commands.updateClipboard([])
         literalCommand = nil
         contextActions.close()
+        model.clearFileDialogContext()
+        model.setActiveContext(nil)
         // Release the field editor first so an earlier composition cannot be restored on reopen.
         panel.makeFirstResponder(nil)
         searchField.stringValue = ""
         applicationIcons.cancelPending()
         model.clear()
+        updateHeaderScopeUI()
         panel.orderOut(nil)
         #if LUMEN_SMOKE
         let allowDeactivate = smoke == nil
@@ -735,9 +825,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             if priorRaw == text { return }
             commands.closeDefinition()
         }
-        let translationCommand = literalCommand == nil ? TranslationCommand.parse(text) : nil
-        let next = literalCommand == nil
+        let inDirectoryScope = model.activeScopedDirectory != nil
+        let parsedTranslation = (!inDirectoryScope && literalCommand == nil) ? TranslationCommand.parse(text) : nil
+        let translationCommand = parsedTranslation.map {
+            SelectionContextBridge.resolvedTranslation($0, with: model.activeContext)
+        }
+        var next: LumenCommandResolution = (!inDirectoryScope && literalCommand == nil)
             ? catalog.resolve(text, isExistingTranslation: { _ in translationCommand != nil }) : .search
+        if !inDirectoryScope && literalCommand == nil {
+            switch next {
+            case .missingArgument(let commandID) where commandID == "qa":
+                if let resolved = SelectionContextBridge.resolvedQuestion(rawPayload: "", with: model.activeContext) {
+                    next = .question(resolved)
+                }
+            case .question(let payload):
+                if let resolved = SelectionContextBridge.resolvedQuestion(rawPayload: payload, with: model.activeContext) {
+                    next = .question(resolved)
+                }
+            case .missingArgument(let commandID) where commandID != "img" && commandID != "qa":
+                if let entry = catalog.entries.first(where: { $0.commandID == commandID }),
+                   let payload = SelectionContextBridge.resolvedWebPayload("", with: model.activeContext) {
+                    next = catalog.resolve("\(entry.keyword) \(payload)")
+                }
+            default:
+                break
+            }
+        }
+        if previousCommand != next, case .clipboard = previousCommand {
+            commands.clearTemplateEditRequest()
+        }
         if priorRaw != text || previousCommand != next {
             contextActions.close()
             inlinePreview.close()
@@ -818,6 +934,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             return false
         case #selector(NSResponder.insertTab(_:)):
             handleTabCompletion(in: textView)
+        case #selector(NSResponder.deleteBackward(_:)):
+            if case .contextMenu = panelState.overlay { return false }
+            guard searchText.isEmpty, panelState.mode == .search, model.popDirectoryScope() else { return false }
+            panel.browsing = false
+            updatePresentation()
+            return true
         case #selector(NSResponder.insertNewline(_:)):
             searchFieldAction()
             openSelection()
@@ -825,6 +947,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         default: return false
         }
         return true
+    }
+
+    private func enterDirectoryScope(_ path: String, in textView: NSTextView? = nil) {
+        panel.browsing = false
+        model.pushDirectoryScope(path)
+        if let editor = textView ?? (searchField.currentEditor() as? NSTextView) {
+            editor.string = ""
+        }
+        searchField.stringValue = ""
+        literalCommand = nil
+        searchFieldAction()
+        updatePresentation()
+        focusSearch()
+    }
+
+    private func clearDirectoryScopeFromChip() {
+        panel.browsing = false
+        model.clearDirectoryScope()
+        updatePresentation()
+        focusSearch()
+    }
+
+    private func dismissFileDialogQuickSwitch() {
+        model.clearFileDialogContext()
+        updatePresentation()
+        focusSearch()
+    }
+
+    private func dismissSelectionContext() {
+        model.setActiveContext(nil)
+        searchFieldAction()
+        updatePresentation()
+        focusSearch()
     }
 
     private func handleTabCompletion(in textView: NSTextView) {
@@ -849,16 +1004,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         let selectedFolder: String? = {
             guard state.mode == .search, let selected = model.selectedResult else { return nil }
             switch selected {
-            case .file(let hit) where hit.kind == "directory": return hit.path
+            case .file(let hit) where hit.kind == "directory" && !hit.name.lowercased().hasSuffix(".app"):
+                return hit.path
+            case .finderFolder(let folder):
+                return folder.path
             case .shortcut(let shortcut):
                 if case .folder(let path) = shortcut.target { return path }
                 return nil
-            default: return nil
+            default:
+                return nil
             }
         }()
+        if model.activeScopedDirectory != nil {
+            if let folder = selectedFolder {
+                enterDirectoryScope(folder, in: textView)
+            }
+            return
+        }
         if panel.browsing, let folder = selectedFolder {
-            let replacement = folder.hasSuffix("/") ? folder : folder + "/"
-            textView.insertText(replacement, replacementRange: NSRange(location: 0, length: raw.utf16.count))
+            enterDirectoryScope(folder, in: textView)
             return
         }
         if !raw.isEmpty, !raw.contains(where: { $0.isWhitespace || $0 == "/" || $0 == "\\" }) {
@@ -872,6 +1036,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 textView.insertText("clip ", replacementRange: NSRange(location: 0, length: raw.utf16.count))
                 return
             }
+            if state.mode == .search,
+               let folderShortcut = model.shortcuts.folderShortcut(forAlias: raw),
+               case .folder(let folderPath) = folderShortcut.target {
+                enterDirectoryScope(folderPath, in: textView)
+                return
+            }
             if lower.count >= 2 || selectedFolder == nil,
                let prefix = keywords.first(where: { $0.hasPrefix(lower) }) {
                 textView.insertText(prefix + " ", replacementRange: NSRange(location: 0, length: raw.utf16.count))
@@ -879,8 +1049,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
         }
         if let folder = selectedFolder {
-            let replacement = folder.hasSuffix("/") ? folder : folder + "/"
-            textView.insertText(replacement, replacementRange: NSRange(location: 0, length: raw.utf16.count))
+            enterDirectoryScope(folder, in: textView)
         }
     }
 
@@ -972,6 +1141,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
         if !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             clearSearchField()
+        } else if model.activeScopedDirectory != nil {
+            panel.browsing = false
+            model.clearDirectoryScope()
+            updatePresentation()
+            focusSearch()
         } else {
             dismissSearch()
         }
@@ -981,15 +1155,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         guard searchPresented, commands.isClipboardCommand, commands.clipboardSelection == id else { return }
         if clipboard.copy(id: id) {
             dismissSearch()
-            #if LUMEN_SMOKE
-            if smoke == nil { pasteIntoPreviousAppIfPermitted() }
-            #else
             pasteIntoPreviousAppIfPermitted()
-            #endif
         }
     }
 
     private func pasteIntoPreviousAppIfPermitted() {
+        #if LUMEN_SMOKE
+        if let smoke {
+            smoke.pasteIntoPreviousAppCount += 1
+            return
+        }
+        #endif
         guard AXIsProcessTrusted() else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
             guard let source = CGEventSource(stateID: .combinedSessionState),
@@ -1006,7 +1182,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private func showClipboardActions() {
         guard let clip = commands.selectedClipboardItem else { return }
-        contextActions.show([
+        var items: [ContextActions.Item] = [
             .init(id: "copy-clip", title: model.t("复制", "Copy"), symbol: "doc.on.doc") { [weak self] in
                 self?.copyClipboardItem(clip.id)
             },
@@ -1015,7 +1191,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             .init(id: "delete-clip", title: model.t("删除", "Delete"), symbol: "trash") { [weak self] in
                 self?.clipboard.remove(id: clip.id)
             }
-        ])
+        ]
+        if clip.text != nil {
+            items.append(.init(id: "edit-template", title: model.t("编辑短语模板…", "Edit Snippet Template…"),
+                               symbol: "pencil") { [weak self] in
+                self?.commands.requestTemplateEdit(for: clip)
+                self?.updatePresentation()
+            })
+        }
+        contextActions.show(items)
     }
 
     private func toggleContextActions() {
@@ -1159,6 +1343,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
             item("copy-name", "复制名称", "Copy Name", "doc.on.doc") { [weak self] in self?.perform(.copyName, on: hit) }
             item("copy-path", "复制路径", "Copy Path", "link") { [weak self] in self?.perform(.copyPath, on: hit) }
+            item("copy-file", "复制文件", "Copy File", "doc.on.clipboard") { [weak self] in
+                self?.perform(.copyFile, on: hit)
+            }
+            if hit.kind == "file" {
+                item("search-in-folder", "在所在文件夹中搜索", "Search in Parent Folder", "folder.badge.magnifyingglass") { [weak self] in
+                    self?.perform(.searchInFolder, on: hit)
+                }
+            }
+            item("open-in-terminal", "在终端中打开", "Open in Terminal", "terminal") { [weak self] in
+                self?.perform(.openInTerminal, on: hit)
+            }
+            if hit.kind == "file" && !hit.name.lowercased().hasSuffix(".app") {
+                item("open-with", "打开方式…", "Open With…", "arrow.up.forward.app") { [weak self] in
+                    self?.showOpenWithActions(for: hit)
+                }
+            }
             if hit.isResident && hit.kind == "directory" {
                 item("pin-folder", "固定项目文件夹", "Pin Project Folder", "pin") { [weak self] in
                     guard let self else { return }
@@ -1182,8 +1382,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
         case .shortcut(let shortcut):
             item("open", "打开", "Open", "return") { [weak self] in self?.open(result) }
+            if case .folder(let path) = shortcut.target {
+                item("search-inside", "目录内搜索", "Search Inside", "magnifyingglass") { [weak self] in
+                    self?.enterDirectoryScope(path)
+                }
+            }
             item("toggle-pin", shortcut.pinned ? "取消固定" : "固定", shortcut.pinned ? "Unpin" : "Pin", "pin") { [weak self] in
                 self?.model.shortcuts.togglePin(shortcut)
+            }
+        case .snippet(let clip):
+            item("copy-snippet", "复制展开内容", "Copy Expanded", "return") { [weak self] in self?.open(result) }
+            item("toggle-pin", clip.pinned ? "取消固定" : "固定", clip.pinned ? "Unpin" : "Pin", "pin") { [weak self] in
+                self?.clipboard.togglePin(id: clip.id)
+            }
+            item("edit-template", "编辑短语模板…", "Edit Snippet Template…", "pencil") { [weak self] in
+                self?.openSnippetTemplateEditor(for: clip)
+            }
+        case .finderFolder(let folder):
+            if model.activeFileDialog != nil {
+                item("jump-folder", "跳转此目录", "Jump to Folder", "return") { [weak self] in self?.open(result) }
+            }
+            item("search-inside", "目录内搜索", "Search Inside", "magnifyingglass") { [weak self] in
+                self?.enterDirectoryScope(folder.path)
+            }
+            item("reveal", "在 Finder 中显示", "Show in Finder", "folder") { [weak self] in
+                self?.revealPathInFinder(folder.path)
+            }
+            item("copy-path", "复制路径", "Copy Path", "link") { [weak self] in
+                self?.copyTextAndDismiss(folder.path)
             }
         }
         return items
@@ -1222,9 +1448,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private func open(_ result: LauncherResult) {
         guard panelState.mode == .search || panelState.mode == .window else { return }
         switch result {
-        case .file(let hit): perform(model.primaryFileAction(for: hit), on: hit)
+        case .file(let hit):
+            if let dialog = model.activeFileDialog {
+                navigateActiveDialog(dialog, hit: hit)
+            } else {
+                perform(model.primaryFileAction(for: hit), on: hit)
+            }
         case .action(let action): runAction(action)
-        case .shortcut(let shortcut): openShortcut(shortcut)
+        case .shortcut(let shortcut):
+            if let dialog = model.activeFileDialog, case .folder(let path) = shortcut.target {
+                guard searchPresented, model.visibleResults.contains(result),
+                      SearchHit.existsOnDisk(at: path, kind: "directory", permitsDatalessLeaf: true) else {
+                    model.openingFailed()
+                    return
+                }
+                model.shortcuts.noteOpened(shortcut)
+                dismissSearch()
+                fileDialogBridge.navigate(dialog, toPath: path, isDirectory: true) { _ in }
+            } else {
+                openShortcut(shortcut)
+            }
+        case .snippet(let item):
+            guard searchPresented, model.visibleResults.contains(result) else { return }
+            if clipboard.copyExpanded(item) != nil {
+                dismissSearch()
+                pasteIntoPreviousAppIfPermitted()
+            } else {
+                model.openingFailed()
+            }
+        case .finderFolder(let folder):
+            guard searchPresented, model.visibleResults.contains(result) else { return }
+            if let dialog = model.activeFileDialog {
+                navigateActiveDialog(dialog, path: folder.path, isDirectory: true)
+            } else if SearchHit.existsOnDisk(at: folder.path, kind: "directory", permitsDatalessLeaf: true) {
+                let url = URL(fileURLWithPath: folder.path, isDirectory: true)
+                #if LUMEN_SMOKE
+                if let smoke { smoke.opened = url; dismissSearch(); return }
+                #endif
+                if NSWorkspace.shared.open(url) { dismissSearch() }
+                else { model.openingFailed() }
+            } else {
+                model.openingFailed()
+            }
         case .calculation(let calculation):
             guard searchPresented, model.calculation == calculation else { return }
             copyTextAndDismiss(calculation.copyValue)
@@ -1413,12 +1678,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
               commands.executableMatches.contains(where: { $0.action.destination == .executable(command) }) else { return }
         contextActions.close()
         inlinePreview.close()
+        let defaultArg = SelectionContextBridge.defaultExecutableArgument(for: model.activeContext)
         if withInputFile {
             commands.prompt(command, placeholder: model.t("本机文件的绝对路径", "Absolute path to a local file"), required: true)
+            if case .selectedFiles(let paths, _)? = model.activeContext, let firstPath = paths.first {
+                commands.executionArgument = firstPath
+            }
         } else if let placeholder = command.argument {
             commands.prompt(command, placeholder: placeholder, required: false)
+            if let defaultArg {
+                commands.executionArgument = defaultArg
+            }
+        } else if case .shortcut = command.source {
+            let fileInput: String?
+            if case .selectedFiles(let paths, _)? = model.activeContext,
+               let first = paths.first,
+               SearchHit.pathAttributes(at: first, kind: "file") != nil {
+                fileInput = first
+            } else {
+                fileInput = nil
+            }
+            runExecutable(command, argument: fileInput)
         } else {
-            runExecutable(command, argument: nil)
+            runExecutable(command, argument: defaultArg)
         }
         updatePresentation()
     }
@@ -1615,7 +1897,177 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                     self.model.copied(action)
                 } else { self.model.openingFailed() }
             }
+        case .copyFile:
+            if hit.isPlaceholder {
+                model.cloudCopyBlocked()
+                return
+            }
+            model.resolve(hit, action: action) { [weak self] url in
+                guard let self, self.searchPresented else { return }
+                #if LUMEN_SMOKE
+                if self.smoke?.isSimulatedDataless(url) == true {
+                    self.model.cloudCopyBlocked()
+                    return
+                }
+                #endif
+                if LauncherFileTools.isResidentForFileCopy(url) {
+                    if ClipboardManager.writeInternalFileURL(url, to: self.targetPasteboard) {
+                        self.model.copied(.copyFile)
+                    } else {
+                        self.model.openingFailed()
+                    }
+                } else if SearchHit.existsOnDisk(at: hit.path, kind: hit.kind, permitsDatalessLeaf: true) {
+                    self.model.cloudCopyBlocked()
+                } else {
+                    self.model.openingFailed()
+                }
+            }
+        case .openInTerminal:
+            model.resolve(hit, action: action) { [weak self] url in
+                guard let self, self.searchPresented else { return }
+                let dirURL = LauncherFileTools.targetDirectoryForTerminal(path: url.path, isDirectory: hit.kind == "directory")
+                #if LUMEN_SMOKE
+                let terminalURL = self.smoke?.preferredTerminalOverride ?? LauncherFileTools.preferredTerminalApplicationURL()
+                #else
+                let terminalURL = LauncherFileTools.preferredTerminalApplicationURL()
+                #endif
+                guard let terminalURL else {
+                    self.model.openingFailed()
+                    return
+                }
+                #if LUMEN_SMOKE
+                if let smoke = self.smoke {
+                    smoke.openedInTerminal.append((directory: dirURL, terminal: terminalURL))
+                    self.model.noteFileOpened(hit)
+                    self.dismissSearch()
+                    return
+                }
+                #endif
+                let config = NSWorkspace.OpenConfiguration()
+                config.activates = true
+                NSWorkspace.shared.open([dirURL], withApplicationAt: terminalURL, configuration: config) { [weak self] app, error in
+                    DispatchQueue.main.async {
+                        guard let self else { return }
+                        if app != nil && error == nil {
+                            self.model.noteFileOpened(hit)
+                            self.dismissSearch()
+                        } else {
+                            self.model.openingFailed()
+                        }
+                    }
+                }
+            }
+        case .openWith(let appURL):
+            model.resolve(hit, action: action) { [weak self] url in
+                guard let self, self.searchPresented else { return }
+                #if LUMEN_SMOKE
+                if let smoke = self.smoke {
+                    smoke.openedWith.append((file: url, application: appURL))
+                    self.model.noteFileOpened(hit)
+                    self.dismissSearch()
+                    return
+                }
+                #endif
+                let config = NSWorkspace.OpenConfiguration()
+                config.activates = true
+                NSWorkspace.shared.open([url], withApplicationAt: appURL, configuration: config) { [weak self] app, error in
+                    DispatchQueue.main.async {
+                        guard let self else { return }
+                        if app != nil && error == nil {
+                            self.model.noteFileOpened(hit)
+                            self.dismissSearch()
+                        } else {
+                            self.model.openingFailed()
+                        }
+                    }
+                }
+            }
+        case .searchInFolder:
+            guard searchPresented, model.containsCurrentFile(hit) else { return }
+            let parentPath = (hit.path as NSString).deletingLastPathComponent
+            guard !parentPath.isEmpty,
+                  SearchHit.existsOnDisk(at: parentPath, kind: "directory", permitsDatalessLeaf: true) else {
+                model.openingFailed()
+                return
+            }
+            enterDirectoryScope(parentPath)
         }
+    }
+
+    private func showOpenWithActions(for hit: SearchHit) {
+        guard searchPresented, model.containsCurrentFile(hit),
+              hit.kind == "file", !hit.name.lowercased().hasSuffix(".app") else { return }
+        let url = URL(fileURLWithPath: hit.path)
+        #if LUMEN_SMOKE
+        let apps = smoke?.openWithAppsOverride?(url) ?? LauncherFileTools.openWithApplications(for: url)
+        #else
+        let apps = LauncherFileTools.openWithApplications(for: url)
+        #endif
+        var submenu: [ContextActions.Item] = [
+            .init(id: "open-with-back", title: model.t("← 返回", "← Back"), symbol: "chevron.left") { [weak self] in
+                self?.showSearchContextActions()
+            }
+        ]
+        for app in apps {
+            submenu.append(.init(
+                id: "open-with-app:\(app.bundleID ?? app.url.path)",
+                title: app.name,
+                symbol: "app"
+            ) { [weak self] in
+                self?.perform(.openWith(app.url), on: hit)
+            })
+        }
+        contextActions.show(submenu)
+        updatePresentation()
+    }
+
+    private func openSnippetTemplateEditor(for item: ClipboardItem) {
+        guard searchPresented else { return }
+        if let editor = searchField.currentEditor() as? NSTextView {
+            editor.string = "cb "
+        }
+        searchField.stringValue = "cb "
+        literalCommand = nil
+        searchFieldAction()
+        commands.chooseClipboard(item.id)
+        commands.requestTemplateEdit(for: item)
+        updatePresentation()
+    }
+
+    private func navigateActiveDialog(_ dialog: FileDialogContext, hit: SearchHit) {
+        let isDirectory = hit.kind == "directory"
+        model.resolve(hit, action: .open) { [weak self] url in
+            guard let self, self.searchPresented else { return }
+            self.model.noteFileOpened(hit)
+            self.dismissSearch()
+            self.fileDialogBridge.navigate(dialog, toPath: url.path, isDirectory: isDirectory) { _ in }
+        }
+    }
+
+    private func navigateActiveDialog(_ dialog: FileDialogContext, path: String, isDirectory: Bool) {
+        guard SearchHit.existsOnDisk(at: path, kind: isDirectory ? "directory" : "file", permitsDatalessLeaf: true) else {
+            model.openingFailed()
+            return
+        }
+        dismissSearch()
+        fileDialogBridge.navigate(dialog, toPath: path, isDirectory: isDirectory) { _ in }
+    }
+
+    private func revealPathInFinder(_ path: String) {
+        guard SearchHit.existsOnDisk(at: path, kind: "directory", permitsDatalessLeaf: true) else {
+            model.openingFailed()
+            return
+        }
+        let url = URL(fileURLWithPath: path, isDirectory: true)
+        #if LUMEN_SMOKE
+        if let smoke {
+            smoke.revealed = url
+            dismissSearch()
+            return
+        }
+        #endif
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+        dismissSearch()
     }
 
     private func refreshInlinePreview() {
@@ -2027,6 +2479,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
     }
 
+    private func replaceTranslationSelectionIfAvailable() -> Bool {
+        guard searchPresented,
+              case .translation(let command) = panelState.mode,
+              searchText == command.raw,
+              !translation.output.isEmpty,
+              model.activeContext?.canReplaceInPlace == true,
+              (panel.firstResponder as? NSTextView)?.hasMarkedText() != true else {
+            return false
+        }
+        guard ClipboardManager.writeInternalString(translation.output, to: targetPasteboard) else {
+            return false
+        }
+        translation.noteCopied()
+        dismissSearch()
+        pasteIntoPreviousAppIfPermitted()
+        return true
+    }
+
     func recordShortcut(_ event: NSEvent) {
         do {
             let key = try HotKey(event: event)
@@ -2082,8 +2552,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func updateSearchField() {
-        searchField.placeholderString = model.t("搜索文件、应用和系统设置", "Search files, apps, and system settings")
+        if let currentFolder = model.activeScopeBreadcrumbs.last {
+            searchField.placeholderString = model.t("在「\(currentFolder)」中搜索", "Search in “\(currentFolder)”")
+        } else {
+            searchField.placeholderString = model.t("搜索文件、应用和系统设置", "Search files, apps, and system settings")
+        }
         searchField.setAccessibilityLabel(model.t("搜索", "Search"))
+    }
+
+    private func updateHeaderScopeUI() {
+        updateSearchField()
+        let breadcrumbs = model.activeScopeBreadcrumbs
+        let hasScope = !breadcrumbs.isEmpty
+        if let scopeChipHost {
+            if hasScope {
+                scopeChipHost.rootView = DirectoryScopeHeaderChip(breadcrumbs: breadcrumbs, chinese: model.zh) { [weak self] in
+                    self?.clearDirectoryScopeFromChip()
+                }
+                scopeChipHost.isHidden = false
+                scopeChipHost.invalidateIntrinsicContentSize()
+            } else {
+                scopeChipHost.isHidden = true
+            }
+            searchFieldLeadingDefault?.isActive = !hasScope
+            searchFieldLeadingAfterScope?.isActive = hasScope
+        }
+        let aliasFolder = hasScope ? nil : model.activeAliasFolder
+        let hasAlias = aliasFolder != nil
+        if let aliasPillHost {
+            if let aliasFolder {
+                aliasPillHost.rootView = FolderAliasHeaderPill(title: aliasFolder.title, alias: aliasFolder.alias)
+                aliasPillHost.isHidden = false
+                aliasPillHost.invalidateIntrinsicContentSize()
+            } else {
+                aliasPillHost.isHidden = true
+            }
+            searchFieldTrailingDefault?.isActive = !hasAlias
+            searchFieldTrailingBeforeAlias?.isActive = hasAlias
+        }
     }
 
     private func updateStatusMenu() {
@@ -2184,6 +2690,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private func updateSearchPresentation() {
         guard searchPresented else { return }
+        updateHeaderScopeUI()
         let pinnedApps = model.visibleResults.prefix(SearchWindow.maximumVisibleRows).compactMap { row -> ActionMatch? in
             guard case .shortcut(let shortcut) = row, let action = model.application(for: shortcut) else { return nil }
             return ActionMatch(action: action, score: 0)
@@ -2198,7 +2705,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             for: state,
             rows: geometryRows,
             showsResults: model.showsResults,
-            needsAccessibility: windowManagement.issue == .permissionRequired
+            needsAccessibility: windowManagement.issue == .permissionRequired,
+            hasFileDialogBanner: model.activeFileDialog != nil,
+            hasContextBanner: model.activeContext != nil
         )
         var frame = panel.frame
         let widthDelta = target.width - frame.width
@@ -2349,6 +2858,7 @@ final class SearchPanel: NSPanel {
     var onClipboardActions: (() -> Bool)?
     var onAnswerPage: ((Int) -> Bool)?
     var onSettings: (() -> Void)?
+    var onCommandReturn: (() -> Bool)?
     override var canBecomeKey: Bool { true }
 
     private func handleCommand(_ event: NSEvent) -> Bool {
@@ -2361,7 +2871,9 @@ final class SearchPanel: NSPanel {
         if modifiers == [.command] {
             if key == "y" { if !event.isARepeat { onFileAction?(.preview) } }
             else if key == "k" { onContextActions?() }
-            else if event.keyCode == kVK_Return || event.keyCode == kVK_ANSI_KeypadEnter { onFileAction?(.reveal) }
+            else if event.keyCode == kVK_Return || event.keyCode == kVK_ANSI_KeypadEnter {
+                if onCommandReturn?() != true { onFileAction?(.reveal) }
+            }
             else { return false }
         } else if key == "c", modifiers == [.command, .shift] {
             onFileAction?(.copyName)

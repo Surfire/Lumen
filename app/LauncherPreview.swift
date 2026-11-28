@@ -8,7 +8,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 enum FileAction: Equatable {
-    case open, reveal, preview, copyName, copyPath
+    case open, reveal, preview, copyName, copyPath, copyFile, openInTerminal, openWith(URL), searchInFolder
 
     var allowsCloudReference: Bool { true }
 }

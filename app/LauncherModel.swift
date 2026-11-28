@@ -66,7 +66,7 @@ enum FileDiagnosisState: Equatable {
 }
 
 enum LauncherProblem: Equatable {
-    case status, indexing, search, embeddings, embeddingNoProgress, opening, scope, scopeState, watch, online, stale, preview, copiedName, copiedPath
+    case status, indexing, search, embeddings, embeddingNoProgress, opening, scope, scopeState, watch, online, stale, preview, copiedName, copiedPath, copiedFile, cloudCopyBlocked
 }
 
 struct LauncherNotice: Equatable {
@@ -159,6 +159,9 @@ final class Launcher: ObservableObject {
     @Published private(set) var query = ""
     @Published private(set) var scopedDirectories: [String] = []
     @Published private(set) var activeAliasFolder: SavedShortcut? = nil
+    @Published private(set) var activeFileDialog: FileDialogContext? = nil
+    @Published private(set) var openFinderFolders: [OpenFinderFolder] = []
+    @Published private(set) var activeContext: CapturedContext? = nil
     private var imageProjector: URL?
     @Published private(set) var isImageSearch = false
     @Published private(set) var hits: [SearchHit] = []
@@ -270,6 +273,7 @@ final class Launcher: ObservableObject {
     private var contentWriter: Process?
     private let engine: LauncherEngine
     private let defaults: UserDefaults?
+    private let clipboard: ClipboardManager?
     private var watchSupported: Bool?
     private var watchReportsProgress = false
     private var watchSupportsCachedStart = false
@@ -337,7 +341,7 @@ final class Launcher: ObservableObject {
         scopePending || indexPhase == .needsIndex || indexPhase == .unreadable || watchState == .needsSetup
     }
 
-    var showsResults: Bool { hasQuery ? (canSearch || !visibleResults.isEmpty) : !shortcuts.home.isEmpty }
+    var showsResults: Bool { hasQuery ? (canSearch || !visibleResults.isEmpty) : !visibleResults.isEmpty }
 
     var installedActions: [LaunchAction] {
         appActions.sorted { $0.title(chinese: zh).localizedStandardCompare($1.title(chinese: zh)) == .orderedAscending }
@@ -370,8 +374,42 @@ final class Launcher: ObservableObject {
         return (query, nil)
     }
 
+    var activeHighlightQuery: String {
+        if let folder = activeAliasFolder,
+           let resolved = shortcuts.resolveFolderAliasQuery(query),
+           resolved.shortcut.id == folder.id {
+            return resolved.remainder
+        }
+        return query
+    }
+
+    func setFileDialogContext(_ dialog: FileDialogContext?, finderFolders: [OpenFinderFolder]) {
+        let nextFolders = dialog != nil ? finderFolders : []
+        guard activeFileDialog != dialog || openFinderFolders != nextFolders else { return }
+        let activatedWithFolders = activeFileDialog == nil && dialog != nil && !nextFolders.isEmpty
+        set(\.activeFileDialog, to: dialog)
+        set(\.openFinderFolders, to: nextFolders)
+        rebuildVisibleResults()
+        if activatedWithFolders && !hasQuery, let firstID = visibleResults.first?.id {
+            set(\.selectedID, to: firstID)
+        } else {
+            reconcileSelection()
+        }
+    }
+
+    func clearFileDialogContext() {
+        setFileDialogContext(nil, finderFolders: [])
+    }
+
+    func setActiveContext(_ context: CapturedContext?) {
+        set(\.activeContext, to: context)
+    }
+
     private func computeVisibleResults() -> [LauncherResult] {
-        guard hasQuery else { return shortcuts.home.map(LauncherResult.shortcut) }
+        guard hasQuery else {
+            let finder = activeFileDialog != nil ? openFinderFolders.map(LauncherResult.finderFolder) : []
+            return finder + shortcuts.home.map(LauncherResult.shortcut)
+        }
         if isImageSearch || activeScopedDirectory != nil || activeAliasFolder != nil {
             return hits.map(LauncherResult.file)
         }
@@ -392,6 +430,9 @@ final class Launcher: ObservableObject {
         let commands = native + saved + executables
         let result = calculation.map { [LauncherResult.calculation($0)] } ?? []
         let filteredQuery = LauncherFileQuery(query).isFiltered
+        let snippets: [(LauncherResult, Double)] = (!filteredQuery ? (clipboard?.matchingTemplates(for: query) ?? []) : []).map {
+            (.snippet($0.item), Double($0.score))
+        }
         let bookmarks: [(LauncherResult, Double)] = filteredQuery
             ? []
             : bookmarkLibrary.matches(query, limit: 8).map { (.bookmark($0.hit), $0.score) }
@@ -401,7 +442,7 @@ final class Launcher: ObservableObject {
         let dictionary: [(LauncherResult, Double)] = (!filteredQuery ? dictionaryQuickResult : nil).map {
             [(.dictionary($0), 68.0)]
         } ?? []
-        let extras = bookmarks + personal + dictionary
+        let extras = snippets + bookmarks + personal + dictionary
         guard !commands.isEmpty || !extras.isEmpty else { return result + hits.map(LauncherResult.file) }
         let files: [(LauncherResult, Double)] = hits.map { hit in
             // Keep lexical order on ties. Regular use can move a direct file above a partial command match.
@@ -448,10 +489,12 @@ final class Launcher: ObservableObject {
         currencyStore: CurrencyRateStore? = nil,
         bookmarkLibrary: BookmarkLibrary? = nil,
         personalDataStore: PersonalDataStore? = nil,
-        definitionLookup: (@Sendable (String) -> String?)? = nil
+        definitionLookup: (@Sendable (String) -> String?)? = nil,
+        clipboard: ClipboardManager? = nil
     ) {
         self.engine = engine
         self.defaults = defaults
+        self.clipboard = clipboard
         let storeDefaults = defaults
             ?? UserDefaults(suiteName: "io.github.surfire.lumen.ephemeral.\(UUID().uuidString)")
             ?? .standard
@@ -516,6 +559,14 @@ final class Launcher: ObservableObject {
             }
         }.store(in: &storeChanges)
         self.personalDataStore.objectWillChange.sink { [weak self] in
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.closed, self.hasQuery, !self.isImageSearch,
+                      self.activeScopedDirectory == nil, self.activeAliasFolder == nil else { return }
+                self.rebuildVisibleResults()
+                self.reconcileSelection()
+            }
+        }.store(in: &storeChanges)
+        self.clipboard?.$templates.dropFirst().sink { [weak self] _ in
             DispatchQueue.main.async { [weak self] in
                 guard let self, !self.closed, self.hasQuery, !self.isImageSearch,
                       self.activeScopedDirectory == nil, self.activeAliasFolder == nil else { return }
@@ -657,6 +708,8 @@ final class Launcher: ObservableObject {
         case .preview: return t("无法快速查看此文件。", "Could not preview the file.")
         case .copiedName: return t("已复制名称", "Name copied")
         case .copiedPath: return t("已复制路径", "Path copied")
+        case .copiedFile: return t("已复制文件", "File copied")
+        case .cloudCopyBlocked: return t("此文件仅在云端，未下载，无法复制文件。", "This file is cloud-only and cannot be copied without downloading.")
         case .opening: return t("macOS 无法打开这个项目。", "macOS could not open this item.")
         case .scope: return t("索引范围中的路径必须以 / 开头。", "Index scope paths must start with /.")
         case .scopeState: return t("无法保存索引范围更新状态。请检查索引目录权限后重试。", "Could not save the scope update state. Check index directory permissions and try again.")
@@ -778,10 +831,10 @@ final class Launcher: ObservableObject {
         rebuildVisibleResults()
         if let first = visibleResults.first {
             switch first {
-            case .file, .dictionary, .bookmark, .contact, .calendarEvent, .reminder: break
+            case .file, .dictionary, .bookmark, .contact, .calendarEvent, .reminder, .finderFolder: break
             case .action(let action):
                 if isPrimaryAction(action) { set(\.selectedID, to: first.id) }
-            case .shortcut, .calculation: set(\.selectedID, to: first.id)
+            case .shortcut, .calculation, .snippet: set(\.selectedID, to: first.id)
             }
         }
         reconcileSelection()
@@ -1151,7 +1204,17 @@ final class Launcher: ObservableObject {
     func previewFailed() { set(\.searchNotice, to: LauncherNotice(.preview)) }
 
     func copied(_ action: FileAction) {
-        set(\.searchNotice, to: LauncherNotice(action == .copyName ? .copiedName : .copiedPath))
+        let problem: LauncherProblem
+        switch action {
+        case .copyName: problem = .copiedName
+        case .copyFile: problem = .copiedFile
+        default: problem = .copiedPath
+        }
+        set(\.searchNotice, to: LauncherNotice(problem))
+    }
+
+    func cloudCopyBlocked() {
+        set(\.searchNotice, to: LauncherNotice(.cloudCopyBlocked))
     }
 
     func containsCurrentFile(_ hit: SearchHit) -> Bool {

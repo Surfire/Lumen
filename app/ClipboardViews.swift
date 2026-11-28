@@ -84,6 +84,11 @@ struct ClipboardHistoryView: View {
                 )
             }
         }
+        .onChange(of: commands.pendingTemplateEditItem, initial: true) { _, item in
+            guard let item else { return }
+            commands.clearTemplateEditRequest()
+            openEditor(for: item)
+        }
         .onDisappear { editorDraft = nil }
     }
 

@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Surfire/Lumen/releases/tag/v0.6.4"><img src="https://img.shields.io/badge/Release-v0.6.4_(Build_42)-e11d48?style=flat-square" alt="Release v0.6.4"></a>
+  <a href="https://github.com/Surfire/Lumen/releases/tag/v0.6.5"><img src="https://img.shields.io/badge/Release-v0.6.5_(Build_43)-e11d48?style=flat-square" alt="Release v0.6.5"></a>
   <a href="https://github.com/Surfire/Lumen/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Surfire/Lumen/ci.yml?branch=main&style=flat-square&label=CI" alt="CI Status"></a>
   <img src="https://img.shields.io/badge/Platform-Apple_Silicon_%7C_macOS_14%2B-1e293b?style=flat-square" alt="Platform">
   <img src="https://img.shields.io/badge/Engine-Rust_%2B_AppKit%2FSwiftUI-0f172a?style=flat-square" alt="Stack">
@@ -54,9 +54,9 @@
 - **Built-In Pinyin & Smart Initials**: Search Chinese filenames by full pinyin or initials (`xm` → `项目计划`) and launch apps by camelCase or word initials (`vsc`, `ps`, `wx`, `am`) out of the box.
 - **Private Query Learning**: Remembers which app or file you pick for a specific query using local hashed affinity (no plaintext queries or paths stored in preferences), automatically prioritizing installed apps and active projects over old archive or backup folders.
 
-### 2. Visual-First Preview & Matched PDF Pages
-- **Jump Straight to Highlighted PDF Pages**: Instead of showing disconnected raw text snippets, PDF hits open directly to the matching page with amber passage highlighting above the full text context.
-- **Unified `Space` & `⌘Y` Quick Look**: Press **`Space`** while browsing results (while still typing spaces normally in the query box) or **`⌘Y`** to open a floating preview window that automatically scales to true PDF page bounds, image aspect ratios, and code layouts.
+### 2. Unified Visual Preview: Inline & Floating Auto-Scale
+- **`⌘Y` Inline + `Space` Standalone Window Across Formats**: Press **`⌘Y`** on any supported file for an instant inline preview inside the search bar, or **`Space`** while browsing to open a floating window that scales to PDF crop boxes, image aspect ratios, and reading widths.
+- **Instant Offline Rendering & Match Jump Across Docs**: Renders **Markdown** (local relative images and light/dark `<picture>` media, with external network badges kept offline so previews never spin), **Word / RTF**, multi-sheet **Excel**, **CSV / TSV**, source code, and **PDFs**—automatically jumping to and highlighting the matching page, paragraph, or spreadsheet tab.
 - **Subtitle-to-Media Quick Jump**: When a search matches dialogue inside an `.srt` or `.vtt` subtitle file, use the context action menu to open the linked video or audio file immediately.
 
 ### 3. Private Offline AI & Complete Office Support

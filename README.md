@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Surfire/Lumen/releases/tag/v0.6.4"><img src="https://img.shields.io/badge/Release-v0.6.4_(Build_42)-e11d48?style=flat-square" alt="Release v0.6.4"></a>
+  <a href="https://github.com/Surfire/Lumen/releases/tag/v0.6.5"><img src="https://img.shields.io/badge/Release-v0.6.5_(Build_43)-e11d48?style=flat-square" alt="Release v0.6.5"></a>
   <a href="https://github.com/Surfire/Lumen/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Surfire/Lumen/ci.yml?branch=main&style=flat-square&label=CI" alt="CI Status"></a>
   <img src="https://img.shields.io/badge/Platform-Apple_Silicon_%7C_macOS_14%2B-1e293b?style=flat-square" alt="Platform">
   <img src="https://img.shields.io/badge/Engine-Rust_%2B_AppKit%2FSwiftUI-0f172a?style=flat-square" alt="Stack">
@@ -54,9 +54,9 @@
 - **原生中文拼音与智能缩写**：内建全拼、拼音首字母（如 `xm` 命中「项目计划」）与常用应用缩写（如 `vsc`、`ps`、`wx`、`am`），无需安装任何第三方插件。
 - **越用越准的私密记忆**：本地自动记住你针对特定搜索词打开过的目标文件或应用（仅保存加密哈希，零明文记录），优先呈现正式安装的应用与活跃工作文件，自动降权历史备份与归档目录。
 
-### 2. 视觉优先预览：PDF 原页高亮直达
-- **直达命中页码 + 琥珀色原页高亮**：搜到 PDF 文档时，不再只给出一小段脱离上下文的纯文本，而是直接翻到命中页并用琥珀色高亮标记匹配段落，同时保留上下文摘录。
-- **空格与 `⌘Y` 自适应悬浮预览**：浏览结果时按 **`空格`** 或 **`⌘Y`** 即可呼出 Quick Look 悬浮窗（输入打字时空格键仍正常输入），窗口按 PDF 页面裁切框、图片方向与代码比例自动贴合缩放。
+### 2. 统一视觉预览：内嵌直达与悬浮精读
+- **`⌘Y` 面板内嵌 + `空格` 独立浮窗，全格式统一体验**：浏览任意文件时按 **`⌘Y`** 均在搜索面板右侧直接内嵌预览，按 **`空格`** 呼出自动按页面/比例缩放的独立预览窗（输入打字时空格键仍正常输入）。
+- **Markdown / Word / 多表 Excel / 代码秒开渲染，命中即跳即高亮**：离线零网络瞬时渲染 **`.md`**（支持本地相对路径与深浅色 `<picture>` 插图，外链徽章自动离线化绝不转圈）、**`.docx` / `.rtf`**、多工作表 **`.xlsx`**、**`.csv` / `.tsv`** 与源码文本，结合 **PDF 命中页琥珀色高亮** 自动跳转并聚焦到匹配段落或对应工作表。
 - **字幕一键直达音视频**：搜到 `.srt` / `.vtt` 字幕中的台词时，可直接通过快捷操作打开同目录关联的视频或音频文件。
 
 ### 3. 本地离线 AI 检索与全格式 Office 支持

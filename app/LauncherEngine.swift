@@ -520,13 +520,14 @@ final class LauncherEngine {
     var nameSearchBusy: Bool { core?.isNameBusy == true || connection?.isBusy == true }
 
     @discardableResult
-    func status(includeScope: Bool, complete: @escaping @MainActor (EngineResponse) -> Void) -> Process? {
-        if !textEmbeddingBackend.isValidLocalOpenAI, let core {
+    func status(includeScope: Bool, includeLocalOpenAI: Bool = true,
+                complete: @escaping @MainActor (EngineResponse) -> Void) -> Process? {
+        if (!includeLocalOpenAI || !textEmbeddingBackend.isValidLocalOpenAI), let core {
             nextID &+= 1
             core.status(SearchRequest(id: nextID, op: "status", include_scope: includeScope), complete: complete)
             return nil
         }
-        return run(statusArguments(includeScope: includeScope), complete: complete)
+        return run(statusArguments(includeScope: includeScope, includeLocalOpenAI: includeLocalOpenAI), complete: complete)
     }
 
     func warmNameSearch() {
@@ -638,8 +639,9 @@ final class LauncherEngine {
         }
     }
 
-    func searchImages(_ query: String, projector: URL, complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
-        submit(query, mode: "semantic", limit: 5, to: \.imageConnection,
+    func searchImages(_ query: String, projector: URL, limit: Int = 5,
+                      complete: @escaping (Result<[SearchHit], SearchFailure>) -> Void) {
+        submit(query, mode: "semantic", limit: limit, to: \.imageConnection,
                command: imageServeArguments(projector: projector),
                idleTimeout: .seconds(45), complete: complete)
     }
@@ -684,9 +686,11 @@ final class LauncherEngine {
         ["semantic-serve"] + textEmbeddingBackend.openAICliArguments + gemmaOptions
     }
 
-    func statusArguments(includeScope: Bool) -> [String] {
+    func statusArguments(includeScope: Bool, includeLocalOpenAI: Bool = true) -> [String] {
         var args = includeScope ? ["status", "--include-scope"] : ["status"]
-        args += textEmbeddingBackend.openAICliArguments
+        if includeLocalOpenAI {
+            args += textEmbeddingBackend.openAICliArguments
+        }
         return args
     }
 

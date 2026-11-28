@@ -3966,6 +3966,11 @@ final class LauncherSmoke {
                   "writer lease notice title fell back to permissions wording: \(leaseTitle)")
         try check(!leaseTitle.contains("访问权限") && !leaseTitle.contains("verify access"),
                   "writer lease notice falsely reported permissions issue: \(leaseTitle)")
+        let permissionTitle = model.title(
+            for: LauncherNotice(.watch, "open index writer lease: Permission denied")
+        )
+        try check(!permissionTitle.contains("写锁") && !permissionTitle.contains("index lock"),
+                  "permission error on writer lease falsely reported lock contention: \(permissionTitle)")
 
         try? FileManager.default.removeItem(at: directory.appendingPathComponent("fail-watch"))
         try signal("lease-once")
@@ -5150,6 +5155,119 @@ final class LauncherSmoke {
                   "Option A image recall displaced direct rows, stole selection, or skipped mode=image: modes=\(modes), names=\(optModel.hits.map(\.name))")
         optModel.close()
 
+        // 6. Issue #3: main-bar .imageOnly recall in .localOpenAI mode works while text model is offline/unverified.
+        let decoupleDir = directory.appendingPathComponent("phase3-v063-image-decouple", isDirectory: true)
+        try FileManager.default.createDirectory(at: decoupleDir, withIntermediateDirectories: true)
+        let sunsetImage = decoupleDir.appendingPathComponent("sunset-recall.png")
+        try Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).write(to: sunsetImage)
+        let fakeProjector = decoupleDir.appendingPathComponent("mmproj-custom.gguf")
+        try Data("projector".utf8).write(to: fakeProjector)
+        let decoupleEngineFile = decoupleDir.appendingPathComponent("engine")
+        let decoupleDB = decoupleDir.appendingPathComponent("index.sqlite")
+        try Data().write(to: decoupleDB)
+        let decoupleScript = #"""
+        #!/usr/bin/python3
+        import json, signal, sys
+        from pathlib import Path
+        root = Path(__file__).parent
+        command, *args = sys.argv[3:]
+        if command == 'status':
+            print(json.dumps(dict(
+                items=2, documents=1,
+                scope=dict(roots=[str(root)], allow=[], deny=[], documents=True, content_roots=[str(root)]),
+                content=dict(pending=0, checked=1, total=1),
+                gemma=dict(documents_enabled=True, embedded_chunks=4, skipped_chunks=0, pending=False, limited=False, chunk_limit=1000),
+                images=dict(enabled=True, vectors=1, pending=False, limited=False, vector_limit=1000)
+            )))
+        elif command == 'watch':
+            if '--help' in args:
+                print('--progress')
+            else:
+                print('{"event":"ready"}', flush=True)
+                signal.pause()
+        elif command == 'model-status':
+            print(json.dumps(dict(available=False, verified=False, diagnostic='connection refused')))
+            sys.exit(1)
+        elif command == 'serve':
+            for line in sys.stdin:
+                req = json.loads(line)
+                print(json.dumps(dict(id=req['id'], hits=[])), flush=True)
+        elif command == 'semantic-serve':
+            (root / 'unexpected-semantic-serve').touch()
+            sys.exit('semantic-serve must not be launched for .imageOnly in .localOpenAI mode')
+        elif command == 'image-serve':
+            assert '--projector' in args and args[args.index('--projector') + 1] == str(root / 'mmproj-custom.gguf'), args
+            assert '--openai-url' not in args and '--openai-model' not in args, args
+            for line in sys.stdin:
+                req = json.loads(line)
+                with (root / 'image-requests.jsonl').open('a') as f:
+                    f.write(json.dumps(dict(query=req.get('query'), limit=req.get('limit'))) + '\n')
+                hits = [dict(path=str(root / 'sunset-recall.png'), name='sunset-recall.png', kind='file',
+                             availability='local', matched_by='image_embedding', snippet=None,
+                             document_stamp=None, pdf_page=None)]
+                print(json.dumps(dict(id=req['id'], hits=hits)), flush=True)
+        """#
+        try Data(decoupleScript.utf8).write(to: decoupleEngineFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: decoupleEngineFile.path)
+        let decoupleSuite = "lumen-phase3-v063-decouple-\(UUID().uuidString)"
+        guard let decoupleDefaults = UserDefaults(suiteName: decoupleSuite) else {
+            throw Failure("missing isolated v063 image decouple defaults")
+        }
+        defer { decoupleDefaults.removePersistentDomain(forName: decoupleSuite) }
+        TextEmbeddingBackendConfig(
+            mode: .localOpenAI,
+            baseURL: "http://127.0.0.1:18080/v1",
+            model: "qwen3-emb",
+            dimensions: 16,
+            signature: "openai-local:qwen3-emb@16"
+        ).save(to: decoupleDefaults)
+        decoupleDefaults.set(fakeProjector.path, forKey: "launcher.imageProjector.v1")
+        let decoupleEngine = LauncherEngine(
+            executable: decoupleEngineFile,
+            database: decoupleDB,
+            gemmaHome: decoupleDir,
+            supportsStreamingBatches: true
+        )
+        let decoupleModel = Launcher(engine: decoupleEngine, defaults: decoupleDefaults, locale: "en")
+        defer { decoupleModel.close() }
+        decoupleModel.start(automaticallyIndex: false)
+        try await until("v063 image decouple fixture did not become ready") {
+            decoupleModel.canSearch && decoupleModel.watchState == .running &&
+                decoupleModel.localModelState == .unavailable(.verification) &&
+                decoupleModel.imageCoverage?.hasResults == true &&
+                decoupleModel.gemmaCoverage?.hasResults == true
+        }
+        decoupleModel.setSearchPresented(true)
+        decoupleModel.setQuery("sunset beach")
+        try await until("main-bar .imageOnly did not recall image while localOpenAI was unavailable") {
+            !decoupleModel.semanticBusy &&
+                decoupleModel.hits.contains(where: { $0.name == "sunset-recall.png" && $0.isImageMatch })
+        }
+        try check(!FileManager.default.fileExists(atPath: decoupleDir.appendingPathComponent("unexpected-semantic-serve").path),
+                  "main-bar .imageOnly in .localOpenAI mode launched semantic-serve")
+        try check(decoupleModel.localModelState == .unavailable(.verification),
+                  "image-serve recall overwrote offline localOpenAI localModelState: \(decoupleModel.localModelState)")
+        if let recalled = decoupleModel.hits.first(where: { $0.name == "sunset-recall.png" }) {
+            var resolvedURL: URL?
+            decoupleModel.resolve(recalled, action: .open) { resolvedURL = $0 }
+            try await until("main-bar image recall hit could not be opened while localOpenAI was unavailable") {
+                resolvedURL?.path == sunsetImage.path
+            }
+        }
+        decoupleModel.setImageQuery("sunset", projector: fakeProjector)
+        try await until("explicit img query did not return image hit") {
+            !decoupleModel.searching &&
+                decoupleModel.hits.contains(where: { $0.name == "sunset-recall.png" && $0.isImageMatch })
+        }
+        let imageRequests = try String(contentsOf: decoupleDir.appendingPathComponent("image-requests.jsonl"), encoding: .utf8)
+            .split(separator: "\n")
+            .map { try JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] ?? [:] }
+        try check(imageRequests.count == 2 &&
+                  (imageRequests[0]["limit"] as? Int) == 3 &&
+                  (imageRequests[1]["limit"] as? Int) == 5,
+                  "expected image-serve limits [3, 5], got \(imageRequests)")
+        decoupleModel.close()
+
         try type("", into: app)
         print("Phase 3 regressions passed (IndexStatusState isolation, caches, dual-lane CoreSearchConnection, ContentBatch skip, streaming clients)")
     }
@@ -6178,6 +6296,7 @@ final class LauncherSmoke {
         try check(cliEngine.embedArguments(stream: true) == ["embed"] + expectedOpenAI + ["--stream", "--max", "32"]
                   && cliEngine.modelStatusArguments(verify: true) == ["model-status"] + expectedOpenAI + ["--verify"]
                   && cliEngine.statusArguments(includeScope: true) == ["status", "--include-scope"] + expectedOpenAI
+                  && cliEngine.statusArguments(includeScope: true, includeLocalOpenAI: false) == ["status", "--include-scope"]
                   && cliEngine.diagnoseArguments(path: "/tmp/doc.pdf") == ["diagnose"] + expectedOpenAI + ["--", "/tmp/doc.pdf"]
                   && cliEngine.semanticServeArguments() == ["semantic-serve"] + expectedOpenAI + ["--gemma-home", fakeGemma.path]
                   && cliEngine.imageIndexArguments(projector: fakeProjector, stream: false) == ["image-index", "--projector", fakeProjector.path, "--max", "16", "--gemma-home", fakeGemma.path]
@@ -6257,7 +6376,143 @@ final class LauncherSmoke {
             }
         }
         try check(!settings.isVisible && !NSApp.isActive, "Settings verification activated the app or showed a window")
+        try await verifyV063SwiftDecoupleSettings()
         print("v0.6.1 Settings UI & Local OpenAI Embedding smoke passed (config roundtrip, loopback validation, decoupled CLI args, zero 鹿鸣, Light/Dark rendering)")
+    }
+
+    private func verifyV063SwiftDecoupleSettings() async throws {
+        // Issues #1, #2, #4: cold-start readiness with missing socket, dimension refresh, and lease permission error.
+        let dir = directory.appendingPathComponent("v063-swift-decouple-settings", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let db = dir.appendingPathComponent("index.sqlite")
+        try Data().write(to: db)
+        let engineFile = dir.appendingPathComponent("engine")
+        let script = #"""
+        #!/usr/bin/python3
+        import json, signal, sys
+        from pathlib import Path
+        root = Path(__file__).parent
+        command, *args = sys.argv[3:]
+        if command == 'status':
+            with (root / 'status-calls.log').open('a') as f:
+                f.write(' '.join(args) + '\n')
+            if '--openai-url' in args and (root / 'fail-openai-status').exists():
+                sys.exit('connect unix socket: No such file or directory')
+            dims = int((root / 'server-dims').read_text().strip()) if (root / 'server-dims').exists() else 16
+            embedded = 5 if dims == 16 else 0
+            print(json.dumps(dict(
+                items=3, documents=1,
+                scope=dict(roots=[str(root)], allow=[], deny=[], documents=True, content_roots=[str(root)]),
+                content=dict(pending=0, checked=1, total=1),
+                gemma=dict(documents_enabled=True, embedded_chunks=embedded, skipped_chunks=0,
+                           pending=(dims != 16), limited=False, chunk_limit=100),
+                images=dict(enabled=False, vectors=0, pending=False, limited=False, vector_limit=100)
+            )))
+        elif command == 'model-status':
+            if (root / 'fail-model-status').exists():
+                print(json.dumps(dict(available=False, verified=False, diagnostic='connect: No such file or directory')))
+                sys.exit(1)
+            dims = int((root / 'server-dims').read_text().strip()) if (root / 'server-dims').exists() else 16
+            print(json.dumps(dict(
+                available=True, verified='--verify' in args,
+                dimensions=dims, signature=f'openai-local:qwen3@{dims}'
+            )))
+        elif command == 'watch':
+            if '--help' in args:
+                print('--progress')
+            else:
+                with (root / 'watch-launches.log').open('a') as f:
+                    f.write('watch\n')
+                if (root / 'perm-denied-watch').exists():
+                    sys.exit('open index writer lease: Permission denied')
+                print('{"event":"ready"}', flush=True)
+                signal.pause()
+        """#
+        try Data(script.utf8).write(to: engineFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: engineFile.path)
+
+        let failOpenAI = dir.appendingPathComponent("fail-openai-status")
+        let failModel = dir.appendingPathComponent("fail-model-status")
+        let serverDims = dir.appendingPathComponent("server-dims")
+        try Data().write(to: failOpenAI)
+        try Data().write(to: failModel)
+        try Data("16".utf8).write(to: serverDims)
+
+        let suite1 = "io.github.surfire.lumen.smoke.v063.decouple.\(UUID().uuidString)"
+        guard let defaults1 = UserDefaults(suiteName: suite1) else {
+            throw Failure("failed to create isolated UserDefaults for v063 decouple smoke")
+        }
+        defer { defaults1.removePersistentDomain(forName: suite1) }
+        let missingSockURL = "unix://\(dir.path)/missing-\(UUID().uuidString).sock"
+        TextEmbeddingBackendConfig(mode: .localOpenAI, baseURL: missingSockURL, model: "qwen3").save(to: defaults1)
+
+        let engine1 = LauncherEngine(executable: engineFile, database: db, supportsStreamingBatches: true)
+        let model1 = Launcher(engine: engine1, defaults: defaults1, locale: "en")
+        defer { model1.close() }
+        model1.start(automaticallyIndex: false)
+
+        try await until("cold start with offline localOpenAI failed to become searchable and watch-ready") {
+            model1.canSearch && model1.indexPhase == .ready && model1.watchState == .running
+        }
+        try await until("refreshCoverage did not probe localOpenAI status and surface AI notice") {
+            model1.embeddingNotice?.problem == .embeddings &&
+                model1.localModelState == .unavailable(.verification)
+        }
+        try check(model1.canSearch && model1.indexPhase == .ready && model1.indexNotice == nil,
+                  "offline localOpenAI status revoked file search readiness: phase=\(model1.indexPhase) notice=\(String(describing: model1.indexNotice))")
+        let statusCalls = try String(contentsOf: dir.appendingPathComponent("status-calls.log"), encoding: .utf8)
+            .split(separator: "\n").map(String.init)
+        try check(statusCalls.first?.contains("--openai-url") == false &&
+                  statusCalls.contains(where: { $0.contains("--openai-url") }),
+                  "expected cold-start status without --openai-url followed by coverage refresh with --openai-url: \(statusCalls)")
+
+        // Issue #2: verifyLocalModel dimension update (16d -> 24d) automatically refreshes coverage.
+        try? FileManager.default.removeItem(at: failOpenAI)
+        try? FileManager.default.removeItem(at: failModel)
+        model1.verifyLocalModel()
+        try await until("verifyLocalModel 16d did not update backend dims and coverage") {
+            model1.localModelState == .ready &&
+                model1.textEmbeddingBackend.dimensions == 16 &&
+                model1.gemmaCoverage?.embedded_chunks == 5 &&
+                model1.gemmaCoverage?.pending == false &&
+                model1.embeddingNotice == nil
+        }
+        try Data("24".utf8).write(to: serverDims)
+        model1.verifyLocalModel()
+        try await until("verifyLocalModel 24d did not trigger refreshCoverage for updated partition") {
+            model1.localModelState == .ready &&
+                model1.textEmbeddingBackend.dimensions == 24 &&
+                model1.textEmbeddingBackend.signature == "openai-local:qwen3@24" &&
+                model1.gemmaCoverage?.embedded_chunks == 0 &&
+                model1.gemmaCoverage?.pending == true
+        }
+        model1.close()
+
+        // Issue #4: "open index writer lease: Permission denied" fails watch immediately without lease retries.
+        try? FileManager.default.removeItem(at: dir.appendingPathComponent("watch-launches.log"))
+        try Data().write(to: dir.appendingPathComponent("perm-denied-watch"))
+        let suite2 = "io.github.surfire.lumen.smoke.v063.watchperm.\(UUID().uuidString)"
+        guard let defaults2 = UserDefaults(suiteName: suite2) else {
+            throw Failure("failed to create isolated UserDefaults for v063 watch perm smoke")
+        }
+        defer { defaults2.removePersistentDomain(forName: suite2) }
+        let engine2 = LauncherEngine(executable: engineFile, database: db, supportsStreamingBatches: true)
+        let model2 = Launcher(engine: engine2, defaults: defaults2, locale: "en")
+        defer { model2.close() }
+        model2.start(automaticallyIndex: false)
+        try await until("watcher permission failure did not transition immediately to .failed") {
+            model2.watchState == .failed && model2.watchNotice?.problem == .watch
+        }
+        let watchLaunches = try String(contentsOf: dir.appendingPathComponent("watch-launches.log"), encoding: .utf8)
+            .split(separator: "\n").count
+        try check(watchLaunches == 1, "watcher retried lease permission error (\(watchLaunches) launches)")
+        if let notice = model2.watchNotice {
+            let renderedTitle = model2.title(for: notice)
+            try check(!renderedTitle.contains("写锁") && !renderedTitle.contains("index lock"),
+                      "permission error notice title mentioned lock contention: \(renderedTitle)")
+        }
+        model2.close()
+        print("v0.6.3 Swift decouple settings regressions passed (#1 cold-start readiness, #2 dims coverage refresh, #4 lease permission failure)")
     }
 
     private func verifyV060SwiftUXRegressions(_ app: AppDelegate) async throws {

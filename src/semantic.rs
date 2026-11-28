@@ -2350,7 +2350,7 @@ mod tests {
         let executable = root.join("encoder");
         fs::write(
             &executable,
-            "#!/bin/sh\nprintf '%s\\n' '[1,0,0,0,0,0,0,0]'\n",
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '[1,0,0,0,0,0,0,0]'\n",
         )
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();

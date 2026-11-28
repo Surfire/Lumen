@@ -1,5 +1,12 @@
 # 更新记录
 
+## 0.6.3（build 41）
+
+- **冷启动索引就绪与本机向量端点完全解耦（#1）**：本地 Unix Socket 校验延迟至实际连接时触发，停止 `oMLX`/`Ollama` 或移除 `.sock` 时 `lumen status` 安全降级返回已有索引状态与覆盖率；App 启动直接读取本地 SQLite 就绪状态，确保文件名/正文检索与 `lumen watch` 文件监听离线可用。
+- **消除同名模型维度 Split-Brain 与模型标识防碰撞（#2 方案 A）**：在线时短超时实时探测最新维度并立即刷新覆盖率与待重算状态，仅离线时回退历史分区；保留「模型名 + 维度」无端口分区键以便更换端口或连接方式时复用已有向量，对含特殊字符或超长模型名附加确定性短哈希防碰撞。
+- **主搜索框以文搜图独立直连内置 `image-serve`（#3）**：本地 OpenAI 文本后端离线或正在验证时，主框 `.imageOnly` 仍直接按内置 Gemma 图像覆盖率与投影器独立召回图片，不再经由文本端 `semantic-serve` 中转或修改文本模型状态。
+- **精细区分写锁争用与权限错误、旧版 `.xls` 数字单元格及发布保护（#4–#7）**：写锁退避与文案收窄至 `"cannot acquire index writer lease"`；为 `.xls` BIFF8 补充 `NUMBER`、`RK`、`MULRK` 与公式缓存浮点数值提取；修复 `.github/workflows/release.yml` 手动发布源 ref 与版本一致性校验及真实 Gemma v1 迁移测试夹具残留。
+
 ## 0.6.2（build 40）
 
 - **内核级 `lumen watch` 孤儿进程防护**：在 `lumen watch` 经管道启动时通过 macOS `kqueue` 零开销监听 `stdout` 管道对端关闭，当主应用退出、重启更新或被终止时立即自动退出并释放 `index.sqlite-watch-lock` 写锁；同时 `Launcher.close()` 在退出前短暂等待活跃子进程回收，消除升级/重启交接撞锁。

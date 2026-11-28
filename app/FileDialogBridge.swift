@@ -15,6 +15,24 @@ struct FileDialogContext: Equatable, Sendable {
     let appName: String
     let appBundleID: String?
     let kind: Kind
+    let servicePID: pid_t?
+    let dialogElement: FileDialogAXElement?
+
+    init(
+        appPID: pid_t,
+        appName: String,
+        appBundleID: String?,
+        kind: Kind,
+        servicePID: pid_t? = nil,
+        dialogElement: FileDialogAXElement? = nil
+    ) {
+        self.appPID = appPID
+        self.appName = appName
+        self.appBundleID = appBundleID
+        self.kind = kind
+        self.servicePID = servicePID
+        self.dialogElement = dialogElement
+    }
 }
 
 /// Directory currently displayed by a Finder window, verified local and non-dataless.
@@ -174,15 +192,15 @@ struct NativeFileDialogAXAdapter: FileDialogAXAdapter {
     }
 
     func postKeyboardShortcut(keyCode: CGKeyCode, flags: CGEventFlags) -> Bool {
-        guard let source = CGEventSource(stateID: .combinedSessionState),
+        guard let source = CGEventSource(stateID: .privateState),
               let keyDown = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true),
               let keyUp = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false) else {
             return false
         }
         keyDown.flags = flags
         keyUp.flags = flags
-        keyDown.post(tap: .cgAnnotatedSessionEventTap)
-        keyUp.post(tap: .cgAnnotatedSessionEventTap)
+        keyDown.post(tap: .cgSessionEventTap)
+        keyUp.post(tap: .cgSessionEventTap)
         return true
     }
 
@@ -202,7 +220,9 @@ final class FileDialogBridge {
     private static let finderBundleID = "com.apple.finder"
     private static let maxTraversalDepth = 6
     private static let maxTraversalNodes = 80
-    private static let maxParentWalkHops = 8
+    private static let maxParentWalkHops = 16
+    private static let initialFocusSettleNanoseconds: UInt64 = 80_000_000
+    private static let maxFocusWaitNanoseconds: UInt64 = 500_000_000
 
     private static let openIdentifiers: Set<String> = ["open-panel", "NSOpenPanel"]
     private static let saveIdentifiers: Set<String> = ["save-panel", "NSSavePanel"]
@@ -237,8 +257,8 @@ final class FileDialogBridge {
     convenience init(axAdapter: FileDialogAXAdapter = NativeFileDialogAXAdapter()) {
         self.init(
             axAdapter: axAdapter,
-            pollIntervalNanoseconds: 20_000_000,
-            pollTimeoutNanoseconds: 400_000_000
+            pollIntervalNanoseconds: 25_000_000,
+            pollTimeoutNanoseconds: 600_000_000
         )
     }
 
@@ -272,8 +292,15 @@ final class FileDialogBridge {
         for focused in focusedCandidates {
             if let focusedPID = axAdapter.pid(of: focused),
                axAdapter.bundleIdentifier(for: focusedPID) == Self.openAndSaveServiceBundleID {
-                let kind = classifyRemoteOpenAndSavePanel(focusedElement: focused, servicePID: focusedPID)
-                return FileDialogContext(appPID: pid, appName: appName, appBundleID: bundleID, kind: kind)
+                let remote = classifyRemoteOpenAndSavePanel(focusedElement: focused, servicePID: focusedPID)
+                return FileDialogContext(
+                    appPID: pid,
+                    appName: appName,
+                    appBundleID: bundleID,
+                    kind: remote.kind,
+                    servicePID: focusedPID,
+                    dialogElement: remote.dialogElement
+                )
             }
         }
 
@@ -296,12 +323,26 @@ final class FileDialogBridge {
 
         for window in windowCandidates {
             for sheet in activeSheets(on: window).reversed() {
-                if let kind = classifyDialogRoot(sheet) {
-                    return FileDialogContext(appPID: pid, appName: appName, appBundleID: bundleID, kind: kind)
+                if let inspected = inspectDialogRoot(sheet) {
+                    return FileDialogContext(
+                        appPID: pid,
+                        appName: appName,
+                        appBundleID: bundleID,
+                        kind: inspected.kind,
+                        servicePID: inspected.servicePID,
+                        dialogElement: sheet
+                    )
                 }
             }
-            if let kind = classifyDialogRoot(window) {
-                return FileDialogContext(appPID: pid, appName: appName, appBundleID: bundleID, kind: kind)
+            if let inspected = inspectDialogRoot(window) {
+                return FileDialogContext(
+                    appPID: pid,
+                    appName: appName,
+                    appBundleID: bundleID,
+                    kind: inspected.kind,
+                    servicePID: inspected.servicePID,
+                    dialogElement: window
+                )
             }
         }
         return nil
@@ -310,7 +351,7 @@ final class FileDialogBridge {
     private func classifyRemoteOpenAndSavePanel(
         focusedElement: FileDialogAXElement,
         servicePID: pid_t
-    ) -> FileDialogContext.Kind {
+    ) -> (kind: FileDialogContext.Kind, dialogElement: FileDialogAXElement?) {
         var roots: [FileDialogAXElement] = []
         var seen = Set<FileDialogAXElement>()
 
@@ -320,8 +361,8 @@ final class FileDialogBridge {
             roots.append(element)
         }
 
-        addRoot(axAdapter.elementAttribute(kAXWindowAttribute as String, of: focusedElement))
         addRoot(axAdapter.elementAttribute(kAXTopLevelUIElementAttribute as String, of: focusedElement))
+        addRoot(axAdapter.elementAttribute(kAXWindowAttribute as String, of: focusedElement))
         if let serviceApp = axAdapter.applicationElement(for: servicePID) {
             addRoot(axAdapter.elementAttribute(kAXFocusedWindowAttribute as String, of: serviceApp))
             for win in axAdapter.elementsAttribute(kAXWindowsAttribute as String, of: serviceApp).prefix(2) {
@@ -331,15 +372,49 @@ final class FileDialogBridge {
 
         for root in roots {
             for sheet in activeSheets(on: root).reversed() {
-                if let kind = classifyDialogRoot(sheet, allowUnmarkedFallback: true) {
-                    return kind
+                if let inspected = inspectDialogRoot(sheet) {
+                    return (inspected.kind, sheet)
                 }
             }
-            if let kind = classifyDialogRoot(root, allowUnmarkedFallback: true) {
-                return kind
+            if let inspected = inspectDialogRoot(root) {
+                return (inspected.kind, root)
             }
         }
-        return .open
+
+        for root in roots {
+            for sheet in activeSheets(on: root).reversed() {
+                if let inspected = inspectDialogRoot(sheet, allowUnmarkedFallback: true) {
+                    return (inspected.kind, sheet)
+                }
+            }
+            if isDialogOwnedRoot(root, servicePID: servicePID),
+               let inspected = inspectDialogRoot(root, allowUnmarkedFallback: true) {
+                return (inspected.kind, root)
+            }
+        }
+
+        if let first = roots.first,
+           let inspected = inspectDialogRoot(first, allowUnmarkedFallback: true) {
+            return (inspected.kind, nil)
+        }
+        return (.open, nil)
+    }
+
+    private func isDialogOwnedRoot(_ element: FileDialogAXElement, servicePID: pid_t) -> Bool {
+        if axAdapter.pid(of: element) == servicePID {
+            return true
+        }
+        let role = axAdapter.stringAttribute(kAXRoleAttribute as String, of: element)
+        if role == (kAXSheetRole as String) {
+            return true
+        }
+        if axAdapter.stringAttribute(kAXSubroleAttribute as String, of: element) == (kAXDialogSubrole as String) {
+            return true
+        }
+        if let id = axAdapter.stringAttribute(kAXIdentifierAttribute as String, of: element) {
+            return Self.openIdentifiers.contains(id) || Self.saveIdentifiers.contains(id)
+        }
+        return false
     }
 
     private func activeSheets(on window: FileDialogAXElement) -> [FileDialogAXElement] {
@@ -361,10 +436,10 @@ final class FileDialogBridge {
         return result
     }
 
-    private func classifyDialogRoot(
+    private func inspectDialogRoot(
         _ root: FileDialogAXElement,
         allowUnmarkedFallback: Bool = false
-    ) -> FileDialogContext.Kind? {
+    ) -> (kind: FileDialogContext.Kind, servicePID: pid_t?)? {
         let rootRole = axAdapter.stringAttribute(kAXRoleAttribute as String, of: root)
         let rootSubrole = axAdapter.stringAttribute(kAXSubroleAttribute as String, of: root)
         let isDialogOrSheet = rootRole == (kAXSheetRole as String) || rootSubrole == (kAXDialogSubrole as String)
@@ -375,13 +450,26 @@ final class FileDialogBridge {
         var hasSaveAsField = false
         var hasOpenButton = false
         var hasSaveButton = false
+        var detectedServicePID: pid_t?
+        var checkedPIDs = Set<pid_t>()
+
+        func noteElementPID(_ element: FileDialogAXElement) {
+            guard detectedServicePID == nil,
+                  let elementPID = axAdapter.pid(of: element),
+                  checkedPIDs.insert(elementPID).inserted else {
+                return
+            }
+            if axAdapter.bundleIdentifier(for: elementPID) == Self.openAndSaveServiceBundleID {
+                detectedServicePID = elementPID
+            }
+        }
 
         if let defaultButton = axAdapter.elementAttribute(kAXDefaultButtonAttribute as String, of: root),
            let buttonKind = buttonDialogKind(defaultButton) {
             if buttonKind == .save { hasSaveButton = true } else { hasOpenButton = true }
         }
 
-        var queue: [(element: FileDialogAXElement, depth: Int, inNestedSheetOrPopover: Bool)] = [(root, 0, false)]
+        var queue: [(element: FileDialogAXElement, depth: Int)] = [(root, 0)]
         var head = 0
         var visited = Set<FileDialogAXElement>()
 
@@ -390,33 +478,35 @@ final class FileDialogBridge {
             head += 1
 
             guard visited.insert(current.element).inserted else { continue }
+            noteElementPID(current.element)
 
             let role = axAdapter.stringAttribute(kAXRoleAttribute as String, of: current.element)
             let subrole = axAdapter.stringAttribute(kAXSubroleAttribute as String, of: current.element)
             let identifier = axAdapter.stringAttribute(kAXIdentifierAttribute as String, of: current.element)
+
+            let isNestedOverlay = current.depth > 0 &&
+                (role == (kAXPopoverRole as String) || role == (kAXSheetRole as String))
+            if isNestedOverlay {
+                continue
+            }
 
             if let identifier {
                 if Self.openIdentifiers.contains(identifier) { explicitOpen = true }
                 if Self.saveIdentifiers.contains(identifier) { explicitSave = true }
             }
 
-            let isNestedOverlay = current.depth > 0 &&
-                (role == (kAXPopoverRole as String) || role == (kAXSheetRole as String))
-            let nested = current.inNestedSheetOrPopover || isNestedOverlay
-
             if role == (kAXBrowserRole as String) || role == (kAXOutlineRole as String) {
                 hasFileBrowser = true
             }
 
-            if !nested,
-               role == (kAXTextFieldRole as String),
+            if role == (kAXTextFieldRole as String),
                subrole != (kAXSearchFieldSubrole as String),
                axAdapter.boolAttribute(kAXEnabledAttribute as String, of: current.element) != false,
                isLikelySaveAsField(current.element, identifier: identifier) {
                 hasSaveAsField = true
             }
 
-            if !nested, role == (kAXButtonRole as String), let buttonKind = buttonDialogKind(current.element) {
+            if role == (kAXButtonRole as String), let buttonKind = buttonDialogKind(current.element) {
                 if buttonKind == .save { hasSaveButton = true } else { hasOpenButton = true }
             }
 
@@ -429,19 +519,20 @@ final class FileDialogBridge {
 
             if !shouldSkipChildren, current.depth < Self.maxTraversalDepth {
                 for child in axAdapter.elementsAttribute(kAXChildrenAttribute as String, of: current.element) {
-                    queue.append((child, current.depth + 1, nested))
+                    queue.append((child, current.depth + 1))
                 }
             }
         }
 
-        if explicitOpen { return .open }
-        if explicitSave { return .save }
+        if explicitOpen { return (.open, detectedServicePID) }
+        if explicitSave { return (.save, detectedServicePID) }
         if allowUnmarkedFallback {
-            return (hasSaveAsField || (hasSaveButton && !hasOpenButton)) ? .save : .open
+            let kind: FileDialogContext.Kind = (hasSaveAsField || (hasSaveButton && !hasOpenButton)) ? .save : .open
+            return (kind, detectedServicePID)
         }
         guard isDialogOrSheet, hasFileBrowser else { return nil }
-        if hasSaveAsField || (hasSaveButton && !hasOpenButton) { return .save }
-        if hasOpenButton || !hasSaveAsField { return .open }
+        if hasSaveAsField || (hasSaveButton && !hasOpenButton) { return (.save, detectedServicePID) }
+        if hasOpenButton || !hasSaveAsField { return (.open, detectedServicePID) }
         return nil
     }
 
@@ -658,7 +749,10 @@ final class FileDialogBridge {
         navigationGeneration &+= 1
         let generation = navigationGeneration
 
-        _ = axAdapter.activateApplication(pid: context.appPID)
+        // Never call activate on an already-active host app: that can pull key focus onto a document window.
+        if !axAdapter.isApplicationActive(pid: context.appPID) {
+            _ = axAdapter.activateApplication(pid: context.appPID)
+        }
 
         Task { @MainActor [weak self] in
             guard let self, self.navigationGeneration == generation else {
@@ -666,8 +760,8 @@ final class FileDialogBridge {
                 return
             }
 
-            await self.waitForTargetApplicationFocus(context: context, generation: generation)
-            guard self.navigationGeneration == generation else {
+            let focusReady = await self.waitForDialogFocus(context: context, generation: generation)
+            guard focusReady, self.navigationGeneration == generation else {
                 completion(false)
                 return
             }
@@ -708,36 +802,109 @@ final class FileDialogBridge {
                 return
             }
 
-            try? await Task.sleep(nanoseconds: self.pollIntervalNanoseconds * 2)
-            guard self.navigationGeneration == generation else {
-                completion(false)
-                return
+            let maxConfirmWaitNs = self.pollIntervalNanoseconds * 6
+            var confirmElapsedNs: UInt64 = 0
+            while confirmElapsedNs < maxConfirmWaitNs {
+                try? await Task.sleep(nanoseconds: self.pollIntervalNanoseconds)
+                guard self.navigationGeneration == generation else {
+                    completion(false)
+                    return
+                }
+                if self.currentFocusedElement(for: context) != inputField {
+                    completion(true)
+                    return
+                }
+                confirmElapsedNs += self.pollIntervalNanoseconds
             }
 
-            if self.currentFocusedElement(for: context) == inputField {
-                _ = self.axAdapter.performAction(kAXConfirmAction as String, on: inputField)
-            }
+            _ = self.axAdapter.performAction(kAXConfirmAction as String, on: inputField)
             completion(true)
         }
     }
 
-    private func waitForTargetApplicationFocus(context: FileDialogContext, generation: UInt64) async {
-        let maxActivationWaitNs: UInt64 = min(200_000_000, pollTimeoutNanoseconds)
+    private func waitForDialogFocus(context: FileDialogContext, generation: UInt64) async -> Bool {
+        let initialSettleNs: UInt64 = pollIntervalNanoseconds >= 20_000_000
+            ? Self.initialFocusSettleNanoseconds
+            : pollIntervalNanoseconds
+        try? await Task.sleep(nanoseconds: initialSettleNs)
+        guard navigationGeneration == generation else { return false }
+
+        let maxFocusWaitNs = min(Self.maxFocusWaitNanoseconds, pollTimeoutNanoseconds)
         var elapsedNs: UInt64 = 0
-        while elapsedNs < maxActivationWaitNs {
-            guard navigationGeneration == generation else { return }
-            if axAdapter.isApplicationActive(pid: context.appPID) {
-                return
+        var raisedDialog = false
+
+        while elapsedNs <= maxFocusWaitNs {
+            guard navigationGeneration == generation else { return false }
+            if isSystemFocusInsideDialog(context: context) {
+                return true
             }
-            if let focused = axAdapter.systemFocusedElement(),
-               let focusedPID = axAdapter.pid(of: focused),
-               focusedPID == context.appPID
-                   || axAdapter.bundleIdentifier(for: focusedPID) == Self.openAndSaveServiceBundleID {
-                return
+            if !raisedDialog, let dialogElement = context.dialogElement {
+                raisedDialog = true
+                _ = axAdapter.performAction(kAXRaiseAction as String, on: dialogElement)
             }
+            if elapsedNs >= maxFocusWaitNs { break }
             try? await Task.sleep(nanoseconds: pollIntervalNanoseconds)
             elapsedNs += pollIntervalNanoseconds
         }
+        return false
+    }
+
+    private func isSystemFocusInsideDialog(context: FileDialogContext) -> Bool {
+        guard let focused = axAdapter.systemFocusedElement() else {
+            return false
+        }
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        var queue: [(element: FileDialogAXElement, hops: Int)] = [(focused, 0)]
+        var head = 0
+        var visited = Set<FileDialogAXElement>()
+
+        while head < queue.count {
+            let current = queue[head]
+            head += 1
+            guard visited.insert(current.element).inserted else { continue }
+
+            if let dialogElement = context.dialogElement, current.element == dialogElement {
+                return true
+            }
+            if let currentPID = axAdapter.pid(of: current.element) {
+                if currentPID == ownPID, context.appPID != ownPID {
+                    return false
+                }
+                if let servicePID = context.servicePID, currentPID == servicePID {
+                    return true
+                }
+                if axAdapter.bundleIdentifier(for: currentPID) == Self.openAndSaveServiceBundleID {
+                    return true
+                }
+            }
+            if context.dialogElement == nil, isDialogContainerElement(current.element) {
+                return true
+            }
+
+            guard current.hops < Self.maxParentWalkHops else { continue }
+            for attr in [
+                kAXParentAttribute as String,
+                kAXTopLevelUIElementAttribute as String,
+                kAXWindowAttribute as String,
+            ] {
+                if let ancestor = axAdapter.elementAttribute(attr, of: current.element) {
+                    queue.append((ancestor, current.hops + 1))
+                }
+            }
+        }
+        return false
+    }
+
+    private func isDialogContainerElement(_ element: FileDialogAXElement) -> Bool {
+        let role = axAdapter.stringAttribute(kAXRoleAttribute as String, of: element)
+        let subrole = axAdapter.stringAttribute(kAXSubroleAttribute as String, of: element)
+        let identifier = axAdapter.stringAttribute(kAXIdentifierAttribute as String, of: element)
+        let isCandidateContainer = role == (kAXSheetRole as String)
+            || role == (kAXWindowRole as String)
+            || subrole == (kAXDialogSubrole as String)
+            || (identifier.map { Self.openIdentifiers.contains($0) || Self.saveIdentifiers.contains($0) } ?? false)
+        guard isCandidateContainer else { return false }
+        return inspectDialogRoot(element) != nil
     }
 
     private func captureBaseline(for context: FileDialogContext) -> NavigationBaseline {
@@ -746,27 +913,41 @@ final class FileDialogBridge {
         var initialTextFields = Set<FileDialogAXElement>()
 
         var roots: [FileDialogAXElement] = []
+        if let dialogElement = context.dialogElement {
+            roots.append(dialogElement)
+        }
         if let app = axAdapter.applicationElement(for: context.appPID) {
-            if let fw = axAdapter.elementAttribute(kAXFocusedWindowAttribute as String, of: app) {
+            if let fw = axAdapter.elementAttribute(kAXFocusedWindowAttribute as String, of: app),
+               !roots.contains(fw) {
                 roots.append(fw)
             }
-            if let mw = axAdapter.elementAttribute(kAXMainWindowAttribute as String, of: app), !roots.contains(mw) {
+            if let mw = axAdapter.elementAttribute(kAXMainWindowAttribute as String, of: app),
+               !roots.contains(mw) {
                 roots.append(mw)
             }
         }
+        func appendServiceWindows(for pid: pid_t) {
+            guard axAdapter.bundleIdentifier(for: pid) == Self.openAndSaveServiceBundleID,
+                  let serviceApp = axAdapter.applicationElement(for: pid) else {
+                return
+            }
+            for win in axAdapter.elementsAttribute(kAXWindowsAttribute as String, of: serviceApp).prefix(2)
+                where !roots.contains(win) {
+                roots.append(win)
+            }
+        }
+
         if let focusedBefore {
             if let win = axAdapter.elementAttribute(kAXWindowAttribute as String, of: focusedBefore),
                !roots.contains(win) {
                 roots.append(win)
             }
-            if let focusedPID = axAdapter.pid(of: focusedBefore),
-               axAdapter.bundleIdentifier(for: focusedPID) == Self.openAndSaveServiceBundleID,
-               let serviceApp = axAdapter.applicationElement(for: focusedPID) {
-                for win in axAdapter.elementsAttribute(kAXWindowsAttribute as String, of: serviceApp).prefix(2)
-                    where !roots.contains(win) {
-                    roots.append(win)
-                }
+            if let focusedPID = axAdapter.pid(of: focusedBefore) {
+                appendServiceWindows(for: focusedPID)
             }
+        }
+        if let servicePID = context.servicePID {
+            appendServiceWindows(for: servicePID)
         }
 
         for root in roots {
@@ -840,7 +1021,12 @@ final class FileDialogBridge {
     private func currentFocusedElement(for context: FileDialogContext) -> FileDialogAXElement? {
         if let sysFocused = axAdapter.systemFocusedElement() {
             if let focusedPID = axAdapter.pid(of: sysFocused) {
+                let ownPID = ProcessInfo.processInfo.processIdentifier
+                if focusedPID == ownPID, context.appPID != ownPID {
+                    return nil
+                }
                 if focusedPID == context.appPID
+                    || focusedPID == context.servicePID
                     || axAdapter.bundleIdentifier(for: focusedPID) == Self.openAndSaveServiceBundleID {
                     return sysFocused
                 }

@@ -156,8 +156,58 @@ struct ActionMatch: Equatable {
     var primary: Bool { score >= 80 }
 }
 
+struct DictionaryQuickResult: Equatable, Hashable, Sendable {
+    let word: String
+    let summary: String
+    let fullText: String
+    let subtitle: String
+}
+
+struct BookmarkHit: Identifiable, Equatable, Hashable, Sendable {
+    let id: String
+    let title: String
+    let url: String
+    let domain: String
+    let browser: String
+    let folderPath: String
+}
+
+struct ContactHit: Identifiable, Equatable, Hashable, Sendable {
+    let id: String
+    let fullName: String
+    let subtitle: String
+    let primaryPhone: String?
+    let primaryEmail: String?
+    let organization: String?
+}
+
+struct CalendarEventHit: Identifiable, Equatable, Hashable, Sendable {
+    let id: String
+    let title: String
+    let startDate: Date
+    let endDate: Date
+    let isAllDay: Bool
+    let calendarTitle: String
+    let location: String?
+    let meetingURL: String?
+    let dateSummary: String
+}
+
+struct ReminderHit: Identifiable, Equatable, Hashable, Sendable {
+    let id: String
+    let title: String
+    let dueDate: Date?
+    let listTitle: String
+    let notes: String?
+    let priority: Int
+    let dueSummary: String
+    let isCompleted: Bool
+}
+
 enum LauncherResult: Identifiable, Equatable {
     case file(SearchHit), action(LaunchAction), shortcut(SavedShortcut), calculation(CalculationResult)
+    case dictionary(DictionaryQuickResult), bookmark(BookmarkHit), contact(ContactHit)
+    case calendarEvent(CalendarEventHit), reminder(ReminderHit)
 
     var id: String {
         switch self {
@@ -165,6 +215,11 @@ enum LauncherResult: Identifiable, Equatable {
         case .action(let action): return action.id
         case .shortcut(let shortcut): return shortcut.rowID
         case .calculation: return "calculation"
+        case .dictionary(let d): return "dict:\(d.word.lowercased())"
+        case .bookmark(let b): return "bm:\(b.id)"
+        case .contact(let c): return "contact:\(c.id)"
+        case .calendarEvent(let e): return "event:\(e.id)"
+        case .reminder(let r): return "rem:\(r.id)"
         }
     }
 }
@@ -260,6 +315,90 @@ enum LaunchCatalog {
         guard !word.isEmpty, word.count <= 100 else { return nil }
         return LaunchAction(id: "system:define", english: "Look Up in Dictionary", chinese: "在词典中查找",
                             symbol: "book", destination: .system(.define(word)), aliases: [])
+    }
+
+    private static let reservedBareDictionaryTokens: Set<String> = ["t", "tr", "f", "define", "dict", "查词"]
+    private static let disallowedBareDictionaryPunctuation = CharacterSet(charactersIn: #"/\:.+-*=()[]@#$%^&?!~"'`<>"#)
+
+    static func bareDictionaryWord(_ query: String) -> String? {
+        guard !query.isEmpty,
+              !query.contains(where: { $0.isWhitespace || $0.isNewline }),
+              !reservedBareDictionaryTokens.contains(query.lowercased()) else { return nil }
+        let canonical = query.precomposedStringWithCanonicalMapping
+        for scalar in canonical.unicodeScalars {
+            if CharacterSet.decimalDigits.contains(scalar)
+                || disallowedBareDictionaryPunctuation.contains(scalar) {
+                return nil
+            }
+        }
+        let allLatin = canonical.unicodeScalars.allSatisfy(isLatinLetterScalar)
+        if allLatin {
+            return (2...32).contains(canonical.count) ? query : nil
+        }
+        let allCJK = canonical.unicodeScalars.allSatisfy(isCJKIdeographScalar)
+        if allCJK {
+            return (2...8).contains(canonical.count) ? query : nil
+        }
+        return nil
+    }
+
+    static func compactDictionarySummary(_ definition: String, word: String) -> String {
+        let normalizedNewlines = definition.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let trimmedWord = word.trimmingCharacters(in: .whitespacesAndNewlines)
+        var lines = normalizedNewlines.split(separator: "\n", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        if !trimmedWord.isEmpty, lines.count > 1,
+           lines[0].compare(trimmedWord, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame {
+            lines.removeFirst()
+        }
+        var collapsed = lines.joined(separator: " ")
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        if !trimmedWord.isEmpty,
+           let range = collapsed.range(of: trimmedWord, options: [.anchored, .caseInsensitive]) {
+            let tail = collapsed[range.upperBound...].drop(while: { $0.isWhitespace })
+            if let first = tail.first, ["|", ":", "：", "—", "–", "-"].contains(first) {
+                let stripped = tail.dropFirst().drop(while: { $0.isWhitespace })
+                if !stripped.isEmpty {
+                    collapsed = String(stripped)
+                }
+            }
+        }
+        let maxLength = 160
+        guard collapsed.count > maxLength else { return collapsed }
+        let prefix = String(collapsed.prefix(maxLength - 1))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return prefix + "…"
+    }
+
+    private static func isLatinLetterScalar(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 0x0041...0x005A, // A-Z
+             0x0061...0x007A, // a-z
+             0x00C0...0x00D6, // Latin-1 Supplement (excluding ×)
+             0x00D8...0x00F6, // Latin-1 Supplement (excluding ÷)
+             0x00F8...0x00FF,
+             0x0100...0x024F, // Latin Extended-A & B
+             0x1E00...0x1EFF: // Latin Extended Additional
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func isCJKIdeographScalar(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 0x3400...0x4DBF,   // CJK Unified Ideographs Extension A
+             0x4E00...0x9FFF,   // CJK Unified Ideographs
+             0xF900...0xFAFF,   // CJK Compatibility Ideographs
+             0x20000...0x2EBEF: // CJK Unified Ideographs Extensions B-F
+            return true
+        default:
+            return false
+        }
     }
 
     static func applicationRoots(home: URL) -> [URL] {

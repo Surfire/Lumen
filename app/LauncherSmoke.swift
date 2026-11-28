@@ -46,7 +46,19 @@ final class LauncherSmoke {
     var chosenDiagnosticFile: URL?
     var chosenImageFolder: URL?
     var chosenImageProjector: URL?
-    var definitionProvider: (@Sendable (String) -> String?)?
+    private let definitionStorage = SmokeDefinitionStorage()
+    var definitionProvider: (@Sendable (String) -> String?)? {
+        get { definitionStorage.get() }
+        set { definitionStorage.set(newValue) }
+    }
+    nonisolated func lookupDefinition(_ word: String) -> String? {
+        definitionStorage.get()?(word)
+    }
+
+    func makeDefinitionLookup() -> @Sendable (String) -> String? {
+        let storage = definitionStorage
+        return { word in storage.get()?(word) }
+    }
     private var previewDownloadRelease: AsyncStream<Void>.Continuation?
     private var previewDownloadsStarted = 0
     private var previewDownloadsCancelled = 0
@@ -117,6 +129,9 @@ final class LauncherSmoke {
     private lazy var translationSuite = "io.github.surfire.lumen.gui-smoke.\(UUID())"
     private lazy var translationPreferences = UserDefaults(suiteName: translationSuite)
     private let translationSecrets = SmokeTranslationSecrets()
+    private let personalDataHarness = SmokePersonalDataHarness()
+    private var smokeChromiumBookmarksURL: URL { directory.appendingPathComponent("smoke-chrome-bookmarks.json") }
+    private var smokeSafariBookmarksURL: URL { directory.appendingPathComponent("smoke-safari-bookmarks.plist") }
     var shortcutFixturePreferences: UserDefaults? { exists("quicklinks-scenario") ? translationPreferences : nil }
 
     func makeScriptCatalog() -> LauncherScriptCatalog {
@@ -131,6 +146,52 @@ final class LauncherSmoke {
 
     func makeTranslationModel() -> TranslationPanelModel {
         TranslationPanelModel(defaults: translationPreferences, client: .init(secrets: translationSecrets, timeout: 3))
+    }
+
+    func makeCurrencyStore() -> CurrencyRateStore {
+        CurrencyRateStore(
+            defaults: translationPreferences!,
+            cacheURL: directory.appendingPathComponent("smoke-currency-rates.json"),
+            fetcher: { _ in throw CancellationError() }
+        )
+    }
+
+    func makeBookmarkLibrary() -> BookmarkLibrary {
+        BookmarkLibrary(
+            defaults: translationPreferences!,
+            sources: [
+                BookmarkSource(browser: "Chrome", kind: .chromiumJSON, url: smokeChromiumBookmarksURL),
+                BookmarkSource(browser: "Safari", kind: .safariPlist, url: smokeSafariBookmarksURL),
+            ]
+        )
+    }
+
+    func makePersonalDataStore() -> PersonalDataStore {
+        PersonalDataStore(defaults: translationPreferences!, provider: personalDataHarness.makeProvider())
+    }
+
+    func makeIsolatedLauncher(
+        engine: LauncherEngine,
+        defaults: UserDefaults,
+        locale: String = "en"
+    ) -> Launcher {
+        let currencyURL = directory.appendingPathComponent("smoke-currency-\(UUID().uuidString).json")
+        let currencyStore = CurrencyRateStore(
+            defaults: defaults,
+            cacheURL: currencyURL,
+            fetcher: { _ in throw CancellationError() }
+        )
+        let bookmarkLibrary = BookmarkLibrary(defaults: defaults, sources: [])
+        let personalStore = PersonalDataStore(defaults: defaults, provider: PersonalDataProvider())
+        return Launcher(
+            engine: engine,
+            defaults: defaults,
+            locale: locale,
+            currencyStore: currencyStore,
+            bookmarkLibrary: bookmarkLibrary,
+            personalDataStore: personalStore,
+            definitionLookup: makeDefinitionLookup()
+        )
     }
 
     private init(_ directory: URL, language: String, usesOffscreenWindows: Bool) {
@@ -394,6 +455,11 @@ final class LauncherSmoke {
             return
         }
 
+        if exists("spotlight-scenario") {
+            try await verifySpotlightParityFeatures(app)
+            return
+        }
+
         if exists("action-scenario") {
             try verifyClipboardOptIn(app.clipboard)
             try writeClipboardText("External copy fixture")
@@ -405,6 +471,7 @@ final class LauncherSmoke {
             try await verifyWindowActions(app)
             app.clipboard.clearAll()
             try await verifyClipboardHistory(app)
+            try await verifySpotlightParityFeatures(app)
             return
         }
 
@@ -5075,7 +5142,7 @@ final class LauncherSmoke {
         guard let defaults = UserDefaults(suiteName: suite) else { throw Failure("missing isolated embedding defaults") }
         defaults.set(true, forKey: "gemmaIndexingEnabled")
         defaults.set(false, forKey: "gemmaIndexingPaused")
-        let model = Launcher(engine: LauncherEngine(executable: executable, database: database), defaults: defaults)
+        let model = makeIsolatedLauncher(engine: LauncherEngine(executable: executable, database: database), defaults: defaults)
         defer {
             model.close()
             defaults.removePersistentDomain(forName: suite)
@@ -5670,7 +5737,7 @@ final class LauncherSmoke {
         defer { streamDefaults.removePersistentDomain(forName: streamDefaultsSuite) }
 
         let streamEngine = LauncherEngine(executable: streamEngineFile, database: streamDB, supportsStreamingBatches: true)
-        let streamModel = Launcher(engine: streamEngine, defaults: streamDefaults, locale: "en")
+        let streamModel = makeIsolatedLauncher(engine: streamEngine, defaults: streamDefaults, locale: "en")
         defer { streamModel.close() }
         streamModel.start(automaticallyIndex: false)
         try await until("phase3 stream fixture did not become searchable") { streamModel.canSearch && streamModel.watchState == .running }
@@ -5699,7 +5766,7 @@ final class LauncherSmoke {
             throw Failure("missing isolated phase3 pause defaults")
         }
         defer { pauseDefaults.removePersistentDomain(forName: pauseDefaultsSuite) }
-        let pauseModel = Launcher(engine: streamEngine, defaults: pauseDefaults, locale: "en")
+        let pauseModel = makeIsolatedLauncher(engine: streamEngine, defaults: pauseDefaults, locale: "en")
         defer { pauseModel.close() }
         pauseModel.start(automaticallyIndex: false)
         try await until("phase3 pause fixture did not become ready") {
@@ -5723,7 +5790,7 @@ final class LauncherSmoke {
             throw Failure("missing isolated phase3 turn defaults")
         }
         defer { turnDefaults.removePersistentDomain(forName: turnDefaultsSuite) }
-        let turnModel = Launcher(engine: streamEngine, defaults: turnDefaults, locale: "en")
+        let turnModel = makeIsolatedLauncher(engine: streamEngine, defaults: turnDefaults, locale: "en")
         defer { turnModel.close() }
         var turnCompletedCount = 0
         turnModel.maxEmbeddingBatchesPerTurn = { 1 }
@@ -5839,7 +5906,7 @@ final class LauncherSmoke {
         }
         defer { optDefaults.removePersistentDomain(forName: optDefaultsSuite) }
         let optEngine = LauncherEngine(executable: optEngineFile, database: optDB, supportsStreamingBatches: true)
-        let optModel = Launcher(engine: optEngine, defaults: optDefaults, locale: "zh")
+        let optModel = makeIsolatedLauncher(engine: optEngine, defaults: optDefaults, locale: "zh")
         defer { optModel.close() }
         optModel.start(automaticallyIndex: false)
         try await until("Option A fixture did not become ready") {
@@ -5933,7 +6000,7 @@ final class LauncherSmoke {
             gemmaHome: decoupleDir,
             supportsStreamingBatches: true
         )
-        let decoupleModel = Launcher(engine: decoupleEngine, defaults: decoupleDefaults, locale: "en")
+        let decoupleModel = makeIsolatedLauncher(engine: decoupleEngine, defaults: decoupleDefaults, locale: "en")
         defer { decoupleModel.close() }
         decoupleModel.start(automaticallyIndex: false)
         try await until("v063 image decouple fixture did not become ready") {
@@ -6295,15 +6362,28 @@ final class LauncherSmoke {
             .map { HotKey(code: UInt32(kVK_Space), modifiers: UInt32($0), key: "␣") }
         let voiceOver = try HotKey(event: event(kVK_ANSI_G, "G", in: app, flags: [.control, .option]))
         for chord in spaceChords + [voiceOver] {
-            let enabled = bindings.contains { entry in
-                (entry["kHISymbolicHotKeyEnabled"] as? NSNumber)?.boolValue == true &&
-                    (entry["kHISymbolicHotKeyCode"] as? NSNumber)?.uint32Value == chord.code &&
-                    (entry["kHISymbolicHotKeyModifiers"] as? NSNumber).map { $0.uint32Value & HotKey.mask } == chord.modifiers
-            }
+            let matching = bindings.filter(chord.matchesSymbolicEntry)
+            let enabled = matching.contains { ($0["kHISymbolicHotKeyEnabled"] as? NSNumber)?.boolValue == true }
+            let disabled = !enabled && matching.contains { ($0["kHISymbolicHotKeyEnabled"] as? NSNumber)?.boolValue == false }
             var reserved = false
             do { try chord.checkSystemShortcut() }
             catch HotKeyIssue.system { reserved = true }
             try check(reserved == enabled, "\(chord.label) conflict did not match the system shortcut catalog")
+            try check(chord.hasDisabledSystemSymbolicEntry() == disabled,
+                      "\(chord.label) disabled symbolic hotkey detection did not match the system catalog")
+        }
+        let cmdSpace = HotKey(code: UInt32(kVK_Space), modifiers: UInt32(cmdKey), key: "␣")
+        if cmdSpace.hasDisabledSystemSymbolicEntry() {
+            // Disabled Spotlight ⌘Space must not fail checkSystemShortcut() and must retry non-exclusively.
+            try cmdSpace.checkSystemShortcut()
+            let probeSpace = GlobalHotKey {}
+            defer { probeSpace.close() }
+            do {
+                try probeSpace.set(cmdSpace)
+                try check(probeSpace.shortcut == cmdSpace, "disabled ⌘Space registration did not retain shortcut")
+            } catch HotKeyIssue.occupied {
+                // Another user launcher on the host exclusively holds ⌘Space; confirm it was never .system.
+            }
         }
         app.recordShortcut(try event(kVK_ANSI_Comma, ",", in: app, flags: [.command]))
         guard case .app? = app.model.hotKeyIssue else { throw Failure("Command–comma did not retain the Settings binding") }
@@ -6322,6 +6402,9 @@ final class LauncherSmoke {
                                          GetApplicationEventTarget(), UInt32(kEventHotKeyExclusive), &occupied)
         try check(status == noErr && occupied != nil, "cannot reserve conflict fixture (\(status))")
         defer { if let occupied { UnregisterEventHotKey(occupied) } }
+        let nonSystemChord = HotKey(code: UInt32(kVK_ANSI_X), modifiers: modifiers, key: "X")
+        try check(!nonSystemChord.hasDisabledSystemSymbolicEntry(),
+                  "non-system chord falsely matched disabled symbolic hotkey catalog")
         app.recordShortcut(try event(kVK_ANSI_X, "X", in: app, flags: flags))
         guard case .occupied? = app.model.hotKeyIssue else {
             throw Failure("occupied chord was not diagnosed (\(String(describing: app.model.hotKeyIssue)))")
@@ -7038,7 +7121,10 @@ final class LauncherSmoke {
         if let isoDefaults = UserDefaults(suiteName: isoSuite) {
             defer { isoDefaults.removePersistentDomain(forName: isoSuite) }
             let isoEngine = LauncherEngine(executable: fakeGemma, database: directory.appendingPathComponent("iso.sqlite"), gemmaHome: fakeGemma)
-            let isoLauncher = Launcher(engine: isoEngine, defaults: isoDefaults, locale: "en")
+            let isoLauncher = Launcher(engine: isoEngine, defaults: isoDefaults, locale: "en",
+                                       currencyStore: makeCurrencyStore(),
+                                       bookmarkLibrary: makeBookmarkLibrary(),
+                                       personalDataStore: makePersonalDataStore())
             defer { isoLauncher.close() }
             try check(isoLauncher.textEmbeddingBackend.mode == .builtin, "Launcher did not default to .builtin")
             isoLauncher.applyTextEmbeddingBackend(savedConfig)
@@ -7153,7 +7239,7 @@ final class LauncherSmoke {
         TextEmbeddingBackendConfig(mode: .localOpenAI, baseURL: missingSockURL, model: "qwen3").save(to: defaults1)
 
         let engine1 = LauncherEngine(executable: engineFile, database: db, supportsStreamingBatches: true)
-        let model1 = Launcher(engine: engine1, defaults: defaults1, locale: "en")
+        let model1 = makeIsolatedLauncher(engine: engine1, defaults: defaults1, locale: "en")
         defer { model1.close() }
         model1.start(automaticallyIndex: false)
 
@@ -7203,7 +7289,7 @@ final class LauncherSmoke {
         }
         defer { defaults2.removePersistentDomain(forName: suite2) }
         let engine2 = LauncherEngine(executable: engineFile, database: db, supportsStreamingBatches: true)
-        let model2 = Launcher(engine: engine2, defaults: defaults2, locale: "en")
+        let model2 = makeIsolatedLauncher(engine: engine2, defaults: defaults2, locale: "en")
         defer { model2.close() }
         model2.start(automaticallyIndex: false)
         try await until("watcher permission failure did not transition immediately to .failed") {
@@ -7381,7 +7467,10 @@ final class LauncherSmoke {
         let db = directory.appendingPathComponent("v064-filedefault.sqlite")
         func makeLauncher() -> Launcher {
             Launcher(engine: LauncherEngine(executable: fakeGemma, database: db, gemmaHome: fakeGemma),
-                     defaults: isoDefaults, locale: "en")
+                     defaults: isoDefaults, locale: "en",
+                     currencyStore: makeCurrencyStore(),
+                     bookmarkLibrary: makeBookmarkLibrary(),
+                     personalDataStore: makePersonalDataStore())
         }
 
         let initial = makeLauncher()
@@ -7625,6 +7714,389 @@ final class LauncherSmoke {
         print("v0.6.4 fileDefaultAction regressions passed (.open, .revealInFinder, Return/double-click/Cmd+Return/Cmd+K, folders/.app, Frecency, UserDefaults persistence)")
     }
 
+    private func verifySpotlightParityFeatures(_ app: AppDelegate) async throws {
+        let model = app.model
+        let fm = FileManager.default
+        let captureAll = exists("capture-icons") || exists("capture-snapshots") || exists("capture-spotlight")
+        app.settings?.close()
+        if !model.canSearch {
+            app.startBackgroundIndex()
+            try await until("spotlight smoke index ready") { model.canSearch }
+        }
+
+        // 1. Currency conversion + daily disk cache + zero network on fresh cache.
+        let isoSuite = "io.github.surfire.lumen.smoke.v066.\(UUID().uuidString)"
+        guard let isoDefaults = UserDefaults(suiteName: isoSuite) else {
+            throw Failure("failed to create isolated UserDefaults suite for spotlight smoke")
+        }
+        defer { isoDefaults.removePersistentDomain(forName: isoSuite) }
+
+        final class FetchCounter: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value = 0
+            var count: Int { lock.withLock { value } }
+            func increment() { lock.withLock { value += 1 } }
+        }
+
+        let cacheURL = directory.appendingPathComponent("v066-currency-cache.json")
+        try? fm.removeItem(at: cacheURL)
+        defer { try? fm.removeItem(at: cacheURL) }
+        let counter = FetchCounter()
+        let mockRateJSON = Data(#"{"result":"success","time_last_update_utc":"Sat, 28 Nov 2026 00:00:00 +0000","base_code":"USD","rates":{"USD":1.0,"CNY":7.5,"EUR":0.9,"JPY":150.0,"GBP":0.78}}"#.utf8)
+        let store = CurrencyRateStore(defaults: isoDefaults, cacheURL: cacheURL) { _ in
+            counter.increment()
+            return mockRateJSON
+        }
+        try check(store.snapshot.isFallback && store.autoRefreshEnabled && !store.refreshing && store.lastError == nil,
+                  "CurrencyRateStore did not start on built-in fallback")
+        guard let fallbackEn = CalculationResult.evaluate("$100 to cny", rates: store.snapshot, preferChinese: false),
+              let fallbackZh = CalculationResult.evaluate("100美元换人民币", rates: store.snapshot, preferChinese: true) else {
+            throw Failure("fallback currency conversion failed for English or Chinese prompt")
+        }
+        try check(fallbackEn.display.contains("CNY") && fallbackZh.display.contains("CNY") &&
+                  fallbackEn.detail != nil && fallbackZh.detail != nil,
+                  "currency calculation missing detail or currency unit")
+
+        await store.refreshIfStale()
+        try check(counter.count == 1 && !store.snapshot.isFallback && store.snapshot.rates["CNY"] == 7.5 &&
+                  fm.fileExists(atPath: cacheURL.path) && store.lastError == nil,
+                  "CurrencyRateStore.refreshIfStale did not persist fetched snapshot")
+        await store.refreshIfStale()
+        try check(counter.count == 1, "CurrencyRateStore re-fetched fresh same-day cache")
+
+        let reloadedStore = CurrencyRateStore(defaults: isoDefaults, cacheURL: cacheURL) { _ in
+            counter.increment()
+            throw Failure("unexpected network call on fresh cached CurrencyRateStore")
+        }
+        try check(reloadedStore.snapshot == store.snapshot, "CurrencyRateStore did not reload persisted JSON cache")
+        await reloadedStore.refreshIfStale()
+        try check(counter.count == 1, "reloaded CurrencyRateStore hit network despite fresh disk cache")
+
+        let badCacheURL = directory.appendingPathComponent("v066-currency-bad.json")
+        defer { try? fm.removeItem(at: badCacheURL) }
+        let badStore = CurrencyRateStore(defaults: isoDefaults, cacheURL: badCacheURL) { _ in
+            Data(#"{"result":"error","rates":{"USD":1.0}}"#.utf8)
+        }
+        await badStore.refreshNow()
+        try check(badStore.snapshot.isFallback && badStore.lastError != nil,
+                  "CurrencyRateStore accepted incomplete/invalid currency JSON")
+
+        let injected = CurrencyRateSnapshot(
+            base: "USD",
+            rates: ["USD": 1.0, "CNY": 8.0, "EUR": 0.9, "JPY": 150.0],
+            updatedDate: "2026-11-28",
+            fetchedAt: Date(),
+            isFallback: false
+        )
+        model.currencyStore.injectForTesting(injected)
+        defer { model.currencyStore.injectForTesting(.fallback) }
+
+        app.showSearch()
+        try type("$100 to cny", into: app)
+        try await until("injected currency calculation appeared") {
+            guard let calc = model.calculation,
+                  case .calculation(let first)? = model.visibleResults.first else { return false }
+            return first == calc && calc.display.contains("CNY")
+        }
+        guard let fxCalc = model.calculation else { throw Failure("missing currency calculation") }
+        let numericCopy = Double(fxCalc.copyValue.replacingOccurrences(of: ",", with: ""))
+        try check(numericCopy == 800.0 && fxCalc.detail?.contains("2026-11-28") == true,
+                  "injected currency snapshot did not drive calculation: \(fxCalc)")
+        if captureAll {
+            try capture("lumen-spotlight-currency.png", appearance: .aqua, window: app.panel)
+            print("Screenshot: lumen-spotlight-currency.png")
+            app.panel.appearance = nil
+        }
+        func verifySpotlightInternalCopy(_ label: String) throws {
+            let priorCount = app.clipboard.items.count
+            try check(filePasteboard.types?.contains(ClipboardManager.internalType) == true, "\(label) was not marked internal")
+            app.clipboard.poll()
+            try check(app.clipboard.items.count == priorCount, "\(label) leaked into clipboard history")
+        }
+
+        try key(kVK_Return, "\r", in: app)
+        try await until("Return on currency calculation copied value and dismissed search") {
+            self.filePasteboard.string(forType: .string) == fxCalc.copyValue && !app.searchPresented
+        }
+        try verifySpotlightInternalCopy("Copy Currency Conversion")
+
+        // 2. Prefix-free dictionary lookup (debounced, cancelled on query change, ranked below exact file hit).
+        let priorDefinitionProvider = definitionProvider
+        definitionProvider = { word in
+            switch word.lowercased() {
+            case "ephemeral": return "ephemeral | iˈfem(ə)rəl |\nadjective lasting for a very short time."
+            case "archive": return "archive | ˈärˌkīv |\nnoun a collection of historical documents."
+            default: return nil
+            }
+        }
+        defer { definitionProvider = priorDefinitionProvider }
+
+        app.showSearch()
+        try type("ephem", into: app)
+        try await Task.sleep(for: .milliseconds(25))
+        try type("ephemeral", into: app)
+        try check(model.dictionaryQuickResult == nil, "stale prefix dictionary lookup appeared before debounce")
+        try await until("prefix-free dictionary result appeared") {
+            model.dictionaryQuickResult?.word == "ephemeral" &&
+                model.visibleResults.contains {
+                    if case .dictionary(let d) = $0 { return d.word == "ephemeral" }
+                    return false
+                }
+        }
+        guard let dictQuick = model.dictionaryQuickResult else { throw Failure("missing dictionaryQuickResult") }
+        try check(!dictQuick.summary.contains("\n") && dictQuick.summary.count <= 160,
+                  "dictionary summary was not compact single-line: \(dictQuick.summary)")
+        if captureAll {
+            try capture("lumen-spotlight-dictionary.png", appearance: .aqua, window: app.panel)
+            print("Screenshot: lumen-spotlight-dictionary.png")
+            if exists("capture-spotlight") {
+                try capture("spotlight-currency-dictionary.png", appearance: .aqua, window: app.panel)
+                print("Screenshot: spotlight-currency-dictionary.png")
+            }
+            app.panel.appearance = nil
+        }
+
+        model.selection = "dict:ephemeral"
+        try key(kVK_Return, "\r", in: app)
+        try await until("Return on .dictionary row opened definition card") {
+            if case .definition(let word, let text, false) = app.panelState.mode {
+                return word == "ephemeral" && (text?.contains("lasting for a very short time") ?? false)
+            }
+            return false
+        }
+        try key(kVK_Return, "\r", in: app)
+        try check(app.commands.definitionCopied &&
+                  filePasteboard.string(forType: .string)?.contains("lasting for a very short time") == true,
+                  "Return on dictionary card did not copy full definition")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try check(app.commands.definition == nil && app.panelState.mode == .search,
+                  "Escape did not close dictionary card")
+
+        try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+        try check(app.contextActions.items.map(\.id) == ["show-definition", "copy-definition", "copy-word"],
+                  "dictionary Cmd+K menu mismatch: \(app.contextActions.items.map(\.id))")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+
+        try type("ephemeral ", into: app)
+        try check(model.dictionaryQuickResult == nil &&
+                  !model.visibleResults.contains { if case .dictionary = $0 { return true }; return false },
+                  "trailing whitespace did not immediately clear prefix-free dictionary result")
+
+        try type("archive", into: app)
+        try await until("archive file and dictionary merged") {
+            !model.searching &&
+                model.hits.contains { $0.name == "archive-one.txt" } &&
+                model.dictionaryQuickResult?.word == "archive"
+        }
+        guard let fileIdx = model.visibleResults.firstIndex(where: {
+            if case .file(let h) = $0 { return h.name == "archive-one.txt" }
+            return false
+        }),
+              let dictIdx = model.visibleResults.firstIndex(where: {
+                  if case .dictionary(let d) = $0 { return d.word == "archive" }
+                  return false
+              }) else {
+            throw Failure("missing file or dictionary row for archive ranking check")
+        }
+        try check(fileIdx < dictIdx, "prefix-free dictionary ranked above stronger exact/prefix file hit")
+
+        // 3. Browser bookmarks (synthetic Chromium JSON + Safari Plist + open/copy actions).
+        let chromeObj: [String: Any] = [
+            "roots": [
+                "bookmark_bar": [
+                    "type": "folder",
+                    "name": "Bookmarks Bar",
+                    "children": [[
+                        "type": "folder",
+                        "name": "Work",
+                        "children": [[
+                            "type": "url",
+                            "name": "Lumen Docs Guide",
+                            "url": "https://docs.example.com/lumen/guide",
+                        ]],
+                    ]],
+                ]
+            ]
+        ]
+        let chromeData = try JSONSerialization.data(withJSONObject: chromeObj)
+        try chromeData.write(to: smokeChromiumBookmarksURL)
+        let safariObj: [String: Any] = [
+            "Title": "",
+            "WebBookmarkType": "WebBookmarkTypeList",
+            "Children": [[
+                "Title": "Reading",
+                "WebBookmarkType": "WebBookmarkTypeList",
+                "Children": [[
+                    "WebBookmarkType": "WebBookmarkTypeLeaf",
+                    "URIDictionary": ["title": "Swift Concurrency Notes"],
+                    "URLString": "https://swift.example.org/concurrency",
+                ]],
+            ]],
+        ]
+        let safariData = try PropertyListSerialization.data(fromPropertyList: safariObj, format: .binary, options: 0)
+        try safariData.write(to: smokeSafariBookmarksURL)
+        defer {
+            try? fm.removeItem(at: smokeChromiumBookmarksURL)
+            try? fm.removeItem(at: smokeSafariBookmarksURL)
+        }
+
+        await model.bookmarkLibrary.syncNow(force: true)
+        try check(model.bookmarkLibrary.enabled && model.bookmarkLibrary.count == 2 &&
+                  model.bookmarkLibrary.matches("concurrency").contains { $0.hit.browser == "Safari" },
+                  "BookmarkLibrary did not index synthetic Chromium and Safari bookmarks")
+
+        try type("lumen docs guide", into: app)
+        try await until("synthetic bookmark appeared in search results") {
+            model.visibleResults.contains {
+                if case .bookmark(let b) = $0 { return b.title == "Lumen Docs Guide" }
+                return false
+            }
+        }
+        guard let bmResult = model.visibleResults.first(where: {
+            if case .bookmark(let b) = $0 { return b.title == "Lumen Docs Guide" }
+            return false
+        }) else { throw Failure("missing bookmark row") }
+        model.selection = bmResult.id
+        try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+        try check(app.contextActions.items.map(\.id) == ["open-bookmark", "copy-bookmark-url"],
+                  "bookmark Cmd+K actions mismatch: \(app.contextActions.items.map(\.id))")
+        try key(kVK_DownArrow, "\u{f701}", in: app)
+        try key(kVK_Return, "\r", in: app)
+        try await until("bookmark Copy URL action wrote URL") {
+            self.filePasteboard.string(forType: .string) == "https://docs.example.com/lumen/guide" && !app.searchPresented
+        }
+        try verifySpotlightInternalCopy("Copy Bookmark URL")
+
+        let quicklinksBefore = dispatchedQuicklinks.count
+        app.showSearch()
+        try type("lumen docs guide", into: app)
+        model.selection = bmResult.id
+        try key(kVK_Return, "\r", in: app)
+        try await until("Return on bookmark opened URL and dismissed search") {
+            self.dispatchedQuicklinks.count == quicklinksBefore + 1 &&
+                self.dispatchedQuicklinks.last?.absoluteString == "https://docs.example.com/lumen/guide" &&
+                !app.searchPresented
+        }
+
+        // 4. Strictly opt-in Personal Sources (default-OFF, denied -> stays off, authorized -> search/complete).
+        let personal = model.personalDataStore
+        personalDataHarness.reset()
+        try check(!personal.contactsEnabled && !personal.calendarEnabled && !personal.remindersEnabled,
+                  "personal sources were not opt-in by default")
+        await personal.refreshIfNeeded(force: true)
+        try check(personalDataHarness.accessRequests == 0 && personal.matches("alice").isEmpty,
+                  "refreshIfNeeded triggered TCC request or returned results while disabled")
+
+        personalDataHarness.nextAccess = .denied
+        await personal.setContactsEnabled(true)
+        try check(!personal.contactsEnabled && personal.contactsAuth == .denied,
+                  "denied contacts permission left toggle enabled")
+
+        personalDataHarness.nextAccess = .authorized
+        personalDataHarness.setContactsStatus(.authorized)
+        personal.refreshAuthorizationStatuses()
+        try check(personal.contactsAuth == .authorized, "refreshAuthorizationStatuses did not pick up System Settings grant")
+        personalDataHarness.contacts = [
+            ContactHit(id: "c1", fullName: "Alice Zhang", subtitle: "Acme Corp · +1-555-0100",
+                       primaryPhone: "+1-555-0100", primaryEmail: "alice@example.com", organization: "Acme Corp")
+        ]
+        let start = Date().addingTimeInterval(3600)
+        personalDataHarness.events = [
+            CalendarEventHit(id: "e1", title: "Weekly Sync Alice", startDate: start,
+                             endDate: start.addingTimeInterval(3600), isAllDay: false,
+                             calendarTitle: "Work", location: "Zoom",
+                             meetingURL: "https://meet.example.com/weekly-sync", dateSummary: "Today 15:00")
+        ]
+        personalDataHarness.reminders = [
+            ReminderHit(id: "r1", title: "Send Alice proposal", dueDate: start, listTitle: "Tasks",
+                        notes: nil, priority: 1, dueSummary: "Today 14:30", isCompleted: false)
+        ]
+
+        await personal.setContactsEnabled(true)
+        await personal.setCalendarEnabled(true)
+        await personal.setRemindersEnabled(true)
+        try check(personal.contactsEnabled && personal.calendarEnabled && personal.remindersEnabled &&
+                  personal.contactsCount == 1 && personal.eventsCount == 1 && personal.remindersCount == 1,
+                  "enabling authorized personal sources did not populate counts")
+
+        app.showSearch()
+        try type("alice", into: app)
+        try await until("personal data results appeared in search") {
+            model.visibleResults.contains { if case .contact = $0 { return true }; return false } &&
+                model.visibleResults.contains { if case .calendarEvent = $0 { return true }; return false } &&
+                model.visibleResults.contains { if case .reminder = $0 { return true }; return false }
+        }
+
+        if captureAll {
+            try capture("lumen-spotlight-sources-light.png", appearance: .aqua, window: app.panel)
+            try capture("lumen-spotlight-sources-dark.png", appearance: .darkAqua, window: app.panel)
+            print("Screenshot: lumen-spotlight-sources-light.png")
+            print("Screenshot: lumen-spotlight-sources-dark.png")
+            if exists("capture-spotlight") {
+                try capture("spotlight-sources.png", appearance: .aqua, window: app.panel)
+                print("Screenshot: spotlight-sources.png")
+            }
+            app.panel.appearance = nil
+        }
+
+        model.selection = "event:e1"
+        let meetingBefore = dispatchedQuicklinks.count
+        try key(kVK_Return, "\r", in: app)
+        try await until("Return on calendar event joined meeting URL") {
+            self.dispatchedQuicklinks.count == meetingBefore + 1 &&
+                self.dispatchedQuicklinks.last?.absoluteString == "https://meet.example.com/weekly-sync" &&
+                !app.searchPresented
+        }
+
+        app.showSearch()
+        try type("alice", into: app)
+        model.selection = "contact:c1"
+        try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+        try check(app.contextActions.items.map(\.id) == ["open-contact", "copy-phone", "copy-email", "copy-contact-name"],
+                  "contact Cmd+K actions mismatch: \(app.contextActions.items.map(\.id))")
+        try key(kVK_DownArrow, "\u{f701}", in: app)
+        try key(kVK_Return, "\r", in: app)
+        try await until("contact Copy Phone action copied phone number") {
+            self.filePasteboard.string(forType: .string) == "+1-555-0100" && !app.searchPresented
+        }
+        try verifySpotlightInternalCopy("Copy Contact Phone")
+
+        app.showSearch()
+        try type("alice", into: app)
+        model.selection = "rem:r1"
+        try key(kVK_Return, "\r", in: app)
+        try await until("Return on reminder completed reminder via store") {
+            self.personalDataHarness.completedIDs == ["r1"] && !app.searchPresented
+        }
+
+        if captureAll, !exists("settings-scenario") {
+            app.showSettings()
+            app.settingsSession.page = .general
+            if let settingsWindow = app.settings {
+                let originalFrame = settingsWindow.frame
+                settingsWindow.setContentSize(NSSize(width: 780, height: 1160))
+                try await Task.sleep(for: .milliseconds(120))
+                try capture("lumen-settings-sources-light.png", appearance: .aqua, window: settingsWindow)
+                try capture("lumen-settings-sources-dark.png", appearance: .darkAqua, window: settingsWindow)
+                settingsWindow.appearance = nil
+                settingsWindow.setFrame(originalFrame, display: false)
+                settingsWindow.close()
+                print("Screenshot: lumen-settings-sources-light.png")
+                print("Screenshot: lumen-settings-sources-dark.png")
+            }
+        }
+
+        personalDataHarness.reset()
+        await personal.setContactsEnabled(false)
+        await personal.setCalendarEnabled(false)
+        await personal.setRemindersEnabled(false)
+        try? fm.removeItem(at: smokeChromiumBookmarksURL)
+        try? fm.removeItem(at: smokeSafariBookmarksURL)
+        await model.bookmarkLibrary.syncNow(force: true)
+        app.dismissSearch()
+        print("v0.6.6 Spotlight-parity regressions passed (currency cache & eval, prefix-free dictionary & ranking, bookmarks, opt-in personal data)")
+    }
+
     private struct Failure: Error, CustomStringConvertible {
         let description: String
         init(_ description: String) { self.description = description }
@@ -7755,6 +8227,106 @@ private final class SmokeTranslationSecrets: TranslationSecrets, @unchecked Send
 
     func remove(provider: UUID) {
         lock.withLock { _ = values.removeValue(forKey: provider) }
+    }
+}
+
+private final class SmokeDefinitionStorage: @unchecked Sendable {
+    private let lock = NSLock()
+    private var provider: (@Sendable (String) -> String?)?
+
+    func get() -> (@Sendable (String) -> String?)? {
+        lock.withLock { provider }
+    }
+
+    func set(_ next: (@Sendable (String) -> String?)?) {
+        lock.withLock { provider = next }
+    }
+}
+
+private final class SmokePersonalDataHarness: @unchecked Sendable {
+    private let lock = NSLock()
+    var contactsStatus: PersonalDataAuthStatus = .notDetermined
+    var calendarStatus: PersonalDataAuthStatus = .notDetermined
+    var remindersStatus: PersonalDataAuthStatus = .notDetermined
+    var nextAccess: PersonalDataAuthStatus = .denied
+    var accessRequests = 0
+    var contacts: [ContactHit] = []
+    var events: [CalendarEventHit] = []
+    var reminders: [ReminderHit] = []
+    var completedIDs: [String] = []
+
+    func reset() {
+        lock.withLock {
+            contactsStatus = .notDetermined
+            calendarStatus = .notDetermined
+            remindersStatus = .notDetermined
+            nextAccess = .denied
+            accessRequests = 0
+            contacts = []
+            events = []
+            reminders = []
+            completedIDs = []
+        }
+    }
+
+    func setContactsStatus(_ status: PersonalDataAuthStatus) {
+        lock.withLock { contactsStatus = status }
+    }
+
+    func makeProvider() -> PersonalDataProvider {
+        PersonalDataProvider(
+            contactsStatus: { [weak self] in
+                self?.lock.withLock { self?.contactsStatus } ?? .notDetermined
+            },
+            requestContactsAccess: { [weak self] in
+                guard let self else { return .denied }
+                return self.lock.withLock {
+                    self.accessRequests += 1
+                    self.contactsStatus = self.nextAccess
+                    return self.nextAccess
+                }
+            },
+            fetchContacts: { [weak self] in
+                self?.lock.withLock { self?.contacts } ?? []
+            },
+            calendarStatus: { [weak self] in
+                self?.lock.withLock { self?.calendarStatus } ?? .notDetermined
+            },
+            requestCalendarAccess: { [weak self] in
+                guard let self else { return .denied }
+                return self.lock.withLock {
+                    self.accessRequests += 1
+                    self.calendarStatus = self.nextAccess
+                    return self.nextAccess
+                }
+            },
+            fetchEvents: { [weak self] _, _ in
+                self?.lock.withLock { self?.events } ?? []
+            },
+            remindersStatus: { [weak self] in
+                self?.lock.withLock { self?.remindersStatus } ?? .notDetermined
+            },
+            requestRemindersAccess: { [weak self] in
+                guard let self else { return .denied }
+                return self.lock.withLock {
+                    self.accessRequests += 1
+                    self.remindersStatus = self.nextAccess
+                    return self.nextAccess
+                }
+            },
+            fetchReminders: { [weak self] in
+                self?.lock.withLock { self?.reminders } ?? []
+            },
+            completeReminder: { [weak self] id in
+                guard let self else { return false }
+                return self.lock.withLock {
+                    guard let index = self.reminders.firstIndex(where: { $0.id == id }) else { return false }
+                    self.reminders.remove(at: index)
+                    self.completedIDs.append(id)
+                    return true
+                }
+            }
+        )
     }
 }
 #endif

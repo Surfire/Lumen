@@ -56,10 +56,50 @@ struct HotKey: Codable, Equatable {
         let keys = try symbolicHotKeys()
         if keys.contains(where: { entry in
             guard (entry["kHISymbolicHotKeyEnabled"] as? NSNumber)?.boolValue == true else { return false }
-            let code = (entry["kHISymbolicHotKeyCode"] as? NSNumber)?.uint32Value
-            let modifiers = (entry["kHISymbolicHotKeyModifiers"] as? NSNumber)?.uint32Value
-            return code == self.code && modifiers.map { $0 & Self.mask } == self.modifiers
+            return matchesSymbolicEntry(entry)
         }) { throw HotKeyIssue.system }
+    }
+
+    func hasDisabledSystemSymbolicEntry() -> Bool {
+        guard let keys = try? symbolicHotKeys() else { return false }
+        return hasDisabledSystemSymbolicEntry(in: keys)
+    }
+
+    func hasDisabledSystemSymbolicEntry(in entries: [[String: Any]]) -> Bool {
+        var foundDisabled = false
+        for entry in entries where matchesSymbolicEntry(entry) {
+            guard let enabled = (entry["kHISymbolicHotKeyEnabled"] as? NSNumber)?.boolValue else { continue }
+            if enabled { return false }
+            foundDisabled = true
+        }
+        return foundDisabled
+    }
+
+    func matchesSymbolicEntry(_ entry: [String: Any]) -> Bool {
+        let entryCode: UInt32?
+        let entryModifiers: UInt32?
+        if let code = (entry["kHISymbolicHotKeyCode"] as? NSNumber)?.uint32Value,
+           let modifiers = (entry["kHISymbolicHotKeyModifiers"] as? NSNumber)?.uint32Value {
+            entryCode = code
+            entryModifiers = Self.normalizeSymbolicModifiers(modifiers)
+        } else if let params = entry["kHISymbolicHotKeyParameters"] as? [NSNumber], params.count >= 3 {
+            entryCode = params[1].uint32Value
+            entryModifiers = Self.normalizeSymbolicModifiers(params[2].uint32Value)
+        } else {
+            return false
+        }
+        return entryCode == code && entryModifiers == modifiers
+    }
+
+    private static func normalizeSymbolicModifiers(_ raw: UInt32) -> UInt32 {
+        let carbon = raw & Self.mask
+        if carbon != 0 || raw == 0 { return carbon }
+        var converted: UInt32 = 0
+        if raw & UInt32(NSEvent.ModifierFlags.command.rawValue) != 0 { converted |= UInt32(cmdKey) }
+        if raw & UInt32(NSEvent.ModifierFlags.option.rawValue) != 0 { converted |= UInt32(optionKey) }
+        if raw & UInt32(NSEvent.ModifierFlags.control.rawValue) != 0 { converted |= UInt32(controlKey) }
+        if raw & UInt32(NSEvent.ModifierFlags.shift.rawValue) != 0 { converted |= UInt32(shiftKey) }
+        return converted
     }
 
     private func symbolicHotKeys() throws -> [[String: Any]] {
@@ -103,8 +143,13 @@ final class GlobalHotKey {
         let next = serial &+ 1
         var candidate: EventHotKeyRef?
         let identifier = EventHotKeyID(signature: Self.signature, id: next)
-        let status = RegisterEventHotKey(shortcut.code, shortcut.modifiers, identifier,
+        var status = RegisterEventHotKey(shortcut.code, shortcut.modifiers, identifier,
                                          GetApplicationEventTarget(), UInt32(kEventHotKeyExclusive), &candidate)
+        if status == eventHotKeyExistsErr, shortcut.hasDisabledSystemSymbolicEntry() {
+            candidate = nil
+            status = RegisterEventHotKey(shortcut.code, shortcut.modifiers, identifier,
+                                         GetApplicationEventTarget(), 0, &candidate)
+        }
         if status == eventHotKeyExistsErr { throw HotKeyIssue.occupied }
         guard status == noErr, let candidate else { throw HotKeyIssue.registration(status) }
         disable()

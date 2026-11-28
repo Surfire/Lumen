@@ -164,8 +164,14 @@ final class Launcher: ObservableObject {
     @Published private(set) var launchMatches: [ActionMatch] = []
     private var executableMatches: [ActionMatch] = []
     @Published private(set) var calculation: CalculationResult?
+    @Published private(set) var dictionaryQuickResult: DictionaryQuickResult?
+    let currencyStore: CurrencyRateStore
+    let bookmarkLibrary: BookmarkLibrary
+    let personalDataStore: PersonalDataStore
+    let definitionLookup: @Sendable (String) -> String?
     let shortcuts: ShortcutLibrary
     private var shortcutChanges: AnyCancellable?
+    private var storeChanges: Set<AnyCancellable> = []
     @Published var selectedID: String?
     var selection: String? {
         get { selectedID }
@@ -181,6 +187,11 @@ final class Launcher: ObservableObject {
         didSet {
             guard language != oldValue else { return }
             defaults?.set(language, forKey: "language")
+            if hasQuery && !isImageSearch {
+                set(\.calculation, to: CalculationResult.evaluate(query, rates: currencyStore.snapshot, preferChinese: zh))
+                rebuildVisibleResults()
+                reconcileSelection()
+            }
         }
     }
 
@@ -273,6 +284,8 @@ final class Launcher: ObservableObject {
     private var diagnosisGeneration: UInt64 = 0
     private var textDebounce: Task<Void, Never>?
     private var semanticDebounce: Task<Void, Never>?
+    private var dictionaryTask: Task<Void, Never>?
+    private var dictionaryGeneration: UInt64 = 0
     private var firstNamesReady = false { didSet { syncCanSearch() } }
     // An existing index may contain paths hidden by permission changes while Lumen was closed.
     private var scopeTrustedForLookup = false { didSet { syncCanSearch() } }
@@ -342,20 +355,35 @@ final class Launcher: ObservableObject {
             return nil
         })
         let native = launchMatches.filter { !linkedApps.contains($0.action.id) }.map {
-            (LauncherResult.action($0.action), $0.score)
+            (LauncherResult.action($0.action), Double($0.score))
         }
-        let saved = shortcuts.map { (LauncherResult.shortcut($0.record), $0.score) }
-        let executables = executableMatches.map { (LauncherResult.action($0.action), $0.score) }
+        let saved = shortcuts.map { (LauncherResult.shortcut($0.record), Double($0.score)) }
+        let executables = executableMatches.map { (LauncherResult.action($0.action), Double($0.score)) }
         let commands = native + saved + executables
         let result = calculation.map { [LauncherResult.calculation($0)] } ?? []
-        guard !commands.isEmpty else { return result + hits.map(LauncherResult.file) }
-        let files: [(LauncherResult, Int)] = hits.map { hit in
+        let filteredQuery = LauncherFileQuery(query).isFiltered
+        let bookmarks: [(LauncherResult, Double)] = filteredQuery
+            ? []
+            : bookmarkLibrary.matches(query, limit: 8).map { (.bookmark($0.hit), $0.score) }
+        let personal: [(LauncherResult, Double)] = filteredQuery
+            ? []
+            : personalDataStore.matches(query, limitPerSource: 5).map { ($0.result, $0.score) }
+        let dictionary: [(LauncherResult, Double)] = (!filteredQuery ? dictionaryQuickResult : nil).map {
+            [(.dictionary($0), 68.0)]
+        } ?? []
+        let extras = bookmarks + personal + dictionary
+        guard !commands.isEmpty || !extras.isEmpty else { return result + hits.map(LauncherResult.file) }
+        let files: [(LauncherResult, Double)] = hits.map { hit in
             // Keep lexical order on ties. Regular use can move a direct file above a partial command match.
             let direct = hit.matched_by != "path" && !hit.isRelatedHit
-            let rank = direct ? 79 + frecency.boost(LauncherFrecency.fileID(hit.path), query: query) : 78
+            let rank = direct ? Double(79 + frecency.boost(LauncherFrecency.fileID(hit.path), query: query)) : 62.0
             return (.file(hit), rank)
         }
-        return result + (commands + files).sorted { $0.1 > $1.1 }.map(\.0)
+        let merged = (commands + files + extras).enumerated().sorted { lhs, rhs in
+            if lhs.element.1 != rhs.element.1 { return lhs.element.1 > rhs.element.1 }
+            return lhs.offset < rhs.offset
+        }.map(\.element.0)
+        return result + merged
     }
 
     private func rebuildVisibleResults() {
@@ -381,9 +409,27 @@ final class Launcher: ObservableObject {
             gemmaCoverage?.documents_enabled == true && gemmaCoverage?.pending == true && gemmaCoverage?.limited == false
     }
 
-    init(engine: LauncherEngine, defaults: UserDefaults?, locale: String? = nil) {
+    init(
+        engine: LauncherEngine,
+        defaults: UserDefaults?,
+        locale: String? = nil,
+        currencyStore: CurrencyRateStore? = nil,
+        bookmarkLibrary: BookmarkLibrary? = nil,
+        personalDataStore: PersonalDataStore? = nil,
+        definitionLookup: (@Sendable (String) -> String?)? = nil
+    ) {
         self.engine = engine
         self.defaults = defaults
+        let storeDefaults = defaults
+            ?? UserDefaults(suiteName: "io.github.surfire.lumen.ephemeral.\(UUID().uuidString)")
+            ?? .standard
+        let ephemeralCacheURL = defaults == nil
+            ? FileManager.default.temporaryDirectory.appendingPathComponent("lumen-ephemeral-rates-\(UUID().uuidString).json")
+            : nil
+        self.currencyStore = currencyStore ?? CurrencyRateStore(defaults: storeDefaults, cacheURL: ephemeralCacheURL)
+        self.bookmarkLibrary = bookmarkLibrary ?? BookmarkLibrary(defaults: storeDefaults, sources: defaults == nil ? [] : nil)
+        self.personalDataStore = personalDataStore ?? PersonalDataStore(defaults: storeDefaults)
+        self.definitionLookup = definitionLookup ?? { LauncherSystemActions.dictionaryDefinition($0) }
         let loadedBackend = TextEmbeddingBackendConfig.load(from: defaults)
         self.textEmbeddingBackend = loadedBackend
         engine.setTextEmbeddingBackend(loadedBackend)
@@ -419,6 +465,28 @@ final class Launcher: ObservableObject {
                 self.reconcileSelection()
             }
         }
+        self.currencyStore.$snapshot.dropFirst().sink { [weak self] snapshot in
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.closed, self.hasQuery, !self.isImageSearch else { return }
+                self.set(\.calculation, to: CalculationResult.evaluate(self.query, rates: snapshot, preferChinese: self.zh))
+                self.rebuildVisibleResults()
+                self.reconcileSelection()
+            }
+        }.store(in: &storeChanges)
+        self.bookmarkLibrary.$enabled.combineLatest(self.bookmarkLibrary.$count).dropFirst().sink { [weak self] _, _ in
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.closed, self.hasQuery, !self.isImageSearch else { return }
+                self.rebuildVisibleResults()
+                self.reconcileSelection()
+            }
+        }.store(in: &storeChanges)
+        self.personalDataStore.objectWillChange.sink { [weak self] in
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.closed, self.hasQuery, !self.isImageSearch else { return }
+                self.rebuildVisibleResults()
+                self.reconcileSelection()
+            }
+        }.store(in: &storeChanges)
         applicationOpens = LaunchDispatcher.didOpenApplication.sink { [weak self] action in
             guard let self, !self.closed, self.appActions.contains(action) else { return }
             self.frecency.noteOpened(action.id, query: self.query)
@@ -479,15 +547,34 @@ final class Launcher: ObservableObject {
     func setSearchPresented(_ presented: Bool) {
         guard isSearchPresented != presented else { return }
         isSearchPresented = presented
-        if !presented { cancelSilentRefresh() }
+        if presented {
+            refreshSourcesOnOpen()
+        } else {
+            cancelSilentRefresh()
+        }
     }
 
     func setSettingsPresented(_ presented: Bool) {
         guard isSettingsPresented != presented else { return }
         isSettingsPresented = presented
-        if presented, canSearch, !scopePending {
-            lastSettingsCoverageRefresh = .now
-            refreshCoverage()
+        if presented {
+            personalDataStore.refreshAuthorizationStatuses()
+            if canSearch, !scopePending {
+                lastSettingsCoverageRefresh = .now
+                refreshCoverage()
+            }
+        }
+    }
+
+    func refreshSourcesOnOpen() {
+        bookmarkLibrary.refreshIfNeeded()
+        Task { @MainActor [weak self] in
+            guard let self, !self.closed else { return }
+            await self.personalDataStore.refreshIfNeeded()
+        }
+        Task { @MainActor [weak self] in
+            guard let self, !self.closed else { return }
+            await self.currencyStore.refreshIfStale()
         }
     }
 
@@ -498,6 +585,7 @@ final class Launcher: ObservableObject {
         cancelWatchRetry()
         textDebounce?.cancel()
         semanticDebounce?.cancel()
+        cancelDictionaryLookup(clearResult: true)
         cancelCoverageRead()
         cancelModelCheck()
         clearFileDiagnosis()
@@ -593,13 +681,14 @@ final class Launcher: ObservableObject {
         }
         guard text != query || leavingImages else { return }
         set(\.query, to: text)
-        set(\.calculation, to: CalculationResult.evaluate(text))
+        set(\.calculation, to: CalculationResult.evaluate(text, rates: currencyStore.snapshot, preferChinese: zh))
         updateLaunchMatches()
+        scheduleDictionaryLookup(for: text)
         scheduleSearch(clearRows: leavingImages)
         rebuildVisibleResults()
         if let first = visibleResults.first {
             switch first {
-            case .file: break
+            case .file, .dictionary, .bookmark, .contact, .calendarEvent, .reminder: break
             case .action(let action):
                 if isPrimaryAction(action) { set(\.selectedID, to: first.id) }
             case .shortcut, .calculation: set(\.selectedID, to: first.id)
@@ -634,6 +723,7 @@ final class Launcher: ObservableObject {
         set(\.launchMatches, to: [])
         executableMatches = []
         set(\.calculation, to: nil)
+        cancelDictionaryLookup(clearResult: true)
         scheduleSearch(clearRows: true)
     }
 
@@ -673,7 +763,50 @@ final class Launcher: ObservableObject {
         set(\.calculation, to: nil)
         set(\.launchMatches, to: [])
         executableMatches = []
+        cancelDictionaryLookup(clearResult: true)
         scheduleSearch(clearRows: true)
+    }
+
+    private func cancelDictionaryLookup(clearResult: Bool = true) {
+        dictionaryGeneration &+= 1
+        dictionaryTask?.cancel()
+        dictionaryTask = nil
+        if clearResult { set(\.dictionaryQuickResult, to: nil) }
+    }
+
+    private func scheduleDictionaryLookup(for text: String) {
+        cancelDictionaryLookup(clearResult: false)
+        guard !closed, !isImageSearch, let word = LaunchCatalog.bareDictionaryWord(text) else {
+            set(\.dictionaryQuickResult, to: nil)
+            return
+        }
+        if dictionaryQuickResult?.word.caseInsensitiveCompare(word) != .orderedSame {
+            set(\.dictionaryQuickResult, to: nil)
+        }
+        let generation = dictionaryGeneration
+        let lookup = definitionLookup
+        let subtitle = t("词典释义", "Dictionary")
+        dictionaryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(120))
+            guard !Task.isCancelled, let self, !self.closed, self.dictionaryGeneration == generation else { return }
+            let definition: String? = await Task.detached(priority: .userInitiated) {
+                guard !Task.isCancelled else { return nil }
+                return lookup(word)
+            }.value
+            guard !Task.isCancelled, !closed, dictionaryGeneration == generation else { return }
+            self.dictionaryTask = nil
+            guard let trimmed = definition?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+                self.set(\.dictionaryQuickResult, to: nil)
+                self.rebuildVisibleResults()
+                self.reconcileSelection()
+                return
+            }
+            let summary = LaunchCatalog.compactDictionarySummary(trimmed, word: word)
+            let quick = DictionaryQuickResult(word: word, summary: summary, fullText: trimmed, subtitle: subtitle)
+            self.set(\.dictionaryQuickResult, to: quick)
+            self.rebuildVisibleResults()
+            self.reconcileSelection()
+        }
     }
 
     private func invalidateSearch(clearRows: Bool = true, keepAction: Bool = false) {

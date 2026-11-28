@@ -31,6 +31,7 @@ struct SearchWindow: View {
     let selectRow: (LauncherResult, Bool) -> Void
     let moveSelection: (Int) -> Void
     let fileAction: (FileAction, SearchHit) -> Void
+    let contextItemsForResult: (LauncherResult) -> [ContextActions.Item]
 
     static let headerHeight: CGFloat = PanelGeometry.headerHeight
     static let footerHeight: CGFloat = PanelGeometry.footerHeight
@@ -229,13 +230,24 @@ struct SearchWindow: View {
         }
         if showsResults {
             keyHint("↑↓", model.t("选择", "Select"))
-            if case .file(let file) = model.selectedResult {
+            switch model.selectedResult {
+            case .file(let file):
                 keyHint("↵", fileActionTitle(model.primaryFileAction(for: file)))
                 keyHint("⌘↵", fileActionTitle(model.secondaryFileAction(for: file)))
                 if file.kind == "file" {
                     keyHint(model.t("空格 / ⌘Y", "Space / ⌘Y"), model.t("悬浮 / 侧边", "Window / Inline"))
                 }
-            } else {
+            case .calculation:
+                keyHint("↵", model.t("复制", "Copy"))
+            case .dictionary:
+                keyHint("↵", model.t("查看释义", "Define"))
+            case .bookmark:
+                keyHint("↵", model.t("打开链接", "Open"))
+            case .calendarEvent(let event):
+                keyHint("↵", event.meetingURL != nil ? model.t("入会", "Join") : model.t("打开", "Open"))
+            case .reminder:
+                keyHint("↵", model.t("完成", "Complete"))
+            case .contact, .action, .shortcut, .none:
                 keyHint("↵", fileActionTitle(.open))
             }
         }
@@ -306,10 +318,41 @@ struct SearchWindow: View {
                         case .action(let action): actionRow(action, highlight: highlight, selected: selected).id(result.id)
                         case .shortcut(let shortcut):
                             utilityRow(result, title: shortcut.title, detail: shortcut.detail, symbol: shortcut.symbol,
-                                       highlight: highlight, selected: selected).id(result.id)
+                                       highlight: highlight, selected: selected,
+                                       badge: (model.t("快捷链接", "Quicklink"), "bolt", false)).id(result.id)
                         case .calculation(let calculation):
-                            utilityRow(result, title: calculation.display, detail: model.t("回车复制", "Return to Copy"),
-                                       symbol: "plus.forwardslash.minus", highlight: nil, selected: selected).id(result.id)
+                            utilityRow(result, title: calculation.display,
+                                       detail: calculation.detail ?? model.t("回车复制", "Return to Copy"),
+                                       symbol: "plus.forwardslash.minus", highlight: nil, selected: selected,
+                                       badge: calculation.detail != nil ? (model.t("汇率", "FX"), "banknote", false) : nil)
+                            .id(result.id)
+                        case .dictionary(let dict):
+                            utilityRow(result, title: dict.word, detail: dict.summary, symbol: "book.closed",
+                                       highlight: highlight, highlightDetail: false, selected: selected,
+                                       detailTruncation: .tail,
+                                       badge: (model.t("词典", "Dict"), "book.closed", false)).id(result.id)
+                        case .bookmark(let bookmark):
+                            utilityRow(result, title: bookmark.title.isEmpty ? bookmark.domain : bookmark.title,
+                                       detail: bookmark.domain.isEmpty ? bookmark.browser : "\(bookmark.domain) · \(bookmark.browser)",
+                                       symbol: "safari", highlight: highlight, selected: selected,
+                                       badge: (model.t("书签", "Bookmark"), "bookmark", false)).id(result.id)
+                        case .contact(let contact):
+                            utilityRow(result, title: contact.fullName, detail: contact.subtitle,
+                                       symbol: "person.crop.circle", highlight: highlight, selected: selected,
+                                       detailTruncation: .tail,
+                                       badge: (model.t("通讯录", "Contact"), "person.crop.circle", false)).id(result.id)
+                        case .calendarEvent(let event):
+                            utilityRow(result, title: event.title, detail: "\(event.dateSummary) · \(event.calendarTitle)",
+                                       symbol: "calendar", highlight: highlight, selected: selected,
+                                       detailTruncation: .tail,
+                                       badge: event.meetingURL != nil
+                                           ? (model.t("入会", "Join"), "video", true)
+                                           : (model.t("日程", "Event"), "calendar", false)).id(result.id)
+                        case .reminder(let reminder):
+                            utilityRow(result, title: reminder.title, detail: "\(reminder.dueSummary) · \(reminder.listTitle)",
+                                       symbol: reminder.isCompleted ? "checkmark.circle.fill" : "checklist",
+                                       highlight: highlight, selected: selected, detailTruncation: .tail,
+                                       badge: (model.t("提醒", "Reminder"), "checklist", false)).id(result.id)
                         }
                     }
                 }
@@ -372,7 +415,9 @@ struct SearchWindow: View {
     }
 
     private func utilityRow(_ result: LauncherResult, title: String, detail: String, symbol: String,
-                            highlight: LauncherHighlight?, selected: Bool) -> some View {
+                            highlight: LauncherHighlight?, highlightDetail: Bool = true, selected: Bool,
+                            detailTruncation: Text.TruncationMode = .middle,
+                            badge: (title: String, symbol: String, emphasized: Bool)? = nil) -> some View {
         return HStack(spacing: 10) {
             if case .shortcut(let shortcut) = result, let action = model.application(for: shortcut) {
                 ActionResultIcon(action: action, image: ApplicationIcons.Key(action).flatMap { applicationIcons.images[$0] },
@@ -385,17 +430,29 @@ struct SearchWindow: View {
             }
             VStack(alignment: .leading, spacing: 2) {
                 Text(highlight?.text(title, size: 13, colorScheme: colorScheme, mode: .action) ?? AttributedString(title))
-                    .font(.system(size: 13, weight: .medium)).lineLimit(1)
-                Text(highlight?.text(detail, size: 11, colorScheme: colorScheme) ?? AttributedString(detail))
-                    .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    .font(.system(size: 13, weight: .medium)).lineLimit(1).truncationMode(.tail)
+                Text((highlightDetail ? highlight?.text(detail, size: 11, colorScheme: colorScheme) : nil) ?? AttributedString(detail))
+                    .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1).truncationMode(detailTruncation)
+                    .help(detail)
             }
-            Spacer(minLength: 2)
-            if case .shortcut = result { ResultCategory(title: model.t("快捷链接", "Quicklink"), symbol: "bolt") }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if let badge {
+                ResultCategory(title: badge.title, symbol: badge.symbol, emphasized: badge.emphasized)
+            }
         }
         .padding(.horizontal, 8)
         .frame(height: 44)
         .modifier(ResultRowChrome(selected: selected))
         .overlay { ActionRowClickView { selectRow(result, $0 == 2) }.accessibilityHidden(true) }
+        .contextMenu {
+            ForEach(contextItemsForResult(result)) { item in
+                Button {
+                    item.perform()
+                } label: {
+                    Label(item.title, systemImage: item.symbol)
+                }
+            }
+        }
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(selected ? .isSelected : [])
         .accessibilityAction(named: Text(model.t("执行", "Run"))) { open(result) }

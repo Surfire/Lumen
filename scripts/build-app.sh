@@ -38,11 +38,11 @@ fi
 xcrun swiftc -O -j "$(sysctl -n hw.ncpu)" -swift-version 5 -target "$SWIFT_TARGET" -module-cache-path "$PWD/target/SwiftModuleCache" -parse-as-library \
     -import-objc-header include/lumen_core.h target/release/liblumen.a -larchive \
     -Xlinker -dead_strip -Xlinker -dead_strip_dylibs \
-    -framework DiskArbitration -framework IOKit -framework WebKit \
+    -framework DiskArbitration -framework IOKit -framework WebKit -framework Contacts -framework EventKit \
     $SMOKE_FLAG \
     app/LumenApp.swift app/LauncherUpdater.swift app/LauncherEngine.swift app/LauncherHotKey.swift app/LauncherModel.swift \
     app/WindowAccess.swift app/WindowManagement.swift \
-    app/LauncherViews.swift app/SettingsDesignSystem.swift app/LocalEmbeddingSettings.swift app/LauncherSettingsViews.swift app/LauncherHighlight.swift app/LauncherActions.swift app/LauncherSystemActions.swift app/LauncherFileQuery.swift app/LauncherPreview.swift app/LauncherShortcuts.swift app/LauncherCalculation.swift $SMOKE_SOURCE \
+    app/LauncherViews.swift app/SettingsDesignSystem.swift app/LocalEmbeddingSettings.swift app/LauncherSettingsViews.swift app/LauncherHighlight.swift app/LauncherActions.swift app/LauncherSystemActions.swift app/LauncherFileQuery.swift app/LauncherPreview.swift app/LauncherShortcuts.swift app/LauncherCalculation.swift app/LauncherCurrencyRates.swift app/LauncherBookmarks.swift app/LauncherPersonalData.swift $SMOKE_SOURCE \
     app/LumenCommandCatalog.swift app/LumenQuickAnswer.swift app/LauncherCommands.swift app/LauncherScripts.swift app/LauncherImageSearch.swift \
     app/ClipboardStore.swift app/ClipboardManager.swift app/ClipboardViews.swift \
     app/InlinePreview.swift app/MacPreview.swift app/DocumentPreviewRenderer.swift app/DocumentWebPreviewView.swift app/MacInlinePreviewView.swift app/LauncherInlinePreview.swift \
@@ -68,6 +68,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
  <key>LSMinimumSystemVersion</key><string>14.0</string>
  <key>LSUIElement</key><true/>
  <key>NSAppleEventsUsageDescription</key><string>Lumen uses macOS automation only when you run a system action such as Empty Trash or Toggle Dark Mode.</string>
+ <key>NSContactsUsageDescription</key><string>Lumen searches your local Contacts only after you explicitly turn on Contacts search in Settings.</string>
+ <key>NSCalendarsFullAccessUsageDescription</key><string>Lumen searches your upcoming Calendar events and meeting links only after you explicitly turn on Calendar search in Settings.</string>
+ <key>NSRemindersFullAccessUsageDescription</key><string>Lumen searches and lets you complete your Reminders only after you explicitly turn on Reminders search in Settings.</string>
  <key>NSAppTransportSecurity</key>
  <dict>
   <key>NSExceptionDomains</key>

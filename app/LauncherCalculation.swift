@@ -3,8 +3,15 @@ import Foundation
 struct CalculationResult: Equatable {
     let display: String
     let copyValue: String
+    let detail: String?
 
-    static func evaluate(_ query: String) -> Self? {
+    init(display: String, copyValue: String, detail: String? = nil) {
+        self.display = display
+        self.copyValue = copyValue
+        self.detail = detail
+    }
+
+    static func evaluate(_ query: String, rates: CurrencyRateSnapshot? = nil, preferChinese: Bool = false) -> Self? {
         let expression = query.precomposedStringWithCompatibilityMapping
             .replacingOccurrences(of: "×", with: "*")
             .replacingOccurrences(of: "÷", with: "/")
@@ -13,6 +20,9 @@ struct CalculationResult: Equatable {
         guard !expression.isEmpty, expression.utf8.count <= 128 else { return nil }
 
         if let conversion = convert(expression) { return conversion }
+        if let currency = convertCurrency(expression, rates: rates ?? .fallback, preferChinese: preferChinese) {
+            return currency
+        }
         let explicit = expression.hasPrefix("=")
         if !explicit && expression.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil { return nil }
         var parser = Parser(input: Array(explicit ? expression.dropFirst() : expression[...]))
@@ -106,6 +116,271 @@ struct CalculationResult: Equatable {
         let converted = (amount * from.factor + from.offset - to.offset) / to.factor
         guard let result = format(from.dimension == "temperature" && abs(converted) < 1e-10 ? 0 : converted) else { return nil }
         return Self(display: "\(result.display) \(to.symbol)", copyValue: "\(result.copy) \(to.symbol)")
+    }
+
+    // MARK: - Currency Conversion
+
+    private static let ambiguousYenToken = "¥"
+
+    private static let currencyAliases: [String: String] = {
+        let definitions: [(String, [String])] = [
+            ("USD", ["usd", "us$", "$", "dollar", "dollars", "us dollar", "us dollars", "美元", "美金", "美刀"]),
+            ("CNY", ["cny", "rmb", "cnh", "cn¥", "rmb¥", "人民币", "人民币元", "元", "块", "圆"]),
+            ("HKD", ["hkd", "hk$", "港币", "港元", "港纸"]),
+            ("TWD", ["twd", "ntd", "nt$", "新台币", "台币"]),
+            ("MOP", ["mop", "mop$", "澳门元", "澳门币", "葡币"]),
+            ("JPY", ["jpy", "jp¥", "yen", "日元", "日币", "円"]),
+            ("EUR", ["eur", "€", "euro", "euros", "欧元"]),
+            ("GBP", ["gbp", "£", "pound", "pounds", "sterling", "英镑"]),
+            ("KRW", ["krw", "₩", "won", "韩元", "韩币"]),
+            ("SGD", ["sgd", "s$", "sg$", "新币", "新加坡元", "新加坡币"]),
+            ("AUD", ["aud", "a$", "au$", "澳元", "澳币", "澳大利亚元"]),
+            ("CAD", ["cad", "c$", "ca$", "加元", "加币", "加拿大元"]),
+            ("CHF", ["chf", "瑞郎", "瑞士法郎"]),
+            ("NZD", ["nzd", "nz$", "纽币", "纽元", "新西兰元"]),
+            ("INR", ["inr", "₹", "rupee", "rupees", "卢比", "印度卢比"]),
+            ("THB", ["thb", "฿", "baht", "泰铢", "泰币"]),
+            ("MYR", ["myr", "rm", "ringgit", "马币", "林吉特", "马来西亚林吉特"]),
+            ("VND", ["vnd", "₫", "dong", "越南盾"]),
+            ("PHP", ["php", "₱", "菲律宾比索", "菲币"]),
+            ("IDR", ["idr", "rp", "印尼盾", "印尼卢比"]),
+            ("RUB", ["rub", "₽", "ruble", "rubles", "卢布", "俄罗斯卢布"]),
+            ("BRL", ["brl", "r$", "雷亚尔", "巴西雷亚尔"]),
+            ("MXN", ["mxn", "mex$", "墨西哥比索"]),
+            ("SEK", ["sek", "瑞典克朗"]),
+            ("NOK", ["nok", "挪威克朗"]),
+            ("DKK", ["dkk", "丹麦克朗"]),
+            ("PLN", ["pln", "zł", "兹罗提", "波兰兹罗提"]),
+            ("TRY", ["try", "₺", "lira", "里拉", "土耳其里拉"]),
+            ("ZAR", ["zar", "南非兰特", "兰特"]),
+            ("AED", ["aed", "迪拉姆", "阿联酋迪拉姆"]),
+            ("SAR", ["sar", "里亚尔", "沙特里亚尔"]),
+            (ambiguousYenToken, ["¥", "￥"]),
+        ]
+        var table: [String: String] = [:]
+        for (code, aliases) in definitions {
+            for alias in aliases {
+                table[alias.lowercased()] = code
+            }
+        }
+        return table
+    }()
+
+    private static let sortedPrefixSymbols: [String] = [
+        "mop$", "mex$", "rmb¥", "us$", "hk$", "nt$", "sg$", "au$", "ca$", "nz$", "cn¥", "jp¥",
+        "s$", "a$", "c$", "r$", "$", "€", "£", "¥", "￥", "₩", "฿", "₹", "₫", "₱", "₽", "₺",
+    ]
+
+    private static let sortedCurrencyAliases: [String] = currencyAliases.keys.sorted { lhs, rhs in
+        if lhs.count != rhs.count { return lhs.count > rhs.count }
+        return lhs < rhs
+    }
+
+    private static let currencyConnectors: [String] = [
+        "等于多少", "是多少", "合多少", "兑换为", "兑换成", "换算成", "转换为",
+        "等于", "兑换", "换成", "换算", "转成", "转换", "转为", "折合",
+        "into", "to", "in", "as", "->", "=>", "→", "=",
+        "换", "转", "兑", "到", "成",
+    ]
+
+    private static let numberPrefixRegex = try! NSRegularExpression(
+        pattern: #"^(\+?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\+?\.\d+)"#
+    )
+
+    private static func isASCIIWordChar(_ ch: Character) -> Bool {
+        guard let scalar = ch.unicodeScalars.first, ch.unicodeScalars.count == 1 else { return false }
+        return (scalar.value >= 65 && scalar.value <= 90)
+            || (scalar.value >= 97 && scalar.value <= 122)
+            || (scalar.value >= 48 && scalar.value <= 57)
+    }
+
+    private static func matchLeadingAlias(in text: String) -> (code: String, remaining: String, hadTrailingSpace: Bool)? {
+        let lower = text.lowercased()
+        for alias in sortedCurrencyAliases {
+            guard lower.hasPrefix(alias) else { continue }
+            let endIdx = text.index(text.startIndex, offsetBy: alias.count)
+            if let lastChar = alias.last, isASCIIWordChar(lastChar),
+               endIdx < text.endIndex, isASCIIWordChar(text[endIdx]) {
+                continue
+            }
+            let hadTrailingSpace = endIdx < text.endIndex && text[endIdx].isWhitespace
+            let rest = String(text[endIdx...]).trimmingCharacters(in: .whitespaces)
+            if let code = currencyAliases[alias] {
+                return (code, rest, hadTrailingSpace)
+            }
+        }
+        return nil
+    }
+
+    private static func stripConnector(from text: String) -> (hadConnector: Bool, remaining: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        let lower = trimmed.lowercased()
+        for connector in currencyConnectors {
+            guard lower.hasPrefix(connector) else { continue }
+            let endIdx = trimmed.index(trimmed.startIndex, offsetBy: connector.count)
+            if let lastChar = connector.last, isASCIIWordChar(lastChar),
+               endIdx < trimmed.endIndex, isASCIIWordChar(trimmed[endIdx]) {
+                continue
+            }
+            var rest = String(trimmed[endIdx...]).trimmingCharacters(in: .whitespaces)
+            for suffix in ["是多少", "多少", "?"] where rest.hasPrefix(suffix) {
+                rest = String(rest.dropFirst(suffix.count)).trimmingCharacters(in: .whitespaces)
+            }
+            return (true, rest)
+        }
+        return (false, trimmed)
+    }
+
+    private static func resolveYen(fromRaw: String, toRaw: String, fullQuery: String) -> (from: String, to: String) {
+        let lower = fullQuery.lowercased()
+        let hasJapaneseClue = lower.contains("日元") || lower.contains("日币") || lower.contains("円")
+            || lower.contains("jpy") || lower.contains("yen") || lower.contains("jp¥")
+        var from = fromRaw
+        var to = toRaw
+        if from == ambiguousYenToken && to == ambiguousYenToken {
+            from = "JPY"
+            to = "CNY"
+        } else if from == ambiguousYenToken {
+            if to == "CNY" || hasJapaneseClue {
+                from = "JPY"
+            } else {
+                from = "CNY"
+            }
+        } else if to == ambiguousYenToken {
+            if from == "CNY" || hasJapaneseClue {
+                to = "JPY"
+            } else {
+                to = "CNY"
+            }
+        }
+        return (from, to)
+    }
+
+    private static func convertCurrency(_ expression: String, rates: CurrencyRateSnapshot, preferChinese: Bool) -> Self? {
+        var working = expression.trimmingCharacters(in: .whitespacesAndNewlines)
+        while let last = working.last, last == "?" || last == "？" {
+            working.removeLast()
+        }
+        working = working.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !working.isEmpty else { return nil }
+
+        let lowerWorking = working.lowercased()
+        var prefixCurrency: String?
+        for symbol in sortedPrefixSymbols {
+            if lowerWorking.hasPrefix(symbol) {
+                let endIdx = working.index(working.startIndex, offsetBy: symbol.count)
+                if let lastChar = symbol.last, isASCIIWordChar(lastChar),
+                   endIdx < working.endIndex, isASCIIWordChar(working[endIdx]) {
+                    continue
+                }
+                prefixCurrency = currencyAliases[symbol]
+                working = String(working[endIdx...]).trimmingCharacters(in: .whitespaces)
+                break
+            }
+        }
+
+        guard let numMatch = numberPrefixRegex.firstMatch(in: working, range: NSRange(working.startIndex..., in: working)),
+              let numRange = Range(numMatch.range(at: 1), in: working),
+              let amount = Double(working[numRange].replacingOccurrences(of: ",", with: "")),
+              amount.isFinite, amount >= 0 else {
+            return nil
+        }
+
+        let afterNumber = String(working[numRange.upperBound...])
+        let trimmedAfterNumber = afterNumber.trimmingCharacters(in: .whitespaces)
+        guard !trimmedAfterNumber.isEmpty else { return nil }
+
+        var sourceCode: String
+        var afterSource: String
+        var separatedByWhitespace = false
+
+        if let prefix = prefixCurrency {
+            sourceCode = prefix
+            afterSource = trimmedAfterNumber
+            // Allow optional clarifying currency right after number, e.g. "¥1000 jpy to usd"
+            if let clarified = matchLeadingAlias(in: afterSource), !clarified.remaining.isEmpty {
+                let (hadConn, _) = stripConnector(from: clarified.remaining)
+                if hadConn {
+                    if sourceCode == ambiguousYenToken || clarified.code == sourceCode {
+                        sourceCode = clarified.code
+                        afterSource = clarified.remaining
+                    }
+                }
+            }
+        } else {
+            guard let matchedSource = matchLeadingAlias(in: trimmedAfterNumber),
+                  !matchedSource.remaining.isEmpty else {
+                return nil
+            }
+            sourceCode = matchedSource.code
+            separatedByWhitespace = matchedSource.hadTrailingSpace
+            afterSource = matchedSource.remaining
+        }
+
+        let (hadConnector, targetText) = stripConnector(from: afterSource)
+        guard hadConnector || prefixCurrency != nil || separatedByWhitespace else { return nil }
+        guard !targetText.isEmpty,
+              let targetCodeRaw = currencyAliases[targetText.lowercased()] else {
+            return nil
+        }
+
+        let resolved = resolveYen(fromRaw: sourceCode, toRaw: targetCodeRaw, fullQuery: expression)
+        guard let converted = rates.convert(amount, from: resolved.from, to: resolved.to),
+              let unitRate = rates.convert(1.0, from: resolved.from, to: resolved.to) else {
+            return nil
+        }
+
+        let formattedAmount = formatCurrencyValue(converted)
+        let formattedUnitRate = formatUnitRate(unitRate)
+        let sourceTag = rates.isFallback
+            ? (preferChinese ? "内置汇率" : "Built-in")
+            : rates.updatedDate
+        let detail = "1 \(resolved.from) = \(formattedUnitRate) \(resolved.to) · \(sourceTag)"
+        return Self(
+            display: "\(formattedAmount.display) \(resolved.to)",
+            copyValue: formattedAmount.copy,
+            detail: detail
+        )
+    }
+
+    private static func formatCurrencyValue(_ value: Double) -> (display: String, copy: String) {
+        let posix = Locale(identifier: "en_US_POSIX")
+        let absVal = abs(value)
+        let plain: String
+        if absVal == 0 || absVal >= 0.01 {
+            plain = String(format: "%.2f", locale: posix, value == 0 ? 0 : value)
+        } else {
+            let lead = max(2, Int(ceil(-log10(absVal))))
+            let decimals = min(8, lead + 3)
+            var raw = String(format: "%.\(decimals)f", locale: posix, value)
+            while raw.hasSuffix("0") && raw.split(separator: ".").last?.count ?? 0 > 2 {
+                raw.removeLast()
+            }
+            plain = raw
+        }
+        return (groupThousands(plain), plain)
+    }
+
+    private static func formatUnitRate(_ rate: Double) -> String {
+        let posix = Locale(identifier: "en_US_POSIX")
+        let absRate = abs(rate)
+        var raw: String
+        if absRate >= 100 {
+            raw = String(format: "%.2f", locale: posix, rate)
+        } else if absRate >= 0.01 {
+            raw = String(format: "%.4f", locale: posix, rate)
+        } else if absRate > 0 {
+            let lead = max(2, Int(ceil(-log10(absRate))))
+            let decimals = min(8, lead + 3)
+            raw = String(format: "%.\(decimals)f", locale: posix, rate)
+        } else {
+            return "0"
+        }
+        if raw.contains(".") {
+            while raw.hasSuffix("0") { raw.removeLast() }
+            if raw.hasSuffix(".") { raw.removeLast() }
+        }
+        return groupThousands(raw)
     }
 
     private struct Parser {

@@ -525,6 +525,13 @@ struct LauncherSettings: View {
             ClipboardSettingsView(clipboard: clipboard, chinese: model.zh)
         }
         .onAppear { clipboard.loadHistory() }
+
+        SearchSourcesSettingsCard(
+            model: model,
+            bookmarkLibrary: model.bookmarkLibrary,
+            currencyStore: model.currencyStore,
+            personalDataStore: model.personalDataStore
+        )
     }
 
     private var startupWell: some View {
@@ -1751,6 +1758,199 @@ private extension HotKeyIssue {
         case .registration(let status):
             return model.t("无法注册快捷键（系统状态 \(status)）。",
                            "Could not register the shortcut (system status \(status)).")
+        }
+    }
+}
+
+@MainActor
+private struct SearchSourcesSettingsCard: View {
+    @ObservedObject var model: Launcher
+    @ObservedObject var bookmarkLibrary: BookmarkLibrary
+    @ObservedObject var currencyStore: CurrencyRateStore
+    @ObservedObject var personalDataStore: PersonalDataStore
+
+    var body: some View {
+        LumenSettingsCard(title: model.t("搜索来源与汇率", "Search Sources & Currency"), icon: "sparkles.rectangle.stack") {
+            LumenSettingsWell(padding: 12) {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(alignment: .center, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(model.t("浏览器书签", "Browser Bookmarks"))
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(SettingsTheme.textPrimary)
+                            Text(bookmarkSubtitle)
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(SettingsTheme.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 8)
+                        Toggle(model.t("浏览器书签", "Browser Bookmarks"), isOn: Binding(
+                            get: { bookmarkLibrary.enabled },
+                            set: { bookmarkLibrary.setEnabled($0) }
+                        ))
+                        .labelsHidden()
+                        .accessibilityIdentifier("settings.bookmarks.enabled")
+                    }
+
+                    LumenSettingsHairline()
+
+                    HStack(alignment: .center, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(model.t("每日缓存汇率", "Daily Cached Currency Rates"))
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(SettingsTheme.textPrimary)
+                            Text(currencySubtitle)
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(SettingsTheme.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            if let error = currencyStore.lastError, !error.isEmpty {
+                                Text(model.t("更新失败：\(error)", "Refresh failed: \(error)"))
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(SettingsTheme.amber)
+                                    .lineLimit(2)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                        Spacer(minLength: 8)
+                        HStack(spacing: 8) {
+                            if currencyStore.refreshing {
+                                ProgressView()
+                                    .controlSize(.small)
+                            }
+                            Button(model.t("刷新", "Refresh")) {
+                                Task { await currencyStore.refreshNow() }
+                            }
+                            .buttonStyle(LumenSecondaryButtonStyle())
+                            .disabled(currencyStore.refreshing)
+                            .accessibilityIdentifier("settings.currency.refresh")
+
+                            Toggle(model.t("每日缓存汇率", "Daily Cached Currency Rates"), isOn: Binding(
+                                get: { currencyStore.autoRefreshEnabled },
+                                set: { currencyStore.setAutoRefreshEnabled($0) }
+                            ))
+                            .labelsHidden()
+                            .accessibilityIdentifier("settings.currency.auto-refresh")
+                        }
+                        .fixedSize()
+                    }
+
+                    LumenSettingsHairline()
+
+                    Text(model.t("隐私数据来源（默认关闭，仅在授权后本机检索）",
+                                 "Personal Sources (Off by default; searched locally after access is granted)"))
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(SettingsTheme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    personalRow(
+                        scope: .contacts,
+                        title: model.t("通讯录", "Contacts"),
+                        auth: personalDataStore.contactsAuth,
+                        count: personalDataStore.contactsCount,
+                        countUnitZh: "位联系人",
+                        isEnabled: personalDataStore.contactsEnabled,
+                        setEnabled: { await personalDataStore.setContactsEnabled($0) }
+                    )
+
+                    LumenSettingsHairline()
+
+                    personalRow(
+                        scope: .calendar,
+                        title: model.t("日历日程", "Calendar Events"),
+                        auth: personalDataStore.calendarAuth,
+                        count: personalDataStore.eventsCount,
+                        countUnitZh: "条日程",
+                        isEnabled: personalDataStore.calendarEnabled,
+                        setEnabled: { await personalDataStore.setCalendarEnabled($0) }
+                    )
+
+                    LumenSettingsHairline()
+
+                    personalRow(
+                        scope: .reminders,
+                        title: model.t("提醒事项", "Reminders"),
+                        auth: personalDataStore.remindersAuth,
+                        count: personalDataStore.remindersCount,
+                        countUnitZh: "条提醒",
+                        isEnabled: personalDataStore.remindersEnabled,
+                        setEnabled: { await personalDataStore.setRemindersEnabled($0) }
+                    )
+                }
+            }
+        }
+        .onAppear { personalDataStore.refreshAuthorizationStatuses() }
+    }
+
+    private var bookmarkSubtitle: String {
+        if bookmarkLibrary.enabled {
+            return model.t("Chrome / Safari / Arc / Edge / Brave 等（\(bookmarkLibrary.count) 条书签）",
+                           "Chrome / Safari / Arc / Edge / Brave... (\(bookmarkLibrary.count) indexed)")
+        }
+        return model.t("支持 Chrome / Safari / Arc / Edge / Brave 等本地书签",
+                       "Chrome / Safari / Arc / Edge / Brave & more")
+    }
+
+    private var currencySubtitle: String {
+        if currencyStore.snapshot.isFallback {
+            return model.t("当前快照：Built-in（内置基准汇率）", "Snapshot: Built-in baseline rates")
+        }
+        return model.t("当前快照：\(currencyStore.snapshot.updatedDate)",
+                       "Snapshot: \(currencyStore.snapshot.updatedDate)")
+    }
+
+    @ViewBuilder
+    private func personalRow(
+        scope: PersonalDataScope,
+        title: String,
+        auth: PersonalDataAuthStatus,
+        count: Int,
+        countUnitZh: String,
+        isEnabled: Bool,
+        setEnabled: @escaping (Bool) async -> Void
+    ) -> some View {
+        let blocked = auth == .denied || auth == .restricted
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(SettingsTheme.textPrimary)
+                if blocked {
+                    Label(model.t("系统权限未开启，无法本机检索", "Permission required in System Settings"),
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(SettingsTheme.amber)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if auth == .authorized {
+                    Text(isEnabled
+                         ? model.t("已授权 · 已索引 \(count) \(countUnitZh)", "Authorized · \(count) indexed")
+                         : model.t("已授权 · 开启后可搜索", "Authorized · Toggle on to search"))
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(SettingsTheme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text(model.t("默认关闭 · 开启时按需请求权限", "Off by default · Requests access only when enabled"))
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(SettingsTheme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 8)
+            HStack(spacing: 8) {
+                if blocked {
+                    Button(model.t("前往系统设置", "Open System Settings")) {
+                        PersonalDataStore.openPrivacySettings(for: scope)
+                    }
+                    .buttonStyle(LumenSecondaryButtonStyle())
+                    .accessibilityIdentifier("settings.personal.\(scope.rawValue).privacy")
+                }
+                Toggle(title, isOn: Binding(
+                    get: { isEnabled },
+                    set: { value in Task { await setEnabled(value) } }
+                ))
+                .labelsHidden()
+                .accessibilityIdentifier("settings.personal.\(scope.rawValue)")
+            }
+            .fixedSize()
         }
     }
 }

@@ -230,7 +230,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             open: { [weak self] in self?.open($0) },
             selectRow: { [weak self] result, doubleClick in self?.selectRow(result, doubleClick: doubleClick) },
             moveSelection: { [weak self] in self?.moveCurrentSelection($0) },
-            fileAction: { [weak self] action, hit in self?.perform(action, on: hit) }
+            fileAction: { [weak self] action, hit in self?.perform(action, on: hit) },
+            contextItemsForResult: { [weak self] result in
+                self?.searchContextItems(for: result, requireSelected: false) ?? []
+            }
         ))
         results.translatesAutoresizingMaskIntoConstraints = false
         results.sizingOptions = []
@@ -283,7 +286,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                                     database: smoke?.database ?? locations.database,
                                     syntheticRoot: smoke?.corpus, gemmaHome: smoke?.gemmaHome)
         self.engine = engine
-        model = Launcher(engine: engine, defaults: defaults, locale: smoke?.language)
+        model = Launcher(engine: engine,
+                         defaults: defaults,
+                         locale: smoke?.language,
+                         currencyStore: smoke?.makeCurrencyStore(),
+                         bookmarkLibrary: smoke?.makeBookmarkLibrary(),
+                         personalDataStore: smoke?.makePersonalDataStore(),
+                         definitionLookup: smoke?.makeDefinitionLookup())
         externalVolumes = ExternalVolumeCatalog(engine: engine)
         imageSearch = LauncherImageSearch(engine: engine, defaults: defaults)
         clipboard = smoke?.makeClipboardManager() ?? ClipboardManager(defaults: .standard, pasteboard: .general)
@@ -526,6 +535,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         // Revalidate when returning from System Settings.
         if settings?.isVisible == true || windowManagement.issue == .permissionRequired {
             windowManagement.refreshTrust()
+        }
+        if settings?.isVisible == true {
+            model.personalDataStore.refreshAuthorizationStatuses()
         }
         #if LUMEN_SMOKE
         guard smoke == nil, let configuredKey else { return }
@@ -1044,16 +1056,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private func showSearchContextActions() {
         guard let selected = model.selectedResult else { return }
+        let items = searchContextItems(for: selected, requireSelected: true)
+        guard !items.isEmpty else { return }
+        contextActions.show(items)
+    }
+
+    private func searchContextItems(for result: LauncherResult, requireSelected: Bool) -> [ContextActions.Item] {
         var items: [ContextActions.Item] = []
         func item(_ id: String, _ zh: String, _ en: String, _ symbol: String, _ callback: @escaping () -> Void) {
             items.append(.init(id: id, title: model.t(zh, en), symbol: symbol) { [weak self] in
-                guard let self, self.model.selectedResult?.id == selected.id else { return }
+                guard let self else { return }
+                if requireSelected, self.model.selectedResult?.id != result.id { return }
                 callback()
             })
         }
-        if case .calculation = selected {
-            item("copy", "复制结果", "Copy Result", "doc.on.doc") { [weak self] in self?.open(selected) }
-        } else if case .file(let hit) = selected {
+
+        switch result {
+        case .calculation:
+            item("copy", "复制结果", "Copy Result", "doc.on.doc") { [weak self] in self?.open(result) }
+        case .dictionary(let dict):
+            item("show-definition", "查看释义", "Show Definition", "return") { [weak self] in self?.open(result) }
+            item("copy-definition", "复制释义", "Copy Definition", "doc.on.doc") { [weak self] in
+                self?.copyTextAndDismiss(dict.fullText)
+            }
+            item("copy-word", "复制单词", "Copy Word", "textformat") { [weak self] in
+                self?.copyTextAndDismiss(dict.word)
+            }
+        case .bookmark(let bm):
+            item("open-bookmark", "在浏览器中打开", "Open in Browser", "return") { [weak self] in self?.open(result) }
+            item("copy-bookmark-url", "复制链接", "Copy URL", "link") { [weak self] in
+                self?.copyTextAndDismiss(bm.url)
+            }
+        case .contact(let contact):
+            item("open-contact", "在通讯录中打开", "Open in Contacts", "return") { [weak self] in self?.open(result) }
+            if let phone = contact.primaryPhone, !phone.isEmpty {
+                item("copy-phone", "复制电话", "Copy Phone", "phone") { [weak self] in
+                    self?.copyTextAndDismiss(phone)
+                }
+            }
+            if let email = contact.primaryEmail, !email.isEmpty {
+                item("copy-email", "复制邮箱", "Copy Email", "envelope") { [weak self] in
+                    self?.copyTextAndDismiss(email)
+                }
+            }
+            if !contact.fullName.isEmpty {
+                item("copy-contact-name", "复制姓名", "Copy Name", "doc.on.doc") { [weak self] in
+                    self?.copyTextAndDismiss(contact.fullName)
+                }
+            }
+        case .calendarEvent(let event):
+            if event.meetingURL != nil {
+                item("join-meeting", "加入会议", "Join Meeting", "return") { [weak self] in self?.open(result) }
+                item("open-calendar", "在日历中打开", "Open in Calendar", "calendar") { [weak self] in
+                    self?.openCalendarEvent(event, preferMeetingURL: false)
+                }
+            } else {
+                item("open-calendar", "在日历中打开", "Open in Calendar", "return") { [weak self] in self?.open(result) }
+            }
+            item("copy-event-info", "复制日程信息", "Copy Event Info", "doc.on.doc") { [weak self] in
+                self?.copyTextAndDismiss(Self.formattedEventInfo(event))
+            }
+        case .reminder(let reminder):
+            item("complete-reminder", "标记为已完成", "Complete Reminder", "return") { [weak self] in self?.open(result) }
+            item("copy-reminder-title", "复制提醒标题", "Copy Title", "doc.on.doc") { [weak self] in
+                self?.copyTextAndDismiss(reminder.title)
+            }
+            item("open-reminders", "在提醒事项中打开", "Open Reminders", "checklist") { [weak self] in
+                self?.openRemindersApp(reminder)
+            }
+        case .file(let hit):
             func addFileAction(_ action: FileAction, primary: Bool) {
                 switch action {
                 case .open:
@@ -1070,12 +1141,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
             addFileAction(model.primaryFileAction(for: hit), primary: true)
             addFileAction(model.secondaryFileAction(for: hit), primary: false)
-        } else {
-            item("open", "打开", "Open", "return") { [weak self] in self?.open(selected) }
-        }
-
-        switch selected {
-        case .file(let hit):
             if hit.kind == "file" {
                 if let mediaURL = Self.linkedMediaURL(forSubtitlePath: hit.path) {
                     let ext = mediaURL.pathExtension.lowercased()
@@ -1103,6 +1168,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 }
             }
         case .action(let action):
+            item("open", "打开", "Open", "return") { [weak self] in self?.open(result) }
             if case .executable(let command) = action.destination, case .shortcut = command.source {
                 item("shortcut-input", "使用输入文件运行…", "Run with Input File…", "doc") { [weak self] in
                     self?.prepareExecution(command, withInputFile: true)
@@ -1115,12 +1181,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 }
             }
         case .shortcut(let shortcut):
+            item("open", "打开", "Open", "return") { [weak self] in self?.open(result) }
             item("toggle-pin", shortcut.pinned ? "取消固定" : "固定", shortcut.pinned ? "Unpin" : "Pin", "pin") { [weak self] in
                 self?.model.shortcuts.togglePin(shortcut)
             }
-        case .calculation: break
         }
-        contextActions.show(items)
+        return items
     }
 
     private func pin(title: String, target: SavedShortcut.Target) {
@@ -1161,9 +1227,155 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         case .shortcut(let shortcut): openShortcut(shortcut)
         case .calculation(let calculation):
             guard searchPresented, model.calculation == calculation else { return }
-            if ClipboardManager.writeInternalString(calculation.copyValue, to: targetPasteboard) { dismissSearch() }
-            else { model.openingFailed() }
+            copyTextAndDismiss(calculation.copyValue)
+        case .dictionary(let dict):
+            guard searchPresented, model.visibleResults.contains(result) else { return }
+            contextActions.close()
+            inlinePreview.close()
+            commands.lookupDefinition(dict.word) { @Sendable _ in dict.fullText }
+            updatePresentation()
+        case .bookmark(let bookmark):
+            guard searchPresented, model.visibleResults.contains(result) else { return }
+            guard let url = URL(string: bookmark.url),
+                  let scheme = url.scheme?.lowercased(),
+                  ["http", "https", "file"].contains(scheme) else {
+                model.openingFailed()
+                return
+            }
+            openExternalURLAndDismiss(url)
+        case .contact(let contact):
+            guard searchPresented, model.visibleResults.contains(result) else { return }
+            openContactInApp(contact)
+        case .calendarEvent(let event):
+            guard searchPresented, model.visibleResults.contains(result) else { return }
+            openCalendarEvent(event, preferMeetingURL: true)
+        case .reminder(let reminder):
+            guard searchPresented, model.visibleResults.contains(result) else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if await self.model.personalDataStore.completeReminder(id: reminder.id) {
+                    if self.searchPresented { self.dismissSearch() }
+                } else {
+                    self.model.openingFailed()
+                }
+            }
         }
+    }
+
+    private func copyTextAndDismiss(_ text: String) {
+        if ClipboardManager.writeInternalString(text, to: targetPasteboard) {
+            if searchPresented { dismissSearch() }
+        } else {
+            model.openingFailed()
+        }
+    }
+
+    private func openExternalURLAndDismiss(_ url: URL) {
+        #if LUMEN_SMOKE
+        if let smoke {
+            smoke.dispatchedQuicklinks.append(url)
+            if searchPresented { dismissSearch() }
+            return
+        }
+        #endif
+        if NSWorkspace.shared.open(url) {
+            if searchPresented { dismissSearch() }
+        } else {
+            model.openingFailed()
+        }
+    }
+
+    private func openAppByBundleIdentifier(_ bundleIdentifier: String) -> Bool {
+        guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) else {
+            return false
+        }
+        #if LUMEN_SMOKE
+        if let smoke {
+            smoke.dispatchedQuicklinks.append(appURL)
+            if searchPresented { dismissSearch() }
+            return true
+        }
+        #endif
+        if NSWorkspace.shared.open(appURL) {
+            if searchPresented { dismissSearch() }
+            return true
+        }
+        return false
+    }
+
+    private func openContactInApp(_ contact: ContactHit) {
+        let encoded = contact.id.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed) ?? ""
+        if !encoded.isEmpty, let url = URL(string: "addressbook://\(encoded)") {
+            #if LUMEN_SMOKE
+            if smoke != nil {
+                openExternalURLAndDismiss(url)
+                return
+            }
+            #endif
+            if NSWorkspace.shared.urlForApplication(toOpen: url) != nil {
+                openExternalURLAndDismiss(url)
+                return
+            }
+        }
+        if openAppByBundleIdentifier("com.apple.AddressBook") { return }
+        if let fallback = contact.primaryPhone ?? contact.primaryEmail ?? (contact.fullName.isEmpty ? nil : contact.fullName) {
+            copyTextAndDismiss(fallback)
+        } else {
+            model.openingFailed()
+        }
+    }
+
+    private func openCalendarEvent(_ event: CalendarEventHit, preferMeetingURL: Bool) {
+        if preferMeetingURL, let meeting = event.meetingURL, let url = SavedShortcut.webURL(meeting) {
+            openExternalURLAndDismiss(url)
+            return
+        }
+        if let calURL = URL(string: "calshow:\(Int(event.startDate.timeIntervalSinceReferenceDate))") {
+            #if LUMEN_SMOKE
+            if smoke != nil {
+                openExternalURLAndDismiss(calURL)
+                return
+            }
+            #endif
+            if NSWorkspace.shared.urlForApplication(toOpen: calURL) != nil {
+                openExternalURLAndDismiss(calURL)
+                return
+            }
+        }
+        if !openAppByBundleIdentifier("com.apple.iCal") {
+            model.openingFailed()
+        }
+    }
+
+    private func openRemindersApp(_ reminder: ReminderHit) {
+        let encoded = reminder.id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? ""
+        let reminderURL = URL(string: encoded.isEmpty ? "x-apple-reminderkit://" : "x-apple-reminderkit://REMCDReminder/\(encoded)")
+        if let reminderURL {
+            #if LUMEN_SMOKE
+            if smoke != nil {
+                openExternalURLAndDismiss(reminderURL)
+                return
+            }
+            #endif
+            if NSWorkspace.shared.urlForApplication(toOpen: reminderURL) != nil {
+                openExternalURLAndDismiss(reminderURL)
+                return
+            }
+        }
+        if !openAppByBundleIdentifier("com.apple.reminders") {
+            model.openingFailed()
+        }
+    }
+
+    private static func formattedEventInfo(_ event: CalendarEventHit) -> String {
+        var parts = ["\(event.title) — \(event.dateSummary)"]
+        if let location = event.location, !location.isEmpty {
+            parts.append(location)
+        }
+        if let meetingURL = event.meetingURL, !meetingURL.isEmpty {
+            parts.append(meetingURL)
+        }
+        return parts.joined(separator: "\n")
     }
 
     private func openShortcut(_ shortcut: SavedShortcut) {
@@ -1264,12 +1476,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if case .system(.define(let word)) = action.destination {
             contextActions.close()
             inlinePreview.close()
-            #if LUMEN_SMOKE
-            let fetcher: @Sendable (String) -> String? = smoke?.definitionProvider ?? { @Sendable in LauncherSystemActions.dictionaryDefinition($0) }
-            #else
-            let fetcher: @Sendable (String) -> String? = { @Sendable in LauncherSystemActions.dictionaryDefinition($0) }
-            #endif
-            commands.lookupDefinition(word, fetcher: fetcher)
+            commands.lookupDefinition(word, fetcher: model.definitionLookup)
             updatePresentation()
             return
         }

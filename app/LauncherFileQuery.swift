@@ -17,7 +17,17 @@ struct LauncherFileQuery {
 
     var isFiltered: Bool { !kinds.isEmpty || !paths.isEmpty || !extensions.isEmpty }
 
-    init(_ raw: String) {
+    static func normalizedDirectoryScope(_ path: String) -> String {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        var normalized = trimmed.precomposedStringWithCanonicalMapping
+        while normalized.count > 1, normalized.hasSuffix("/") {
+            normalized.removeLast()
+        }
+        return normalized == "/" ? "/" : normalized + "/"
+    }
+
+    init(_ raw: String, scopedDirectory: String? = nil) {
         let fullRange = NSRange(raw.startIndex..<raw.endIndex, in: raw)
         let tokens = Self.tokenRegex.matches(in: raw, range: fullRange).compactMap { match in
             Range(match.range, in: raw).map { String(raw[$0]) }
@@ -26,6 +36,12 @@ struct LauncherFileQuery {
         var extensions: [String] = []
         var kinds: [String] = []
         var paths: [String] = []
+        if let scopedDirectory {
+            let normalizedScope = Self.normalizedDirectoryScope(scopedDirectory)
+            if !normalizedScope.isEmpty {
+                paths.append(normalizedScope)
+            }
+        }
         for token in tokens {
             let lower = token.lowercased()
             if lower.hasPrefix("kind:") {

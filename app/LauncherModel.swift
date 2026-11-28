@@ -157,6 +157,8 @@ final class Launcher: ObservableObject {
 
     let indexStatus: IndexStatusState
     @Published private(set) var query = ""
+    @Published private(set) var scopedDirectories: [String] = []
+    @Published private(set) var activeAliasFolder: SavedShortcut? = nil
     private var imageProjector: URL?
     @Published private(set) var isImageSearch = false
     @Published private(set) var hits: [SearchHit] = []
@@ -188,7 +190,10 @@ final class Launcher: ObservableObject {
             guard language != oldValue else { return }
             defaults?.set(language, forKey: "language")
             if hasQuery && !isImageSearch {
-                set(\.calculation, to: CalculationResult.evaluate(query, rates: currencyStore.snapshot, preferChinese: zh))
+                let evaluated = (activeScopedDirectory == nil && activeAliasFolder == nil)
+                    ? CalculationResult.evaluate(query, rates: currencyStore.snapshot, preferChinese: zh)
+                    : nil
+                set(\.calculation, to: evaluated)
                 rebuildVisibleResults()
                 reconcileSelection()
             }
@@ -273,6 +278,7 @@ final class Launcher: ObservableObject {
     private var resultsRevision: UInt64?
     private var rejectedPaths = Set<String>()
     private var presentedQuery = ""
+    private var presentedScope: String?
     private var directHits: [SearchHit] = []
     private var coverageUpdate: Task<Void, Never>?
     private var coverageRead: Process?
@@ -342,9 +348,33 @@ final class Launcher: ObservableObject {
         return appActions.first { $0.id == id }
     }
 
+    var activeScopedDirectory: String? { scopedDirectories.last }
+
+    var activeScopeBreadcrumbs: [String] {
+        scopedDirectories.map { path in
+            let name = (path as NSString).lastPathComponent
+            return name.isEmpty ? path : name
+        }
+    }
+
+    private var activeFileQueryContext: (raw: String, scopedDirectory: String?) {
+        if let scoped = activeScopedDirectory {
+            return (query, scoped)
+        }
+        if let folder = activeAliasFolder,
+           case .folder(let path) = folder.target,
+           let resolved = shortcuts.resolveFolderAliasQuery(query),
+           resolved.shortcut.id == folder.id {
+            return (resolved.remainder, LauncherFileQuery.normalizedDirectoryScope(path))
+        }
+        return (query, nil)
+    }
+
     private func computeVisibleResults() -> [LauncherResult] {
         guard hasQuery else { return shortcuts.home.map(LauncherResult.shortcut) }
-        if isImageSearch { return hits.map(LauncherResult.file) }
+        if isImageSearch || activeScopedDirectory != nil || activeAliasFolder != nil {
+            return hits.map(LauncherResult.file)
+        }
         let nativeScores = Dictionary(uniqueKeysWithValues: launchMatches.map { ($0.action.id, $0.score) })
         let shortcuts = shortcuts.matches(query).filter { match in
             guard case .application(let id) = match.record.target else { return true }
@@ -390,7 +420,9 @@ final class Launcher: ObservableObject {
         set(\.visibleResults, to: computeVisibleResults())
     }
 
-    var hasQuery: Bool { !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    var hasQuery: Bool {
+        activeScopedDirectory != nil || !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
     var canSearch: Bool { canSearchFlag }
 
     private func syncCanSearch() {
@@ -461,13 +493,15 @@ final class Launcher: ObservableObject {
         shortcutChanges = shortcuts.objectWillChange.sink { [weak self] in
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
+                self.refreshFolderAliasStateIfNeeded()
                 self.rebuildVisibleResults()
                 self.reconcileSelection()
             }
         }
         self.currencyStore.$snapshot.dropFirst().sink { [weak self] snapshot in
             DispatchQueue.main.async { [weak self] in
-                guard let self, !self.closed, self.hasQuery, !self.isImageSearch else { return }
+                guard let self, !self.closed, self.hasQuery, !self.isImageSearch,
+                      self.activeScopedDirectory == nil, self.activeAliasFolder == nil else { return }
                 self.set(\.calculation, to: CalculationResult.evaluate(self.query, rates: snapshot, preferChinese: self.zh))
                 self.rebuildVisibleResults()
                 self.reconcileSelection()
@@ -475,14 +509,16 @@ final class Launcher: ObservableObject {
         }.store(in: &storeChanges)
         self.bookmarkLibrary.$enabled.combineLatest(self.bookmarkLibrary.$count).dropFirst().sink { [weak self] _, _ in
             DispatchQueue.main.async { [weak self] in
-                guard let self, !self.closed, self.hasQuery, !self.isImageSearch else { return }
+                guard let self, !self.closed, self.hasQuery, !self.isImageSearch,
+                      self.activeScopedDirectory == nil, self.activeAliasFolder == nil else { return }
                 self.rebuildVisibleResults()
                 self.reconcileSelection()
             }
         }.store(in: &storeChanges)
         self.personalDataStore.objectWillChange.sink { [weak self] in
             DispatchQueue.main.async { [weak self] in
-                guard let self, !self.closed, self.hasQuery, !self.isImageSearch else { return }
+                guard let self, !self.closed, self.hasQuery, !self.isImageSearch,
+                      self.activeScopedDirectory == nil, self.activeAliasFolder == nil else { return }
                 self.rebuildVisibleResults()
                 self.reconcileSelection()
             }
@@ -672,6 +708,60 @@ final class Launcher: ObservableObject {
         }
     }
 
+    func pushDirectoryScope(_ path: String) {
+        let normalized = LauncherFileQuery.normalizedDirectoryScope(path)
+        guard !normalized.isEmpty, scopedDirectories.last != normalized else { return }
+        if isImageSearch {
+            imageProjector = nil
+            set(\.isImageSearch, to: false)
+            engine.closeImages()
+        }
+        scopedDirectories.append(normalized)
+        set(\.query, to: "")
+        executableMatches = []
+        refreshAfterScopeChange()
+    }
+
+    @discardableResult
+    func popDirectoryScope() -> Bool {
+        guard !scopedDirectories.isEmpty else { return false }
+        scopedDirectories.removeLast()
+        refreshAfterScopeChange()
+        return true
+    }
+
+    func clearDirectoryScope() {
+        guard !scopedDirectories.isEmpty else { return }
+        scopedDirectories.removeAll()
+        refreshAfterScopeChange()
+    }
+
+    @discardableResult
+    private func syncScopedAliasAndAuxiliaryResults(for text: String) -> Bool {
+        let resolvedAlias = activeScopedDirectory == nil ? shortcuts.resolveFolderAliasQuery(text)?.shortcut : nil
+        let changed = resolvedAlias != activeAliasFolder
+        set(\.activeAliasFolder, to: resolvedAlias)
+        let shouldEvaluateCalc = activeScopedDirectory == nil && activeAliasFolder == nil && hasQuery && !isImageSearch
+        set(\.calculation, to: shouldEvaluateCalc ? CalculationResult.evaluate(text, rates: currencyStore.snapshot, preferChinese: zh) : nil)
+        updateLaunchMatches()
+        scheduleDictionaryLookup(for: text)
+        return changed
+    }
+
+    private func refreshAfterScopeChange() {
+        syncScopedAliasAndAuxiliaryResults(for: query)
+        scheduleSearch(clearRows: true)
+        rebuildVisibleResults()
+        reconcileSelection()
+    }
+
+    private func refreshFolderAliasStateIfNeeded() {
+        guard activeScopedDirectory == nil, !isImageSearch else { return }
+        guard shortcuts.resolveFolderAliasQuery(query)?.shortcut != activeAliasFolder else { return }
+        syncScopedAliasAndAuxiliaryResults(for: query)
+        scheduleSearch(clearRows: true)
+    }
+
     func setQuery(_ text: String) {
         let leavingImages = isImageSearch
         if leavingImages {
@@ -679,12 +769,12 @@ final class Launcher: ObservableObject {
             set(\.isImageSearch, to: false)
             engine.closeImages()
         }
-        guard text != query || leavingImages else { return }
+        let nextAlias = activeScopedDirectory == nil ? shortcuts.resolveFolderAliasQuery(text)?.shortcut : nil
+        let aliasChanged = nextAlias != activeAliasFolder
+        guard text != query || leavingImages || aliasChanged else { return }
         set(\.query, to: text)
-        set(\.calculation, to: CalculationResult.evaluate(text, rates: currencyStore.snapshot, preferChinese: zh))
-        updateLaunchMatches()
-        scheduleDictionaryLookup(for: text)
-        scheduleSearch(clearRows: leavingImages)
+        syncScopedAliasAndAuxiliaryResults(for: text)
+        scheduleSearch(clearRows: leavingImages || aliasChanged)
         rebuildVisibleResults()
         if let first = visibleResults.first {
             switch first {
@@ -715,9 +805,11 @@ final class Launcher: ObservableObject {
     }
 
     func setImageQuery(_ text: String, projector: URL) {
-        guard text != query || projector != imageProjector else { return }
+        guard text != query || projector != imageProjector || !scopedDirectories.isEmpty || activeAliasFolder != nil else { return }
         if projector != imageProjector { engine.closeImages() }
         imageProjector = projector
+        scopedDirectories = []
+        set(\.activeAliasFolder, to: nil)
         set(\.isImageSearch, to: true)
         set(\.query, to: text)
         set(\.launchMatches, to: [])
@@ -729,6 +821,10 @@ final class Launcher: ObservableObject {
 
     private func updateLaunchMatches() {
         guard !isImageSearch else { return }
+        if activeScopedDirectory != nil || activeAliasFolder != nil {
+            set(\.launchMatches, to: [])
+            return
+        }
         let now = Date.now
         let current = LauncherFileQuery(query).isFiltered ? [] :
             LaunchCatalog.matches(query, actions: builtInActions + appActions) { frecency.boost($0, query: query, now: now) }
@@ -759,6 +855,8 @@ final class Launcher: ObservableObject {
             set(\.isImageSearch, to: false)
             engine.closeImages()
         }
+        scopedDirectories = []
+        set(\.activeAliasFolder, to: nil)
         set(\.query, to: "")
         set(\.calculation, to: nil)
         set(\.launchMatches, to: [])
@@ -776,7 +874,8 @@ final class Launcher: ObservableObject {
 
     private func scheduleDictionaryLookup(for text: String) {
         cancelDictionaryLookup(clearResult: false)
-        guard !closed, !isImageSearch, let word = LaunchCatalog.bareDictionaryWord(text) else {
+        guard !closed, !isImageSearch, activeScopedDirectory == nil, activeAliasFolder == nil,
+              let word = LaunchCatalog.bareDictionaryWord(text) else {
             set(\.dictionaryQuickResult, to: nil)
             return
         }
@@ -824,6 +923,7 @@ final class Launcher: ObservableObject {
         set(\.searching, to: false)
         if clearRows {
             presentedQuery = ""
+            presentedScope = nil
             directHits = []
             publishHits([])
         }
@@ -847,15 +947,17 @@ final class Launcher: ObservableObject {
             searchImages(term, projector: imageProjector, revision: revision)
             return
         }
-        let keepStablePreviewRows = watchRefresh && presentedQuery == term && hits.contains(where: \.hasPreview)
+        let context = activeFileQueryContext
+        let scope = context.scopedDirectory
+        let keepStablePreviewRows = watchRefresh && presentedQuery == term && presentedScope == scope && hits.contains(where: \.hasPreview)
         var names: Result<[SearchHit], SearchFailure>?
         var text: Result<[SearchHit], SearchFailure>?
         var related: [SearchHit] = []
         let keepImageRelated = textEmbeddingBackend.mode == .localOpenAI
-        let oldRelated = presentedQuery == term
+        let oldRelated = presentedQuery == term && presentedScope == scope
             ? hits.filter { $0.isRelatedHit && (localModelState == .ready || (keepImageRelated && $0.isImageMatch)) }
             : []
-        let fileQuery = LauncherFileQuery(term)
+        let fileQuery = LauncherFileQuery(context.raw, scopedDirectory: scope)
         // Short text falls back to a document scan. A one-character edit is a name lookup.
         let searchesText = fileQuery.kind != "folder" && fileQuery.words.count >= 2 &&
             gemmaCoverage?.documents_enabled != false
@@ -874,10 +976,11 @@ final class Launcher: ObservableObject {
             // Keep provisional path filler below body hits and out of the first result update.
             let weakPaths = complete ? nameHits.filter { $0.matched_by == "path" } : []
             var seen = Set<String>()
-            let ranked = [strongNames, bodyHits, weakPaths].flatMap { self.frecency.rankFiles($0, query: term) }
+            let ranked = [strongNames, bodyHits, weakPaths].flatMap { self.frecency.rankFiles($0, query: context.raw) }
             let lexical = Array(ranked.filter { seen.insert($0.path).inserted }.prefix(60))
             guard complete || !lexical.isEmpty else { return }
             self.presentedQuery = term
+            self.presentedScope = scope
             self.directHits = lexical
             self.resultsRevision = revision
             self.publishWithRelated(self.shouldFindRelatedExcerpts(directCount: lexical.count) ? related : [])
@@ -1024,7 +1127,8 @@ final class Launcher: ObservableObject {
     }
 
     var selectedHit: SearchHit? {
-        guard resultsRevision == revision || presentedQuery == query else { return nil }
+        guard resultsRevision == revision ||
+                (presentedQuery == query && presentedScope == activeFileQueryContext.scopedDirectory) else { return nil }
         return hits.first { $0.path == selectedID }
     }
 
@@ -1051,7 +1155,10 @@ final class Launcher: ObservableObject {
     }
 
     func containsCurrentFile(_ hit: SearchHit) -> Bool {
-        !closed && canSearch && (resultsRevision == revision || presentedQuery == query) && hits.contains(hit)
+        !closed && canSearch &&
+            (resultsRevision == revision ||
+                (presentedQuery == query && presentedScope == activeFileQueryContext.scopedDirectory)) &&
+            hits.contains(hit)
     }
 
     func resolve(_ hit: SearchHit, action: FileAction, complete: @escaping (URL) -> Void) {
@@ -1148,7 +1255,7 @@ final class Launcher: ObservableObject {
     }
 
     private func relatedSearchKind(directCount: Int) -> RelatedSearchKind? {
-        guard !scopePending else { return nil }
+        guard !scopePending, activeScopedDirectory == nil, activeAliasFolder == nil else { return nil }
         let textBackendConfigured = textEmbeddingBackend.mode == .builtin || textEmbeddingBackend.isValidLocalOpenAI
         let textReady = textEmbeddingBackend.mode == .builtin || canUseLocalTextModel
         if textBackendConfigured && textReady && gemmaCoverage?.hasResults == true &&
@@ -2015,7 +2122,9 @@ final class Launcher: ObservableObject {
         let generation = silentRefreshGeneration
         let currentRevision = revision
         let term = query
-        let fileQuery = LauncherFileQuery(term)
+        let context = activeFileQueryContext
+        let scope = context.scopedDirectory
+        let fileQuery = LauncherFileQuery(context.raw, scopedDirectory: scope)
         let searchesText = fileQuery.kind != "folder" && fileQuery.words.count >= 2 &&
             gemmaCoverage?.documents_enabled != false
         var names: Result<[SearchHit], SearchFailure>?
@@ -2035,7 +2144,7 @@ final class Launcher: ObservableObject {
             let bodyHits = (try? text?.get()) ?? []
             let weakPaths = nameHits.filter { $0.matched_by == "path" }
             var seen = Set<String>()
-            let ranked = [strongNames, bodyHits, weakPaths].flatMap { self.frecency.rankFiles($0, query: term) }
+            let ranked = [strongNames, bodyHits, weakPaths].flatMap { self.frecency.rankFiles($0, query: context.raw) }
             let lexical = Array(ranked.filter { seen.insert($0.path).inserted }.prefix(60))
             let candidateKind = self.relatedSearchKind(directCount: lexical.count)
             let relatedKind: RelatedSearchKind? = candidateKind.flatMap { kind in
@@ -2045,6 +2154,7 @@ final class Launcher: ObservableObject {
                 kind == .imageOnly ? self.hits.filter(\.isImageMatch) : self.hits.filter(\.isRelatedHit)
             } ?? []
             self.presentedQuery = term
+            self.presentedScope = scope
             self.directHits = lexical
             self.resultsRevision = currentRevision
             self.publishWithRelated(existingRelated)

@@ -195,7 +195,19 @@ final class ShortcutLibrary: ObservableObject {
         else { return .invalid }
         switch shortcut.target {
         case .application(let identifier): guard identifier.hasPrefix("app:") else { return .invalid }
-        case .folder(let path): guard SearchHit.existsOnDisk(at: path, kind: "directory") else { return .invalid }
+        case .folder(let path):
+            guard SearchHit.existsOnDisk(at: path, kind: "directory") else { return .invalid }
+            let normalizedAlias = shortcut.alias.lowercased()
+            if !normalizedAlias.isEmpty {
+                let duplicateFolderAlias = entries.contains { entry in
+                    guard entry.id != shortcut.id, case .folder = entry.target else { return false }
+                    return entry.alias.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalizedAlias
+                }
+                if LumenCommandCatalog.isBuiltInAlias(normalizedAlias, includeOptionalLinks: includeOptionalLinks)
+                    || duplicateFolderAlias {
+                    return .aliasInUse(normalizedAlias)
+                }
+            }
         case .web(let url): guard SavedShortcut.webURL(url.absoluteString) == url else { return .invalid }
         }
         if shortcut.queryParameter != nil {
@@ -241,6 +253,30 @@ final class ShortcutLibrary: ObservableObject {
             return false
         }.sorted { ($0.lastOpened ?? .distantPast) > ($1.lastOpened ?? .distantPast) }
         return pins + recentProjects.prefix(4)
+    }
+
+    func folderShortcut(forAlias rawAlias: String) -> SavedShortcut? {
+        let targetAlias = rawAlias.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !targetAlias.isEmpty else { return nil }
+        return entries.first { entry in
+            guard case .folder = entry.target else { return false }
+            let entryAlias = entry.alias.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return !entryAlias.isEmpty && entryAlias == targetAlias
+        }
+    }
+
+    func resolveFolderAliasQuery(_ raw: String) -> (shortcut: SavedShortcut, remainder: String)? {
+        guard let delimiter = raw.firstIndex(where: \.isWhitespace) else { return nil }
+        let keyword = String(raw[..<delimiter]).lowercased()
+        guard !keyword.isEmpty,
+              !LumenCommandCatalog.isBuiltInAlias(keyword, includeOptionalLinks: includeOptionalLinks),
+              !entries.contains(where: { $0.queryLink?.keyword == keyword }),
+              let shortcut = folderShortcut(forAlias: keyword) else {
+            return nil
+        }
+        let remainder = String(raw[raw.index(after: delimiter)...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (shortcut, remainder)
     }
 
     func matches(_ query: String) -> [(record: SavedShortcut, score: Int)] {
@@ -394,7 +430,7 @@ struct QuicklinksView: View {
                     VStack(alignment: .leading, spacing: 5) {
                         fieldLabel(model.t("搜索别名（可选）", "Search Alias (Optional)"))
                         TextField("", text: $alias,
-                                  prompt: Text(model.t("例如：gh", "e.g. gh")))
+                                  prompt: Text(kind == .folder ? model.t("例如：kh", "e.g. kh") : model.t("例如：gh", "e.g. gh")))
                             .lumenWellField()
                     }
                 }
@@ -424,6 +460,11 @@ struct QuicklinksView: View {
                                 .controlSize(.small)
                         }
                     }
+                    Text(model.t("别名（可选，例如 kh；输入「kh 报价」可仅在此目录搜索）",
+                                 "Alias (optional, e.g. kh; type \"kh quote\" to search inside this folder)"))
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(SettingsTheme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 case .web:
                     HStack(alignment: .top, spacing: 12) {
                         VStack(alignment: .leading, spacing: 5) {

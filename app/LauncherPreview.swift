@@ -98,6 +98,89 @@ enum LocalFile {
     }
 }
 
+enum LauncherFileTools {
+    struct OpenWithApp: Equatable, Identifiable, Sendable {
+        let name: String
+        let url: URL
+        let bundleID: String?
+        var id: String { url.path }
+    }
+
+    static let terminalBundleIdentifiers = [
+        "com.mitchellh.ghostty",
+        "dev.warp.Warp-Stable",
+        "com.googlecode.iterm2",
+        "com.github.wez.wezterm",
+        "org.alacritty",
+        "com.apple.Terminal",
+    ]
+
+    static func isResidentForFileCopy(_ url: URL) -> Bool {
+        guard url.isFileURL, url.host == nil || url.host == "" || url.host == "localhost" else {
+            return false
+        }
+        let path = url.path
+        let result = try? LocalFile.withMaterializationDisabled { () -> Bool in
+            guard let info = SearchHit.statOnDisk(at: path, kind: "file", permitsDatalessLeaf: false)
+                ?? SearchHit.statOnDisk(at: path, kind: "directory", permitsDatalessLeaf: false),
+                info.st_flags & UInt32(SF_DATALESS) == 0 else {
+                return false
+            }
+            return !LocalFile.isUbiquitousPlaceholder(url)
+        }
+        return result == true
+    }
+
+    static func preferredTerminalApplicationURL() -> URL? {
+        for bundleID in terminalBundleIdentifiers {
+            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+                return url
+            }
+        }
+        return nil
+    }
+
+    static func targetDirectoryForTerminal(path: String, isDirectory: Bool) -> URL {
+        if isDirectory {
+            return URL(fileURLWithPath: path, isDirectory: true)
+        }
+        return URL(fileURLWithPath: path, isDirectory: false).deletingLastPathComponent()
+    }
+
+    static func openWithApplications(for url: URL, limit: Int = 12) -> [OpenWithApp] {
+        guard limit > 0, url.isFileURL else { return [] }
+        let candidates: [URL] = (try? LocalFile.withMaterializationDisabled {
+            let workspace = NSWorkspace.shared
+            let defaultApp = workspace.urlForApplication(toOpen: url)
+            let allApps = workspace.urlsForApplications(toOpen: url)
+            return (defaultApp.map { [$0] } ?? []) + allApps
+        }) ?? []
+
+        var seenPaths = Set<String>()
+        var apps: [OpenWithApp] = []
+        apps.reserveCapacity(min(limit, candidates.count))
+
+        for candidate in candidates {
+            let cleanURL = candidate.standardizedFileURL
+            let bundlePath = cleanURL.path
+            guard !bundlePath.isEmpty, seenPaths.insert(bundlePath).inserted else { continue }
+            let bundle = Bundle(url: cleanURL)
+            let bundleID = bundle?.bundleIdentifier
+            let localizedName = try? cleanURL.resourceValues(forKeys: [.localizedNameKey]).localizedName
+            let rawName = localizedName
+                ?? (bundle?.infoDictionary?["CFBundleDisplayName"] as? String)
+                ?? (bundle?.infoDictionary?["CFBundleName"] as? String)
+                ?? cleanURL.deletingPathExtension().lastPathComponent
+            let strippedName = rawName.lowercased().hasSuffix(".app") ? String(rawName.dropLast(4)) : rawName
+            let trimmedName = strippedName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let name = trimmedName.isEmpty ? cleanURL.deletingPathExtension().lastPathComponent : trimmedName
+            apps.append(OpenWithApp(name: name, url: cleanURL, bundleID: bundleID))
+            if apps.count >= limit { break }
+        }
+        return apps
+    }
+}
+
 @MainActor
 final class LocalPreviewPanel: NSPanel {
     private let preview: QLPreviewView?

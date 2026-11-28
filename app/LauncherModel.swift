@@ -146,6 +146,11 @@ enum AppearanceMode: String, CaseIterable, Identifiable {
     }
 }
 
+enum FileDefaultAction: String, CaseIterable {
+    case open
+    case revealInFinder
+}
+
 @MainActor
 final class Launcher: ObservableObject {
     private static let trailingExtensionRegex = try! NSRegularExpression(pattern: #"\.[A-Za-z0-9]{1,8}$"#)
@@ -180,12 +185,31 @@ final class Launcher: ObservableObject {
     }
 
     @Published var appearanceMode: AppearanceMode
+    @Published var fileDefaultAction: FileDefaultAction
     @Published var textEmbeddingBackend: TextEmbeddingBackendConfig
 
     func setAppearanceMode(_ mode: AppearanceMode) {
         guard appearanceMode != mode else { return }
         appearanceMode = mode
         defaults?.set(mode.rawValue, forKey: "appearance")
+    }
+
+    func setFileDefaultAction(_ action: FileDefaultAction) {
+        guard fileDefaultAction != action else { return }
+        fileDefaultAction = action
+        defaults?.set(action.rawValue, forKey: "fileDefaultAction")
+    }
+
+    func usesRevealDefault(for hit: SearchHit) -> Bool {
+        fileDefaultAction == .revealInFinder && hit.kind == "file" && !hit.path.lowercased().hasSuffix(".app")
+    }
+
+    func primaryFileAction(for hit: SearchHit) -> FileAction {
+        usesRevealDefault(for: hit) ? .reveal : .open
+    }
+
+    func secondaryFileAction(for hit: SearchHit) -> FileAction {
+        usesRevealDefault(for: hit) ? .open : .reveal
     }
 
     var localModelState: LocalModelState { indexStatus.localModelState }
@@ -377,6 +401,7 @@ final class Launcher: ObservableObject {
                                        contentPaused: defaults?.bool(forKey: "contentIndexingPaused") ?? false)
         language = locale ?? defaults?.string(forKey: "language") ?? "system"
         appearanceMode = defaults?.string(forKey: "appearance").flatMap(AppearanceMode.init(rawValue:)) ?? .system
+        fileDefaultAction = defaults?.string(forKey: "fileDefaultAction").flatMap(FileDefaultAction.init(rawValue:)) ?? .open
         indexStatus.onScopeChanged = { [weak self] nextScope in
             guard let self else { return }
             self.pauseEmbeddings()

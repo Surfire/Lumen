@@ -175,6 +175,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             if case .contextMenu = state.overlay { return }
             guard case .file(let hit) = self.model.selectedResult else { return }
             if action == .preview { self.togglePreview(hit, allowCloudDownload: true) }
+            else if action == .reveal { self.perform(self.model.secondaryFileAction(for: hit), on: hit) }
             else { self.perform(action, on: hit) }
         }
         let content = SearchBackdrop()
@@ -871,7 +872,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
     }
 
-    private func selectRow(_ result: LauncherResult, doubleClick: Bool) {
+    func selectRow(_ result: LauncherResult, doubleClick: Bool) {
         if panelState.mode == .window, case .action(let action) = result {
             commands.chooseWindowAction(action.id)
             updatePresentation()
@@ -1052,13 +1053,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
         if case .calculation = selected {
             item("copy", "复制结果", "Copy Result", "doc.on.doc") { [weak self] in self?.open(selected) }
+        } else if case .file(let hit) = selected {
+            func addFileAction(_ action: FileAction, primary: Bool) {
+                switch action {
+                case .open:
+                    item("open", "打开", "Open", primary ? "return" : "arrow.up.forward.square") { [weak self] in
+                        self?.perform(.open, on: hit)
+                    }
+                case .reveal:
+                    item("reveal", "在 Finder 中显示", "Show in Finder", primary ? "return" : "folder") { [weak self] in
+                        self?.perform(.reveal, on: hit)
+                    }
+                default:
+                    break
+                }
+            }
+            addFileAction(model.primaryFileAction(for: hit), primary: true)
+            addFileAction(model.secondaryFileAction(for: hit), primary: false)
         } else {
             item("open", "打开", "Open", "return") { [weak self] in self?.open(selected) }
         }
 
         switch selected {
         case .file(let hit):
-            item("reveal", "在 Finder 中显示", "Show in Finder", "folder") { [weak self] in self?.revealInFinder(hit) }
             if hit.kind == "file" {
                 if let mediaURL = Self.linkedMediaURL(forSubtitlePath: hit.path) {
                     let ext = mediaURL.pathExtension.lowercased()
@@ -1143,7 +1160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private func open(_ result: LauncherResult) {
         guard panelState.mode == .search || panelState.mode == .window else { return }
         switch result {
-        case .file(let hit): openFile(hit)
+        case .file(let hit): perform(model.primaryFileAction(for: hit), on: hit)
         case .action(let action): runAction(action)
         case .shortcut(let shortcut): openShortcut(shortcut)
         case .calculation(let calculation):
@@ -1367,16 +1384,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     func revealInFinder(_ hit: SearchHit) {
         model.resolve(hit, action: .reveal) { [weak self] url in
-            #if LUMEN_SMOKE
             guard let self else { return }
+            #if LUMEN_SMOKE
             if let smoke = self.smoke {
                 smoke.revealed = url
-                return
+            } else {
+                NSWorkspace.shared.activateFileViewerSelecting([url])
             }
             #else
-            guard self != nil else { return }
-            #endif
             NSWorkspace.shared.activateFileViewerSelecting([url])
+            #endif
+            self.model.noteFileOpened(hit)
+            self.dismissSearch()
         }
     }
 

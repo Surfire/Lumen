@@ -517,15 +517,23 @@ final class LauncherSmoke {
         try key(kVK_DownArrow, "\u{f701}", in: app)
         try check(model.selection == expected, "down arrow did not select the second row")
         try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
-        try await until("Command–Return selected a local file in Finder") { self.revealed?.path == expected }
-        try check(opened == nil && model.query == "archive", "Finder shortcut opened the file or changed the query")
+        try await until("Command–Return selected a local file in Finder and dismissed search") {
+            self.revealed?.path == expected && !app.searchPresented && model.query.isEmpty && model.hits.isEmpty
+        }
+        try check(opened == nil, "Finder shortcut unexpectedly opened the file")
         revealed = nil
-        try key(kVK_UpArrow, "\u{f700}", in: app)
-        try check(model.selection == model.hits.first?.path, "up arrow did not restore the first row")
+        app.showSearch()
+        try type("archive", into: app)
+        try await until("reopened archive query promoted the revealed file via frecency") {
+            !model.searching && model.hits.first?.path == expected && model.hits.count >= 2
+        }
         try key(kVK_DownArrow, "\u{f701}", in: app)
+        try check(model.selection == model.hits[1].path, "down arrow did not select the second row")
+        try key(kVK_UpArrow, "\u{f700}", in: app)
+        try check(model.selection == expected, "up arrow did not restore the first row")
         try key(kVK_Return, "\r", in: app)
         try await until("Return opened the selected synthetic file and cleared the session") {
-            self.opened?.path == expected && model.query.isEmpty && model.hits.isEmpty
+            self.opened?.path == expected && !app.searchPresented && model.query.isEmpty && model.hits.isEmpty
         }
 
         app.showSearch()
@@ -1288,6 +1296,7 @@ final class LauncherSmoke {
         for verb in ["cb", "clip"] {
             try "Literal command name fixture".write(to: corpus.appendingPathComponent(verb), atomically: true, encoding: .utf8)
         }
+        let fileDefaultFixtures = try makeFileDefaultActionFixtures()
         app.startBackgroundIndex()
         try await until("the isolated file index became available alongside actions") { model.canSearch && model.watchState == .running }
         try check(model.launcherActivityTitle == nil && model.activityTitle == model.t("正在监听文件变化", "Watching file changes"),
@@ -1313,10 +1322,22 @@ final class LauncherSmoke {
         }
         try key(kVK_DownArrow, "\u{f701}", in: app)
         try check(model.selectedHit?.name == "Lumen Action Probe notes.txt", "arrow selection did not reach the file result")
-        try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
-        try await until("the file retained its normal Finder route") { self.revealed?.lastPathComponent == "Lumen Action Probe notes.txt" }
-        try check(dispatchedActions.count == count, "a file Finder action unexpectedly dispatched a quick action")
         guard let expected = model.selectedHit else { throw Failure("lost the selected file") }
+        try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
+        try await until("the file retained its normal Finder route and dismissed search") {
+            self.revealed?.lastPathComponent == "Lumen Action Probe notes.txt" && !app.searchPresented && model.query.isEmpty
+        }
+        try check(dispatchedActions.count == count, "a file Finder action unexpectedly dispatched a quick action")
+        revealed = nil
+        app.showSearch()
+        try type("lumen action probe", into: app)
+        try await until("file result reloaded after Finder dismissal") {
+            !model.searching && model.hits.contains { $0.path == expected.path }
+        }
+        if model.selectedHit?.path != expected.path {
+            try key(kVK_DownArrow, "\u{f701}", in: app)
+        }
+        try check(model.selectedHit?.path == expected.path, "could not re-select the file result after Finder dismissal")
         try key(kVK_ANSI_C, "C", in: app, throughPanel: true, flags: [.command, .shift])
         try await until("Command–Shift–C copied the selected file's name") {
             self.filePasteboard.string(forType: .string) == expected.name && app.searchPresented
@@ -1424,6 +1445,7 @@ final class LauncherSmoke {
         }
         app.showSearch()
         try await verifyPhase2LiveFileInteractions(app)
+        try await verifyFileDefaultActionRegressions(app, fixtures: fileDefaultFixtures)
 
         if exists("syntax-scenario") { try await verifyRawFileQuery(app) }
         if let fixtures = frecencyFixtures {
@@ -3001,26 +3023,28 @@ final class LauncherSmoke {
         let idleFrame = app.panel.frame
         try type("x", into: app)
         try await until("initial nonempty query expanded the launcher") { app.panel.frame.height > idleFrame.height }
+        var semanticQuery = ""
         for (query, filename, original) in [
             ("怎样摆放太阳能板才能让它朝着正午阳光？", "entry-a.md", "midday sun"),
             ("How do I get the clock to run after its battery died?", "entry-b.md", "换上新的电池"),
         ] {
+            semanticQuery = query
             try type(query, into: app)
             try await until("real Gemma returned the cross-language source for \(filename)", seconds: 30) {
                 model.selectedHit?.name == filename &&
                     model.selectedHit?.isSemanticCandidate == true &&
                     model.selectedHit?.snippet?.contains(original) == true
             }
-            try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
-            try await until("Finder action revalidated the real Gemma preview", seconds: 30) {
-                self.revealed?.lastPathComponent == filename
-            }
-            revealed = nil
             let expected = PanelGeometry.size(for: app.panelState, rows: model.visibleResults, showsResults: model.showsResults)
             try check(app.panel.frame.size == expected && abs(app.panel.frame.maxY - idleFrame.maxY) <= 1,
                       "Gemma result did not match PanelGeometry or moved top edge")
+            try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
+            try await until("Finder action revalidated the real Gemma preview and dismissed search", seconds: 30) {
+                self.revealed?.lastPathComponent == filename && !app.searchPresented && model.query.isEmpty
+            }
+            revealed = nil
+            app.showSearch()
         }
-        let semanticQuery = model.query
         try type("x", into: app)
         let pending = corpus.appendingPathComponent("pending.md")
         try Data("A textbook on currents and seasonal ocean tides.".utf8).write(to: pending)
@@ -3084,13 +3108,15 @@ final class LauncherSmoke {
         let enter: ContinuousClock.Instant = .now
         try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
         try await until("Finder dispatched the filename without blocking on body search") {
-            self.revealed?.lastPathComponent == "鹿鸣.md"
+            self.revealed?.lastPathComponent == "鹿鸣.md" && !app.searchPresented && model.query.isEmpty
         }
         try signal("finish-han-body")
         guard let firstName, let revealDispatch else { throw Failure("missing search or Finder timestamps") }
         print(String(format: "Han control-path timing: input to first name %.1f ms, Command–Return to dispatch %.1f ms",
                      milliseconds(began.duration(to: firstName)), milliseconds(enter.duration(to: revealDispatch))))
         revealed = nil
+        app.showSearch()
+        try type("鹿鸣", into: app)
         try await until("the delayed Han body merged below the selected filename") {
             !model.searching && model.selectedHit?.name == "鹿鸣.md" &&
                 model.hits.contains { $0.name == "local-field-notes.md" && $0.matched_by == "text" }
@@ -3147,17 +3173,27 @@ final class LauncherSmoke {
                   model.hits.filter { $0.matched_by == "path" }.count >= 57,
                   "a weaker path match outranked text or a strong name")
         model.selection = model.hits[body].path
-        try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
-        try await until("body hit revealed in Finder") {
-            self.revealed?.lastPathComponent == "body-match.md"
-        }
-        revealed = nil
         let expectedTimingSize = PanelGeometry.size(for: app.panelState, rows: model.visibleResults, showsResults: model.showsResults)
         try check(app.panel.frame.size == expectedTimingSize && abs(app.panel.frame.maxY - top) <= 1 &&
                   app.panel.contentView === chrome,
                   "typing or result lane delivery broke anchored PanelGeometry or replaced the launcher")
+        try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
+        try await until("body hit revealed in Finder and dismissed search") {
+            self.revealed?.lastPathComponent == "body-match.md" && !app.searchPresented && model.query.isEmpty
+        }
+        revealed = nil
 
         // Verify background watch refresh does not close an open Command–K context menu.
+        app.showSearch()
+        try type("crowded needle", into: app)
+        try await until("crowded needle reloaded for Cmd+K watch check") {
+            model.hits.count == 60 && !model.searching
+        }
+        guard let reloadedBody = model.hits.firstIndex(where: { $0.name == "body-match.md" && $0.matched_by == "text" }) else {
+            throw Failure("missing reloaded body hit")
+        }
+        model.selection = model.hits[reloadedBody].path
+        await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
         try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
         try check(app.contextActions.isOpen, "Command–K did not open context actions")
         try signal("update-watch")
@@ -3182,11 +3218,14 @@ final class LauncherSmoke {
         }
         let enter: ContinuousClock.Instant = .now
         try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
-        try await until("bundled engine validated the Han Finder action") { self.revealed?.lastPathComponent == "鹿鸣.md" }
+        try await until("bundled engine validated the Han Finder action") {
+            self.revealed?.lastPathComponent == "鹿鸣.md" && !app.searchPresented && model.query.isEmpty
+        }
         guard let firstName, let revealDispatch else { throw Failure("missing bundled search or Finder timestamps") }
         print(String(format: "Bundled Han timing: input to first name %.1f ms, Command–Return to dispatch %.1f ms",
                      milliseconds(began.duration(to: firstName)), milliseconds(enter.duration(to: revealDispatch))))
         revealed = nil
+        app.showSearch()
     }
 
     private func milliseconds(_ duration: Duration) -> Double {
@@ -3240,7 +3279,11 @@ final class LauncherSmoke {
             app.panel.appearance = nil
         }
         try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
-        try await until("image match did not pass targeted Finder revalidation") { self.revealed?.lastPathComponent == "93a2.png" }
+        try await until("image match did not pass targeted Finder revalidation") {
+            self.revealed?.lastPathComponent == "93a2.png" && !app.searchPresented && model.query.isEmpty
+        }
+        revealed = nil
+        app.showSearch()
         let warmStart = ContinuousClock.now
         try type("img A black umbrella on a grey background", into: app)
         try await until("warm English image search did not rank the opaque umbrella filename first") {
@@ -4122,9 +4165,16 @@ final class LauncherSmoke {
         try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
         revealed = nil
         try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
-        try await until("Command–Return revealed the resident cloud file") { self.revealed?.path == hit.path }
-        try check(opened == nil && model.query == "cloudledger", "Finder action opened the file or closed search")
+        try await until("Command–Return revealed the resident cloud file and dismissed search") {
+            self.revealed?.path == hit.path && !app.searchPresented && model.query.isEmpty
+        }
+        try check(opened == nil, "Finder action unexpectedly opened the file")
         revealed = nil
+        app.showSearch()
+        try type("cloudledger", into: app)
+        try await until("provider metadata result reloaded for Return open") {
+            model.selectedHit?.path == hit.path && !model.searching
+        }
         try key(kVK_Return, "\r", in: app)
         try await until("Return opened the resident cloud file without .online blocking") {
             self.opened?.path == hit.path && !app.searchPresented
@@ -6377,6 +6427,7 @@ final class LauncherSmoke {
         }
         try check(!settings.isVisible && !NSApp.isActive, "Settings verification activated the app or showed a window")
         try await verifyV063SwiftDecoupleSettings()
+        try verifyFileDefaultActionPersistence()
         print("v0.6.1 Settings UI & Local OpenAI Embedding smoke passed (config roundtrip, loopback validation, decoupled CLI args, zero 鹿鸣, Light/Dark rendering)")
     }
 
@@ -6662,6 +6713,261 @@ final class LauncherSmoke {
         try check(LumenApp.linkedMediaURL(forSubtitlePath: notesTxt.path) == nil,
                   "linkedMediaURL matched non-subtitle .txt file")
         print("v0.6.0 Swift UX regressions passed (query-conditioned hashed frecency, app initials/aliases, noise_reason decoding, linkedMediaURL)")
+    }
+
+    private func verifyFileDefaultActionPersistence() throws {
+        let suite = "io.github.surfire.lumen.smoke.v064.filedefault.\(UUID().uuidString)"
+        guard let isoDefaults = UserDefaults(suiteName: suite) else {
+            throw Failure("failed to create isolated UserDefaults suite for fileDefaultAction smoke")
+        }
+        defer { isoDefaults.removePersistentDomain(forName: suite) }
+
+        let fakeGemma = directory.appendingPathComponent("v064-gemma", isDirectory: true)
+        let db = directory.appendingPathComponent("v064-filedefault.sqlite")
+        func makeLauncher() -> Launcher {
+            Launcher(engine: LauncherEngine(executable: fakeGemma, database: db, gemmaHome: fakeGemma),
+                     defaults: isoDefaults, locale: "en")
+        }
+
+        let initial = makeLauncher()
+        defer { initial.close() }
+        try check(initial.fileDefaultAction == .open && isoDefaults.string(forKey: "fileDefaultAction") == nil,
+                  "fresh Launcher did not default fileDefaultAction to .open without writing UserDefaults")
+        initial.setFileDefaultAction(.open)
+        try check(isoDefaults.string(forKey: "fileDefaultAction") == nil,
+                  "setFileDefaultAction(.open) wrote UserDefaults on unchanged value")
+        initial.setFileDefaultAction(.revealInFinder)
+        try check(initial.fileDefaultAction == .revealInFinder &&
+                  isoDefaults.string(forKey: "fileDefaultAction") == "revealInFinder",
+                  "setFileDefaultAction(.revealInFinder) did not update state and UserDefaults")
+
+        let reloaded = makeLauncher()
+        defer { reloaded.close() }
+        try check(reloaded.fileDefaultAction == .revealInFinder,
+                  "fileDefaultAction(.revealInFinder) did not survive reload across a fresh Launcher instance")
+        reloaded.setFileDefaultAction(.open)
+        try check(reloaded.fileDefaultAction == .open && isoDefaults.string(forKey: "fileDefaultAction") == "open",
+                  "setFileDefaultAction(.open) did not persist back to UserDefaults")
+
+        let reloadedOpen = makeLauncher()
+        defer { reloadedOpen.close() }
+        try check(reloadedOpen.fileDefaultAction == .open,
+                  "fileDefaultAction(.open) did not survive reload across a fresh Launcher instance")
+
+        isoDefaults.set("invalid-action", forKey: "fileDefaultAction")
+        let fallback = makeLauncher()
+        defer { fallback.close() }
+        try check(fallback.fileDefaultAction == .open,
+                  "unknown UserDefaults fileDefaultAction value did not fall back to .open")
+    }
+
+    private func makeFileDefaultActionFixtures() throws -> (openFile: URL, revealFile: URL, dblClickFile: URL, folder: URL) {
+        let openFile = corpus.appendingPathComponent("v064-default-open-file.txt")
+        let revealFile = corpus.appendingPathComponent("v064-default-reveal-file.txt")
+        let dblClickFile = corpus.appendingPathComponent("v064-default-dblclick-file.txt")
+        let folder = corpus.appendingPathComponent("v064-default-folder", isDirectory: true)
+        try Data("v064 open fixture".utf8).write(to: openFile)
+        try Data("v064 reveal fixture".utf8).write(to: revealFile)
+        try Data("v064 double-click fixture".utf8).write(to: dblClickFile)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return (openFile, revealFile, dblClickFile, folder)
+    }
+
+    private func verifyFileDefaultActionRegressions(
+        _ app: AppDelegate,
+        fixtures: (openFile: URL, revealFile: URL, dblClickFile: URL, folder: URL)
+    ) async throws {
+        try verifyFileDefaultActionPersistence()
+
+        guard let defaults = shortcutFixturePreferences else {
+            throw Failure("missing isolated preferences for fileDefaultAction smoke")
+        }
+        let model = app.model
+        let previousAction = model.fileDefaultAction
+        defer {
+            model.setFileDefaultAction(previousAction)
+            opened = nil
+            revealed = nil
+        }
+
+        let openFilePath = IndexScope.folderPath(fixtures.openFile)
+        let revealFilePath = IndexScope.folderPath(fixtures.revealFile)
+        let dblClickFilePath = IndexScope.folderPath(fixtures.dblClickFile)
+        let folderPath = IndexScope.folderPath(fixtures.folder)
+
+        func selectFixture(_ query: String, path: String, kind: String) async throws -> SearchHit {
+            app.showSearch()
+            try type(query, into: app)
+            try await until("v064 fixture not indexed: \(query)") {
+                !model.searching && model.hits.contains { $0.path == path && $0.kind == kind }
+            }
+            if model.selectedHit?.path != path { model.selection = path }
+            guard let hit = model.selectedHit, hit.path == path else {
+                throw Failure("could not select v064 fixture: \(query)")
+            }
+            return hit
+        }
+
+        func frecencyBoost(_ hit: SearchHit, query: String) -> Int {
+            LauncherFrecency(defaults: defaults).boost(LauncherFrecency.fileID(hit.path), query: query)
+        }
+
+        // (a) Default `.open` mode: Return & double-click open + dismiss; Cmd+Return reveals + dismisses + records Frecency.
+        model.setFileDefaultAction(.open)
+        try check(model.fileDefaultAction == .open, "expected default fileDefaultAction to be .open")
+
+        let openHit = try await selectFixture("v064-default-open-file", path: openFilePath, kind: "file")
+        try check(!model.usesRevealDefault(for: openHit) &&
+                  model.primaryFileAction(for: openHit) == .open &&
+                  model.secondaryFileAction(for: openHit) == .reveal,
+                  ".open mode did not report primary=.open / secondary=.reveal")
+        try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+        try check(app.contextActions.isOpen &&
+                  app.contextActions.items.prefix(2).map(\.id) == ["open", "reveal"] &&
+                  app.contextActions.items[0].symbol == "return" &&
+                  app.contextActions.items[1].symbol == "folder",
+                  ".open mode Cmd+K ordering or symbols mismatch: \(app.contextActions.items.map { ($0.id, $0.symbol) })")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try check(!app.contextActions.isOpen && app.searchPresented, "Escape did not close Cmd+K menu in .open mode")
+
+        opened = nil
+        revealed = nil
+        try key(kVK_Return, "\r", in: app)
+        try await until(".open mode Return did not open file and dismiss search") {
+            self.opened?.path == openFilePath && self.revealed == nil && !app.searchPresented && model.query.isEmpty
+        }
+        opened = nil
+
+        _ = try await selectFixture("v064-default-open-file", path: openFilePath, kind: "file")
+        opened = nil
+        revealed = nil
+        app.selectRow(.file(openHit), doubleClick: true)
+        try await until(".open mode double-click did not open file and dismiss search") {
+            self.opened?.path == openFilePath && self.revealed == nil && !app.searchPresented && model.query.isEmpty
+        }
+        opened = nil
+
+        _ = try await selectFixture("v064-default-open-file", path: openFilePath, kind: "file")
+        try check(frecencyBoost(openHit, query: "v064-default-open-file") == 0,
+                  "open fixture unexpectedly started with non-zero frecency")
+        opened = nil
+        revealed = nil
+        try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
+        try await until(".open mode Cmd+Return did not reveal file and dismiss search") {
+            self.revealed?.path == openFilePath && self.opened == nil && !app.searchPresented && model.query.isEmpty
+        }
+        try check(frecencyBoost(openHit, query: "v064-default-open-file") > 0,
+                  ".open mode Cmd+Return revealInFinder did not record Frecency")
+        revealed = nil
+
+        // (b) `.revealInFinder` mode: regular files reveal on Return/double-click (+ Frecency) and open on Cmd+Return;
+        // Cmd+K puts Show in Finder first; folders and .app bundles keep opening directly on Return and revealing on Cmd+Return.
+        model.setFileDefaultAction(.revealInFinder)
+        try check(model.fileDefaultAction == .revealInFinder &&
+                  defaults.string(forKey: "fileDefaultAction") == "revealInFinder",
+                  "setFileDefaultAction(.revealInFinder) did not update live Launcher and defaults")
+
+        let revealHit = try await selectFixture("v064-default-reveal-file", path: revealFilePath, kind: "file")
+        try check(model.usesRevealDefault(for: revealHit) &&
+                  model.primaryFileAction(for: revealHit) == .reveal &&
+                  model.secondaryFileAction(for: revealHit) == .open,
+                  ".revealInFinder mode did not flip primary/secondary for regular file")
+
+        try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+        let revealMenu = app.contextActions.items
+        try check(app.contextActions.isOpen &&
+                  revealMenu.prefix(2).map(\.id) == ["reveal", "open"] &&
+                  revealMenu[0].title == model.t("在 Finder 中显示", "Show in Finder") &&
+                  revealMenu[0].symbol == "return" &&
+                  revealMenu[1].title == model.t("打开", "Open") &&
+                  revealMenu[1].symbol == "arrow.up.forward.square" &&
+                  revealMenu.contains { $0.id == "preview" } &&
+                  revealMenu.contains { $0.id == "copy-name" } &&
+                  revealMenu.contains { $0.id == "copy-path" },
+                  ".revealInFinder mode Cmd+K menu mismatch: \(revealMenu.map { ($0.id, $0.title, $0.symbol) })")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+        try check(!app.contextActions.isOpen && app.searchPresented, "Escape did not close Cmd+K menu in .revealInFinder mode")
+
+        try check(frecencyBoost(revealHit, query: "v064-default-reveal-file") == 0,
+                  "reveal fixture unexpectedly started with non-zero frecency")
+        opened = nil
+        revealed = nil
+        try key(kVK_Return, "\r", in: app)
+        try await until(".revealInFinder mode Return did not reveal regular file and dismiss search") {
+            self.revealed?.path == revealFilePath && self.opened == nil && !app.searchPresented && model.query.isEmpty
+        }
+        try check(frecencyBoost(revealHit, query: "v064-default-reveal-file") > 0,
+                  ".revealInFinder mode Return reveal did not record Frecency")
+        revealed = nil
+
+        let dblClickHit = try await selectFixture("v064-default-dblclick-file", path: dblClickFilePath, kind: "file")
+        try check(frecencyBoost(dblClickHit, query: "v064-default-dblclick-file") == 0,
+                  "double-click fixture unexpectedly started with non-zero frecency")
+        opened = nil
+        revealed = nil
+        app.selectRow(.file(dblClickHit), doubleClick: true)
+        try await until(".revealInFinder mode double-click did not reveal regular file and dismiss search") {
+            self.revealed?.path == dblClickFilePath && self.opened == nil && !app.searchPresented && model.query.isEmpty
+        }
+        try check(frecencyBoost(dblClickHit, query: "v064-default-dblclick-file") > 0,
+                  ".revealInFinder mode double-click reveal did not record Frecency")
+        revealed = nil
+
+        _ = try await selectFixture("v064-default-reveal-file", path: revealFilePath, kind: "file")
+        opened = nil
+        revealed = nil
+        try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
+        try await until(".revealInFinder mode Cmd+Return did not open regular file and dismiss search") {
+            self.opened?.path == revealFilePath && self.revealed == nil && !app.searchPresented && model.query.isEmpty
+        }
+        opened = nil
+
+        let folderHit = try await selectFixture("v064-default-folder", path: folderPath, kind: "directory")
+        try check(!model.usesRevealDefault(for: folderHit) &&
+                  model.primaryFileAction(for: folderHit) == .open &&
+                  model.secondaryFileAction(for: folderHit) == .reveal,
+                  ".revealInFinder mode affected directory primary/secondary actions")
+        try key(kVK_ANSI_K, "k", in: app, throughPanel: true, flags: [.command])
+        let folderMenu = app.contextActions.items
+        try check(app.contextActions.isOpen &&
+                  folderMenu.prefix(2).map(\.id) == ["open", "reveal"] &&
+                  folderMenu[0].symbol == "return" &&
+                  folderMenu[1].symbol == "folder" &&
+                  folderMenu.contains { $0.id == "pin-folder" },
+                  ".revealInFinder mode altered directory Cmd+K menu: \(folderMenu.map { ($0.id, $0.symbol) })")
+        try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
+
+        opened = nil
+        revealed = nil
+        try key(kVK_Return, "\r", in: app)
+        try await until(".revealInFinder mode Return did not open directory directly") {
+            self.opened?.path == folderPath && self.revealed == nil && !app.searchPresented && model.query.isEmpty
+        }
+        opened = nil
+
+        _ = try await selectFixture("v064-default-folder", path: folderPath, kind: "directory")
+        opened = nil
+        revealed = nil
+        try key(kVK_Return, "\r", in: app, throughPanel: true, flags: [.command])
+        try await until(".revealInFinder mode Cmd+Return did not reveal directory in Finder") {
+            self.revealed?.path == folderPath && self.opened == nil && !app.searchPresented && model.query.isEmpty
+        }
+        revealed = nil
+
+        let appFileHit = SearchHit(path: "/Applications/Example.APP", name: "Example.APP", kind: "file",
+                                   availability: "local", matched_by: "name", snippet: nil, document_stamp: nil, pdf_page: nil)
+        let appDirHit = SearchHit(path: "/Applications/Example.app", name: "Example.app", kind: "directory",
+                                  availability: "local", matched_by: "name", snippet: nil, document_stamp: nil, pdf_page: nil)
+        for appHit in [appFileHit, appDirHit] {
+            try check(!model.usesRevealDefault(for: appHit) &&
+                      model.primaryFileAction(for: appHit) == .open &&
+                      model.secondaryFileAction(for: appHit) == .reveal,
+                      ".revealInFinder mode did not keep .app bundle opening directly: \(appHit.path)")
+        }
+
+        model.setFileDefaultAction(previousAction)
+        app.showSearch()
+        print("v0.6.4 fileDefaultAction regressions passed (.open, .revealInFinder, Return/double-click/Cmd+Return/Cmd+K, folders/.app, Frecency, UserDefaults persistence)")
     }
 
     private struct Failure: Error, CustomStringConvertible {

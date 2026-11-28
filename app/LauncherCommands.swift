@@ -85,7 +85,7 @@ enum PanelGeometry {
     static let standardRowHeight: CGFloat = 44
     static let previewRowHeight: CGFloat = 60
     static let emptyResultsHeight: CGFloat = 56
-    static let inlinePreviewMinimumHeight: CGFloat = 360
+    static let inlinePreviewMinimumHeight: CGFloat = 420
 
     static func rowHeight(for result: LauncherResult) -> CGFloat {
         if case .file(let hit) = result, hit.hasPreview { return previewRowHeight }

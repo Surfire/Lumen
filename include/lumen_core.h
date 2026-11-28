@@ -6,6 +6,8 @@ extern "C" {
 #endif
 
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 
 typedef struct LumenSessionHandle LumenSessionHandle;
 
@@ -24,6 +26,7 @@ char *lumen_session_search_json(LumenSessionHandle *handle, const char *request_
 char *lumen_session_validate_json(LumenSessionHandle *handle, const char *request_json);
 char *lumen_session_status_json(LumenSessionHandle *handle, const char *request_json);
 char *lumen_session_excerpt_json(LumenSessionHandle *handle, const char *request_json);
+char *lumen_preview_xlsx_json(const uint8_t *bytes, size_t len);
 
 /* NULL is a no-op. Release each non-NULL handle and reply exactly once. */
 void lumen_session_close(LumenSessionHandle *handle);

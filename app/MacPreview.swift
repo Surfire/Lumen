@@ -24,9 +24,44 @@ public struct MacPreviewRenderer: Sendable {
         return try LocalFile.withResidentFile(item.url, expectedStamp: item.revision.isEmpty ? nil : item.revision,
                                               isPending: isPending) {
             switch item.kind {
-            case .quickLook:
-                // The launcher opens Quick Look only after the resident-file check succeeds.
+            case .windowHandoff:
+                // The launcher opens the floating preview window only after the resident-file check succeeds.
                 return PreviewDocument()
+            case .inlineQuickLook:
+                return PreviewDocument(evidence: item.evidence, quickLookURL: item.url)
+            case .richDocument(let format):
+                let resolvedEvidence: PreviewEvidence?
+                if let evidence = item.evidence,
+                   (format == .markdown || format == .delimited),
+                   let context = Self.plainTextContext(at: item.url, evidence: evidence) {
+                    resolvedEvidence = PreviewEvidence(
+                        text: evidence.text,
+                        match: evidence.match,
+                        page: evidence.page,
+                        context: context,
+                        highlight: evidence.highlight
+                    )
+                } else {
+                    resolvedEvidence = item.evidence
+                }
+                let boundedText: String? = (format == .markdown || format == .delimited)
+                    ? (try? Self.readBoundedText(at: item.url, limit: Self.inlineTextBytes))
+                    : nil
+                if let rich = DocumentPreviewRenderer.render(
+                    url: item.url,
+                    format: format,
+                    evidence: resolvedEvidence,
+                    isPending: isPending
+                ) {
+                    return PreviewDocument(
+                        visual: nil,
+                        evidence: resolvedEvidence,
+                        text: boundedText,
+                        isCode: false,
+                        richHTML: rich
+                    )
+                }
+                return PreviewDocument(evidence: resolvedEvidence, quickLookURL: item.url)
             case .excerpt:
                 guard let evidence = item.evidence, !evidence.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     throw PreviewFailure.noExcerpt
@@ -38,9 +73,34 @@ public struct MacPreviewRenderer: Sendable {
                                                                  context: context,
                                                                  highlight: evidence.highlight))
             case .plainText:
-                let text = try Self.readBoundedText(at: item.url, limit: Self.inlineTextBytes)
-                return PreviewDocument(evidence: item.evidence, text: text,
-                                       isCode: Self.isCodeExtension(item.url.pathExtension))
+                let inlineText = try Self.readBoundedText(at: item.url, limit: Self.inlineTextBytes)
+                let fullText = (try? Self.readBoundedText(at: item.url, limit: Self.maxPlainTextBytes)) ?? inlineText
+                let isCode = Self.isCodeExtension(item.url.pathExtension)
+                let resolvedEvidence: PreviewEvidence?
+                if let evidence = item.evidence,
+                   let context = Self.plainTextContext(at: item.url, evidence: evidence) {
+                    resolvedEvidence = PreviewEvidence(
+                        text: evidence.text,
+                        match: evidence.match,
+                        page: evidence.page,
+                        context: context,
+                        highlight: evidence.highlight
+                    )
+                } else {
+                    resolvedEvidence = item.evidence
+                }
+                let rich = DocumentPreviewRenderer.renderPlainText(
+                    text: fullText,
+                    isCode: isCode,
+                    fileName: item.url.lastPathComponent,
+                    evidence: resolvedEvidence
+                )
+                return PreviewDocument(
+                    evidence: resolvedEvidence,
+                    text: inlineText,
+                    isCode: isCode,
+                    richHTML: rich
+                )
             case .image:
                 return PreviewDocument(visual: .image(try thumbnail(item.url)), evidence: item.evidence)
             case .pdf(let page):
@@ -251,6 +311,10 @@ public struct MacPreviewRenderer: Sendable {
         return Data(referencing: data)
     }
 
+    private static let markdownExtensions: Set<String> = ["md", "markdown"]
+    private static let wordExtensions: Set<String> = ["docx", "rtf"]
+    private static let spreadsheetExtensions: Set<String> = ["xlsx"]
+    private static let delimitedExtensions: Set<String> = ["csv", "tsv"]
     private static let proseExtensions: Set<String> = ["txt", "md", "markdown", "log", "csv", "tsv"]
     private static let codeExtensions: Set<String> = [
         "json", "yaml", "yml", "xml", "html", "htm", "toml", "ini", "rs", "swift", "py", "js", "ts",
@@ -262,12 +326,24 @@ public struct MacPreviewRenderer: Sendable {
     private static let inlineTextBytes = 16 * 1024
     private static let clipboardTextBytes = 8 * 1024
 
+    static func isMarkdownExtension(_ ext: String) -> Bool { markdownExtensions.contains(ext.lowercased()) }
+    static func isWordExtension(_ ext: String) -> Bool { wordExtensions.contains(ext.lowercased()) }
+    static func isSpreadsheetExtension(_ ext: String) -> Bool { spreadsheetExtensions.contains(ext.lowercased()) }
+    static func isDelimitedExtension(_ ext: String) -> Bool { delimitedExtensions.contains(ext.lowercased()) }
+    static func richFormat(forExtension ext: String) -> RichPreviewFormat? {
+        let lower = ext.lowercased()
+        if markdownExtensions.contains(lower) { return .markdown }
+        if wordExtensions.contains(lower) { return .word }
+        if spreadsheetExtensions.contains(lower) { return .spreadsheet }
+        if delimitedExtensions.contains(lower) { return .delimited }
+        return nil
+    }
     static func isPlainTextExtension(_ ext: String) -> Bool { plainTextExtensions.contains(ext.lowercased()) }
     static func isCodeExtension(_ ext: String) -> Bool { codeExtensions.contains(ext.lowercased()) }
 
     /// Reads at most `limit` bytes. Rejects binary content and never splits a UTF-8 scalar at the cap.
     /// Call only inside `LocalFile.withResidentFile`.
-    private static func readBoundedText(at url: URL, limit: Int) throws -> String {
+    static func readBoundedText(at url: URL, limit: Int) throws -> String {
         guard let handle = try? FileHandle(forReadingFrom: url) else { throw PreviewFailure.missing }
         defer { try? handle.close() }
         guard let data = try? handle.read(upToCount: limit) else { throw PreviewFailure.invalidContent }

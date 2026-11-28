@@ -214,6 +214,21 @@ pub unsafe extern "C" fn lumen_session_excerpt_json(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn lumen_preview_xlsx_json(bytes: *const u8, len: usize) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| -> Option<*mut c_char> {
+        if bytes.is_null() || len == 0 || (len as u64) > crate::docx::MAX_ARCHIVE {
+            return None;
+        }
+        let slice = unsafe { std::slice::from_raw_parts(bytes, len) };
+        let json = crate::docx::xlsx_preview_json(slice).ok()?;
+        CString::new(json).ok().map(CString::into_raw)
+    }))
+    .ok()
+    .flatten()
+    .unwrap_or(ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lumen_session_close(handle: *mut LumenSessionHandle) {
     if !handle.is_null() {
         let _ = catch_unwind(AssertUnwindSafe(|| drop(unsafe { Box::from_raw(handle) })));
@@ -475,5 +490,98 @@ mod tests {
             );
             lumen_session_close(text_handle);
         }
+    }
+
+    #[test]
+    fn preview_xlsx_ffi_null_bounds_and_roundtrip() {
+        use std::io::{Cursor, Write};
+        use zip::{CompressionMethod, write::SimpleFileOptions};
+
+        unsafe {
+            assert!(lumen_preview_xlsx_json(ptr::null(), 0).is_null());
+            assert!(lumen_preview_xlsx_json(ptr::null(), 32).is_null());
+            let dummy = [1u8, 2, 3, 4];
+            assert!(lumen_preview_xlsx_json(dummy.as_ptr(), 0).is_null());
+            assert!(
+                lumen_preview_xlsx_json(dummy.as_ptr(), (crate::docx::MAX_ARCHIVE as usize) + 1)
+                    .is_null()
+            );
+            assert!(lumen_preview_xlsx_json(dummy.as_ptr(), dummy.len()).is_null());
+        }
+
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut cursor);
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            for (name, content) in [
+                (
+                    "xl/workbook.xml",
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+                       <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+                                 xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+                         <sheets>
+                           <sheet name="概览" sheetId="1" r:id="rId1"/>
+                           <sheet name="季度预算" sheetId="2" r:id="rId2"/>
+                         </sheets>
+                       </workbook>"#,
+                ),
+                (
+                    "xl/_rels/workbook.xml.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+                       <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                         <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+                         <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="/xl/worksheets/sheet2.xml"/>
+                       </Relationships>"#,
+                ),
+                (
+                    "xl/worksheets/sheet1.xml",
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+                       <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+                         <sheetData>
+                           <row r="1">
+                             <c r="A1" t="inlineStr"><is><t>项目</t></is></c>
+                             <c r="C1"><v>42</v></c>
+                           </row>
+                         </sheetData>
+                       </worksheet>"#,
+                ),
+                (
+                    "xl/worksheets/sheet2.xml",
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+                       <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+                         <sheetData>
+                           <row r="1">
+                             <c r="A1" t="b"><v>1</v></c>
+                           </row>
+                         </sheetData>
+                       </worksheet>"#,
+                ),
+            ] {
+                zip.start_file(name, options).unwrap();
+                zip.write_all(content.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let xlsx_bytes = cursor.into_inner();
+        let decoded =
+            reply(unsafe { lumen_preview_xlsx_json(xlsx_bytes.as_ptr(), xlsx_bytes.len()) });
+        assert_eq!(
+            decoded,
+            json!({
+                "sheets": [
+                    {
+                        "name": "概览",
+                        "rows": [["项目", "", "42"]],
+                        "truncated": false
+                    },
+                    {
+                        "name": "季度预算",
+                        "rows": [["TRUE"]],
+                        "truncated": false
+                    }
+                ]
+            })
+        );
     }
 }

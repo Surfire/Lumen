@@ -8,10 +8,23 @@ public struct MacInlinePreviewView: View {
     public let state: InlinePreviewState
     private let image: NSImage?
     public let language: Language
+    private let onWebContainerReady: ((DocumentWebPreviewContainer?) -> Void)?
     public init(state: InlinePreviewState, image: NSImage?, language: Language) {
         self.state = state
         self.image = image
         self.language = language
+        self.onWebContainerReady = nil
+    }
+    init(
+        state: InlinePreviewState,
+        image: NSImage?,
+        language: Language,
+        onWebContainerReady: ((DocumentWebPreviewContainer?) -> Void)?
+    ) {
+        self.state = state
+        self.image = image
+        self.language = language
+        self.onWebContainerReady = onWebContainerReady
     }
 
     private func label(_ zh: String, _ en: String) -> String {
@@ -56,54 +69,72 @@ public struct MacInlinePreviewView: View {
                 Label(reason(error), systemImage: "doc.questionmark")
                     .foregroundStyle(.secondary)
             case .ready(_, let content):
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 10) {
-                        if let visual = content.visual {
-                            switch visual {
-                            case .image:
-                                bitmap(caption: label("图片预览", "Image preview"), hasEvidence: content.evidence != nil)
-                            case .pdf(_, let displayedPage, let isMatchPage):
-                                bitmap(caption: isMatchPage
-                                    ? label("命中第 \(displayedPage) 页", "Match on page \(displayedPage)")
-                                    : label("预览第 \(displayedPage) 页（未定位命中页）", "Page \(displayedPage) preview (match page unknown)"),
-                                       hasEvidence: content.evidence != nil)
-                            }
-                        }
-                        if let text = content.text {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(content.isCode ? label("代码预览", "Code preview") : label("文本预览", "Text preview"))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Text(verbatim: text)
-                                    .font(content.isCode ? .system(size: 11.5, design: .monospaced) : .callout)
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                            .accessibilityIdentifier("lumen-inline-preview-text")
-                        }
+                if let richHTML = content.richHTML {
+                    DocumentWebPreviewRepresentable(
+                        content: richHTML,
+                        chinese: language == .simplifiedChinese,
+                        onContainerReady: onWebContainerReady
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if let qlURL = content.quickLookURL {
+                    VStack(alignment: .leading, spacing: 8) {
                         if let evidence = content.evidence {
-                            let body = evidence.context ?? evidence.text
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(evidence.context != nil
-                                    ? (evidence.match == .related
-                                        ? label("相关段落上下文", "Related excerpt context")
-                                        : label("文字匹配上下文", "Text match context"))
-                                    : (evidence.match == .related
-                                        ? label("相关片段", "Related excerpt")
-                                        : label("文字匹配片段", "Text match excerpt")))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Text(highlighted(body, evidence: evidence))
-                                    .font(.callout)
-                                    .lineSpacing(3)
-                                    .textSelection(.enabled)
+                            PinnedMatchBannerView(evidence: evidence, chinese: language == .simplifiedChinese)
+                        }
+                        EmbeddedQuickLookRepresentable(url: qlURL)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 10) {
+                            if let visual = content.visual {
+                                switch visual {
+                                case .image:
+                                    bitmap(caption: label("图片预览", "Image preview"), hasEvidence: content.evidence != nil)
+                                case .pdf(_, let displayedPage, let isMatchPage):
+                                    bitmap(caption: isMatchPage
+                                        ? label("命中第 \(displayedPage) 页", "Match on page \(displayedPage)")
+                                        : label("预览第 \(displayedPage) 页（未定位命中页）", "Page \(displayedPage) preview (match page unknown)"),
+                                           hasEvidence: content.evidence != nil)
+                                }
+                            }
+                            if let text = content.text {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(content.isCode ? label("代码预览", "Code preview") : label("文本预览", "Text preview"))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Text(verbatim: text)
+                                        .font(content.isCode ? .system(size: 11.5, design: .monospaced) : .callout)
+                                        .textSelection(.enabled)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                .accessibilityIdentifier("lumen-inline-preview-text")
+                            }
+                            if let evidence = content.evidence {
+                                let body = evidence.context ?? evidence.text
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(evidence.context != nil
+                                        ? (evidence.match == .related
+                                            ? label("相关段落上下文", "Related excerpt context")
+                                            : label("文字匹配上下文", "Text match context"))
+                                        : (evidence.match == .related
+                                            ? label("相关片段", "Related excerpt")
+                                            : label("文字匹配片段", "Text match excerpt")))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Text(highlighted(body, evidence: evidence))
+                                        .font(.callout)
+                                        .lineSpacing(3)
+                                        .textSelection(.enabled)
+                                }
                             }
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 }
-                .frame(maxHeight: 380)
             }
         }
         .accessibilityIdentifier("lumen-inline-preview")

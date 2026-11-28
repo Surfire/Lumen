@@ -585,8 +585,9 @@ def verify_content_pipeline(snapshots=None):
         run(root, "en")
         if snapshots:
             snapshots.mkdir(parents=True, exist_ok=True)
-            for image in root.glob("lumen-inline-*.png"):
-                shutil.copyfile(image, snapshots / image.name)
+            for pattern in ("lumen-inline-*.png", "preview-*.png"):
+                for image in root.glob(pattern):
+                    shutil.copyfile(image, snapshots / image.name)
 
 
 def verify_image_search(fixtures, projector, gemma_home, snapshots):

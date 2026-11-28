@@ -100,12 +100,18 @@ struct SearchWindow: View {
                             .buttonStyle(.borderless)
                             .accessibilityLabel(model.t("关闭预览", "Close Preview"))
                         }
-                        MacInlinePreviewView(state: inlinePreview.state, image: inlinePreview.image,
-                                             language: model.zh ? .simplifiedChinese : .english)
+                        MacInlinePreviewView(
+                            state: inlinePreview.state,
+                            image: inlinePreview.image,
+                            language: model.zh ? .simplifiedChinese : .english,
+                            onWebContainerReady: { [weak inlinePreview] container in
+                                inlinePreview?.activeWebContainer = container
+                            }
+                        )
                         Spacer(minLength: 0)
                     }
                     .padding(12)
-                    .frame(width: 380)
+                    .frame(width: 410)
                 }
             case (.search, .localQuickLook), (.search, .none):
                 if showsResults {
@@ -516,18 +522,19 @@ struct SearchWindow: View {
         .accessibilityAction(named: Text(fileActionTitle(.open))) { fileAction(.open, hit) }
         .accessibilityAction(named: Text(fileActionTitle(.reveal))) { fileAction(.reveal, hit) }
         .accessibilityActions {
-            if hit.kind == "file" {
-                Button(model.t("快速查看", "Quick Look")) { fileAction(.preview, hit) }
+            if hit.kind == "file" && !hit.name.lowercased().hasSuffix(".app") {
+                Button(model.t("内嵌预览", "Inline Preview")) { fileAction(.preview, hit) }
             }
             Button(model.t("复制名称", "Copy Name")) { fileAction(.copyName, hit) }
             Button(model.t("复制路径", "Copy Path")) { fileAction(.copyPath, hit) }
         }
         .contextMenu {
-            ForEach(Array([model.primaryFileAction(for: hit), model.secondaryFileAction(for: hit)].enumerated()), id: \.offset) { _, action in
-                Button(fileActionTitle(action)) { fileAction(action, hit) }
-            }
-            Button(model.t("快速查看 · ⌘Y", "Quick Look · ⌘Y")) { fileAction(.preview, hit) }
-                .disabled(hit.kind != "file")
+            let primary = model.primaryFileAction(for: hit)
+            let secondary = model.secondaryFileAction(for: hit)
+            Button("\(fileActionTitle(primary)) · ↵") { fileAction(primary, hit) }
+            Button("\(fileActionTitle(secondary)) · ⌘↵") { fileAction(secondary, hit) }
+            Button(model.t("内嵌预览 · ⌘Y", "Inline Preview · ⌘Y")) { fileAction(.preview, hit) }
+                .disabled(hit.kind != "file" || hit.name.lowercased().hasSuffix(".app"))
             Divider()
             Button(model.t("复制名称 · ⇧⌘C", "Copy Name · ⇧⌘C")) { fileAction(.copyName, hit) }
             Button(model.t("复制路径 · ⌥⌘C", "Copy Path · ⌥⌘C")) { fileAction(.copyPath, hit) }
@@ -538,7 +545,7 @@ struct SearchWindow: View {
         switch action {
         case .open: return model.t("打开", "Open")
         case .reveal: return model.t("在 Finder 中显示", "Show in Finder")
-        case .preview: return model.t("快速查看", "Quick Look")
+        case .preview: return model.t("内嵌预览", "Inline Preview")
         case .copyName: return model.t("复制名称", "Copy Name")
         case .copyPath: return model.t("复制路径", "Copy Path")
         }

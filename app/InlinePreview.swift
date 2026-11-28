@@ -16,15 +16,54 @@ public struct PreviewEvidence: Sendable, Equatable {
     }
 }
 
+public enum RichPreviewFormat: Sendable, Equatable {
+    case markdown
+    case word
+    case spreadsheet
+    case delimited
+    case plainText
+}
+
+public struct RichPreviewContent: Sendable, Equatable {
+    public let format: RichPreviewFormat
+    public let html: String
+    public let localResources: [String: URL]
+    public let memoryResources: [String: Data]
+    public let memoryMimeTypes: [String: String]
+    public let hasHighlights: Bool
+    public let prefersPaperCanvas: Bool
+
+    public init(
+        format: RichPreviewFormat,
+        html: String,
+        localResources: [String: URL] = [:],
+        memoryResources: [String: Data] = [:],
+        memoryMimeTypes: [String: String] = [:],
+        hasHighlights: Bool = false,
+        prefersPaperCanvas: Bool = false
+    ) {
+        self.format = format
+        self.html = html
+        self.localResources = localResources
+        self.memoryResources = memoryResources
+        self.memoryMimeTypes = memoryMimeTypes
+        self.hasHighlights = hasHighlights
+        self.prefersPaperCanvas = prefersPaperCanvas
+    }
+}
+
 public enum PreviewKind: Sendable, Equatable {
     case image
     /// nil means no match page is known. It must not be labelled a hit.
     case pdf(matchPage: Int?)
-    case excerpt
+    case richDocument(RichPreviewFormat)
     /// Bounded inline text or source code from a resident local file.
     case plainText
+    case excerpt
+    /// Render Quick Look directly inside the inline preview pane.
+    case inlineQuickLook
     /// Use the inline area for hydration progress, then hand off to Quick Look.
-    case quickLook
+    case windowHandoff
 }
 
 public struct PreviewSelection: Sendable, Equatable {
@@ -52,11 +91,22 @@ public struct PreviewDocument: Sendable, Equatable {
     public let evidence: PreviewEvidence?
     public let text: String?
     public let isCode: Bool
-    public init(visual: Visual? = nil, evidence: PreviewEvidence? = nil, text: String? = nil, isCode: Bool = false) {
+    public let richHTML: RichPreviewContent?
+    public let quickLookURL: URL?
+    public init(
+        visual: Visual? = nil,
+        evidence: PreviewEvidence? = nil,
+        text: String? = nil,
+        isCode: Bool = false,
+        richHTML: RichPreviewContent? = nil,
+        quickLookURL: URL? = nil
+    ) {
         self.visual = visual
         self.evidence = evidence
         self.text = text
         self.isCode = isCode
+        self.richHTML = richHTML
+        self.quickLookURL = quickLookURL
     }
 }
 

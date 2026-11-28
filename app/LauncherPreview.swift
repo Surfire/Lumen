@@ -4,6 +4,7 @@ import Darwin
 import ImageIO
 import PDFKit
 import Quartz
+import SwiftUI
 import UniformTypeIdentifiers
 
 enum FileAction: Equatable {
@@ -102,8 +103,10 @@ final class LocalPreviewPanel: NSPanel {
     private let preview: QLPreviewView?
     private let pdf: PDFView?
     private let imageView: NSImageView?
+    private(set) var webPreviewContainer: DocumentWebPreviewContainer?
     private let url: URL?
     private var closed = false
+    private static let maxPlainTextPreviewBytes = 512 * 1024
 
     private static let spreadsheetOrDeckExtensions: Set<String> = [
         "xlsx", "xls", "csv", "tsv", "numbers", "pptx", "ppt", "key",
@@ -186,7 +189,7 @@ final class LocalPreviewPanel: NSPanel {
         if Self.spreadsheetOrDeckExtensions.contains(ext) {
             return NSSize(width: min(920, maxW), height: min(620, maxH))
         }
-        if Self.documentOrCodeExtensions.contains(ext) {
+        if Self.documentOrCodeExtensions.contains(ext) || MacPreviewRenderer.isPlainTextExtension(ext) {
             return NSSize(width: min(760, maxW), height: min(680, maxH))
         }
         if Self.videoExtensions.contains(ext) {
@@ -198,18 +201,49 @@ final class LocalPreviewPanel: NSPanel {
         return NSSize(width: min(680, maxW), height: min(520, maxH))
     }
 
+    private static func readBoundedPlainText(at url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: maxPlainTextPreviewBytes) else { return nil }
+        let bytes = [UInt8](data)
+        guard !bytes.contains(0) else { return nil }
+        var end = bytes.count
+        if end == maxPlainTextPreviewBytes {
+            // Avoid splitting a multi-byte UTF-8 scalar at the cap.
+            var lead = end - 1
+            while lead >= 0, end - lead <= 3, bytes[lead] & 0xC0 == 0x80 { lead -= 1 }
+            if lead >= 0, bytes[lead] >= 0xC0 {
+                let needed = bytes[lead] >= 0xF0 ? 4 : (bytes[lead] >= 0xE0 ? 3 : 2)
+                if end - lead < needed { end = lead }
+            }
+        }
+        guard let text = String(data: Data(bytes[..<end]), encoding: .utf8),
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return text
+    }
+
     init?(
         url: URL,
         title: String,
         page: Int? = nil,
         highlight: String? = nil,
         snippet: String? = nil,
+        context: String? = nil,
+        isRelated: Bool = false,
+        chinese: Bool = true,
         maxSize: NSSize? = nil,
         backingScale: CGFloat? = nil
     ) {
         let cap = maxSize ?? NSSize(width: 960, height: 760)
         let size = Self.preferredContentSize(for: url, page: page, maxSize: cap, backingScale: backingScale ?? 2)
         let frame = NSRect(origin: .zero, size: size)
+        let ext = url.pathExtension.lowercased()
+        let trimmedHighlight = highlight?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let resolvedHighlight = trimmedHighlight.isEmpty ? snippet : trimmedHighlight
+        let evidence = snippet.map {
+            PreviewEvidence(text: $0, match: isRelated ? .related : .literal,
+                            page: page, context: context, highlight: resolvedHighlight)
+        }
         let view: NSView
         var destination: PDFPage?
         var firstHighlight: PDFSelection?
@@ -220,7 +254,7 @@ final class LocalPreviewPanel: NSPanel {
             display.displayMode = .singlePageContinuous
             display.autoScales = true
             display.document = document
-            let matches = MacPreviewRenderer.pdfPageSelections(in: document, on: target, highlight: highlight, snippet: snippet)
+            let matches = MacPreviewRenderer.pdfPageSelections(in: document, on: target, highlight: resolvedHighlight, snippet: snippet)
             if !matches.isEmpty {
                 display.highlightedSelections = matches
                 firstHighlight = matches.first
@@ -228,17 +262,95 @@ final class LocalPreviewPanel: NSPanel {
             preview = nil
             pdf = display
             imageView = nil
+            webPreviewContainer = nil
             destination = target
             view = display
-        } else {
-            guard let display = QLPreviewView(frame: frame, style: .normal) else { return nil }
-            display.shouldCloseWithWindow = false
-            display.autostarts = true
-            display.previewItem = url as NSURL
-            preview = display
-            pdf = nil
+        } else if ext == "pdf",
+                  let document = PDFDocument(url: url), !document.isLocked,
+                  document.pageCount > 0 {
+            let display = PDFView(frame: frame)
+            display.displayMode = .singlePageContinuous
+            display.autoScales = true
+            display.document = document
+            if resolvedHighlight != nil || snippet != nil {
+                let limit = min(document.pageCount, 40)
+                for index in 0..<limit {
+                    guard let candidate = document.page(at: index) else { continue }
+                    let matches = MacPreviewRenderer.pdfPageSelections(
+                        in: document, on: candidate, highlight: resolvedHighlight, snippet: snippet
+                    )
+                    if !matches.isEmpty {
+                        display.highlightedSelections = matches
+                        firstHighlight = matches.first
+                        destination = candidate
+                        break
+                    }
+                }
+            }
+            preview = nil
+            pdf = display
             imageView = nil
+            webPreviewContainer = nil
             view = display
+        } else {
+            let richContent: RichPreviewContent?
+            if let richFormat = MacPreviewRenderer.richFormat(forExtension: ext) {
+                richContent = DocumentPreviewRenderer.render(
+                    url: url,
+                    format: richFormat,
+                    evidence: evidence,
+                    isPending: LocalFile.isUbiquitousPlaceholder
+                )
+            } else if MacPreviewRenderer.isPlainTextExtension(ext),
+                      let text = Self.readBoundedPlainText(at: url) {
+                richContent = DocumentPreviewRenderer.renderPlainText(
+                    text: text,
+                    isCode: MacPreviewRenderer.isCodeExtension(ext),
+                    fileName: url.lastPathComponent,
+                    evidence: evidence
+                )
+            } else {
+                richContent = nil
+            }
+            if let richContent {
+                let container = DocumentWebPreviewContainer(chinese: chinese)
+                container.frame = frame
+                container.load(richContent, interactiveFocus: true)
+                preview = nil
+                pdf = nil
+                imageView = nil
+                webPreviewContainer = container
+                view = container
+            } else {
+                guard let display = QLPreviewView(frame: frame, style: .normal) else { return nil }
+                display.shouldCloseWithWindow = false
+                display.autostarts = true
+                display.previewItem = url as NSURL
+                preview = display
+                pdf = nil
+                imageView = nil
+                webPreviewContainer = nil
+                if let evidence {
+                    let wrapper = NSView(frame: frame)
+                    let banner = NSHostingView(rootView: PinnedMatchBannerView(evidence: evidence, chinese: chinese))
+                    banner.translatesAutoresizingMaskIntoConstraints = false
+                    display.translatesAutoresizingMaskIntoConstraints = false
+                    wrapper.addSubview(banner)
+                    wrapper.addSubview(display)
+                    NSLayoutConstraint.activate([
+                        banner.topAnchor.constraint(equalTo: wrapper.topAnchor, constant: 8),
+                        banner.leadingAnchor.constraint(equalTo: wrapper.leadingAnchor, constant: 12),
+                        banner.trailingAnchor.constraint(equalTo: wrapper.trailingAnchor, constant: -12),
+                        display.topAnchor.constraint(equalTo: banner.bottomAnchor, constant: 6),
+                        display.leadingAnchor.constraint(equalTo: wrapper.leadingAnchor),
+                        display.trailingAnchor.constraint(equalTo: wrapper.trailingAnchor),
+                        display.bottomAnchor.constraint(equalTo: wrapper.bottomAnchor),
+                    ])
+                    view = wrapper
+                } else {
+                    view = display
+                }
+            }
         }
         self.url = url
         super.init(contentRect: frame, styleMask: [.titled, .closable, .resizable, .nonactivatingPanel],
@@ -250,6 +362,9 @@ final class LocalPreviewPanel: NSPanel {
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         minSize = NSSize(width: 400, height: 300)
         contentView = view
+        if let webPreviewContainer {
+            initialFirstResponder = webPreviewContainer
+        }
         if let destination {
             pdf?.layoutDocumentView()
             pdf?.go(to: destination)
@@ -283,6 +398,7 @@ final class LocalPreviewPanel: NSPanel {
         preview = nil
         pdf = nil
         imageView = display
+        webPreviewContainer = nil
         url = nil
         super.init(contentRect: frame, styleMask: [.titled, .closable, .resizable, .nonactivatingPanel],
                    backing: .buffered, defer: false)
@@ -307,6 +423,8 @@ final class LocalPreviewPanel: NSPanel {
         preview?.close()
         pdf?.document = nil
         imageView?.image = nil
+        webPreviewContainer?.teardown()
+        webPreviewContainer = nil
         super.close()
     }
 
@@ -315,8 +433,9 @@ final class LocalPreviewPanel: NSPanel {
     override func sendEvent(_ event: NSEvent) {
         if event.type == .keyDown {
             let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
-            if modifiers.isEmpty && (event.keyCode == kVK_Space || event.keyCode == kVK_Escape) ||
-                modifiers == [.command] && event.charactersIgnoringModifiers?.lowercased() == "y" {
+            let editingFind = firstResponder is NSTextView
+            if (modifiers.isEmpty && (event.keyCode == kVK_Escape || (event.keyCode == kVK_Space && !editingFind))) ||
+                (modifiers == [.command] && event.charactersIgnoringModifiers?.lowercased() == "y") {
                 if !event.isARepeat { onToggle?() }
                 return
             }

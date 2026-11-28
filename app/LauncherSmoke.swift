@@ -59,7 +59,8 @@ final class LauncherSmoke {
         let directory = directory
         return .init(isPending: { url in
             ["cloud-preview-placeholder.png", "cloud-quick-look-placeholder.txt",
-             "cloud-quick-look-placeholder.docx"].contains(url.lastPathComponent) &&
+             "cloud-quick-look-placeholder.docx", "cloud-quick-look-inline.docx",
+             "cloud-md-placeholder.png"].contains(url.lastPathComponent) &&
             !FileManager.default.fileExists(atPath: Self.previewHydrated(url, in: directory).path)
         }, download: { [weak self] url, report in
             guard let self else { throw CancellationError() }
@@ -81,6 +82,11 @@ final class LauncherSmoke {
             let bytes: Data
             if url.pathExtension == "png" {
                 bytes = try Data(contentsOf: corpus.appendingPathComponent("Dropbox/cloud-preview-known.png"))
+            } else if url.lastPathComponent == "cloud-quick-look-inline.docx" {
+                bytes = Self.makeDOCXFixture(paragraphs: [
+                    "Cloud inline hydrated DOCX document.",
+                    "LumenCloudInlineDocxHydrated",
+                ])
             } else if url.pathExtension == "docx" {
                 bytes = Data("Hydrated Quick Look Office fixture.".utf8)
             } else {
@@ -3323,6 +3329,7 @@ final class LauncherSmoke {
         try Data("Resident Quick Look text fixture.".utf8).write(to: provider.appendingPathComponent("cloud-quick-look-resident.txt"))
         try Data().write(to: provider.appendingPathComponent("cloud-quick-look-placeholder.txt"))
         try Data().write(to: provider.appendingPathComponent("cloud-quick-look-placeholder.docx"))
+        try Data().write(to: provider.appendingPathComponent("cloud-quick-look-inline.docx"))
         let contextIntro = (0..<24).map { "Intro paragraph line \($0) describing background context." }.joined(separator: "\n")
         let contextTail = (0..<24).map { "Trailing paragraph line \($0) continuing later details." }.joined(separator: "\n")
         try Data("\(contextIntro)\nTarget context anchor paragraph with matching text.\n\(contextTail)".utf8)
@@ -3597,19 +3604,38 @@ final class LauncherSmoke {
         try await until("Command–Y did not open inline code preview for name-only .swift file") {
             if case .ready(let selection, let doc) = app.inlinePreview.state {
                 return selection.kind == .plainText && doc.isCode &&
-                    doc.text?.contains("struct LumenPreviewFixture") == true
+                    doc.text?.contains("struct LumenPreviewFixture") == true &&
+                    app.inlinePreview.activeWebContainer != nil
             }
             return false
         }
-        if exists("capture-preview") {
-            try capture("lumen-inline-code-preview.png", appearance: .aqua, window: app.panel)
-            app.panel.appearance = nil
+        if let codeContainer = app.inlinePreview.activeWebContainer {
+            let deadline = ContinuousClock.now + .seconds(10)
+            var loaded = false
+            while ContinuousClock.now < deadline {
+                if let ok = await codeContainer.evaluateVerificationJS(
+                    "Boolean(document.body && document.body.innerText && document.body.innerText.includes('struct LumenPreviewFixture'))"
+                ) as? Bool, ok {
+                    loaded = true
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(30))
+            }
+            try check(loaded, "inline code WebKit view did not render Swift fixture source")
+            if exists("capture-preview"), let snapshot = await codeContainer.captureSnapshot(),
+               let tiff = snapshot.tiffRepresentation,
+               let rep = NSBitmapImageRep(data: tiff),
+               let png = rep.representation(using: .png, properties: [:]) {
+                try png.write(to: directory.appendingPathComponent("lumen-inline-code-preview.png"))
+            }
         }
+        app.panel.appearance = nil
         try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true)
         try check(!app.inlinePreview.isOpen && app.searchPresented, "Escape did not close inline code preview cleanly")
 
         try await verifyUnlimitedAndCloudPreview(app, provider: provider)
         try await verifyCloudQuickLook(app, provider: provider)
+        try await verifyRichPreviewExperience(app, selected: selected)
         try type("outsideexclusivebody", into: app)
         try await until("body remained outside the chosen scope") { !model.searching }
         try check(model.hits.isEmpty, "unselected text appeared as a hit")
@@ -3766,20 +3792,21 @@ final class LauncherSmoke {
         try check(previewDownloadsStarted == started, "resident cloud text requested a download on Space")
         try escape()
 
-        // Binary cloud placeholder (.docx): right-click preview, Cmd+Y, and Space share unified download -> Quick Look handoff.
+        // Binary cloud placeholder (.docx): right-click preview & Cmd+Y show inline rich-doc download ring;
+        // Space shows .windowHandoff download ring -> Quick Look handoff.
         guard let docxHit = model.hits.first(where: { $0.path == docxPlaceholder.path }) else {
             throw Failure("missing provider docx placeholder hit")
         }
         try check(model.selectedHit?.path == resident.path, "resident row was not selected before unselected right-click preview")
         app.perform(.preview, on: docxHit)
-        try await until("right-click Quick Look on an unselected docx placeholder did not select and start download") {
+        try await until("right-click preview on an unselected docx placeholder did not select and start download") {
             if case .downloading(let item, 0.4) = app.inlinePreview.state {
-                return item.url == docxPlaceholder && model.selectedHit?.path == docxPlaceholder.path
+                return item.url == docxPlaceholder && item.kind == .richDocument(.word) && model.selectedHit?.path == docxPlaceholder.path
             }
             return false
         }
         try escape()
-        try await until("Escape did not cancel the right-click Quick Look download") { self.previewDownloadsCancelled == cancelled + 1 }
+        try await until("Escape did not cancel the right-click docx download") { self.previewDownloadsCancelled == cancelled + 1 }
 
         try select(docxPlaceholder)
         try check(app.inlinePreview.state == .closed && app.localPreview == nil && previewDownloadsStarted == started + 1,
@@ -3787,21 +3814,23 @@ final class LauncherSmoke {
         try cmdY()
         try await until("Cmd+Y did not show the 40% download ring for the cloud docx file") {
             if case .downloading(let item, 0.4) = app.inlinePreview.state {
-                return item.url == docxPlaceholder && app.inlinePreview.isOpen && app.localPreview == nil
+                return item.url == docxPlaceholder && item.kind == .richDocument(.word) &&
+                    app.inlinePreview.isOpen && app.localPreview == nil
             }
             return false
         }
         try escape()
-        try await until("Escape did not cancel the Cmd+Y docx Quick Look download") { self.previewDownloadsCancelled == cancelled + 2 }
+        try await until("Escape did not cancel the Cmd+Y docx download") { self.previewDownloadsCancelled == cancelled + 2 }
         try space()
-        try await until("Space did not show the 40% download ring for the cloud docx file") {
+        try await until("Space did not show the 40% .windowHandoff download ring for the cloud docx file") {
             if case .downloading(let item, 0.4) = app.inlinePreview.state {
-                return item.url == docxPlaceholder && app.inlinePreview.isOpen && app.localPreview == nil
+                return item.url == docxPlaceholder && item.kind == .windowHandoff &&
+                    app.inlinePreview.isOpen && app.localPreview == nil
             }
             return false
         }
         previewDownloadRelease?.yield(())
-        try await until("hydrated cloud docx did not replace the download ring with Quick Look") {
+        try await until("hydrated cloud docx did not replace the download ring with LocalPreviewPanel") {
             app.localPreview?.previewURL == docxPlaceholder && app.inlinePreview.state == .closed
         }
         try escape()
@@ -3820,9 +3849,9 @@ final class LauncherSmoke {
         try escape()
         try await until("Escape did not cancel the Cmd+Y text placeholder download") { self.previewDownloadsCancelled == cancelled + 3 }
         try space()
-        try await until("Space did not show the 40% download ring for the cloud text file") {
+        try await until("Space did not show the 40% .windowHandoff download ring for the cloud text file") {
             if case .downloading(let item, 0.4) = app.inlinePreview.state {
-                return item.url == placeholder && item.kind == .quickLook && app.inlinePreview.isOpen && app.localPreview == nil
+                return item.url == placeholder && item.kind == .windowHandoff && app.inlinePreview.isOpen && app.localPreview == nil
             }
             return false
         }
@@ -3834,12 +3863,12 @@ final class LauncherSmoke {
         try space()
         try await until("second Space did not restart download for the cloud text file") {
             if case .downloading(let item, 0.4) = app.inlinePreview.state {
-                return item.url == placeholder && item.kind == .quickLook
+                return item.url == placeholder && item.kind == .windowHandoff
             }
             return false
         }
         previewDownloadRelease?.yield(())
-        try await until("hydrated cloud text did not replace the download ring with Quick Look") {
+        try await until("hydrated cloud text did not replace the download ring with LocalPreviewPanel") {
             app.localPreview?.previewURL == placeholder && app.inlinePreview.state == .closed
         }
         try escape()
@@ -3855,6 +3884,29 @@ final class LauncherSmoke {
                   "Quick Look / inline hydration started extra downloads or did not cancel exactly four times")
         try escape()
 
+        // Releasing Cmd+Y on a cloud .docx hydrates cleanly into inline rich preview without opening LocalPreviewPanel.
+        let docxInline = provider.appendingPathComponent("cloud-quick-look-inline.docx")
+        try select(docxInline)
+        try cmdY()
+        try await until("Cmd+Y did not show the 40% download ring for cloud inline docx") {
+            if case .downloading(let item, 0.4) = app.inlinePreview.state {
+                return item.url == docxInline && item.kind == .richDocument(.word) &&
+                    app.inlinePreview.isOpen && app.localPreview == nil
+            }
+            return false
+        }
+        previewDownloadRelease?.yield(())
+        try await until("hydrated Cmd+Y cloud docx did not stay in inline preview") {
+            if case .ready(let item, let doc) = app.inlinePreview.state {
+                return item.url == docxInline && item.kind == .richDocument(.word) &&
+                    doc.richHTML != nil && app.inlinePreview.isOpen && app.localPreview == nil
+            }
+            return false
+        }
+        try check(previewDownloadsStarted == started + 7 && previewDownloadsCancelled == cancelled + 4,
+                  "inline cloud docx hydration started extra downloads")
+        try escape()
+
         // Pressing Return on a cloud placeholder must open via NSWorkspace (no .online block).
         opened = nil
         try select(placeholder)
@@ -3865,7 +3917,610 @@ final class LauncherSmoke {
         try check(model.searchNotice == nil, "opening a cloud placeholder raised an online-only error notice")
         opened = nil
         app.showSearch()
-        print("Cloud preview & Quick Look passed (unified .txt/.docx Space + Cmd+Y, progress, Escape cancel, hydrated handoff)")
+        print("Cloud preview & Quick Look passed (unified .txt/.docx Space + Cmd+Y, progress, Escape cancel, hydrated inline & window handoff)")
+    }
+
+    private func verifyRichPreviewExperience(_ app: AppDelegate, selected: URL) async throws {
+        let model = app.model
+        let fm = FileManager.default
+        let richDir = selected.appendingPathComponent("rich-preview", isDirectory: true)
+        try fm.createDirectory(at: richDir, withIntermediateDirectories: true)
+
+        func writeSolidPNG(to url: URL, width: Int, height: Int, r: CGFloat, g: CGFloat, b: CGFloat) throws {
+            guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+                  let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+                                      bytesPerRow: 0, space: colorSpace,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+                throw Failure("could not create CGContext for \(url.lastPathComponent)")
+            }
+            ctx.setFillColor(CGColor(srgbRed: r, green: g, blue: b, alpha: 1))
+            ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+            guard let cgImage = ctx.makeImage() else { throw Failure("could not create CGImage") }
+            let rep = NSBitmapImageRep(cgImage: cgImage)
+            guard let png = rep.representation(using: .png, properties: [:]) else {
+                throw Failure("could not encode PNG for \(url.lastPathComponent)")
+            }
+            try png.write(to: url)
+        }
+
+        try writeSolidPNG(to: richDir.appendingPathComponent("hero-light.png"), width: 220, height: 72, r: 0.16, g: 0.42, b: 0.88)
+        try writeSolidPNG(to: richDir.appendingPathComponent("hero-dark.png"), width: 220, height: 72, r: 0.94, g: 0.56, b: 0.14)
+        try writeSolidPNG(to: richDir.appendingPathComponent("diagram.png"), width: 180, height: 80, r: 0.12, g: 0.65, b: 0.45)
+        try Data().write(to: richDir.appendingPathComponent("cloud-md-placeholder.png"))
+
+        let mdFiller = (1...32).map { "Section paragraph \($0): deterministic local index and WebKit preview pipeline details." }
+            .joined(separator: "\n\n")
+        let markdownSource = """
+        # Lumen Rich Preview Architecture
+
+        <p>
+          <picture>
+            <source media="(prefers-color-scheme: dark)" srcset="hero-dark.png">
+            <img src="hero-light.png" alt="Hero Banner" width="220" height="72">
+          </picture>
+        </p>
+
+        <p>
+          <img src="https://img.shields.io/badge/Build-Passing-brightgreen" alt="CI Badge">
+        </p>
+
+        ![Architecture Diagram](diagram.png)
+
+        ![Cloud Image](cloud-md-placeholder.png)
+
+        ## Quarterly Metrics
+
+        | Component | Latency | Mode |
+        | :--- | ---: | :--- |
+        | Name Index | 1.1 ms | Local |
+        | WebKit Preview | 18 ms | Offline |
+
+        ```swift
+        let previewReady = true
+        ```
+
+        \(mdFiller)
+
+        ## Bottom Anchor
+
+        Final finding: LumenMarkdownNeedle verified across inline and floating WebKit previews.
+        """
+        let mdURL = richDir.appendingPathComponent("rich-fixture.md")
+        try Data(markdownSource.utf8).write(to: mdURL)
+
+        let docxURL = richDir.appendingPathComponent("rich-fixture.docx")
+        var docxParagraphs = ["季度研发复盘与多模态架构设计"]
+        for i in 1...28 {
+            docxParagraphs.append("第 \(i) 节：本段用于验证原生 Word 文档长文滚动排版与离线安全性。")
+        }
+        docxParagraphs.append("核心结论：LumenDocxNeedleKeyword 已在 WebKit 中正确高亮显示。")
+        try Self.makeDOCXFixture(paragraphs: docxParagraphs).write(to: docxURL)
+
+        let xlsxURL = richDir.appendingPathComponent("rich-budget.xlsx")
+        try Self.makeXLSXFixture(sheets: [
+            (name: "概览", rows: [
+                [("A", "模块"), ("B", "负责人"), ("C", "状态")],
+                [("A", "全盘检索"), ("B", "陈敏"), ("C", "已上线")],
+                [("A", "原生预览"), ("B", "Lumen"), ("C", "验收中")],
+            ]),
+            (name: "季度预算", rows: [
+                [("A", "科目"), ("C", "预算明细")],
+                [("A", "研发算力"), ("C", "LumenXlsxSheet2Needle 专项预算 ¥128,000")],
+                [("A", "测试设备"), ("C", "Mac Studio M5 Max")],
+            ]),
+        ]).write(to: xlsxURL)
+
+        let pptxURL = richDir.appendingPathComponent("rich-deck.pptx")
+        try Self.makePPTXFixture(slides: ["LumenPptxDeckNeedle Roadmap Slide 1"]).write(to: pptxURL)
+
+        model.rebuildSavedIndex()
+        try await until("rich preview fixtures were indexed") {
+            !model.scopePending && model.canSearch && model.watchState == .running &&
+                model.contentCoverage?.pending == 0
+        }
+
+        func cmdY() throws { try key(kVK_ANSI_Y, "y", in: app, throughPanel: true, flags: [.command]) }
+        func space() throws {
+            app.panel.browsing = true
+            try key(kVK_Space, " ", in: app, throughPanel: true)
+        }
+        func escape() throws { try key(kVK_Escape, "\u{1b}", in: app, throughPanel: true) }
+
+        func waitJS<T>(_ container: DocumentWebPreviewContainer, label: String,
+                       evaluate: @escaping () async -> T?) async throws -> T {
+            let deadline = ContinuousClock.now + .seconds(12)
+            while ContinuousClock.now < deadline {
+                if let value = await evaluate() { return value }
+                try await Task.sleep(for: .milliseconds(30))
+            }
+            throw Failure("Timed out waiting for WebKit preview JS: \(label)")
+        }
+
+        func captureWeb(_ filename: String, appearance: NSAppearance.Name,
+                        container: DocumentWebPreviewContainer, window: NSWindow) async throws {
+            let priorWindowAppearance = window.appearance
+            let priorAppAppearance = NSApp.appearance
+            defer {
+                window.appearance = priorWindowAppearance
+                NSApp.appearance = priorAppAppearance
+            }
+            let targetAppearance = NSAppearance(named: appearance)
+            window.appearance = targetAppearance
+            NSApp.appearance = targetAppearance
+            window.contentView?.layoutSubtreeIfNeeded()
+            let wantDark = appearance == .darkAqua
+            _ = try await waitJS(container, label: "appearance \(filename)") {
+                let dark = await container.evaluateVerificationJS("window.matchMedia('(prefers-color-scheme: dark)').matches") as? Bool
+                return dark == wantDark ? true : nil
+            }
+            try await Task.sleep(for: .milliseconds(50))
+            guard let snapshot = await container.captureSnapshot(),
+                  let tiff = snapshot.tiffRepresentation,
+                  let rep = NSBitmapImageRep(data: tiff),
+                  let png = rep.representation(using: .png, properties: [:]),
+                  png.count > 1000 else {
+                throw Failure("failed to capture non-empty WebKit snapshot for \(filename)")
+            }
+            try png.write(to: directory.appendingPathComponent(filename))
+        }
+
+        let downloadsBefore = previewDownloadsStarted
+
+        func checkMarkdownWebPreview(_ container: DocumentWebPreviewContainer, label: String) async throws {
+            let info: [String: Any] = try await waitJS(container, label: label) {
+                await container.evaluateVerificationJS("""
+                (() => {
+                  const p = window.__lumenPreview;
+                  if (!p || !(p.matchCount >= 1)) return null;
+                  const imgs = Array.from(document.querySelectorAll('img'));
+                  const httpImgs = imgs.filter(i => /^https?:/i.test(i.getAttribute('src') || ''));
+                  const loadedLocal = imgs.filter(i => (i.getAttribute('src') || '').startsWith('lumen-local://') && i.complete && i.naturalWidth > 0);
+                  const mark = document.querySelector('mark.lumen-hit');
+                  const rect = mark ? mark.getBoundingClientRect() : null;
+                  if (!rect || loadedLocal.length < 2) return null;
+                  return {
+                    matchCount: p.matchCount,
+                    httpCount: httpImgs.length,
+                    loadedLocal: loadedLocal.length,
+                    badges: document.querySelectorAll('.lumen-remote-badge').length,
+                    scrollY: window.scrollY,
+                    top: rect.top,
+                    bottom: rect.bottom,
+                    vh: window.innerHeight
+                  };
+                })()
+                """) as? [String: Any]
+            }
+            try check((info["httpCount"] as? Int) == 0 &&
+                      (info["badges"] as? Int ?? 0) >= 1 &&
+                      (info["matchCount"] as? Int ?? 0) >= 1 &&
+                      (info["loadedLocal"] as? Int ?? 0) >= 2 &&
+                      ((info["scrollY"] as? Double ?? 0) > 0) &&
+                      ((info["top"] as? Double ?? -999) >= -24) &&
+                      ((info["bottom"] as? Double ?? 99999) <= (info["vh"] as? Double ?? 0) + 24),
+                      "\(label) failed: \(info)")
+            try check(previewDownloadsStarted == downloadsBefore, "\(label) triggered a cloud image download")
+        }
+
+        func checkXLSXSheet2WebPreview(_ container: DocumentWebPreviewContainer, label: String) async throws {
+            let info: [String: Any] = try await waitJS(container, label: label) {
+                await container.evaluateVerificationJS("""
+                (() => {
+                  const p = window.__lumenPreview;
+                  const sheetIndex = p ? (typeof p.activeSheetIndex === 'number' ? p.activeSheetIndex : p.activeSheet) : -1;
+                  if (!p || !(p.matchCount >= 1) || sheetIndex !== 1) return null;
+                  const panel1 = document.querySelector('.lumen-sheet-panel[data-sheet-idx="1"]');
+                  if (!panel1 || getComputedStyle(panel1).display === 'none') return null;
+                  const hitInSheet2 = panel1.querySelector('mark.lumen-hit');
+                  if (!hitInSheet2) return null;
+                  const activeTab = document.querySelector('.lumen-sheet-tabs [aria-selected="true"], .lumen-sheet-tabs .active, .lumen-sheet-tabs .is-active, .lumen-sheet-tabs .selected');
+                  const tabsText = (document.querySelector('.lumen-sheet-tabs') || {}).textContent || '';
+                  return {
+                    matchCount: p.matchCount,
+                    activeSheet: sheetIndex,
+                    activeSheetName: typeof p.activeSheet === 'string' ? p.activeSheet : '',
+                    tabText: activeTab ? activeTab.textContent : '',
+                    tabsText: tabsText,
+                    hitText: hitInSheet2.textContent || ''
+                  };
+                })()
+                """) as? [String: Any]
+            }
+            let tabText = info["tabText"] as? String ?? ""
+            let tabsText = info["tabsText"] as? String ?? ""
+            let activeSheetName = info["activeSheetName"] as? String ?? ""
+            try check((info["activeSheet"] as? Int) == 1 &&
+                      (info["matchCount"] as? Int ?? 0) >= 1 &&
+                      tabsText.contains("季度预算") &&
+                      (activeSheetName.isEmpty || activeSheetName == "季度预算") &&
+                      (tabText.isEmpty || tabText.contains("季度预算")),
+                      "\(label) did not auto-activate Sheet 2 (季度预算): \(info)")
+        }
+
+        // 1. Markdown fixture (headings, table, <picture>, remote badge pill, cloud skip, body highlight + scroll).
+        try type("LumenMarkdownNeedle", into: app)
+        try await until("Markdown body hit was not selectable") {
+            model.selectedHit?.path == IndexScope.folderPath(mdURL) && model.selectedHit?.snippet != nil
+        }
+        try cmdY()
+        try await until("Markdown Cmd+Y did not open inline rich HTML preview") {
+            if case .ready(let sel, let doc) = app.inlinePreview.state {
+                return sel.kind == .richDocument(.markdown) && doc.richHTML != nil &&
+                    app.inlinePreview.activeWebContainer != nil && app.localPreview == nil
+            }
+            return false
+        }
+        guard let mdInlineContainer = app.inlinePreview.activeWebContainer else {
+            throw Failure("missing inline WebKit container for Markdown")
+        }
+        try await checkMarkdownWebPreview(mdInlineContainer, label: "inline markdown diagnostics")
+        if exists("capture-preview") {
+            try await captureWeb("preview-inline-md.png", appearance: .aqua, container: mdInlineContainer, window: app.panel)
+        }
+        try escape()
+        try check(!app.inlinePreview.isOpen, "Escape did not close inline markdown preview")
+
+        try space()
+        try await until("Markdown Space did not open LocalPreviewPanel with WebKit") {
+            app.localPreview?.previewURL?.path == IndexScope.folderPath(mdURL) &&
+                app.localPreview?.webPreviewContainer != nil
+        }
+        guard let mdWindow = app.localPreview, let mdWindowContainer = mdWindow.webPreviewContainer else {
+            throw Failure("missing LocalPreviewPanel WebKit container for Markdown")
+        }
+        try await checkMarkdownWebPreview(mdWindowContainer, label: "window markdown diagnostics")
+        if exists("capture-preview") {
+            try await captureWeb("preview-md-light.png", appearance: .aqua, container: mdWindowContainer, window: mdWindow)
+            try await captureWeb("preview-md-dark.png", appearance: .darkAqua, container: mdWindowContainer, window: mdWindow)
+        }
+        try escape()
+        try check(app.localPreview == nil, "Escape did not close markdown LocalPreviewPanel")
+
+        // 2. Real repo README.md parsed by DocumentPreviewRenderer.
+        let repoCandidates = [
+            Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent(),
+            URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent(),
+            URL(fileURLWithPath: fm.currentDirectoryPath),
+        ]
+        guard let repoRoot = repoCandidates.first(where: { fm.fileExists(atPath: $0.appendingPathComponent("README.md").path) }) else {
+            throw Failure("could not locate repo README.md from candidates: \(repoCandidates.map(\.path))")
+        }
+        let readmeURL = repoRoot.appendingPathComponent("README.md")
+        guard let readmeContent = DocumentPreviewRenderer.render(
+            url: readmeURL,
+            format: .markdown,
+            evidence: nil,
+            isPending: { _ in false }
+        ) else {
+            throw Failure("DocumentPreviewRenderer returned nil for repo README.md")
+        }
+        try check(readmeContent.localResources.values.contains { $0.path.contains("/assets/readme/") && $0.pathExtension.lowercased() == "png" },
+                  "README.md did not register local assets/readme/*.png resources: \(readmeContent.localResources.values.map(\.path))")
+        try check(readmeContent.html.range(of: #"<(?:img|source)\b[^>]*\b(?:src|srcset)\s*=\s*["']https?://"#,
+                                           options: [.regularExpression, .caseInsensitive]) == nil,
+                  "README.md rendered HTML still contained external http(s) image sources")
+
+        // 3. .docx zip fixture: filename hit stays inline; body hit highlights mark.lumen-hit >= 1 in Cmd+Y and Space.
+        try type("rich-fixture.docx", into: app)
+        try await until("DOCX filename hit was not selectable") { model.selectedHit?.path == IndexScope.folderPath(docxURL) }
+        try cmdY()
+        try await until("DOCX filename Cmd+Y did not open inline rich preview") {
+            if case .ready(let sel, let doc) = app.inlinePreview.state {
+                return sel.kind == .richDocument(.word) && doc.richHTML != nil &&
+                    app.inlinePreview.activeWebContainer != nil && app.localPreview == nil
+            }
+            return false
+        }
+        if let docxFilenameContainer = app.inlinePreview.activeWebContainer {
+            let hasChineseTitle: Bool = try await waitJS(docxFilenameContainer, label: "docx filename content") {
+                let ok = await docxFilenameContainer.evaluateVerificationJS(
+                    "(document.body && document.body.innerText.includes('季度研发复盘与多模态架构设计')) ? true : null"
+                ) as? Bool
+                return ok
+            }
+            try check(hasChineseTitle && app.localPreview == nil, "DOCX filename inline preview missing Chinese content")
+        }
+        try escape()
+
+        try type("LumenDocxNeedleKeyword", into: app)
+        try await until("DOCX body hit was not selectable") {
+            model.selectedHit?.path == IndexScope.folderPath(docxURL) && model.selectedHit?.snippet != nil
+        }
+        try cmdY()
+        try await until("DOCX body Cmd+Y did not open inline rich preview") {
+            if case .ready(let sel, let doc) = app.inlinePreview.state {
+                return sel.kind == .richDocument(.word) && doc.richHTML != nil &&
+                    app.inlinePreview.activeWebContainer != nil && app.localPreview == nil
+            }
+            return false
+        }
+        guard let docxInlineContainer = app.inlinePreview.activeWebContainer else {
+            throw Failure("missing inline WebKit container for DOCX")
+        }
+        let docxInlineHits: Int = try await waitJS(docxInlineContainer, label: "inline docx match") {
+            guard let count = await docxInlineContainer.evaluateVerificationJS("window.__lumenPreview?.matchCount") as? Int,
+                  count >= 1 else { return nil }
+            return count
+        }
+        try check(docxInlineHits >= 1 && app.localPreview == nil, "DOCX inline preview missed highlight")
+        try escape()
+
+        try space()
+        try await until("DOCX Space did not open LocalPreviewPanel") {
+            app.localPreview?.previewURL?.path == IndexScope.folderPath(docxURL) &&
+                app.localPreview?.webPreviewContainer != nil
+        }
+        guard let docxWindow = app.localPreview, let docxWindowContainer = docxWindow.webPreviewContainer else {
+            throw Failure("missing LocalPreviewPanel WebKit container for DOCX")
+        }
+        let docxWindowHits: Int = try await waitJS(docxWindowContainer, label: "window docx match") {
+            guard let count = await docxWindowContainer.evaluateVerificationJS("window.__lumenPreview?.matchCount") as? Int,
+                  count >= 1 else { return nil }
+            return count
+        }
+        try check(docxWindowHits >= 1, "DOCX window preview missed highlight")
+        if exists("capture-preview") {
+            try await captureWeb("preview-docx-light.png", appearance: .aqua, container: docxWindowContainer, window: docxWindow)
+        }
+        try escape()
+
+        // 4. .xlsx 2-sheet zip fixture: filename hit stays inline; body hit on Sheet 2 activates 季度预算 + highlights cell.
+        try type("rich-budget.xlsx", into: app)
+        try await until("XLSX filename hit was not selectable") { model.selectedHit?.path == IndexScope.folderPath(xlsxURL) }
+        try cmdY()
+        try await until("XLSX filename Cmd+Y did not open inline rich preview") {
+            if case .ready(let sel, let doc) = app.inlinePreview.state {
+                return sel.kind == .richDocument(.spreadsheet) && doc.richHTML != nil && app.localPreview == nil
+            }
+            return false
+        }
+        try escape()
+
+        try type("LumenXlsxSheet2Needle", into: app)
+        try await until("XLSX body hit was not selectable") {
+            model.selectedHit?.path == IndexScope.folderPath(xlsxURL) && model.selectedHit?.snippet != nil
+        }
+        try cmdY()
+        try await until("XLSX body Cmd+Y did not open inline rich preview") {
+            if case .ready(let sel, let doc) = app.inlinePreview.state {
+                return sel.kind == .richDocument(.spreadsheet) && doc.richHTML != nil &&
+                    app.inlinePreview.activeWebContainer != nil && app.localPreview == nil
+            }
+            return false
+        }
+        guard let xlsxInlineContainer = app.inlinePreview.activeWebContainer else {
+            throw Failure("missing inline WebKit container for XLSX")
+        }
+        try await checkXLSXSheet2WebPreview(xlsxInlineContainer, label: "inline xlsx sheet 2 match")
+        if exists("capture-preview") {
+            try await captureWeb("preview-inline-xlsx.png", appearance: .aqua, container: xlsxInlineContainer, window: app.panel)
+        }
+        try escape()
+
+        try space()
+        try await until("XLSX Space did not open LocalPreviewPanel") {
+            app.localPreview?.previewURL?.path == IndexScope.folderPath(xlsxURL) &&
+                app.localPreview?.webPreviewContainer != nil
+        }
+        guard let xlsxWindow = app.localPreview, let xlsxWindowContainer = xlsxWindow.webPreviewContainer else {
+            throw Failure("missing LocalPreviewPanel WebKit container for XLSX")
+        }
+        try await checkXLSXSheet2WebPreview(xlsxWindowContainer, label: "window xlsx sheet 2 match")
+        if exists("capture-preview") {
+            try await captureWeb("preview-xlsx-dark.png", appearance: .darkAqua, container: xlsxWindowContainer, window: xlsxWindow)
+        }
+        try escape()
+
+        // 5. .pptx zip fixture: filename hit stays inline (.inlineQuickLook); Space opens LocalPreviewPanel.
+        try type("rich-deck.pptx", into: app)
+        try await until("PPTX filename hit was not selectable") { model.selectedHit?.path == IndexScope.folderPath(pptxURL) }
+        try cmdY()
+        try await until("PPTX Cmd+Y did not open inlineQuickLook without opening LocalPreviewPanel") {
+            if case .ready(let sel, let doc) = app.inlinePreview.state {
+                return sel.kind == .inlineQuickLook &&
+                    doc.quickLookURL?.path == IndexScope.folderPath(pptxURL) &&
+                    app.localPreview == nil
+            }
+            return false
+        }
+        try escape()
+        try space()
+        try await until("PPTX Space did not open LocalPreviewPanel") {
+            app.localPreview?.previewURL?.path == IndexScope.folderPath(pptxURL)
+        }
+        try escape()
+        try check(app.localPreview == nil && !app.inlinePreview.isOpen, "Escape left PPTX preview open")
+        print("Rich preview experience passed (Markdown + README.md, DOCX, 2-sheet XLSX tab jump, PPTX inline Quick Look & Space)")
+    }
+
+    private nonisolated static func xmlEscaped(_ text: String) -> String {
+        text.replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+    }
+
+    private nonisolated static func makeStoredZip(_ entries: [(String, Data)]) -> Data {
+        var out = Data()
+        var central = Data()
+        func append16(_ data: inout Data, _ value: UInt16) {
+            var le = value.littleEndian
+            withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
+        }
+        func append32(_ data: inout Data, _ value: UInt32) {
+            var le = value.littleEndian
+            withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
+        }
+        for (name, content) in entries {
+            let nameData = Data(name.utf8)
+            let crc = UInt32(content.withUnsafeBytes {
+                crc32(0, $0.bindMemory(to: UInt8.self).baseAddress, uInt($0.count))
+            })
+            let offset = UInt32(out.count)
+            let size = UInt32(content.count)
+            append32(&out, 0x04034b50)
+            append16(&out, 20)
+            append16(&out, 0x0800)
+            append16(&out, 0)
+            append16(&out, 0); append16(&out, 0)
+            append32(&out, crc); append32(&out, size); append32(&out, size)
+            append16(&out, UInt16(nameData.count)); append16(&out, 0)
+            out.append(nameData)
+            out.append(content)
+            append32(&central, 0x02014b50)
+            append16(&central, 20); append16(&central, 20)
+            append16(&central, 0x0800); append16(&central, 0)
+            append16(&central, 0); append16(&central, 0)
+            append32(&central, crc); append32(&central, size); append32(&central, size)
+            append16(&central, UInt16(nameData.count)); append16(&central, 0); append16(&central, 0)
+            append16(&central, 0); append16(&central, 0); append32(&central, 0)
+            append32(&central, offset)
+            central.append(nameData)
+        }
+        let cdOffset = UInt32(out.count)
+        let cdSize = UInt32(central.count)
+        out.append(central)
+        append32(&out, 0x06054b50)
+        append16(&out, 0); append16(&out, 0)
+        append16(&out, UInt16(entries.count)); append16(&out, UInt16(entries.count))
+        append32(&out, cdSize); append32(&out, cdOffset)
+        append16(&out, 0)
+        return out
+    }
+
+    private nonisolated static func makeDOCXFixture(paragraphs: [String]) -> Data {
+        let rels = """
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+          <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+        </Relationships>
+        """
+        let contentTypes = """
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+          <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+          <Default Extension="xml" ContentType="application/xml"/>
+          <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+        </Types>
+        """
+        let body = paragraphs.map { "<w:p><w:r><w:t>\(xmlEscaped($0))</w:t></w:r></w:p>" }.joined()
+        let document = """
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <w:body>\(body)</w:body>
+        </w:document>
+        """
+        return makeStoredZip([
+            ("[Content_Types].xml", Data(contentTypes.utf8)),
+            ("_rels/.rels", Data(rels.utf8)),
+            ("word/document.xml", Data(document.utf8)),
+        ])
+    }
+
+    private nonisolated static func makeXLSXFixture(sheets: [(name: String, rows: [[(col: String, value: String)]])]) -> Data {
+        let rootRels = """
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+          <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+        </Relationships>
+        """
+        var shared: [String] = []
+        var sharedIndex: [String: Int] = [:]
+        func intern(_ text: String) -> Int {
+            if let existing = sharedIndex[text] { return existing }
+            let idx = shared.count
+            shared.append(text)
+            sharedIndex[text] = idx
+            return idx
+        }
+        var entries: [(String, Data)] = [("_rels/.rels", Data(rootRels.utf8))]
+        var sheetOverrides = ""
+        var workbookSheets = ""
+        var workbookRels = ""
+        for (idx, sheet) in sheets.enumerated() {
+            let num = idx + 1
+            sheetOverrides += "<Override PartName=\"/xl/worksheets/sheet\(num).xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
+            workbookSheets += "<sheet name=\"\(xmlEscaped(sheet.name))\" sheetId=\"\(num)\" r:id=\"rId\(num)\"/>"
+            workbookRels += "<Relationship Id=\"rId\(num)\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet\(num).xml\"/>"
+            var rowsXML = ""
+            for (rowOffset, row) in sheet.rows.enumerated() {
+                let rowNum = rowOffset + 1
+                let cellsXML = row.map { cell -> String in
+                    let strIdx = intern(cell.value)
+                    return "<c r=\"\(cell.col)\(rowNum)\" t=\"s\"><v>\(strIdx)</v></c>"
+                }.joined()
+                rowsXML += "<row r=\"\(rowNum)\">\(cellsXML)</row>"
+            }
+            let sheetXML = """
+            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+              <sheetData>\(rowsXML)</sheetData>
+            </worksheet>
+            """
+            entries.append(("xl/worksheets/sheet\(num).xml", Data(sheetXML.utf8)))
+        }
+        let sstItems = shared.map { "<si><t>\(xmlEscaped($0))</t></si>" }.joined()
+        let sharedStringsXML = """
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="\(shared.count)" uniqueCount="\(shared.count)">\(sstItems)</sst>
+        """
+        let workbookXML = """
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+          <sheets>\(workbookSheets)</sheets>
+        </workbook>
+        """
+        let workbookRelsXML = """
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\(workbookRels)</Relationships>
+        """
+        let contentTypes = """
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+          <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+          <Default Extension="xml" ContentType="application/xml"/>
+          <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+          <Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
+          \(sheetOverrides)
+        </Types>
+        """
+        entries.append(("[Content_Types].xml", Data(contentTypes.utf8)))
+        entries.append(("xl/workbook.xml", Data(workbookXML.utf8)))
+        entries.append(("xl/_rels/workbook.xml.rels", Data(workbookRelsXML.utf8)))
+        entries.append(("xl/sharedStrings.xml", Data(sharedStringsXML.utf8)))
+        return makeStoredZip(entries)
+    }
+
+    private nonisolated static func makePPTXFixture(slides: [String]) -> Data {
+        let rels = """
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+          <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
+        </Relationships>
+        """
+        var slideOverrides = ""
+        var entries: [(String, Data)] = [("_rels/.rels", Data(rels.utf8))]
+        for (idx, text) in slides.enumerated() {
+            let num = idx + 1
+            slideOverrides += "<Override PartName=\"/ppt/slides/slide\(num).xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.slide+xml\"/>"
+            let slideXML = """
+            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            <p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+              <p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>\(xmlEscaped(text))</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld>
+            </p:sld>
+            """
+            entries.append(("ppt/slides/slide\(num).xml", Data(slideXML.utf8)))
+        }
+        let contentTypes = """
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+          <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+          <Default Extension="xml" ContentType="application/xml"/>
+          \(slideOverrides)
+        </Types>
+        """
+        entries.append(("[Content_Types].xml", Data(contentTypes.utf8)))
+        return makeStoredZip(entries)
     }
 
     private func writeSparsePreviewPDF(to url: URL) throws {

@@ -1083,16 +1083,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                         self?.openLinkedMedia(mediaURL, for: hit)
                     }
                 }
-                if LauncherInlinePreview.kind(hit) != nil {
+                if !hit.name.lowercased().hasSuffix(".app") {
                     item("preview", "内嵌预览", "Inline Preview", "eye") { [weak self] in
                         self?.previewFile(hit, allowCloudDownload: true)
                     }
                     item("quick-look", "在窗口中预览", "Preview in Window", "macwindow") { [weak self] in
                         self?.previewFile(hit, forceWindow: true, allowCloudDownload: true)
-                    }
-                } else {
-                    item("preview", "快速查看", "Quick Look", "eye") { [weak self] in
-                        self?.previewFile(hit, allowCloudDownload: true)
                     }
                 }
             }
@@ -1424,7 +1420,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         let selected = model.selectedResult
         if case .file(let hit) = selected, model.containsCurrentFile(hit) {
             inlinePreview.retainPreview(for: hit)
-            if case .ready(let item, _) = inlinePreview.state, item.kind == .quickLook {
+            if case .ready(let item, _) = inlinePreview.state, item.kind == .windowHandoff {
                 inlinePreview.close()
                 do { try showLocalPreview(hit, at: item.url) }
                 catch { model.previewFailed() }
@@ -1454,7 +1450,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private func previewFile(_ hit: SearchHit, forceWindow: Bool = false, allowCloudDownload: Bool = false) {
         guard searchPresented, !model.scopePending, model.containsCurrentFile(hit) else { return }
-        if !forceWindow, let kind = LauncherInlinePreview.kind(hit) {
+        if !forceWindow {
+            guard let kind = LauncherInlinePreview.kind(hit) else { return }
             guard hit.isResident || hit.isPlaceholder else { return }
             model.set(\.selectedID, to: hit.id)
             if inlinePreview.hit == hit { inlinePreview.close() }
@@ -1462,18 +1459,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             updatePresentation()
             return
         }
+        guard hit.kind == "file", !hit.name.lowercased().hasSuffix(".app") else { return }
         model.set(\.selectedID, to: hit.id)
         model.resolve(hit, action: .preview) { [weak self] url in
             guard let self, self.searchPresented, !self.model.scopePending, self.model.containsCurrentFile(hit),
                   self.model.selectedResult?.id == hit.id else { return }
-            do {
-                try self.showLocalPreview(hit, at: url)
-            } catch is LocalFile.Placeholder where allowCloudDownload {
-                self.inlinePreview.show(hit, kind: .quickLook, allowCloudDownload: true)
-                self.updatePresentation()
-            } catch {
-                self.model.previewFailed()
+            let ext = url.pathExtension.lowercased()
+            let needsQuickLookBanner = hit.snippet != nil && ext != "pdf"
+                && MacPreviewRenderer.richFormat(forExtension: ext) == nil
+                && !MacPreviewRenderer.isPlainTextExtension(ext)
+            if needsQuickLookBanner {
+                do {
+                    try self.inlinePreview.withResidentFile(url, expectedStamp: nil) {}
+                } catch is LocalFile.Placeholder where allowCloudDownload {
+                    self.inlinePreview.show(hit, kind: .windowHandoff, allowCloudDownload: true, query: self.model.query)
+                    self.updatePresentation()
+                    return
+                } catch {
+                    self.model.previewFailed()
+                    return
+                }
+                let trimmedQuery = self.model.query.trimmingCharacters(in: .whitespacesAndNewlines)
+                let highlight = hit.isSemanticCandidate ? hit.snippet : (trimmedQuery.isEmpty ? hit.snippet : trimmedQuery)
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let context = await self.engine.excerpt(path: hit.path, query: highlight, snippet: hit.snippet)
+                    guard self.searchPresented, !self.model.scopePending, self.model.containsCurrentFile(hit),
+                          self.model.selectedResult?.id == hit.id else { return }
+                    self.presentResolvedLocalPreview(hit, at: url, context: context, allowCloudDownload: allowCloudDownload)
+                }
+                return
             }
+            self.presentResolvedLocalPreview(hit, at: url, context: nil, allowCloudDownload: allowCloudDownload)
+        }
+    }
+
+    private func presentResolvedLocalPreview(_ hit: SearchHit, at url: URL, context: String?, allowCloudDownload: Bool) {
+        do {
+            try showLocalPreview(hit, at: url, context: context)
+        } catch is LocalFile.Placeholder where allowCloudDownload {
+            inlinePreview.show(hit, kind: .windowHandoff, allowCloudDownload: true, query: model.query)
+            updatePresentation()
+        } catch {
+            model.previewFailed()
         }
     }
 
@@ -1507,12 +1535,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         #endif
     }
 
-    private func showLocalPreview(_ hit: SearchHit, at url: URL) throws {
+    private func showLocalPreview(_ hit: SearchHit, at url: URL, context: String? = nil) throws {
         let metrics = previewMetrics()
-        let highlight = hit.isSemanticCandidate ? hit.snippet : model.query
+        let trimmedQuery = model.query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let highlight = hit.isSemanticCandidate ? hit.snippet : (trimmedQuery.isEmpty ? hit.snippet : trimmedQuery)
         guard let preview = try inlinePreview.withResidentFile(url, expectedStamp: nil, {
             LocalPreviewPanel(url: url, title: hit.name, page: hit.pdf_page,
                               highlight: highlight, snippet: hit.snippet,
+                              context: context, isRelated: hit.isSemanticCandidate,
+                              chinese: model.zh,
                               maxSize: metrics.maxSize, backingScale: metrics.scale)
         }) else { throw PreviewFailure.invalidContent }
         presentLocalPreview(preview, on: metrics.visible)
@@ -1527,6 +1558,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             do {
                 guard let preview = try inlinePreview.withResidentFile(url, expectedStamp: nil, {
                     LocalPreviewPanel(url: url, title: url.lastPathComponent,
+                                      chinese: model.zh,
                                       maxSize: metrics.maxSize, backingScale: metrics.scale)
                 }) else { model.previewFailed(); return }
                 presentLocalPreview(preview, on: metrics.visible)

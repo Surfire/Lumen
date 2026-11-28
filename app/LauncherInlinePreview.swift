@@ -15,6 +15,7 @@ final class LauncherInlinePreview: ObservableObject {
     @Published private(set) var state: InlinePreviewState = .closed
     @Published private(set) var hit: SearchHit?
     private(set) var image: NSImage?
+    weak var activeWebContainer: DocumentWebPreviewContainer?
     var onQuickLookReady: (() -> Void)?
     var excerptProvider: (@Sendable (String, String?, String?) async -> String?)?
     private let downloads: DownloadProvider
@@ -36,9 +37,14 @@ final class LauncherInlinePreview: ObservableObject {
                 case .image(let bytes), .pdf(let bytes, _, _): self.image = NSImage(data: bytes)
                 case nil: break
                 }
+                if document.richHTML == nil {
+                    self.activeWebContainer = nil
+                }
+            } else {
+                self.activeWebContainer = nil
             }
             self.state = state
-            if case .ready(let selection, _) = state, selection.kind == .quickLook {
+            if case .ready(let selection, _) = state, selection.kind == .windowHandoff {
                 self.onQuickLookReady?()
             }
         }
@@ -50,11 +56,12 @@ final class LauncherInlinePreview: ObservableObject {
     nonisolated static func kind(_ hit: SearchHit) -> PreviewKind? {
         guard hit.kind == "file" else { return nil }
         let ext = (hit.name as NSString).pathExtension.lowercased()
+        if ext == "app" { return nil }
         if ext == "pdf" { return .pdf(matchPage: hit.pdf_page) }
         if UTType(filenameExtension: ext)?.conforms(to: .image) == true { return .image }
-        if hit.snippet != nil { return .excerpt }
+        if let rich = MacPreviewRenderer.richFormat(forExtension: ext) { return .richDocument(rich) }
         if MacPreviewRenderer.isPlainTextExtension(ext) { return .plainText }
-        return nil
+        return .inlineQuickLook
     }
 
     func show(_ hit: SearchHit, kind: PreviewKind, allowCloudDownload: Bool, query: String = "") {
@@ -86,6 +93,7 @@ final class LauncherInlinePreview: ObservableObject {
     @discardableResult func close() -> Bool {
         guard hit != nil else { return false }
         hit = nil
+        activeWebContainer = nil
         return coordinator.close()
     }
 
@@ -120,14 +128,20 @@ final class LauncherInlinePreview: ObservableObject {
         }
         let document = try await withTaskCancellationHandler(operation: { try await task.value },
                                                            onCancel: { task.cancel() })
-        if document.visual == nil, document.text == nil, let evidence = document.evidence, evidence.context == nil, let excerptProvider,
+        if document.richHTML == nil, document.visual == nil, document.text == nil,
+           let evidence = document.evidence, evidence.context == nil, let excerptProvider,
            let bodyContext = await excerptProvider(item.url.path, evidence.highlight, evidence.text) {
             try Task.checkCancellation()
-            return PreviewDocument(visual: nil, evidence: PreviewEvidence(text: evidence.text,
-                                                                        match: evidence.match,
-                                                                        page: evidence.page,
-                                                                        context: bodyContext,
-                                                                        highlight: evidence.highlight))
+            return PreviewDocument(visual: nil,
+                                   evidence: PreviewEvidence(text: evidence.text,
+                                                             match: evidence.match,
+                                                             page: evidence.page,
+                                                             context: bodyContext,
+                                                             highlight: evidence.highlight),
+                                   text: document.text,
+                                   isCode: document.isCode,
+                                   richHTML: document.richHTML,
+                                   quickLookURL: document.quickLookURL)
         }
         return document
     }

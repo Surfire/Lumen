@@ -307,7 +307,25 @@ fn document_text(xml: &str) -> Result<String> {
 const MAX_OFFICE_PARTS: usize = 128;
 const MAX_SHARED_STRINGS_XML: u64 = 16 * 1024 * 1024;
 const MAX_SHEET_XML: u64 = 16 * 1024 * 1024;
+const MAX_WORKBOOK_XML: u64 = 4 * 1024 * 1024;
 const MAX_SLIDE_XML: u64 = 4 * 1024 * 1024;
+const MAX_PREVIEW_SHEETS: usize = 24;
+const MAX_PREVIEW_ROWS: usize = 1500;
+const MAX_PREVIEW_COLS: usize = 64;
+const MAX_CELL_CHARS: usize = 500;
+const MAX_TOTAL_CELLS: usize = 40_000;
+
+#[derive(serde::Serialize)]
+struct XlsxPreview {
+    sheets: Vec<XlsxPreviewSheet>,
+}
+
+#[derive(serde::Serialize)]
+struct XlsxPreviewSheet {
+    name: String,
+    rows: Vec<Vec<String>>,
+    truncated: bool,
+}
 
 fn append_bounded(body: &mut String, separator: &mut &str, text: &str) -> bool {
     if text.is_empty() {
@@ -543,6 +561,401 @@ pub(super) fn xlsx_text_from_reader<R: Read + Seek>(mut reader: R) -> Result<Str
         }
     }
     Ok(body)
+}
+
+fn normalize_workbook_target(target: &str) -> Option<String> {
+    let trimmed = target.trim().strip_prefix('/').unwrap_or(target.trim());
+    if trimmed.is_empty()
+        || trimmed.contains(['\\', ':', '#', '?'])
+        || trimmed.chars().any(char::is_control)
+        || trimmed
+            .split('/')
+            .any(|component| matches!(component, "" | "." | ".."))
+    {
+        return None;
+    }
+    if trimmed.starts_with("xl/") {
+        Some(trimmed.to_owned())
+    } else {
+        Some(format!("xl/{trimmed}"))
+    }
+}
+
+fn parse_workbook_rels(xml: &str) -> Result<std::collections::HashMap<String, String>> {
+    let mut reader = xml_reader(xml);
+    let mut depth = 0usize;
+    let mut rels = std::collections::HashMap::new();
+    loop {
+        let (_, event) = reader.read_resolved_event()?;
+        match event {
+            Event::Start(node) => {
+                depth += 1;
+                ensure!(depth <= MAX_XML_DEPTH, "XLSX XML nesting exceeds limit");
+                if node.local_name().as_ref() == "Relationship" {
+                    let mut id = None;
+                    let mut target = None;
+                    let mut target_mode = None;
+                    for attr in node.attributes() {
+                        let attr = attr?;
+                        match attr.key.local_name().as_ref() {
+                            "Id" => {
+                                id = Some(
+                                    attr.normalized_value(XmlVersion::Implicit1_0)?.into_owned(),
+                                );
+                            }
+                            "Target" => {
+                                target = Some(
+                                    attr.normalized_value(XmlVersion::Implicit1_0)?.into_owned(),
+                                );
+                            }
+                            "TargetMode" => {
+                                target_mode = Some(
+                                    attr.normalized_value(XmlVersion::Implicit1_0)?.into_owned(),
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    if matches!(target_mode.as_deref(), None | Some("Internal"))
+                        && let (Some(id), Some(target)) = (id, target)
+                        && let Some(normalized) = normalize_workbook_target(&target)
+                    {
+                        rels.insert(id, normalized);
+                    }
+                }
+            }
+            Event::End(_) => depth -= 1,
+            Event::DocType(_) => bail!("DTD is forbidden in XLSX XML"),
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(rels)
+}
+
+fn parse_workbook_sheets(xml: &str) -> Result<Vec<(String, String)>> {
+    let mut reader = xml_reader(xml);
+    let mut depth = 0usize;
+    let mut sheets = Vec::new();
+    loop {
+        let (_, event) = reader.read_resolved_event()?;
+        match event {
+            Event::Start(node) => {
+                depth += 1;
+                ensure!(depth <= MAX_XML_DEPTH, "XLSX XML nesting exceeds limit");
+                if node.local_name().as_ref() == "sheet" {
+                    let mut name = None;
+                    let mut rel_id = None;
+                    for attr in node.attributes() {
+                        let attr = attr?;
+                        match attr.key.local_name().as_ref() {
+                            "name" => {
+                                name = Some(
+                                    attr.normalized_value(XmlVersion::Implicit1_0)?.into_owned(),
+                                );
+                            }
+                            "id" => {
+                                rel_id = Some(
+                                    attr.normalized_value(XmlVersion::Implicit1_0)?.into_owned(),
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(rel_id) = rel_id {
+                        let sheet_name = name
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or_else(|| format!("Sheet {}", sheets.len() + 1));
+                        sheets.push((sheet_name, rel_id));
+                    }
+                }
+            }
+            Event::End(_) => depth -= 1,
+            Event::DocType(_) => bail!("DTD is forbidden in XLSX XML"),
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(sheets)
+}
+
+fn parse_cell_col(reference: &str) -> Option<usize> {
+    let mut col = 0usize;
+    let mut seen_letter = false;
+    for b in reference.bytes() {
+        match b {
+            b'$' if !seen_letter => continue,
+            b'A'..=b'Z' => {
+                seen_letter = true;
+                col = col
+                    .saturating_mul(26)
+                    .saturating_add((b - b'A' + 1) as usize);
+            }
+            b'a'..=b'z' => {
+                seen_letter = true;
+                col = col
+                    .saturating_mul(26)
+                    .saturating_add((b - b'a' + 1) as usize);
+            }
+            _ => break,
+        }
+    }
+    seen_letter.then(|| col - 1)
+}
+
+fn truncate_cell_text(text: &str) -> String {
+    match text.char_indices().nth(MAX_CELL_CHARS) {
+        Some((byte_idx, _)) => {
+            let mut out = String::with_capacity(byte_idx + '…'.len_utf8());
+            out.push_str(&text[..byte_idx]);
+            out.push('…');
+            out
+        }
+        None => text.to_owned(),
+    }
+}
+
+fn parse_preview_sheet(
+    xml: &str,
+    shared: &[String],
+    total_cells: &mut usize,
+    initial_truncated: bool,
+) -> Result<(Vec<Vec<String>>, bool)> {
+    let mut reader = xml_reader(xml);
+    let mut depth = 0usize;
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut current_row: Vec<String> = Vec::new();
+    let mut in_row = false;
+    let mut next_col = 0usize;
+    let mut in_c = false;
+    let mut cell_col = 0usize;
+    let mut cell_type = String::new();
+    let mut in_v = false;
+    let mut in_is = false;
+    let mut in_is_t = false;
+    let mut v_buf = String::new();
+    let mut is_buf = String::new();
+    let mut truncated = initial_truncated;
+
+    loop {
+        let (_, event) = reader.read_resolved_event()?;
+        match event {
+            Event::Start(node) => {
+                depth += 1;
+                ensure!(depth <= MAX_XML_DEPTH, "XLSX XML nesting exceeds limit");
+                match node.local_name().as_ref() {
+                    "row" => {
+                        in_row = true;
+                        current_row.clear();
+                        next_col = 0;
+                    }
+                    "c" if in_row => {
+                        in_c = true;
+                        in_v = false;
+                        in_is = false;
+                        in_is_t = false;
+                        cell_type.clear();
+                        v_buf.clear();
+                        is_buf.clear();
+                        let mut parsed_col = None;
+                        for attr in node.attributes() {
+                            let attr = attr?;
+                            match attr.key.local_name().as_ref() {
+                                "t" => {
+                                    cell_type = attr
+                                        .normalized_value(XmlVersion::Implicit1_0)?
+                                        .into_owned();
+                                }
+                                "r" => {
+                                    let r_val = attr.normalized_value(XmlVersion::Implicit1_0)?;
+                                    parsed_col = parse_cell_col(&r_val);
+                                }
+                                _ => {}
+                            }
+                        }
+                        cell_col = parsed_col.unwrap_or(next_col);
+                        next_col = cell_col.saturating_add(1);
+                    }
+                    "v" if in_c => {
+                        in_v = true;
+                        v_buf.clear();
+                    }
+                    "is" if in_c => {
+                        in_is = true;
+                    }
+                    "t" if in_c && (in_is || cell_type == "inlineStr") => {
+                        in_is_t = true;
+                    }
+                    _ => {}
+                }
+            }
+            Event::End(node) => {
+                match node.local_name().as_ref() {
+                    "v" if in_v => {
+                        in_v = false;
+                    }
+                    "t" if in_is_t => {
+                        in_is_t = false;
+                    }
+                    "is" if in_is => {
+                        in_is = false;
+                        in_is_t = false;
+                    }
+                    "c" if in_c => {
+                        in_c = false;
+                        in_v = false;
+                        in_is = false;
+                        in_is_t = false;
+                        let resolved = if cell_type == "inlineStr" || !is_buf.is_empty() {
+                            is_buf.trim()
+                        } else if cell_type == "s" {
+                            v_buf
+                                .trim()
+                                .parse::<usize>()
+                                .ok()
+                                .and_then(|idx| shared.get(idx))
+                                .map(|s| s.trim())
+                                .unwrap_or("")
+                        } else if cell_type == "b" {
+                            match v_buf.trim() {
+                                "1" | "true" | "TRUE" => "TRUE",
+                                "0" | "false" | "FALSE" => "FALSE",
+                                other => other,
+                            }
+                        } else {
+                            v_buf.trim()
+                        };
+                        if !resolved.is_empty() {
+                            if cell_col >= MAX_PREVIEW_COLS {
+                                truncated = true;
+                            } else {
+                                if current_row.len() <= cell_col {
+                                    current_row.resize_with(cell_col + 1, String::new);
+                                }
+                                current_row[cell_col] = truncate_cell_text(resolved);
+                            }
+                        } else if cell_col >= MAX_PREVIEW_COLS {
+                            truncated = true;
+                        }
+                        cell_type.clear();
+                    }
+                    "row" if in_row => {
+                        in_row = false;
+                        while current_row.last().is_some_and(String::is_empty) {
+                            current_row.pop();
+                        }
+                        if !current_row.is_empty() {
+                            if rows.len() >= MAX_PREVIEW_ROWS || *total_cells >= MAX_TOTAL_CELLS {
+                                truncated = true;
+                            } else {
+                                let remaining_cells = MAX_TOTAL_CELLS - *total_cells;
+                                if current_row.len() > remaining_cells {
+                                    current_row.truncate(remaining_cells);
+                                    truncated = true;
+                                }
+                                *total_cells += current_row.len();
+                                rows.push(std::mem::take(&mut current_row));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                depth -= 1;
+            }
+            Event::Text(text) if in_v || in_is_t => {
+                let target = if in_v { &mut v_buf } else { &mut is_buf };
+                target.push_str(&text.xml10_content());
+            }
+            Event::CData(text) if in_v || in_is_t => {
+                let target = if in_v { &mut v_buf } else { &mut is_buf };
+                target.push_str(&text.xml10_content());
+            }
+            Event::GeneralRef(reference) if in_v || in_is_t => {
+                let decoded = decode_xml_ref(reference)?;
+                let target = if in_v { &mut v_buf } else { &mut is_buf };
+                target.push_str(&decoded);
+            }
+            Event::DocType(_) => bail!("DTD is forbidden in XLSX XML"),
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok((rows, truncated))
+}
+
+/// Extract bounded structured preview sheets and rows from an `.xlsx` workbook
+/// in memory as compact JSON for native table rendering.
+pub fn xlsx_preview_json(bytes: &[u8]) -> Result<String> {
+    ensure!(
+        bytes.len() as u64 <= MAX_ARCHIVE,
+        "XLSX exceeds the archive limit"
+    );
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).context("open XLSX archive")?;
+    ensure!(archive.len() <= MAX_ENTRIES, "XLSX has too many parts");
+    let mut remaining_xml = MAX_TOTAL_XML_BYTES;
+    let shared = match optional_xml_part(
+        &mut archive,
+        "xl/sharedStrings.xml",
+        MAX_SHARED_STRINGS_XML,
+        &mut remaining_xml,
+    )? {
+        Some(xml) => parse_shared_strings(&xml)?,
+        None => Vec::new(),
+    };
+
+    let workbook_xml = optional_xml_part(
+        &mut archive,
+        "xl/workbook.xml",
+        MAX_WORKBOOK_XML,
+        &mut remaining_xml,
+    )?;
+    let workbook_rels_xml = optional_xml_part(
+        &mut archive,
+        "xl/_rels/workbook.xml.rels",
+        MAX_RELATIONSHIPS,
+        &mut remaining_xml,
+    )?;
+
+    let mut resolved = Vec::new();
+    if let (Some(wb_xml), Some(rels_xml)) = (workbook_xml.as_deref(), workbook_rels_xml.as_deref())
+    {
+        let rels = parse_workbook_rels(rels_xml)?;
+        for (name, rel_id) in parse_workbook_sheets(wb_xml)? {
+            if let Some(target) = rels.get(&rel_id)
+                && archive.index_for_name(target).is_some()
+            {
+                resolved.push((name, target.clone()));
+            }
+        }
+    }
+    if resolved.is_empty() {
+        resolved = numbered_parts(&archive, "xl/worksheets/sheet", ".xml")
+            .into_iter()
+            .enumerate()
+            .map(|(idx, part)| (format!("Sheet {}", idx + 1), part))
+            .collect();
+    }
+    ensure!(!resolved.is_empty(), "XLSX has no worksheets");
+
+    let sheets_truncated = resolved.len() > MAX_PREVIEW_SHEETS;
+    if sheets_truncated {
+        resolved.truncate(MAX_PREVIEW_SHEETS);
+    }
+
+    let mut total_cells = 0usize;
+    let mut sheets = Vec::with_capacity(resolved.len());
+    for (sheet_name, part_name) in resolved {
+        let xml = xml_part(&mut archive, &part_name, MAX_SHEET_XML, &mut remaining_xml)?;
+        let (rows, truncated) =
+            parse_preview_sheet(&xml, &shared, &mut total_cells, sheets_truncated)?;
+        sheets.push(XlsxPreviewSheet {
+            name: truncate_cell_text(&sheet_name),
+            rows,
+            truncated,
+        });
+    }
+
+    Ok(serde_json::to_string(&XlsxPreview { sheets })?)
 }
 
 /// Extract searchable slide and speaker-note text from a `.pptx` presentation in memory.
@@ -810,5 +1223,119 @@ mod office_tests {
             text_from_reader(Cursor::new(&bytes)).unwrap(),
             "合同正文摘要"
         );
+    }
+
+    #[test]
+    fn xlsx_preview_json_resolves_multi_sheet_chinese_names_sparse_cols_and_cell_types() {
+        let bytes = make_zip(&[
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+                   <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+                             xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+                     <sheets>
+                       <sheet r:id="rId2" sheetId="2" name="季度预算"/>
+                       <sheet name="概览" sheetId="1" r:id="rId1"/>
+                     </sheets>
+                   </workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+                   <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                     <Relationship Target="/xl/worksheets/sheet2.xml" Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"/>
+                     <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+                   </Relationships>"#,
+            ),
+            (
+                "xl/sharedStrings.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+                   <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+                     <si><t>总收入</t></si>
+                     <si><r><t>研发</t></r><r><t>预算</t></r></si>
+                   </sst>"#,
+            ),
+            (
+                "xl/worksheets/sheet2.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+                   <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+                     <sheetData>
+                       <row r="1">
+                         <c r="A1" t="s"><v>1</v></c>
+                         <c r="C1" t="inlineStr"><is><r><t>1200</t></r><r><t>万</t></r></is></c>
+                       </row>
+                       <row r="2">
+                         <c r="A2" t="b"><v>1</v></c>
+                         <c r="B2" t="b"><v>0</v></c>
+                         <c r="C2" t="str"><f>A1</f><v>达标</v></c>
+                         <c r="D2" t="e"><v>#DIV/0!</v></c>
+                         <c r="E2"><v>98.5</v></c>
+                       </row>
+                     </sheetData>
+                   </worksheet>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+                   <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+                     <sheetData>
+                       <row r="1">
+                         <c t="s" r="A1"><v>0</v></c>
+                         <c><v>5000</v></c>
+                         <c r="D1"/>
+                       </row>
+                     </sheetData>
+                   </worksheet>"#,
+            ),
+        ]);
+
+        let json: serde_json::Value =
+            serde_json::from_str(&xlsx_preview_json(&bytes).unwrap()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "sheets": [
+                    {
+                        "name": "季度预算",
+                        "rows": [
+                            ["研发预算", "", "1200万"],
+                            ["TRUE", "FALSE", "达标", "#DIV/0!", "98.5"]
+                        ],
+                        "truncated": false
+                    },
+                    {
+                        "name": "概览",
+                        "rows": [
+                            ["总收入", "5000"]
+                        ],
+                        "truncated": false
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn xlsx_preview_json_enforces_truncation_bounds_and_fallback_names() {
+        let long_cell = "算".repeat(MAX_CELL_CHARS + 25);
+        let expected_cell = format!("{}…", "算".repeat(MAX_CELL_CHARS));
+        let sheet_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+               <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+                 <sheetData>
+                   <row r="1">
+                     <c r="A1" t="inlineStr"><is><t>{long_cell}</t></is></c>
+                     <c r="BM1" t="inlineStr"><is><t>超出列上限</t></is></c>
+                   </row>
+                 </sheetData>
+               </worksheet>"#
+        );
+        let bytes = make_zip(&[("xl/worksheets/sheet1.xml", &sheet_xml)]);
+        let json: serde_json::Value =
+            serde_json::from_str(&xlsx_preview_json(&bytes).unwrap()).unwrap();
+        assert_eq!(json["sheets"][0]["name"], "Sheet 1");
+        assert_eq!(json["sheets"][0]["truncated"], true);
+        assert_eq!(json["sheets"][0]["rows"][0][0], expected_cell);
+        assert_eq!(json["sheets"][0]["rows"][0].as_array().unwrap().len(), 1);
     }
 }

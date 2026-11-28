@@ -840,6 +840,27 @@ fn decode_biff5_string(codepage: u32, raw: &[u8]) -> String {
         .unwrap_or_else(|| raw.iter().map(|&b| cp1252_byte(b)).collect())
 }
 
+fn decode_biff_rk(rk: u32) -> f64 {
+    let base = if (rk & 2) != 0 {
+        ((rk as i32) >> 2) as f64
+    } else {
+        f64::from_bits(((rk & 0xFFFF_FFFC) as u64) << 32)
+    };
+    if (rk & 1) != 0 { base / 100.0 } else { base }
+}
+
+fn format_biff_number(val: f64) -> Option<String> {
+    if !val.is_finite() {
+        return None;
+    }
+    let val = if val == 0.0 { 0.0 } else { val };
+    if val.fract() == 0.0 && val.abs() <= 9_007_199_254_740_991.0 {
+        Some(format!("{}", val as i64))
+    } else {
+        Some(format!("{val}"))
+    }
+}
+
 /// Extract searchable strings from an Excel 97–2003 (`.xls`) BIFF8 workbook.
 pub(super) fn xls_text<R: Read + Seek>(reader: R) -> Result<String> {
     let mut archive = Ole2Archive::open(reader)?;
@@ -851,13 +872,17 @@ pub(super) fn xls_text<R: Read + Seek>(reader: R) -> Result<String> {
     };
     ensure!(stream.len() >= 4, "truncated XLS workbook stream");
 
+    const REC_FORMULA: u16 = 0x0006;
     const REC_FILEPASS: u16 = 0x002F;
     const REC_CONTINUE: u16 = 0x003C;
     const REC_CODEPAGE: u16 = 0x0042;
+    const REC_MULRK: u16 = 0x00BD;
     const REC_RSTRING: u16 = 0x00D6;
     const REC_SST: u16 = 0x00FC;
+    const REC_NUMBER: u16 = 0x0203;
     const REC_LABEL: u16 = 0x0204;
     const REC_STRING: u16 = 0x0207;
+    const REC_RK: u16 = 0x027E;
     const REC_BOF: u16 = 0x0809;
 
     let mut pos = 0usize;
@@ -986,6 +1011,55 @@ pub(super) fn xls_text<R: Read + Seek>(reader: R) -> Result<String> {
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
                     if !append_bounded(&mut body, &mut separator, trimmed) {
+                        return Ok(body);
+                    }
+                    separator = "\n";
+                }
+            }
+            REC_NUMBER => {
+                if payload.len() < 14 {
+                    continue;
+                }
+                let val = f64::from_bits(read_u64_le(payload, 6)?);
+                if let Some(text) = format_biff_number(val) {
+                    if !append_bounded(&mut body, &mut separator, &text) {
+                        return Ok(body);
+                    }
+                    separator = "\n";
+                }
+            }
+            REC_RK => {
+                if payload.len() < 10 {
+                    continue;
+                }
+                let val = decode_biff_rk(read_u32_le(payload, 6)?);
+                if let Some(text) = format_biff_number(val) {
+                    if !append_bounded(&mut body, &mut separator, &text) {
+                        return Ok(body);
+                    }
+                    separator = "\n";
+                }
+            }
+            REC_MULRK => {
+                let mut off = 4usize;
+                while off + 8 <= payload.len() {
+                    let val = decode_biff_rk(read_u32_le(payload, off + 2)?);
+                    if let Some(text) = format_biff_number(val) {
+                        if !append_bounded(&mut body, &mut separator, &text) {
+                            return Ok(body);
+                        }
+                        separator = "\n";
+                    }
+                    off += 6;
+                }
+            }
+            REC_FORMULA => {
+                if payload.len() < 14 || payload[12..14] == [0xFF, 0xFF] {
+                    continue;
+                }
+                let val = f64::from_bits(read_u64_le(payload, 6)?);
+                if let Some(text) = format_biff_number(val) {
+                    if !append_bounded(&mut body, &mut separator, &text) {
                         return Ok(body);
                     }
                     separator = "\n";
@@ -1960,6 +2034,108 @@ pub(crate) mod tests {
 
         let enc = build_synthetic_xls(true);
         assert!(xls_text(Cursor::new(&enc)).is_err());
+    }
+
+    #[test]
+    fn extracts_xls_biff8_numeric_cells_number_rk_mulrk_and_formula() {
+        let mut wb = Vec::new();
+        // BOF BIFF8 (vers = 0x0600, dt = 0x0005 workbook globals)
+        wb.extend_from_slice(&biff_record(0x0809, &[0x00, 0x06, 0x05, 0x00, 0, 0, 0, 0]));
+
+        // 1. REC_NUMBER (0x0203): integer float 310927431.0, decimal 42.875, and -0.0
+        let mut num_int = vec![0u8; 6]; // row=0, col=0, xf=0
+        num_int.extend_from_slice(&310_927_431.0_f64.to_le_bytes());
+        wb.extend_from_slice(&biff_record(0x0203, &num_int));
+
+        let mut num_dec = vec![0, 0, 1, 0, 0, 0]; // row=0, col=1, xf=0
+        num_dec.extend_from_slice(&42.875_f64.to_le_bytes());
+        wb.extend_from_slice(&biff_record(0x0203, &num_dec));
+
+        let mut num_neg_zero = vec![0, 0, 2, 0, 0, 0]; // row=0, col=2, xf=0
+        num_neg_zero.extend_from_slice(&(-0.0_f64).to_le_bytes());
+        wb.extend_from_slice(&biff_record(0x0203, &num_neg_zero));
+
+        // 2. REC_RK (0x027E):
+        // - 30-bit signed integer: 2026
+        let mut rk_pos_int = vec![1, 0, 0, 0, 0, 0];
+        let rk_val_pos = ((2026i32 << 2) as u32) | 0x02;
+        rk_pos_int.extend_from_slice(&rk_val_pos.to_le_bytes());
+        wb.extend_from_slice(&biff_record(0x027E, &rk_pos_int));
+
+        // - 30-bit negative integer: -4096
+        let mut rk_neg_int = vec![1, 0, 1, 0, 0, 0];
+        let rk_val_neg = ((-4096i32 << 2) as u32) | 0x02;
+        rk_neg_int.extend_from_slice(&rk_val_neg.to_le_bytes());
+        wb.extend_from_slice(&biff_record(0x027E, &rk_neg_int));
+
+        // - 30-bit integer with /100 flag: 12345 / 100 = 123.45
+        let mut rk_div100 = vec![1, 0, 2, 0, 0, 0];
+        let rk_val_div100 = ((12345i32 << 2) as u32) | 0x03;
+        rk_div100.extend_from_slice(&rk_val_div100.to_le_bytes());
+        wb.extend_from_slice(&biff_record(0x027E, &rk_div100));
+
+        // - IEEE-754 float RK (30 MSBs shifted): 6.25
+        let mut rk_float = vec![1, 0, 3, 0, 0, 0];
+        let rk_val_float = ((6.25_f64.to_bits() >> 32) as u32) & 0xFFFF_FFFC;
+        rk_float.extend_from_slice(&rk_val_float.to_le_bytes());
+        wb.extend_from_slice(&biff_record(0x027E, &rk_float));
+
+        // 3. REC_MULRK (0x00BD): row=2, colFirst=0..colLast=2 (3 columns: 1001, 2002, 3003.5)
+        let mut mulrk = Vec::new();
+        mulrk.extend_from_slice(&2u16.to_le_bytes()); // row=2
+        mulrk.extend_from_slice(&0u16.to_le_bytes()); // colFirst=0
+        for &rk in &[
+            ((1001i32 << 2) as u32) | 0x02,
+            ((2002i32 << 2) as u32) | 0x02,
+            ((300_350i32 << 2) as u32) | 0x03, // 3003.5
+        ] {
+            mulrk.extend_from_slice(&0u16.to_le_bytes()); // xf=0
+            mulrk.extend_from_slice(&rk.to_le_bytes());
+        }
+        mulrk.extend_from_slice(&2u16.to_le_bytes()); // colLast=2
+        wb.extend_from_slice(&biff_record(0x00BD, &mulrk));
+
+        // 4. REC_FORMULA (0x0006):
+        // - Cached numeric f64 result: 98765.25
+        let mut formula_num = vec![3, 0, 0, 0, 0, 0]; // row=3, col=0, xf=0
+        formula_num.extend_from_slice(&98765.25_f64.to_le_bytes());
+        formula_num.extend_from_slice(&[0u8; 6]); // grbit + chn + cce
+        wb.extend_from_slice(&biff_record(0x0006, &formula_num));
+
+        // - Cached string tag (result[6..8] == [0xFF, 0xFF]) followed by REC_STRING (0x0207)
+        let mut formula_str_cell = vec![3, 0, 1, 0, 0, 0]; // row=3, col=1, xf=0
+        formula_str_cell.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF]);
+        formula_str_cell.extend_from_slice(&[0u8; 6]);
+        wb.extend_from_slice(&biff_record(0x0006, &formula_str_cell));
+
+        let mut rec_string = Vec::new();
+        rec_string.extend_from_slice(&19u16.to_le_bytes());
+        rec_string.push(0x00); // compressed
+        rec_string.extend_from_slice(b"FormulaStringResult");
+        wb.extend_from_slice(&biff_record(0x0207, &rec_string));
+
+        wb.extend_from_slice(&biff_record(0x000A, &[])); // EOF
+
+        let xls = build_ole2(&[("Workbook", &wb)]);
+        let text = xls_text(Cursor::new(&xls)).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "310927431",
+                "42.875",
+                "0",
+                "2026",
+                "-4096",
+                "123.45",
+                "6.25",
+                "1001",
+                "2002",
+                "3003.5",
+                "98765.25",
+                "FormulaStringResult",
+            ]
+        );
     }
 
     #[test]

@@ -24,6 +24,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -40,9 +42,18 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-release-
 
       - name: Run core verification gates
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           cargo test --locked
           scripts/build-app.sh
+          TAG="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          TARGET_VERSION="${TAG#v}"
+          PLIST_VER="$(plutil -extract CFBundleShortVersionString raw target/Lumen.app/Contents/Info.plist)"
+          if [[ "$TARGET_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] && [ "$PLIST_VER" != "$TARGET_VERSION" ]; then
+            echo "error: release tag version '$TARGET_VERSION' (from '$TAG') does not match Info.plist CFBundleShortVersionString '$PLIST_VER'" >&2
+            exit 1
+          fi
           python3 -B scripts/smoke-app.py
 
       - name: Prepare release notes and signing mode

@@ -392,8 +392,8 @@ struct LauncherSettings: View {
             LumenSettingsHeader(
                 kicker: "GENERAL",
                 title: model.t("通用", "General"),
-                description: model.t("全局快捷键、外观主题、语言与剪贴板历史。",
-                                     "Global shortcut, appearance theme, language, and clipboard history.")
+                description: model.t("全局快捷键、外观主题、语言、文件打开方式与剪贴板历史。",
+                                     "Global shortcut, appearance, language, default file action, and clipboard history.")
             )
         case .index:
             LumenSettingsHeader(
@@ -467,14 +467,11 @@ struct LauncherSettings: View {
             note(model.t("菜单栏中的「打开搜索」始终可用。", "Open Search is always available in the menu bar."))
         }
 
-        LumenSettingsCard(title: model.t("外观与语言", "Appearance & Language"), icon: "paintbrush") {
+        LumenSettingsCard(title: model.t("外观与行为", "Appearance & Behavior"), icon: "slider.horizontal.3") {
             HStack(alignment: .top, spacing: 12) {
                 LumenSettingsWell(padding: 12) {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text(model.t("外观主题", "APPEARANCE").uppercased())
-                            .font(.system(size: 10, weight: .semibold))
-                            .tracking(0.8)
-                            .foregroundStyle(SettingsTheme.textTertiary)
+                        wellKicker(model.t("外观主题", "APPEARANCE"))
                         Picker(model.t("外观", "Appearance"),
                                selection: Binding(get: { model.appearanceMode }, set: { model.setAppearanceMode($0) })) {
                             Text(model.t("跟随系统", "System")).tag(AppearanceMode.system)
@@ -490,10 +487,7 @@ struct LauncherSettings: View {
 
                 LumenSettingsWell(padding: 12) {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text(model.t("界面语言", "LANGUAGE").uppercased())
-                            .font(.system(size: 10, weight: .semibold))
-                            .tracking(0.8)
-                            .foregroundStyle(SettingsTheme.textTertiary)
+                        wellKicker(model.t("界面语言", "LANGUAGE"))
                         Picker(model.t("界面语言", "Interface Language"),
                                selection: Binding(get: { model.language }, set: { model.set(\.language, to: $0) })) {
                             Text(model.t("跟随系统", "System")).tag("system")
@@ -505,6 +499,25 @@ struct LauncherSettings: View {
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .topLeading)
+            }
+
+            LumenSettingsWell(padding: 12) {
+                VStack(alignment: .leading, spacing: 8) {
+                    wellKicker(model.t("文件默认动作", "DEFAULT FILE ACTION"))
+                    Picker(model.t("文件默认动作", "Default File Action"),
+                           selection: Binding(get: { model.fileDefaultAction }, set: { model.setFileDefaultAction($0) })) {
+                        Text(model.t("直接打开", "Open File")).tag(FileDefaultAction.open)
+                        Text(model.t("在 Finder 中显示", "Show in Finder")).tag(FileDefaultAction.revealInFinder)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .accessibilityIdentifier("settings.file-default-action")
+                    Text(model.t("双击或按回车执行默认动作，⌘↵ 自动互换另一项；文件夹与应用始终直接打开。",
+                                 "Return or double-click runs the default action, and ⌘↵ swaps to the other. Folders and apps always open directly."))
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(SettingsTheme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
 
@@ -1379,6 +1392,13 @@ struct LauncherSettings: View {
         let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
         guard let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String else { return version }
         return "\(version) (\(build))"
+    }
+
+    private func wellKicker(_ title: String) -> some View {
+        Text(title.uppercased())
+            .font(.system(size: 10, weight: .semibold))
+            .tracking(0.8)
+            .foregroundStyle(SettingsTheme.textTertiary)
     }
 
     private func note(_ text: String) -> some View {

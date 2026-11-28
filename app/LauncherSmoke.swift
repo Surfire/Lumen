@@ -8691,6 +8691,17 @@ final class LauncherSmoke {
                       for: app.panelState, rows: model.visibleResults, showsResults: model.showsResults, hasFileDialogBanner: true
                   ),
                   "AppDelegate showSearch did not present Quick Switch banner + Finder folder row")
+        app.panel.contentView?.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(40))
+        let fileDialogLight = try render(.aqua, window: app.panel)
+        app.panel.appearance = nil
+        let fdSize = app.panel.frame.size
+        let fdYRange = PanelGeometry.headerHeight..<(PanelGeometry.headerHeight + FileDialogBanner.launcherHeight)
+        try check(!hasBannerInk(in: fileDialogLight, panelSize: fdSize,
+                                xPoints: (fdSize.width - 92)..<(fdSize.width - 34),
+                                yPoints: fdYRange) &&
+                  app.panel.onDismissContext?() == false,
+                  "FileDialogBanner unexpectedly rendered ⌘⇧⌫ hint or handled onDismissContext")
 
         // Cmd+Return preserves normal Reveal without dialog navigation.
         try type("space-doc", into: app)

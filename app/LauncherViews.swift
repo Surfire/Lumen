@@ -1046,18 +1046,6 @@ struct FileDialogBanner: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer(minLength: 8)
-            Text("⌘⇧⌫")
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 4.5)
-                .padding(.vertical, 1.5)
-                .background(.primary.opacity(0.065), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 4, style: .continuous)
-                        .strokeBorder(.primary.opacity(0.11), lineWidth: 0.75)
-                }
-                .fixedSize()
-                .accessibilityIdentifier("selection-context-banner-shortcut")
             Button(action: dismiss) {
                 Image(systemName: "xmark.circle.fill")
                     .font(.system(size: 12))
